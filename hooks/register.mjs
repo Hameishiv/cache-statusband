@@ -51,6 +51,7 @@ const S = {
   prCheckedAt: 0,
   effort: '', // the main loop's effort, as its last request named it
   account: '', // the signed-in account's email, shown when no seat file is configured
+  resumeAt: 0, // when an out-of-usage chat sends itself "Resume"; 0 when none is pending
   fable: null, // { percentUsed, resetsAt } from the plan's per-model weekly limits
   planWindows: [], // 5h and weekly from the same reading, for a session that has sent nothing yet
 }
@@ -77,6 +78,7 @@ const cfg = {
   seatFileDesktop: '',
   rotatorWake: null, // the prompt an unattended account rotator types after rotating: compact without asking
   prPattern: null, // a first prompt naming a PR: keep warm stops once that PR merges or closes
+  autoResume: false, // send "Resume" to a chat cut short by exhausted usage once it renews
 }
 
 // A bad pattern in the settings turns that feature off rather than failing the load
@@ -292,6 +294,60 @@ function worthCompacting() {
 }
 
 // Run off the hook: a command started inside a hook the session waits on is refused
+// Auto-resume: a turn cut short by an exhausted plan window gets "Resume" once it renews.
+// Only usage exhaustion: a short throttle, an overload or any other error is left alone.
+const USAGE_SPENT = /usage limit|limit reached|hit your limit|out of (extra )?usage|limit will reset|resets? (at|in)\b/i
+const RESUME_FALLBACK = 60 * MIN // no reset time known: try once an hour, three times at most
+let resumeTries = 0
+
+// The windows that are full, from the freshest reading this session has
+export function spentWindows(limits, fable, model) {
+  const full = limits.filter((l) => (l.percentUsed || 0) >= 100)
+  if (fable && fable.percentUsed >= 100 && /fable/i.test(String(model))) full.push({ kind: 'fable', ...fable })
+  return full
+}
+
+// When to resume: a minute after the last full window resets; null when no reset time is known
+export function resumeTime(full, at) {
+  const times = full.map((l) => Date.parse(l.resetsAt || '')).filter((t) => t > at)
+  return times.length ? Math.max(...times) + MIN : null
+}
+
+function armResume($, details) {
+  let limits = S.rateLimits.length ? S.rateLimits : borrowedLimits(fleet, { seat: S.seat, desktop: !onTerminal }, now)
+  if (!limits.length) limits = S.planWindows
+  const full = spentWindows(limits, S.fable, S.model)
+  if (!full.length && !USAGE_SPENT.test(String(details || ''))) return // not usage exhaustion
+  const at = resumeTime(full, now)
+  if (!at && resumeTries >= 3) {
+    $.ui.toast('Auto-resume gave up: no reset time is known. Send a message once usage renews.', { timeoutMs: 15000 })
+    return
+  }
+  S.resumeAt = at || now + RESUME_FALLBACK
+  if (!at) resumeTries++
+  $.ui.toast(`Out of usage. This chat resumes on its own at ${clock(S.resumeAt)}.`, { timeoutMs: 15000 })
+  $.ui.invalidate('ui.render')
+}
+
+// From the heartbeat tick: send "Resume" once its time has come, as the person's own word
+async function resumeStep($) {
+  if (!S.resumeAt || now < S.resumeAt || S.working) return
+  S.resumeAt = 0
+  $.ui.invalidate('ui.render')
+  if (worthCompacting()) {
+    compactThenSend($, { text: 'Resume' }, true)
+    return
+  }
+  for (const asUser of [true, false]) {
+    try {
+      await $.prompt.submit({ text: 'Resume', ...(asUser ? { asUser } : {}) })
+      return
+    } catch {
+      // try the plugin's own voice next
+    }
+  }
+}
+
 function compactThenSend($, e, unattended) {
   const msg = { text: e.text, attachments: e.attachments, slash: !!e.command }
   $.clock.after(50, () => runCompactThenSend($, msg, unattended).catch(() => {}))
@@ -706,6 +762,7 @@ function warnStep($) {
 async function tick($) {
   now = await $.clock.now()
   try {
+    await resumeStep($)
     await refreshPlan($)
     await loadSettings($) // /cache set in another session applies here too
     await readSeat($)
@@ -756,6 +813,7 @@ export function register(on, options = {}) {
   cfg.seatFileDesktop = String(options.seatFileDesktop || '')
   cfg.rotatorWake = pattern(options.rotatorWakePattern, 'i')
   cfg.prPattern = pattern(options.prPattern)
+  cfg.autoResume = options.autoResume === true
   on('session.start', async ($, e, next) => {
     now = await $.clock.now()
     home = (await $.env.get('USERPROFILE')) || (await $.env.get('HOME')) || ''
@@ -837,6 +895,11 @@ export function register(on, options = {}) {
   // The first prompt names the session on the board
   on('prompt.submit', async ($, e, next) => {
     now = await $.clock.now()
+    // anything sent to the chat (the person, a rotator's wake-up, our own "Resume") settles a pending resume
+    if (S.resumeAt) {
+      S.resumeAt = 0
+      $.ui.invalidate('ui.render')
+    }
     if (S.label === basename(S.cwd) && e.origin && e.origin.kind === 'composer' && e.text) {
       S.label = basename(S.cwd) + ' · ' + clip(e.text, 40)
     }
@@ -947,6 +1010,7 @@ export function register(on, options = {}) {
     S.waitingSince = 0
     S.tool = ''
     S.lastTurnEnd = now
+    if (e.reason === 'answer') resumeTries = 0 // usage is back: a later cap starts its fallback tries afresh
     try {
       const usage = await $.session.usage()
       if (usage.context && usage.context.tokens) S.ctx = usage.context.tokens
@@ -986,6 +1050,16 @@ export function register(on, options = {}) {
     const r = await next(e)
     markCompacted()
     return r
+  })
+
+  // A main-loop turn the API cut short: arm a resume if what ran out was the plan's usage
+  on('classic.StopFailure', async ($, e, next) => {
+    // a usage cap may be classified rate_limit or unknown; armResume checks it really is usage
+    if (cfg.autoResume && !e.agent_id && (e.error === 'rate_limit' || e.error === 'unknown')) {
+      now = await $.clock.now()
+      armResume($, e.error_details)
+    }
+    return next(e)
   })
 
   on('session.measure', async ($, e, next) => {
@@ -1211,6 +1285,7 @@ function bandSegments() {
   out.push([`session ${money(S.costUsd)}`, '#c0605a', LIGHT])
   if (S.coldRestarts.length) out.push([`${S.coldRestarts.length} cold restart${S.coldRestarts.length === 1 ? '' : 's'} ${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))}`, '#5e5c64', LIGHT])
   // who the terminal session runs as: a configured seat's label, else the signed-in account
+  if (S.resumeAt) out.push([`⏸ resumes ${clock(S.resumeAt)}`, '#e66100', LIGHT])
   const who = S.seat ? `seat ${S.seat}` : S.account ? mask(S.account) : ''
   if (onTerminal && who) out.push([who, '#2a7f8f', LIGHT])
   return out

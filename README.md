@@ -27,6 +27,7 @@ This mod is built on two projects. Both are MIT-licensed.
   - the signed-in account's email (terminal only; masked while recording mode is on), or a seat label when a seat file is configured
 - **Weekly Fable usage.** Read from the same usage endpoint the app's usage card reads, through the session's own credential (the mod never sees the token). One check every 5 minutes, shared by every open session, and it honours the server's `Retry-After`. No model tokens are spent.
 - **Reopened chats are measured before you send.** When you resume or reopen a chat, the mod reads the end of its transcript: the last reply's token usage is what your first message will re-read, and its time says how cold the cache is. So you see the real context size and the cache's age straight away, and the cold-send guard can offer "compact first, then send" on your first message.
+- **Auto-resume after usage renews (opt-in).** When a turn is cut short because the plan's usage ran out, the band shows `⏸ resumes <time>` and the chat is sent "Resume" a minute after the full window resets. Only usage exhaustion arms it: a short throttle or an overload does not. Anything sent to the chat first cancels it. The Desktop app's "Try again" prompt is drawn by the app itself, which a mod cannot remove, so it may stay on screen; the resume goes to the session either way.
 - **Usage on a fresh or reopened chat.** Until a chat has made its own request, the 5-hour and weekly figures come from the freshest open chat on the same account, then from the shared usage check.
 
 ## Requirements
@@ -70,6 +71,7 @@ Everything below is off by default. Set the values in Claude Code's config menu,
 | `seatFileTerminal` | For account rotators: a file holding the active seat's label (e.g. `~/.claude-cli-accounts/.active`). The band shows `seat <label>` in place of the account email, and a change marks the cache cold. |
 | `seatFileDesktop` | The same for sessions the Desktop app runs (only used to notice a rotation). |
 | `rotatorWakePattern` | A regular expression matching the prompt an unattended account rotator types after rotating. That prompt is compacted first without asking, since nobody is there to answer. |
+| `autoResume` | `true` to turn on auto-resume (above). Off by default because it spends usage without asking. |
 | `prPattern` | A regular expression whose first group is a PR number, matched against a chat's first prompt (e.g. `(?:^\|\s)/?merge-pr\s+#?(\d+)`). Keep warm then stops once `gh` reports that PR merged or closed. |
 
 ## Fonts

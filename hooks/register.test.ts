@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { ago, borrowedLimits, fableLimit, pattern, lastContext, modelName, planWindows, untilText } from './register.mjs'
+import { ago, borrowedLimits, fableLimit, pattern, resumeTime, spentWindows, lastContext, modelName, planWindows, untilText } from './register.mjs'
 
 const COMPOSER = { kind: 'composer' } as never
 // An example setup: an account rotator and a merge-pr workflow, as the README describes
@@ -201,4 +201,44 @@ test('a reopened chat borrows plan windows from the freshest session on the same
   expect(borrowedLimits(list, { seat: 'A', desktop: false }, at)[0].percentUsed).toBe(44)
   expect(borrowedLimits(list, { seat: '', desktop: true }, at)[0].percentUsed).toBe(90)
   expect(borrowedLimits([{ seat: 'A', updatedAt: at, rateLimits: five(80, '2026-10-29T09:00:00Z') }], { seat: 'A', desktop: false }, at)).toEqual([])
+})
+
+test('auto-resume waits for the last full window to reset, and only for usage', async () => {
+  const at = Date.parse('2026-10-29T10:00:00Z')
+  const limits = [
+    { kind: 'five_hour', percentUsed: 100, resetsAt: '2026-10-29T12:00:00Z' },
+    { kind: 'seven_day', percentUsed: 40, resetsAt: '2026-11-04T23:00:00Z' },
+  ]
+  expect(spentWindows(limits, null, 'claude-opus-5-5').map((l) => l.kind)).toEqual(['five_hour'])
+  expect(resumeTime(spentWindows(limits, null, 'claude-opus-5-5'), at)).toBe(Date.parse('2026-10-29T12:00:00Z') + 60000)
+  // Fable's weekly cap only stops a Fable chat
+  const fable = { percentUsed: 100, resetsAt: '2026-11-04T23:00:00Z' }
+  expect(spentWindows([], fable, 'claude-opus-5-5')).toEqual([])
+  expect(resumeTime(spentWindows([], fable, 'claude-fable-5-1'), at)).toBe(Date.parse('2026-11-04T23:00:00Z') + 60000)
+  // nothing full, or no reset time: no time to resume at
+  expect(resumeTime(spentWindows([{ kind: 'five_hour', percentUsed: 80 }], null, ''), at)).toBe(null)
+})
+
+test('a chat cut short by spent usage sends "Resume" once the window renews; a throttle does not', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = engine($, on)
+  on('classic.StopFailure', () => ({}))
+  await start($, 50000, clock)
+  const t0 = 60000 // the mock clock starts at 0 and start() advanced it a minute
+  const resetsAt = new Date(t0 + 2 * 3600000).toISOString()
+  await $.session.measure({ context: { tokens: 50000, window: 1000000, percent: 5 }, rateLimits: [{ kind: 'five_hour', percentUsed: 100, resetsAt }], changed: [] } as never)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  await clock.advance(3600000)
+  expect(seen.submits).toEqual([])
+  await clock.advance(3600000 + 2 * 60000)
+  expect(seen.submits).toEqual(['Resume'])
+})
+
+test('a short throttle or an overload arms no resume', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = engine($, on)
+  on('classic.StopFailure', () => ({}))
+  await start($, 50000, clock)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: 'Too many requests, slow down' })
+  await ($ as any).classic.StopFailure({ error: 'overloaded', error_details: 'Overloaded' })
+  await clock.advance(4 * 3600000)
+  expect(seen.submits).toEqual([])
 })

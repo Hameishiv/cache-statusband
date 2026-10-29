@@ -31,6 +31,12 @@
       "title": "PR session pattern",
       "description": "A regular expression whose first group is a PR number, matched against a session's first prompt (e.g. (?:^|\\s)/?merge-pr\\s+#?(\\d+)). Keep warm then stops once gh reports that PR merged or closed. Leave empty to turn off.",
       "default": ""
+    },
+    "autoResume": {
+      "type": "boolean",
+      "title": "Auto-resume after usage renews",
+      "description": "When a chat's turn is cut short because the plan's usage ran out, send it \"Resume\" a minute after the full window resets. Spends usage without asking, so it is off by default. Anything you send first cancels it.",
+      "default": false
     }
   }
 }
