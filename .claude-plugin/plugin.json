@@ -1,0 +1,36 @@
+{
+  "name": "cache-statusband",
+  "version": "1.1.0",
+  "description": "Nate Herk's Cache Keeper plus a ccstatusline-style status band: model, effort, context, cache, 5-hour/weekly/Fable usage with resets, and reopened chats measured before you send",
+  "author": {
+    "name": "Hameishiv, built on Cache Keeper by Nate Herk"
+  },
+  "homepage": "https://github.com/Hameishiv/cache-statusband",
+  "license": "MIT",
+  "userConfig": {
+    "seatFileTerminal": {
+      "type": "string",
+      "title": "Seat file (terminal)",
+      "description": "For account rotators: a file holding the active seat's label (e.g. ~/.claude-cli-accounts/.active). The band then shows that label in place of the account email, and a change marks the cache cold. Leave empty to show the account email.",
+      "default": ""
+    },
+    "seatFileDesktop": {
+      "type": "string",
+      "title": "Seat file (desktop app)",
+      "description": "The same for sessions the desktop app runs. Only used to notice a rotation; the app's band doesn't show it. Leave empty to turn off.",
+      "default": ""
+    },
+    "rotatorWakePattern": {
+      "type": "string",
+      "title": "Rotator wake-up pattern",
+      "description": "A regular expression matching the prompt an unattended account rotator types after rotating. Such a prompt is compacted first without asking, since nobody is there to answer. Leave empty to turn off.",
+      "default": ""
+    },
+    "prPattern": {
+      "type": "string",
+      "title": "PR session pattern",
+      "description": "A regular expression whose first group is a PR number, matched against a session's first prompt (e.g. (?:^|\\s)/?merge-pr\\s+#?(\\d+)). Keep warm then stops once gh reports that PR merged or closed. Leave empty to turn off.",
+      "default": ""
+    }
+  }
+}
