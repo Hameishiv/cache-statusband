@@ -1206,7 +1206,7 @@ function bandSegments() {
   if (five) out.push(limitSegment('5h', five, '#7b5ea7', LIGHT))
   if (week) out.push(limitSegment('week', week, '#8fbf8f', DARK))
   // its reset is the weekly one's, already shown
-  if (S.fable) out.push(limitSegment('Fable wk', S.fable, '#d38fc5', DARK, false))
+  if (S.fable) out.push(limitSegment('Fable', S.fable, '#d38fc5', DARK, false))
   for (const l of S.rateLimits) if (l.kind !== 'five_hour' && l.kind !== 'seven_day') out.push(limitSegment(LIMIT_LABEL[l.kind] || l.kind, l, '#5e5c64', LIGHT))
   out.push([`session ${money(S.costUsd)}`, '#c0605a', LIGHT])
   if (S.coldRestarts.length) out.push([`${S.coldRestarts.length} cold restart${S.coldRestarts.length === 1 ? '' : 's'} ${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))}`, '#5e5c64', LIGHT])

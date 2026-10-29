@@ -3,7 +3,7 @@
 A Claude Code mod that keeps a big chat's prompt cache warm, warns before an expensive cold restart, and draws a colour-blocked status band above the prompt with the numbers you'd otherwise need a status line for.
 
 ```
- Opus 5.5 ▶ high ▶ ctx 287k · rewrite ≈ $2.29 ▶ ● cache warm 42m ▶ 5h 27% · 3h22m ▶ week 33% · 5d19h ▶ Fable wk 6% ▶ session $23 ▶ you@example.com ▶
+ Opus 5.5 ▶ high ▶ ctx 287k · rewrite ≈ $2.29 ▶ ● cache warm 42m ▶ 5h 27% · 3h22m ▶ week 33% · 5d19h ▶ Fable 6% ▶ session $23 ▶ you@example.com ▶
 ```
 
 It works in the terminal and in the Desktop app's Code tab, so it replaces a command status line.
