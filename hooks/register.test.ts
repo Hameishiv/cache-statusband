@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { ago, borrowedLimits, fableLimit, pattern, resumeTime, spentWindows, lastContext, modelName, planWindows, untilText } from './register.mjs'
+import { ago, borrowedLimits, capFirst, fableLimit, HUES, paint, pattern, resumeTime, spentWindows, lastContext, modelName, planWindows, untilText } from './register.mjs'
 
 const COMPOSER = { kind: 'composer' } as never
 // An example setup: an account rotator and a merge-pr workflow, as the README describes
@@ -224,12 +224,12 @@ test('a chat cut short by spent usage sends "Resume" once the window renews; a t
   on('classic.StopFailure', () => ({}))
   await start($, 50000, clock)
   const t0 = 60000 // the mock clock starts at 0 and start() advanced it a minute
-  const resetsAt = new Date(t0 + 2 * 3600000).toISOString()
+  const resetsAt = new Date(t0 + 30 * 60000).toISOString()
   await $.session.measure({ context: { tokens: 50000, window: 1000000, percent: 5 }, rateLimits: [{ kind: 'five_hour', percentUsed: 100, resetsAt }], changed: [] } as never)
   await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
-  await clock.advance(3600000)
+  await clock.advance(20 * 60000)
   expect(seen.submits).toEqual([])
-  await clock.advance(3600000 + 2 * 60000)
+  await clock.advance(12 * 60000)
   expect(seen.submits).toEqual(['Resume'])
 })
 
@@ -239,6 +239,34 @@ test('a short throttle or an overload arms no resume', { options: { autoResume: 
   await start($, 50000, clock)
   await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: 'Too many requests, slow down' })
   await ($ as any).classic.StopFailure({ error: 'overloaded', error_details: 'Overloaded' })
-  await clock.advance(4 * 3600000)
+  await clock.advance(70 * 60000) // past the hourly fallback a wrongly armed resume would use
   expect(seen.submits).toEqual([])
+})
+
+// WCAG contrast ratio of two #rrggbb colours
+function contrast(a: string, b: string) {
+  const lum = (hex: string) => {
+    const [r, g, bl] = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255).map((c) => (c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4))
+    return 0.2126 * r + 0.7152 * g + 0.0722 * bl
+  }
+  const [x, y] = [lum(a), lum(b)].sort((p, q) => q - p)
+  return (x + 0.05) / (y + 0.05)
+}
+
+test('neighbouring segments alternate dark and light, so any two neighbours contrast', async () => {
+  const painted = paint([['a', 'blue'], ['b', 'cyan'], ['c', 'blue']])
+  expect(painted.map(([, bg]) => bg)).toEqual([HUES.blue[0], HUES.cyan[1], HUES.blue[0]])
+  for (const [dark, light] of Object.values(HUES)) {
+    expect(contrast(dark, '#ffffff')).toBeGreaterThanOrEqual(4.5) // its text reads
+    expect(contrast(light, '#1e1e1e')).toBeGreaterThanOrEqual(4.5)
+    for (const [, otherLight] of Object.values(HUES)) expect(contrast(dark, otherLight)).toBeGreaterThanOrEqual(3) // any neighbour pair
+  }
+})
+
+test('each segment starts with a capital, past a leading symbol', async () => {
+  expect(capFirst('● cache warm 42m')).toBe('● Cache warm 42m')
+  expect(capFirst('medium')).toBe('Medium')
+  expect(capFirst('5h 27% · 3h22m')).toBe('5h 27% · 3h22m')
+  expect(capFirst('⏸ resumes 3:10am')).toBe('⏸ Resumes 3:10am')
+  expect(capFirst('you@example.com')).toBe('you@example.com')
 })

@@ -1226,10 +1226,39 @@ export function register(on, options = {}) {
   })
 }
 
-// The band's segments, ccstatusline style: [text, background, foreground]
+// The band's segments, ccstatusline style: each names a hue, and paint() picks that hue's
+// dark or light shade by position, alternating, so neighbours always contrast
 const LIGHT = '#ffffff'
 const DARK = '#1e1e1e'
-const ALERT = { warn: ['#e5a50a', DARK], hot: ['#c01c28', LIGHT] }
+export const HUES = {
+  red: ['#a51d2d', '#ffa3a3'],
+  yellow: ['#6b4b00', '#f6d32d'],
+  blue: ['#1a4f99', '#99c1f1'],
+  green: ['#1d5c3d', '#8ff0a4'],
+  cyan: ['#0a5960', '#7fe0e0'],
+  gray: ['#4a4950', '#c0bfbc'],
+  purple: ['#5a3d8a', '#c9a8f0'],
+  pink: ['#74305f', '#f0a8dc'],
+  salmon: ['#7f302a', '#f5a99f'],
+  orange: ['#8a3700', '#ffbe6f'],
+  teal: ['#175858', '#88d8c8'],
+}
+const WARN = 'orange'
+const HOT = 'red'
+
+// Every segment's first word capitalised, past a leading symbol (● cache → ● Cache); "5h" stays
+export function capFirst(text) {
+  if (/^\S+@\S+$/.test(text)) return text // an email stays as written
+  return String(text).replace(/^([^\p{L}\p{N}]*)(\p{Ll})/u, (_, lead, letter) => lead + letter.toUpperCase())
+}
+
+// [text, hue] -> [text, background, foreground], dark and light shades in turn
+export function paint(segs) {
+  return segs.map(([text, hue], i) => {
+    const dark = i % 2 === 0
+    return [capFirst(text), (HUES[hue] || HUES.gray)[dark ? 0 : 1], dark ? LIGHT : DARK]
+  })
+}
 
 export function modelName(id) {
   const m = String(id || '').toLowerCase().match(/(opus|sonnet|haiku|fable)-(\d+)(?:-(\d+))?/)
@@ -1249,11 +1278,10 @@ export function untilText(iso, at) {
   return ms > 0 ? ago(ms) : ''
 }
 
-function limitSegment(label, limit, bg, fg, showReset = true) {
+function limitSegment(label, limit, hue, showReset = true) {
   const pct = limit.percentUsed || 0
-  const [b, f] = pct >= 95 ? ALERT.hot : pct >= 80 ? ALERT.warn : [bg, fg]
   const left = showReset ? untilText(limit.resetsAt, now) : ''
-  return [`${label} ${Math.round(pct)}%${left ? ' · ' + left : ''}`, b, f]
+  return [`${label} ${Math.round(pct)}%${left ? ' · ' + left : ''}`, pct >= 95 ? HOT : pct >= 80 ? WARN : hue]
 }
 
 function bandSegments() {
@@ -1262,33 +1290,33 @@ function bandSegments() {
   const big = S.ctx >= settings.bigTokens
   const out = []
   // the app's composer already shows the model and effort
-  if (onTerminal) out.push([modelName(S.model), '#a33a3a', LIGHT])
-  if (onTerminal && S.effort) out.push([S.effort, '#d4a72c', DARK])
+  if (onTerminal) out.push([modelName(S.model), 'red'])
+  if (onTerminal && S.effort) out.push([S.effort, 'yellow'])
   const rewrite = money(rewriteCost(S.ctx, S.model, ttl))
-  out.push([`ctx ${tokens(S.ctx)} · ${st.kind === 'cold' && big ? 'next send rewrites ≈ ' : 'rewrite ≈ '}${rewrite}`, ...(st.kind === 'cold' && big ? ALERT.hot : ['#3d6fb4', LIGHT])])
-  if (st.kind === 'kept') out.push([`◆ K.W. until ${clock(S.keepWarmUntil)} · ${S.pings} ping${S.pings === 1 ? '' : 's'} ${money(S.pingUsd)}`, '#1c71d8', LIGHT])
-  else if (st.kind === 'warm') out.push([`● cache warm ${minutes(st.left)}`, '#2e8540', LIGHT])
-  else if (st.kind === 'cooling') out.push([`◐ cache cools in ${minutes(st.left)}`, ...ALERT.warn])
-  else if (st.kind === 'cold') out.push([`○ cache cold ${ago(-st.left)}`, ...(big ? ['#7a1f2b', LIGHT] : ['#5e5c64', LIGHT])])
-  else out.push(['cache –', '#5e5c64', LIGHT])
+  out.push([`Ctx ${tokens(S.ctx)} · ${st.kind === 'cold' && big ? 'Next send rewrites ≈ ' : 'Rewrite ≈ '}${rewrite}`, st.kind === 'cold' && big ? HOT : 'blue'])
+  if (st.kind === 'kept') out.push([`◆ K.W. until ${clock(S.keepWarmUntil)} · ${S.pings} ping${S.pings === 1 ? '' : 's'} ${money(S.pingUsd)}`, 'cyan'])
+  else if (st.kind === 'warm') out.push([`● cache warm ${minutes(st.left)}`, 'green'])
+  else if (st.kind === 'cooling') out.push([`◐ cache cools in ${minutes(st.left)}`, WARN])
+  else if (st.kind === 'cold') out.push([`○ cache cold ${ago(-st.left)}`, big ? HOT : 'gray'])
+  else out.push(['cache –', 'gray'])
   // the engine's own reading once a request has run; before that another session's on the same account, then the shared usage reading
   let limits = S.rateLimits.filter((l) => !l.resetsAt || Date.parse(l.resetsAt) > now) // a window that reset since is stale
   if (!limits.length) limits = borrowedLimits(fleet, { seat: S.seat, desktop: !onTerminal }, now)
   if (!limits.length) limits = S.planWindows
   const five = limits.find((l) => l.kind === 'five_hour')
   const week = limits.find((l) => l.kind === 'seven_day')
-  if (five) out.push(limitSegment('5h', five, '#7b5ea7', LIGHT))
-  if (week) out.push(limitSegment('week', week, '#8fbf8f', DARK))
+  if (five) out.push(limitSegment('5h', five, 'purple'))
+  if (week) out.push(limitSegment('Week', week, 'green'))
   // its reset is the weekly one's, already shown
-  if (S.fable) out.push(limitSegment('Fable', S.fable, '#d38fc5', DARK, false))
-  for (const l of S.rateLimits) if (l.kind !== 'five_hour' && l.kind !== 'seven_day') out.push(limitSegment(LIMIT_LABEL[l.kind] || l.kind, l, '#5e5c64', LIGHT))
-  out.push([`session ${money(S.costUsd)}`, '#c0605a', LIGHT])
-  if (S.coldRestarts.length) out.push([`${S.coldRestarts.length} cold restart${S.coldRestarts.length === 1 ? '' : 's'} ${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))}`, '#5e5c64', LIGHT])
+  if (S.fable) out.push(limitSegment('Fable', S.fable, 'pink', false))
+  for (const l of S.rateLimits) if (l.kind !== 'five_hour' && l.kind !== 'seven_day') out.push(limitSegment(LIMIT_LABEL[l.kind] || l.kind, l, 'gray'))
+  out.push([`session ${money(S.costUsd)}`, 'salmon'])
+  if (S.coldRestarts.length) out.push([`${S.coldRestarts.length} cold restart${S.coldRestarts.length === 1 ? '' : 's'} ${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))}`, 'gray'])
+  if (S.resumeAt) out.push([`⏸ resumes ${clock(S.resumeAt)}`, WARN])
   // who the terminal session runs as: a configured seat's label, else the signed-in account
-  if (S.resumeAt) out.push([`⏸ resumes ${clock(S.resumeAt)}`, '#e66100', LIGHT])
   const who = S.seat ? `seat ${S.seat}` : S.account ? mask(S.account) : ''
-  if (onTerminal && who) out.push([who, '#2a7f8f', LIGHT])
-  return out
+  if (onTerminal && who) out.push([who, 'teal'])
+  return paint(out)
 }
 
 function footerLabel() {
