@@ -62,12 +62,14 @@ const names = { cache: 'cache', keepwarm: 'keepwarm', board: 'board', handoff: '
 let now = 0
 let home = ''
 let lastHeartbeat = 0
+let lastPrune = 0
 let rec = { on: false, strict: false }
 let mask = (s) => s
 let fleet = [] // heartbeats of every session, this one included
 const alerted = new Map() // sessionId -> state or warning key already announced
 let paneOpen = false
 let justCompacted = false
+let compactedCold = false
 let handoffPending = false
 let seatFile = ''
 let onTerminal = false
@@ -250,6 +252,9 @@ function rotatedCold() {
 
 // The next request writes the shorter context: no TTL evidence and nothing to warn about
 function markCompacted() {
+  // a compaction of a cold cache (Claude Code auto-compacts a big chat as it is sent) still pays a rewrite
+  const left = msLeft(S.lastActivity, ttlMin())
+  compactedCold = compactedCold || (left !== null && left <= 0) || rotatedCold()
   justCompacted = true
   S.lastActivity = 0
 }
@@ -607,16 +612,47 @@ const TAIL_BYTES = 1024 * 1024
 // $.fs.read stops at 4 MiB and has no offset, so a long transcript's tail comes through node
 const TAIL_JS = "const fs=require('fs'),p=process.argv[1],s=fs.statSync(p).size,n=Math.min(s," + TAIL_BYTES + "),b=Buffer.alloc(n),fd=fs.openSync(p,'r');fs.readSync(fd,b,0,n,s-n);process.stdout.write(b)"
 
+// A chat's last request, kept past the session: the app has no $.process.run, so it cannot
+// read a transcript over 4 MiB, and a big chat is exactly the one the cold-send guard is for
+const LAST_KEEP = 30 * 24 * 60 * MIN
+async function rememberLast($) {
+  if (!S.id || !S.ctx) return
+  try {
+    // the chat's cold rewrites too, so their cost survives a reopen
+    await $.store.set('last:' + S.id, { ctx: S.ctx, at: S.lastActivity, model: S.model, effort: S.effort, cold: S.coldRestarts.slice(-50) })
+  } catch {
+    // another session holds the store's lock: the next request writes it
+  }
+}
+
 async function seedFromTranscript($, path) {
-  if (!path) return
   let found = null
   try {
     const st = await $.fs.stat(path)
-    if (st.kind !== 'file' || !st.size) return
-    const text = st.size <= 4 * 1024 * 1024 ? String(await $.fs.read(path)) : (await $.process.run(['node', '-e', TAIL_JS, path], { timeoutMs: 15000 })).stdout
-    found = lastContext(String(text).split('\n'))
+    if (st.kind === 'file' && st.size) {
+      const text = st.size <= 4 * 1024 * 1024 ? String(await $.fs.read(path)) : (await $.process.run(['node', '-e', TAIL_JS, path], { timeoutMs: 15000 })).stdout
+      found = lastContext(String(text).split('\n'))
+    }
   } catch {
-    return // no transcript yet (a new chat) or unreadable: the first request measures it
+    // no transcript yet, or too big to read here (the app): fall back on what this mod kept
+  }
+  let last = null
+  try {
+    last = S.id ? await $.store.get('last:' + S.id) : null
+  } catch {
+    last = null
+  }
+  if (last && Array.isArray(last.cold) && !S.coldRestarts.length) S.coldRestarts = last.cold
+  if (!found && S.id) {
+    try {
+      // before its first record, a chat open under an earlier version still has its heartbeat
+      const hb = last ? null : await $.store.get('hb:' + S.id)
+      const r = last || (hb && { ctx: hb.ctx, at: hb.lastActivity, model: hb.model, effort: hb.effort })
+      // an `at` of 0 was written between a compaction and the next request
+      if (r && r.ctx) found = { ctx: r.ctx, at: r.at, model: r.model, effort: r.effort, compacted: !r.at }
+    } catch {
+      // store unavailable: the first request measures it
+    }
   }
   if (!found) return
   S.ctx = found.ctx
@@ -654,7 +690,16 @@ export function fableLimit(body) {
 }
 
 async function readFleet($) {
-  const keys = (await $.store.keys()).filter((k) => k.startsWith('hb:'))
+  const all = await $.store.keys()
+  // a chat untouched for a month will not be reopened to send: drop its record
+  if (now - lastPrune > 60 * MIN) {
+    lastPrune = now
+    for (const k of all.filter((k) => k.startsWith('last:'))) {
+      const r = await $.store.get(k)
+      if (!r || now - (r.at || now) > LAST_KEEP) await $.store.delete(k)
+    }
+  }
+  const keys = all.filter((k) => k.startsWith('hb:'))
   const list = []
   for (const k of keys) {
     const hb = await $.store.get(k)
@@ -732,6 +777,7 @@ async function keepWarmStep($) {
     return stopKeepWarm($, `the ping wrote ${tokens(u.cache_creation_input_tokens)} tokens instead of reading the cache`)
   }
   S.lastActivity = now
+  await rememberLast($)
 }
 
 function warnStep($) {
@@ -870,7 +916,9 @@ export function register(on, options = {}) {
     H.armed = false
     // the last chat's compaction says nothing about this one, and would mute its cold-send guard
     justCompacted = false
+    compactedCold = false
     S.floor = 0
+    S.coldRestarts = [] // the new chat's own, from its record below
     try {
       S.id = (await $.session.id()) || S.id
     } catch {
@@ -980,8 +1028,11 @@ export function register(on, options = {}) {
       if (written > 0) S.ttlSource = 'reported by the API'
     }
     if (afterCompact) {
-      // the first request after a compaction writes the new, shorter context: expected
+      // the first request after a compaction writes the new, shorter context: expected,
+      // but on a cache that had gone cold it is the cold rewrite, only smaller
       S.floor = total
+      if (compactedCold && written > 30000) S.coldRestarts.push({ at: now, tokens: written, usd: rewriteCost(written, S.model, ttlMin()), gapMin: 0 })
+      compactedCold = false
     } else if (S.lastActivity && total > 30000 && written / total > 0.5) {
       // Without the API's word: a rewrite after 5-60 idle minutes suggests the 5-minute TTL,
       // unless a rotation emptied the cache (a compaction already cleared lastActivity)
@@ -999,6 +1050,7 @@ export function register(on, options = {}) {
     }
     S.ctx = total
     S.lastActivity = now
+    await rememberLast($)
     return result
   })
 
@@ -1034,6 +1086,7 @@ export function register(on, options = {}) {
   // A compaction arrives by several roads (typed /compact, auto-compact, a plugin,
   // the desktop host running it inside a turn); each one marks it
   on('session.compact', async ($, e, next) => {
+    now = await $.clock.now()
     const r = await next(e)
     if (!e.agentId) markCompacted()
     return r
@@ -1187,7 +1240,8 @@ export function register(on, options = {}) {
     const segs = bandSegments()
     const parts = segs.map(([text, bg, fg], i) => Box({ flexDirection: 'row', flexShrink: 0, children: [
       Text({ backgroundColor: bg, color: fg, children: [` ${text} `] }),
-      Text(segs[i + 1] ? { color: bg, backgroundColor: segs[i + 1][1], children: ['▶'] } : { color: bg, children: ['▶'] }),
+      // the last segment ends square
+      ...(segs[i + 1] ? [Text({ color: bg, backgroundColor: segs[i + 1][1], children: ['▶'] })] : []),
     ] }))
     const left = Box({ flexDirection: 'row', flexWrap: 'wrap', flexShrink: 1, children: parts })
     // the buttons stay together on one row, however the segments wrap
@@ -1299,6 +1353,8 @@ function bandSegments() {
   else if (st.kind === 'cooling') out.push([`◐ cache cools in ${minutes(st.left)}`, WARN])
   else if (st.kind === 'cold') out.push([`○ cache cold ${ago(-st.left)}`, big ? HOT : 'gray'])
   else out.push(['cache –', 'gray'])
+  // what this chat has already paid to rewrite cold caches, beside the next send's estimate
+  if (S.coldRestarts.length) out.push([`Cold rewrites ${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))} (${S.coldRestarts.length})`, 'gray'])
   // the engine's own reading once a request has run; before that another session's on the same account, then the shared usage reading
   let limits = S.rateLimits.filter((l) => !l.resetsAt || Date.parse(l.resetsAt) > now) // a window that reset since is stale
   if (!limits.length) limits = borrowedLimits(fleet, { seat: S.seat, desktop: !onTerminal }, now)
@@ -1311,7 +1367,6 @@ function bandSegments() {
   if (S.fable) out.push(limitSegment('Fable', S.fable, 'pink', false))
   for (const l of S.rateLimits) if (l.kind !== 'five_hour' && l.kind !== 'seven_day') out.push(limitSegment(LIMIT_LABEL[l.kind] || l.kind, l, 'gray'))
   out.push([`session ${money(S.costUsd)}`, 'salmon'])
-  if (S.coldRestarts.length) out.push([`${S.coldRestarts.length} cold restart${S.coldRestarts.length === 1 ? '' : 's'} ${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))}`, 'gray'])
   if (S.resumeAt) out.push([`⏸ resumes ${clock(S.resumeAt)}`, WARN])
   // who the terminal session runs as: a configured seat's label, else the signed-in account
   const who = S.seat ? `seat ${S.seat}` : S.account ? mask(S.account) : ''

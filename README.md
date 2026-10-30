@@ -1,32 +1,44 @@
 # Cache Statusband
 
-A Claude Code mod that keeps a big chat's prompt cache warm, warns before an expensive cold restart, and draws a colour-blocked status band above the prompt with the numbers you'd otherwise need a status line for.
+A status band and prompt-cache guard for coding agents. The main version is a Claude Code mod. It keeps a big chat's prompt cache warm, warns before an expensive cold rewrite, resumes chats cut short by spent usage, and draws a colour-blocked status band above the prompt with the numbers you'd otherwise need a status line for.
 
 ```
- Opus 5.5 ▶ High ▶ Ctx 287k · Rewrite ≈ $2.29 ▶ ● Cache warm 42m ▶ 5h 27% · 3h22m ▶ Week 33% · 5d19h ▶ Fable 6% ▶ Session $23 ▶ you@example.com ▶
+ Opus 5.5 ▶ High ▶ Ctx 287k · Rewrite ≈ $2.29 ▶ ● Cache warm 42m ▶ Cold rewrites $4.10 (2) ▶ 5h 27% · 3h22m ▶ Week 33% · 5d19h ▶ Fable 6% ▶ Session $23 ▶ you@example.com
 ```
 
 It works in the terminal and in the Desktop app's Code tab, so it replaces a command status line.
 
-## Credits
+## Three versions
 
-This mod is built on two projects. Both are MIT-licensed.
+| Folder | Agent | What it covers |
+|---|---|---|
+| repository root | Claude Code | Everything below. |
+| [`codex/`](codex/) | OpenAI Codex CLI | What Codex lets an add-on do: its built-in footer set up to show model, effort, context and 5-hour/weekly usage; a hook that reports a reopened session's last context size; a `board` command listing local sessions. |
+| [`grok/`](grok/) | xAI Grok Build | A status-line command showing model, effort, context, cache token counts, weekly usage and session cost. |
 
-- **[Cache Keeper](https://github.com/nateherkai/claude-code-mods) by Nate Herk.** The whole cache side is his: the warm/cold tracking, keep warm, the cold-send guard, `/board`, `/handoff` and the session-handoff skill. This repository started from his version 1.0.0.
+The cache half (keep warm, the cold-send guard, rewrite costs) exists only in the Claude Code version. It is built around Anthropic's prompt cache, which expires after 5 minutes or an hour and charges extra to write again. OpenAI and xAI cache automatically, with no lifetime the user pays to renew, so there is nothing for it to act on there. Each port's README says what it ported, what it could not, and why.
+
+## Credits and origin
+
+Two MIT-licensed projects made this possible.
+
+- **[Cache Keeper](https://github.com/nateherkai/claude-code-mods) by Nate Herk.** The Claude Code version started from his version 1.0.0, and his code is still its core: the warm/cold tracking, keep warm, the cold-send guard, `/board`, `/handoff`, the session-handoff skill, the pricing table and recording-mode masking. About 93% of his lines are still here, most of them unchanged, and they make up roughly two thirds of the mod's code today (58% counting the tests, which are all new).
 - **[ccstatusline](https://github.com/sirmalloc/ccstatusline) by Matthew Breedlove (sirmalloc).** The band's look (coloured segments, powerline-style arrows) and the choice of what to show (model, effort, context, 5-hour and weekly usage with reset times) follow ccstatusline. No ccstatusline code is used.
+
+So this is not a rewrite of Cache Keeper. It is Cache Keeper with a large set of new features built on it, plus ports to two other agents.
 
 ## What it adds to Cache Keeper
 
 - **A status band, always shown.** Coloured segments for:
   - model and effort (terminal only, since the app's composer already shows them)
   - context size and the cost of rewriting it
-  - cache state
+  - cache state, and what this chat has already paid to rewrite cold caches (kept when the chat is reopened)
   - 5-hour and weekly usage with time to reset
   - weekly Fable usage
   - session cost
   - the signed-in account's email (terminal only; masked while recording mode is on), or a seat label when a seat file is configured
 - **Weekly Fable usage.** Read from the same usage endpoint the app's usage card reads, through the session's own credential (the mod never sees the token). One check every 5 minutes, shared by every open session, and it honours the server's `Retry-After`. No model tokens are spent.
-- **Reopened chats are measured before you send.** When you resume or reopen a chat, the mod reads the end of its transcript: the last reply's token usage is what your first message will re-read, and its time says how cold the cache is. So you see the real context size and the cache's age straight away, and the cold-send guard can offer "compact first, then send" on your first message.
+- **Reopened chats are measured before you send.** When you resume or reopen a chat, the mod reads the end of its transcript: the last reply's token usage is what your first message will re-read, and its time says how cold the cache is. So you see the real context size and the cache's age straight away, and the cold-send guard can offer "compact first, then send" on your first message. A transcript over 4 MB is too big for the Desktop app to read, so the mod also keeps each chat's last context size and time in its own store and falls back on that.
 - **Auto-resume after usage renews (opt-in).** When a turn is cut short because the plan's usage ran out, the band shows `⏸ resumes <time>` and the chat is sent "Resume" a minute after the full window resets. Only usage exhaustion arms it: a short throttle or an overload does not. Anything sent to the chat first cancels it. The Desktop app's "Try again" prompt is drawn by the app itself, which a mod cannot remove, so it may stay on screen; the resume goes to the session either way.
 - **Usage on a fresh or reopened chat.** Until a chat has made its own request, the 5-hour and weekly figures come from the freshest open chat on the same account, then from the shared usage check.
 

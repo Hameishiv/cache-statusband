@@ -7,9 +7,15 @@ const SETUP = { options: { seatFileTerminal: '~/.claude-cli-accounts/.active', s
 
 
 // The engine beneath the mod: a terminal session on seat A, nothing on disk but the seat file
-function engine($: any, on: any, seat = { label: 'A' }) {
+function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unknown>) {
   const clock = mock.clock(on)
-  mock.store(on)
+  if (kept) {
+    // a store already holding what an earlier run of this mod wrote
+    on('store.get', (_: unknown, e: any) => ({ value: kept.get(e.key) }))
+    on('store.set', (_: unknown, e: any) => (kept.set(e.key, e.value), { value: undefined }))
+    on('store.delete', (_: unknown, e: any) => (kept.delete(e.key), { value: undefined }))
+    on('store.keys', () => ({ value: [...kept.keys()] }))
+  } else mock.store(on)
   mock.env(on, { USERPROFILE: 'C:/Users/T' })
   const seen = { compacts: 0, submits: [] as string[], asks: 0 }
   on('session.id', () => ({ value: 'sid-test' }))
@@ -269,4 +275,47 @@ test('each segment starts with a capital, past a leading symbol', async () => {
   expect(capFirst('5h 27% · 3h22m')).toBe('5h 27% · 3h22m')
   expect(capFirst('⏸ resumes 3:10am')).toBe('⏸ Resumes 3:10am')
   expect(capFirst('you@example.com')).toBe('you@example.com')
+})
+
+test('a big chat the app reopens asks before a cold send, from the kept record when the transcript is too big to read', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, 'Send anyway')
+  on('fs.stat', () => ({ value: { kind: 'file', size: 26 * 1024 * 1024 } }))
+  on('process.run', () => {
+    throw new Error('CLI only')
+  })
+  await clock.advance(60000)
+  const at = await clock.now()
+  // what this mod wrote after the chat's last reply, 77 minutes ago: past the 1-hour cache
+  kept.set('last:sid-test', { ctx: 545000, at, model: 'claude-opus-5-5', effort: 'high' })
+  await clock.advance(77 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+  await $.prompt.submit({ text: 'Give me the e-mail', origin: COMPOSER, wait: false } as never)
+  expect(seen.asks).toBe(1)
+})
+
+test('a cold send that Claude Code auto-compacts still counts as a cold rewrite, and the count is kept for a reopen', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock } = engine($, on, { label: 'A' }, kept)
+  let next: unknown = null
+  on('turn.step', async function* () {
+    return { answer: '', toolUses: [], usage: next }
+  })
+  on('turn.complete', () => ({ text: '' }))
+  on('session.usage', () => ({ value: {} }))
+  await start($, 300000, clock)
+  const step = async (u: unknown) => {
+    next = u
+    const it = ($ as any).turn.step({ model: 'claude-opus-5-5', messages: [] })
+    if (it && typeof it[Symbol.asyncIterator] === 'function') for await (const _ of it) void _
+    else await it
+  }
+  const oneHour = (n: number) => ({ cache_creation_input_tokens: n, cache_creation: { ephemeral_1h_input_tokens: n, ephemeral_5m_input_tokens: 0 } })
+  await step(usage(oneHour(400000)))
+  await clock.advance(77 * 60000) // the 1-hour cache lapses
+  await $.command.run({ command: 'compact', args: '' }) // as the auto-compaction marks it
+  await step(usage(oneHour(260000)))
+  const rec = kept.get('last:sid-test') as { cold: unknown[] }
+  expect(rec.cold.length).toBe(1)
 })
