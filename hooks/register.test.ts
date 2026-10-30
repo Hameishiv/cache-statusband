@@ -3225,6 +3225,11 @@ async function coldChat($: any, on: any, hooks: (kept: Map<string, unknown>) => 
   return { clock, seen, fills, kept }
 }
 const send = ($: any, text: string, command?: { name: string; args: string }) => $.prompt.submit({ text, ...(command ? { command } : {}), origin: COMPOSER, wait: false } as never)
+// A typed /branch: the person submits the command, which runs locally and sends nothing to the chat, and the fork's SessionStart follows
+const typeBranch = async ($: any) => {
+  await send($, '/branch', { name: 'branch', args: '' })
+  await ($ as any).classic.SessionStart({ source: 'fork', transcript_path: '/h/fork.jsonl' })
+}
 
 test('after the put-back the person presses Enter and the cold-send dialog comes again: it offers no "Compact first" and says why, and nothing is put back a second time', SETUP, async ($, on) => {
   const log = askLog(on)
@@ -3859,7 +3864,7 @@ test('a "Compact first" message in flight when the chat is branched is still sen
   seen.duringCompact = () => (++n === 1 ? new Promise<void>((r) => { finish = r }) : Promise.resolve())
   await send($, 'carry on here')
   await clock.advance(60000)
-  await ($ as any).classic.SessionStart({ source: 'fork', transcript_path: '/h/fork.jsonl' })
+  await typeBranch($)
   await clock.advance(60000)
   finish()
   await clock.advance(1000)
@@ -3930,7 +3935,7 @@ test('a branch while a message waits on a compaction that succeeds: the fork is 
   await clock.advance(1000)
   await send($, 'second') // waits on the first compaction
   await clock.advance(1000)
-  await ($ as any).classic.SessionStart({ source: 'fork', transcript_path: '/h/fork.jsonl' })
+  await typeBranch($)
   await clock.advance(60000)
   finish()
   await clock.advance(1000)
@@ -3945,7 +3950,7 @@ test('a branch while a message waits on a compaction that hangs: it is still aba
   await clock.advance(1000)
   await send($, 'second')
   await clock.advance(1000)
-  await ($ as any).classic.SessionStart({ source: 'fork', transcript_path: '/h/fork.jsonl' })
+  await typeBranch($)
   await clock.advance(15 * 60000 + 1000)
   await clock.advance(1000)
   expect({ compacts: seen.compacts, submits: seen.submits, fills }).toEqual({ compacts: 1, submits: [], fills: ['first\n\nsecond'] })
@@ -3957,7 +3962,7 @@ test('a compaction of ours still out when the chat is branched does not mute the
   hang(seen)
   await send($, 'one')
   await clock.advance(15 * 60000 + 1000) // abandoned, still out
-  await ($ as any).classic.SessionStart({ source: 'fork', transcript_path: '/h/fork.jsonl' })
+  await typeBranch($)
   await ($ as any).classic.PostCompact({}) // the person's own /compact in the fork succeeds
   await ($ as any).classic.SessionStart({ source: 'compact' })
   await clock.advance(1000)
@@ -4129,7 +4134,7 @@ test('a message sent after a branch, while the compaction started before it is s
   seen.duringCompact = () => (++n === 1 ? new Promise<void>((r) => { finish = r }) : Promise.resolve())
   await send($, 'first')
   await clock.advance(1000)
-  await ($ as any).classic.SessionStart({ source: 'fork', transcript_path: '/h/fork.jsonl' })
+  await typeBranch($)
   await clock.advance(1000)
   await send($, 'second') // the fork's own message: the same conversation, so it waits
   await clock.advance(60000)
@@ -4450,7 +4455,7 @@ async function resumeBranching($: any, on: any, before?: () => void) {
 test('a pending Resume survives a /branch and goes', { options: { autoResume: true } }, async ($, on) => {
   const { clock, seen } = await resumeBranching($, on)
   await clock.advance(30 * 60000)
-  await ($ as any).classic.SessionStart({ source: 'fork', transcript_path: '/h/fork.jsonl' })
+  await typeBranch($)
   expect(await bandResume($)).not.toBe(null) // still pending in the fork
   await clock.advance(62 * 60000)
   expect(seen.submits).toEqual(['Resume'])
@@ -4459,11 +4464,80 @@ test('a pending Resume survives a /branch and goes', { options: { autoResume: tr
 test('a Resume compacting when the chat is branched still goes into the fork', { options: { autoResume: true } }, async ($, on) => {
   const { clock, seen } = await resumeBranching($, on)
   let n = 0
-  seen.duringCompact = async () => { if (++n === 1) await ($ as any).classic.SessionStart({ source: 'fork', transcript_path: '/h/fork.jsonl' }) }
+  seen.duringCompact = async () => { if (++n === 1) await typeBranch($) }
   await clock.advance(91 * 60000 + 1000)
   await clock.advance(10000)
   expect(seen.submits).toEqual(['Resume'])
   expect(seen.toasts.filter((t) => /the automatic one/.test(t))).toEqual([])
+})
+
+// A typed /branch is a local command: it sends nothing to the chat, so it counts as no send
+test('a typed /branch while the Resume compacts is no message sent meanwhile: the Resume goes and says nothing about being cancelled', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = await resumeBranching($, on)
+  let n = 0
+  seen.duringCompact = async () => { if (++n === 1) await typeBranch($) }
+  await clock.advance(91 * 60000 + 1000)
+  await clock.advance(10000)
+  expect({ submits: seen.submits, compacts: seen.compacts }).toEqual({ submits: ['Resume'], compacts: 1 })
+  expect(seen.toasts.filter((t) => /sent meanwhile|the automatic one|Not sent/.test(t))).toEqual([])
+})
+
+test('a typed /branch keeps the Resume hold of a put-back message: the Resume still waits for it, and goes 15 minutes after the put-back', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = await resumeBranching($, on, () => {
+    askLog(on) // "Compact first" for 'hello'; the first answer offered otherwise (Send anyway) for the cold-send dialog a typed command would get if it counted as a send
+    on('prompt.fill', () => ({ isFilled: true }))
+  })
+  let n = 0
+  seen.duringCompact = () => (++n === 1 ? new Promise(() => {}) : Promise.resolve())
+  await clock.advance(91 * 60000 + 1000)
+  await clock.advance(5 * 60000)
+  await $.prompt.submit({ text: 'hello', origin: COMPOSER, wait: false } as never)
+  await clock.advance(10 * 60000 + 2000) // abandoned: 'hello' is back in the box
+  await clock.advance(3 * 60000)
+  expect(await bandText($, /⏸ Resumes? /)).toBe('⏸ Resume waits for your message')
+  await typeBranch($)
+  await clock.advance(5 * 60000)
+  expect(seen.submits).toEqual([])
+  expect(await bandText($, /⏸ Resumes? /)).toBe('⏸ Resume waits for your message')
+  await clock.advance(8 * 60000) // 16 minutes after the put-back
+  expect(seen.submits).toEqual(['Resume'])
+})
+
+test('a typed /branch leaves no send pending: a due Resume is not delayed by it', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = engine($, on)
+  on('classic.StopFailure', () => ({}))
+  on('classic.SessionStart', () => ({}))
+  on('turn.step', async function* () { return { answer: '', toolUses: [], usage: null } })
+  await start($, 50000, clock)
+  const t0 = await clock.now()
+  await $.session.measure({ context: { tokens: 50000, window: 1000000, percent: 5 }, rateLimits: [{ kind: 'five_hour', percentUsed: 100, resetsAt: new Date(t0 + 90 * 60000).toISOString() }], changed: [] } as never)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  await clock.advance(91 * 60000 - 20000) // the Resume is due 20 s from now
+  await typeBranch($)
+  await clock.advance(40000) // it fell due 20 s ago
+  expect(seen.submits).toEqual(['Resume']) // a send handed on, its request not started, would hold it for 2 minutes
+})
+
+test('a typed /branch keeps the tracking of the text a put-back left in the box: a later put-back goes in behind it', SETUP, async ($, on) => {
+  askLog(on)
+  const { clock, seen, fills } = await coldChat($, on, () => on('classic.SessionStart', () => ({})))
+  hang(seen)
+  await send($, 'one')
+  await clock.advance(15 * 60000 + 1000)
+  expect(fills).toEqual(['one'])
+  await typeBranch($)
+  await clock.advance(60000)
+  await send($, WAKE_TEXT)
+  await clock.advance(1000)
+  expect(fills).toEqual(['one', 'one\n\n' + WAKE_TEXT])
+})
+
+test('a typed /branch on a cold big chat opens no cold-send dialog and compacts nothing', SETUP, async ($, on) => {
+  const log = askLog(on)
+  const { clock, seen } = await coldChat($, on, () => on('classic.SessionStart', () => ({})))
+  await typeBranch($)
+  await clock.advance(1000)
+  expect({ asked: log.asked.length, compacts: seen.compacts }).toEqual({ asked: 0, compacts: 0 })
 })
 
 for (const source of ['clear', 'resume']) {

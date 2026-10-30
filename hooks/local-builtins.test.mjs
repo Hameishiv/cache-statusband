@@ -20,8 +20,8 @@ try {
   skipWhy = 'the engine could not be read: ' + (err && err.message)
 }
 
-// The `type:"..."` of each object literal holding `name:"<name>"`
-function typesOf(name) {
+// The source text of each object literal holding `name:"<name>"`
+function objectsOf(name) {
   const out = []
   const re = new RegExp('name:"' + name + '"', 'g')
   let m
@@ -42,8 +42,16 @@ function typesOf(name) {
       else if (src[e] === '}' && --d === 0) break
     }
     if (e - s > 6000) continue
-    const obj = src.slice(s, e + 1)
-    d = 0
+    out.push(src.slice(s, e + 1))
+  }
+  return out
+}
+
+// The `type:"..."` of each object literal holding `name:"<name>"`
+function typesOf(name) {
+  const out = []
+  for (const obj of objectsOf(name)) {
+    let d = 0
     for (let k = 0; k < obj.length; k++) {
       if (obj[k] === '{') d++
       else if (obj[k] === '}') d--
@@ -62,4 +70,15 @@ test('every LOCAL_BUILTINS entry is a local or local-jsx command in the installe
     return !t.some((x) => x === 'local' || x === 'local-jsx') || t.includes('prompt')
   })
   assert.deepEqual(wrong, [])
+})
+
+// `/branch` is the typed command that creates a fork; LOCAL_BUILTINS must name every spelling of it. The engine defines no alias for it (`/fork` is another command: a background agent), so `branch` alone is listed.
+test('/branch is in LOCAL_BUILTINS, and the engine gives it no alias that would also have to be listed', { skip: skipWhy || (objectsOf('branch').length === 0 ? 'the engine\'s command definitions are not readable here' : false) }, () => {
+  assert.ok(LOCAL_BUILTINS.has('branch'))
+  const defs = objectsOf('branch').filter((o) => o.includes('type:"local-jsx"'))
+  assert.equal(defs.length, 1)
+  assert.doesNotMatch(defs[0], /aliases:/)
+  assert.doesNotMatch(src, /aliases:\[[^\]]*"branch"/) // no other command takes the name as an alias
+  assert.doesNotMatch(src, /aliases:\[[^\]]*"fork"/) // and `fork` is not an alias of anything, so not of /branch
+  assert.equal(LOCAL_BUILTINS.has('fork'), false)
 })
