@@ -1232,7 +1232,7 @@ test('a rotation meant for other sessions, hours after a no-change wake-up and w
   expect(r.text).not.toMatch(/now C/)
 })
 
-test('a seat adopted after a request landed since the wake-up marks the cache cold', SETUP, async ($, on) => {
+test('a seat adopted after a request landed since the wake-up marks the cache cold when the wake-up showed no change', SETUP, async ($, on) => {
   const kept = new Map<string, unknown>()
   const seat = { label: 'A' }
   const { clock, seen } = engine($, on, seat, kept)
@@ -1335,4 +1335,122 @@ test('a request right after the window closes, before any tick sees it close, al
   const rec = kept.get('last:sid-test') as any
   expect(rec.seat).toBe('B')
   expect(rec.account).toBe('b@x')
+})
+
+test('only the first late field can re-mark the cache cold: a second one arriving on a later tick does not', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const seat = { label: 'A' }
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock, seen } = engine($, on, seat, kept, undefined, disk)
+  answer(on, seen, 'Send anyway')
+  const step = stepper($, on)
+  await start($, 300000, clock)
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never) // nothing written yet
+  await clock.advance(1000)
+  await step(usage({ cache_read_input_tokens: 300000 })) // the wake-up's request lands, perhaps on the old account
+  await clock.advance(30000)
+  seat.label = 'B'
+  await clock.advance(30000) // the seat is adopted: the cache is cold
+  let r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/account rotated/)
+  await $.prompt.submit({ text: 'carry on', origin: COMPOSER, wait: false } as never)
+  expect(seen.asks).toBe(1)
+  await step(usage({ cache_creation_input_tokens: 300000 })) // that request ran on the new account: the cache is warm
+  await clock.advance(30000)
+  disk.files['.claude.json'] = account('b@x')
+  await clock.advance(30000) // the account is adopted, but it is the same rotation
+  r = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/account rotated/)
+  await $.prompt.submit({ text: 'and again', origin: COMPOSER, wait: false } as never)
+  expect(seen.asks).toBe(1)
+})
+
+// A plan fetch started before a wake-up is the old account's reading, though the seat file may not show it yet
+function planFetchHeld($: any, on: any, kept: Map<string, unknown>, disk: { files: Record<string, string> }) {
+  const held = { release: () => {}, hold: false, fetches: 0 }
+  const seat = { label: 'A' }
+  const { clock } = engine($, on, seat, kept, undefined, disk)
+  kept.set('plan:cli:A', { at: 1, next: 2, windows: [], why: 'ok' }) // a reading long past due
+  on('session.authorize', () => ({ value: { handle: 'h' } }))
+  on('http.fetch', async () => {
+    held.fetches++
+    if (held.hold) await new Promise<void>((r) => (held.release = r))
+    return { value: { ok: true, status: 200, headers: {}, text: JSON.stringify({ five_hour: { utilization: held.hold ? 55 : 7, resets_at: 9999999999 } }) } }
+  })
+  return { held, clock }
+}
+
+test('a plan fetch still out when the wake-up comes is dropped, though only .claude.json showed the rotation', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { held, clock } = planFetchHeld($, on, kept, disk)
+  await clock.advance(60000)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await clock.advance(31000) // the first tick reads the plan
+  const first = kept.get('plan:cli:A') as any
+  expect(first.windows[0].percentUsed).toBe(7)
+  held.hold = true
+  await clock.advance(5 * 60000) // a tick fetches, and the fetch is held
+  expect(held.fetches).toBe(2)
+  disk.files['.claude.json'] = account('b@x')
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never) // the seat file is not written yet
+  held.release()
+  await clock.advance(10)
+  expect((kept.get('plan:cli:A') as any).at).toBe(first.at)
+  expect((kept.get('plan:cli:A') as any).windows[0].percentUsed).toBe(7)
+})
+
+test('a plan fetch still out across a wake-up is dropped even when it returns after the window has closed', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { held, clock } = planFetchHeld($, on, kept, disk)
+  await clock.advance(60000)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await clock.advance(31000) // the first tick reads the plan
+  const first = kept.get('plan:cli:A') as any
+  held.hold = true
+  await clock.advance(5 * 60000)
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never) // nothing written
+  await clock.advance(4 * 60000) // the window has closed: the seat is not unknown any more
+  held.release()
+  await clock.advance(10)
+  expect((kept.get('plan:cli:A') as any).at).toBe(first.at)
+})
+
+// The shared plan reading is the seat's: while the seat is unknown it may be the old account's
+const RESUME = { options: { ...SETUP.options, autoResume: true } }
+const fullWeek = (at: number) => [{ kind: 'seven_day', percentUsed: 100, resetsAt: new Date(at + 30 * 60000).toISOString() }]
+
+test('while the seat is unknown after a wake-up, the old seat\'s full weekly window arms no resume', RESUME, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  on('classic.StopFailure', () => ({}))
+  on('session.authorize', () => ({ value: { handle: 'h' } }))
+  await clock.advance(60000)
+  const t0 = await clock.now()
+  kept.set('plan:cli:A', { at: t0, next: t0 + 60 * 60000, fable: null, windows: fullWeek(t0), why: 'ok' })
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await clock.advance(30000) // the tick takes the stored reading
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never) // the seat file still names A
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: 'Too many requests, slow down' })
+  await clock.advance(60 * 60000)
+  expect(seen.submits).toEqual([])
+})
+
+test('a wake-up that already shows a new account drops the shared windows, which are the old account\'s', { options: { rotatorWakePattern: WAKE.options.rotatorWakePattern, autoResume: true } }, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  on('classic.StopFailure', () => ({}))
+  on('session.authorize', () => ({ value: { handle: 'h' } }))
+  await clock.advance(60000)
+  const t0 = await clock.now()
+  kept.set('plan', { at: t0, next: t0 + 60 * 60000, fable: null, windows: fullWeek(t0), why: 'ok' })
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await clock.advance(30000)
+  disk.files['.claude.json'] = account('b@x')
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: 'Too many requests, slow down' })
+  await clock.advance(60 * 60000)
+  expect(seen.submits).toEqual([])
 })
