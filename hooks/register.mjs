@@ -627,9 +627,9 @@ function abandon($, done, gen, seq) {
   return batch
 }
 
-// Whether one of this mod's /compact runs started in a chat since replaced is still out (an abandoned one too): the engine's compaction marks may be its late end, which says nothing about this chat
+// Whether one of this mod's /compact runs started in a chat since replaced is still out (an abandoned one too): the engine's compaction marks may be its late end, which says nothing about this chat. A run out longer than two COMPACT_LIMITs no longer counts, as for abandoned, so a hung one does not mute the marks for good
 function staleRunOut() {
-  for (const r of liveRuns) if (r.gen !== chatGen) return true
+  for (const r of liveRuns) if (r.gen !== chatGen && now - r.at < 2 * COMPACT_LIMIT) return true
   return false
 }
 
@@ -721,7 +721,7 @@ async function runCompactThenSend($, msg, unattended, before, wake) {
     }
     else if (!cancelled()) { // a send already cancelled does not compact for nothing
       const gen = chatGen // a compaction of a chat since replaced says nothing about the new one
-      const live = { gen, seq: ++compactSeq }
+      const live = { gen, seq: ++compactSeq, at: now }
       const run = (async () => {
         liveRuns.add(live)
         const done = $.command.run({ command: 'compact', args: '' })

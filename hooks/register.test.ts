@@ -3606,12 +3606,30 @@ test('while a compaction of an earlier chat is still out, the engine\'s compacti
   await clock.advance(60000)
   await ($ as any).classic.SessionStart({ source: 'clear' })
   await mainStep($) // the new chat's first request
-  await clock.advance(80 * 60000) // the new chat goes cold
+  await clock.advance(10 * 60000)
   await ($ as any).classic.PostCompact({}) // the old compaction's late end, as the engine reports it
   await ($ as any).classic.SessionStart({ source: 'compact' })
+  await clock.advance(70 * 60000) // the new chat goes cold
   await send($, 'new chat message')
   await clock.advance(1000)
   expect(log.asked.length).toBe(2) // the guard still asks
+})
+
+test('an earlier chat\'s compaction out longer than two compaction limits no longer mutes the engine\'s compaction marks', SETUP, async ($, on) => {
+  const log = askLog(on)
+  const { clock, seen } = await coldChat($, on, () => (on('classic.SessionStart', () => ({})), on('classic.PostCompact', () => ({}))))
+  hang(seen)
+  await send($, 'old chat message') // Compact first: hangs, never settles
+  await clock.advance(60000)
+  await ($ as any).classic.SessionStart({ source: 'clear' })
+  await mainStep($)
+  await clock.advance(31 * 60000) // the old run has been out past two limits
+  await ($ as any).classic.PostCompact({}) // the person's own /compact in the new chat
+  await ($ as any).classic.SessionStart({ source: 'compact' })
+  await clock.advance(60 * 60000)
+  await send($, 'new chat message')
+  await clock.advance(1000)
+  expect(log.asked.length).toBe(1) // marked compacted: the guard does not ask
 })
 
 test('an older compaction that succeeds late does not forget a newer abandoned one: the next send that needs a compaction starts none beside it', SETUP, async ($, on) => {
