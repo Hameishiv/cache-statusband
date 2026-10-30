@@ -2729,6 +2729,22 @@ test('a refusal count left by a settled arm does not cut the next arm short', { 
   expect(seen.toasts.filter((t) => /Trying again at/.test(t)).length).toBe(4)
 })
 
+test('a new arm while the Resume is pending again after refusals starts its count afresh', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = engine($, on)
+  on('classic.StopFailure', () => ({}))
+  await start($, 50000, clock)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  seen.failSubmit = true
+  await clock.advance(60 * 60000 + 30000)
+  await clock.advance(2 * 60000 + 30000)
+  await clock.advance(2 * 60000 + 30000)
+  expect(seen.toasts.filter((t) => /Trying again at/.test(t)).length).toBe(3)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" }) // armed anew, nothing settled
+  await clock.advance(60 * 60000 + 30000)
+  expect(seen.toasts.filter((t) => /after four tries/.test(t)).length).toBe(0)
+  expect(seen.toasts.filter((t) => /Trying again at/.test(t)).length).toBe(4)
+})
+
 test('a refused Resume is not armed again in a chat cleared while the submit was out', { options: { autoResume: true } }, async ($, on) => {
   const { clock, seen } = engine($, on)
   on('classic.StopFailure', () => ({}))
