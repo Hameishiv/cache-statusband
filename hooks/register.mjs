@@ -434,9 +434,9 @@ let resumeTries = 0
 let staleArmedGen = -1 // the identityGen at which a failure of an earlier request was already given its free minute
 let resumeFromReadings = false // the pending resume rests on plan windows, not on the error's wording (nor, after dropReadings, on a re-arm); cleared wherever resumeAt is
 let submitsSeen = 0 // messages handed on to the chat so far (not dropped, not ours, not a local command) and each "Compact first" the person picks, so an unattended send can tell the person sent something meanwhile
-let sendsHeld = 0 // a cold-send dialog is open, any send of the person's is being handed on down the chain, or a compact-then-send is in flight: a due resume waits
+let sendsHeld = 0 // a cold-send dialog is open, any send handed on that is not this mod's own is going down the chain, or a compact-then-send is in flight: a due resume waits
 let wakePendingId = 0 // the wakeCount of a rotator wake-up that has arrived and whose own request has not started (0: none): a due resume waits and a drop of the readings does not re-arm it, as the wake-up's turn settles it. A wake-up lowers it only if it is still its own id, so an earlier one giving up cannot release a later one's hold
-let sendPending = new Map() // id -> deadline: a send of the person's (or another plugin's) that was handed on and whose request has not started: a due resume waits. A main-loop request, /clear or resuming another chat lowers all; the deadline (SEND_SAFETY after hand-over) covers a send that never starts a request
+let sendPending = new Map() // id -> deadline: a send handed on that is not this mod's own (and the person's own message this mod sends again after Compact first) whose request has not started: a due resume waits. A main-loop request, /clear or resuming another chat lowers all; the deadline (SEND_SAFETY after hand-over) covers a send that never starts a request
 let sendPendingId = 0
 let stepsSeen = 0 // main-loop requests started so far
 let realSends = 0 // messages handed on to the chat (submitsSeen without the "Compact first" picks)
@@ -575,7 +575,7 @@ async function runCompactThenSend($, msg, unattended, before, wake) {
     if (!cancelled()) $.ui.toast('Could not compact (' + clip(String((err && err.message) || err), 80) + '), so the message goes as typed.', { timeoutMs: 8000 })
   }
   if (cancelled()) {
-    // a message that reached the chat while compacting (another plugin's too, or the person's own Compact first), or /clear or a resume, cancels an automatic one (a local command or a dropped send does not), and with it the wake-up's turn
+    // a message that reached the chat while compacting (another plugin's too, or the person's own Compact first), or /clear or a resume, cancels an automatic one (a local command or a dropped send does not), and with it the wake-up's turn. A cancelled Resume is armed again when no request starts (resumeCancelledAt)
     lowerWake(wake)
     // the Resume's send goes again unless another request starts or the chat is replaced
     const rearm = !wake && chatGen === before.chat && stepsSeen === before.steps
@@ -1378,9 +1378,9 @@ export function register(on, options = {}) {
     const isCold = rotated || (left !== null && left <= 0)
     // These run locally or start afresh: a cold cache costs them nothing
     const local = e.command && ['compact', 'clear', names.cache, names.keepwarm, names.board, names.handoff].includes(e.command.name)
-    // a message handed on and not dropped by a later hook reaches the chat: the unattended sends see it. Not a local command (LOCAL_BUILTINS), nor this mod's own Resume or send. Whether it settles a pending resume is up to its request (turn.step)
+    // a message handed on and not dropped by a later hook reaches the chat: the unattended sends see it. Not a local command (isLocalBuiltin), nor this mod's own Resume or send. Whether it settles a pending resume is up to its request (turn.step)
     const counts = !local && !isLocalBuiltin(e.command) && !(e.origin && e.origin.kind === 'plugin' && e.origin.name === $.plugin.name)
-    const mine = counts || fromUser // a send of the person's: a due resume waits while it is handed on, whether or not the guard asked
+    const mine = counts || fromUser // a send handed on that is not this mod's own, or any command of the person's: a due resume waits while it is handed on, whether or not the guard asked
     const through = async () => {
       if (mine) sendsHeld++
       const pendingId = counts ? ++sendPendingId : 0 // handed on and not this mod's own: its request may start well after next() returns
