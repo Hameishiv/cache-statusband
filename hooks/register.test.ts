@@ -219,8 +219,13 @@ test('a reopened chat borrows plan windows from the freshest session on the same
     { seat: 'A', desktop: false, updatedAt: at, rateLimits: five(1, '2026-10-29T12:00:00Z'), self: true },
   ]
   expect(borrowedLimits(list, { seat: 'A', desktop: false }, at)[0].percentUsed).toBe(44)
-  expect(borrowedLimits(list, { seat: '', desktop: true }, at)[0].percentUsed).toBe(90)
+  expect(borrowedLimits(list, { seat: '', desktop: true }, at)).toEqual([]) // an unseated session does not borrow a seated one's
   expect(borrowedLimits([{ seat: 'A', updatedAt: at, rateLimits: five(80, '2026-10-29T09:00:00Z') }], { seat: 'A', desktop: false }, at)).toEqual([])
+  // a seated and an unseated session on one surface are not known to share an account
+  const mixed = [{ seat: '', desktop: true, updatedAt: at, rateLimits: five(70, '2026-10-29T12:00:00Z') }, { seat: 'B', desktop: true, updatedAt: at, rateLimits: five(90, '2026-10-29T12:00:00Z') }]
+  expect(borrowedLimits(mixed, { seat: 'A', desktop: true }, at)).toEqual([])
+  expect(borrowedLimits(mixed.slice(1), { seat: '', desktop: true }, at)).toEqual([])
+  expect(borrowedLimits(mixed, { seat: '', desktop: true }, at)[0].percentUsed).toBe(70)
 })
 
 test('auto-resume waits for the last full window to reset, and only for usage', async () => {
@@ -266,6 +271,17 @@ test('"rate limit reached" is a throttle and arms no resume; "5-hour limit reach
   await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: 'Weekly limit reached' })
   await clock.advance(70 * 60000)
   expect(seen.submits).toEqual(['Resume', 'Resume'])
+})
+
+test('a /clear drops the resume armed in the last chat', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = engine($, on)
+  on('classic.StopFailure', () => ({}))
+  on('classic.SessionStart', () => ({}))
+  await start($, 50000, clock)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  await ($ as any).classic.SessionStart({ source: 'clear' })
+  await clock.advance(70 * 60000)
+  expect(seen.submits).toEqual([])
 })
 
 test('a short throttle or an overload arms no resume', { options: { autoResume: true } }, async ($, on) => {

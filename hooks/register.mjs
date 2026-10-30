@@ -502,7 +502,8 @@ export function stillOpen(limits, at) {
 }
 
 export function borrowedLimits(list, self, at) {
-  const same = (hb) => (self.seat && hb.seat ? hb.seat === self.seat : hb.desktop === self.desktop)
+  // a seat on either side must match: a seated and an unseated session are not known to share an account
+  const same = (hb) => (self.seat || hb.seat ? hb.seat === self.seat : hb.desktop === self.desktop)
   const best = list
     .filter((hb) => !hb.self && Array.isArray(hb.rateLimits) && hb.rateLimits.length && same(hb))
     .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))[0]
@@ -1001,7 +1002,12 @@ export function register(on, options = {}) {
     justCompacted = false
     compactedCold = false
     S.floor = 0
+    S.ctx = 0 // the last chat's size; the new chat's own is seeded below
     S.coldRestarts = [] // the new chat's own, from its record below
+    // a resume armed in the last chat must not fire into this one
+    S.resumeAt = 0
+    resumeTries = 0
+    $.ui.invalidate('ui.render')
     try {
       S.id = (await $.session.id()) || S.id
     } catch {
