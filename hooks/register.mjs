@@ -538,7 +538,7 @@ async function runCompactThenSend($, msg, unattended, seenBefore, wake) {
     if (!cancelled()) $.ui.toast('Could not compact (' + clip(String((err && err.message) || err), 80) + '), so the message goes as typed.', { timeoutMs: 8000 })
   }
   if (cancelled()) {
-    // a message that reached the chat while compacting cancels an automatic one (a local command or a dropped send does not), and with it the wake-up's turn
+    // a message that reached the chat while compacting (another plugin's too), or /clear or a resume, cancels an automatic one (a local command or a dropped send does not), and with it the wake-up's turn
     if (wake) wakePending = false
     $.ui.toast((compacted ? 'Compacted. A message' : 'A message') + ' was sent meanwhile, so the automatic one was not sent.', { timeoutMs: 8000 })
     return
