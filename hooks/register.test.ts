@@ -3636,6 +3636,48 @@ test('an older compaction that succeeds late does not forget a newer abandoned o
   expect(seen.compacts).toBe(2)
 })
 
+test('a message waiting on a shared compaction when the chat is cleared is not sent into the new chat, nor does it start a compaction there', SETUP, async ($, on) => {
+  askLog(on)
+  const { clock, seen, fills } = await coldChat($, on, () => on('classic.SessionStart', () => ({})))
+  hang(seen)
+  await send($, 'first') // its compaction hangs
+  await clock.advance(1000)
+  await send($, 'second') // waits on it
+  await clock.advance(1000)
+  await ($ as any).classic.SessionStart({ source: 'clear' })
+  await clock.advance(15 * 60000 + 1000) // the old compaction is abandoned: both wait no longer
+  expect({ compacts: seen.compacts, submits: seen.submits, fills }).toEqual({ compacts: 1, submits: [], fills: [] })
+  expect(seen.toasts.filter((t) => /Not sent, because the chat was cleared: (first|second)/.test(t)).length).toBe(2)
+})
+
+test('a /clear between the abandonment and the put-back fill leaves the new chat\'s box alone', SETUP, async ($, on) => {
+  askLog(on)
+  const { clock, seen, fills } = await coldChat($, on, () => on('classic.SessionStart', () => ({})))
+  hang(seen)
+  await send($, 'one') // its compaction starts 50 ms on and is abandoned 15 minutes after that; the fill follows 50 ms later
+  await clock.advance(50 + 15 * 60000 + 20)
+  expect(seen.toasts.filter((t) => /Compaction has not finished/.test(t))).toEqual([]) // not put back yet
+  await ($ as any).classic.SessionStart({ source: 'clear' })
+  await clock.advance(1000)
+  expect(fills).toEqual([])
+  expect(seen.toasts.filter((t) => t.includes('Not sent, because the chat was cleared: one')).length).toBe(1)
+})
+
+test('a message put back while an unsent slash command is in the box is quoted in a toast, not joined to it', SETUP, async ($, on) => {
+  const dialogs = heldAsk(on)
+  const { clock, seen, fills } = await coldChat($, on)
+  hang(seen)
+  await send($, '/merge-pr 1', { name: 'merge-pr', args: '1' }) // its compaction hangs, then it is put back alone
+  await clock.advance(1000)
+  void send($, 'three') // its dialog stays open
+  await clock.advance(15 * 60000)
+  expect(fills).toEqual(['/merge-pr 1'])
+  dialogs.release('Compact first, then send')
+  await clock.advance(1000)
+  expect(fills).toEqual(['/merge-pr 1'])
+  expect(seen.toasts.filter((t) => /Also not sent: three/.test(t)).length).toBe(1)
+})
+
 // The band's segment matching re as drawn, or null when it shows none
 async function bandText($: any, re: RegExp) {
   const ui = await $.ui.mount({ plugin: 'test', component: 'AbovePrompt', surface: 'terminal', viewport: { columns: 200, rows: 30 }, props: {} } as never)
