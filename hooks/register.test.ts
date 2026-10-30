@@ -3290,3 +3290,132 @@ test('a batch that is only one slash command fills it alone', SETUP, async ($, o
   expect(fills).toEqual(['/merge-pr 1'])
   expect(seen.toasts.filter((t) => /Also not sent/.test(t))).toEqual([])
 })
+
+test('the person\'s own successful /compact clears the abandoned mark: the next "Compact first" compacts normally', SETUP, async ($, on) => {
+  const log = askLog(on)
+  const { clock, seen } = await coldChat($, on, () => on('classic.PostCompact', () => ({})))
+  let n = 0
+  seen.duringCompact = () => (++n === 1 ? new Promise(() => {}) : Promise.resolve())
+  await send($, 'one')
+  await clock.advance(15 * 60000 + 1000) // abandoned
+  await ($ as any).classic.PostCompact({}) // the person ran /compact and it worked
+  await mainStep($)
+  await clock.advance(3 * 60 * 60000) // cold again
+  await send($, 'later')
+  await clock.advance(1000)
+  expect(log.asked[log.asked.length - 1].labels).toContain('Compact first, then send')
+  expect({ compacts: seen.compacts, submits: seen.submits }).toEqual({ compacts: 2, submits: ['later'] })
+})
+
+test('an abandoned compaction that never settles is waited for only a second 15 minutes: after that a send may compact again', SETUP, async ($, on) => {
+  const log = askLog(on)
+  const { clock, seen, fills } = await coldChat($, on)
+  let n = 0
+  seen.duringCompact = () => (++n === 1 ? new Promise(() => {}) : Promise.resolve())
+  await send($, 'one')
+  await clock.advance(15 * 60000 + 1000) // abandoned
+  await clock.advance(13 * 60000) // 29 minutes after it started
+  await send($, 'two')
+  await clock.advance(1000)
+  expect(log.asked[log.asked.length - 1].labels).toEqual(['Send anyway', 'Cancel'])
+  expect({ compacts: seen.compacts, fills }).toEqual({ compacts: 1, fills: ['one'] })
+  await clock.advance(2 * 60000) // 31 minutes
+  await send($, 'three')
+  await clock.advance(1000)
+  expect(log.asked[log.asked.length - 1].labels).toContain('Compact first, then send')
+  expect({ compacts: seen.compacts, submits: seen.submits }).toEqual({ compacts: 2, submits: ['three'] })
+})
+
+// The Resume's compaction hangs; the person clears the chat while it is out
+async function clearedDuringResumeCompaction($: any, on: any) {
+  const log = askLog(on)
+  const fills: string[] = []
+  const { clock, seen } = await resumeCompacting($, on, () => {
+    on('prompt.fill', (_: unknown, e: any) => (fills.push(e.text), { isFilled: true }))
+    on('classic.SessionStart', () => ({}))
+  })
+  let finish: () => void = () => {}
+  let n = 0
+  seen.duringCompact = () => (++n === 1 ? new Promise<void>((r) => { finish = r }) : Promise.resolve())
+  await clock.advance(91 * 60000 + 1000) // the Resume compacts, and it hangs
+  await clock.advance(5 * 60000)
+  await ($ as any).classic.SessionStart({ source: 'clear' })
+  await mainStep($) // the new chat's first request (300k in this fixture)
+  return { clock, seen, fills, log, finish: () => finish() }
+}
+
+test('a compaction abandoned after a /clear is not the new chat\'s: its first cold send compacts, and is not put back', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen, fills } = await clearedDuringResumeCompaction($, on)
+  await clock.advance(11 * 60000) // the old chat's compaction is abandoned now
+  await clock.advance(80 * 60000) // the new chat goes cold
+  await send($, 'new chat msg')
+  await clock.advance(1000)
+  expect({ compacts: seen.compacts, submits: seen.submits, fills }).toEqual({ compacts: 2, submits: ['new chat msg'], fills: [] })
+})
+
+test('a compaction of the old chat that succeeds late does not mute the new chat\'s cold-send guard', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen, log, finish } = await clearedDuringResumeCompaction($, on)
+  await clock.advance(11 * 60000) // abandoned
+  await clock.advance(80 * 60000) // the new chat goes cold
+  finish() // the old chat's compaction succeeds, late
+  await clock.advance(1000)
+  await send($, 'new chat msg')
+  await clock.advance(1000)
+  expect(log.asked.length).toBe(1) // asked
+})
+
+test('a compaction of the old chat that succeeds in time, after the /clear, does not mute the new chat\'s cold-send guard either', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, log, finish } = await clearedDuringResumeCompaction($, on)
+  finish() // 5 minutes after the clear, well inside the 15: the Resume's own compaction ends
+  await clock.advance(1000)
+  await clock.advance(80 * 60000) // the new chat goes cold
+  await send($, 'new chat msg')
+  await clock.advance(1000)
+  expect(log.asked.length).toBe(1)
+})
+
+test('"Compact first" on a /btw question while the Resume compacts leaves the Resume alone: it goes after the compaction, and the question goes back in the prompt box', { options: { autoResume: true } }, async ($, on) => {
+  const log = askLog(on)
+  const fills: string[] = []
+  const { clock, seen } = await resumeCompacting($, on, () => on('prompt.fill', (_: unknown, e: any) => (fills.push(e.text), { isFilled: true })))
+  let n = 0
+  seen.duringCompact = async () => { if (++n === 1) await send($, '/btw what is X?', { name: 'btw', args: 'what is X?' }) }
+  await clock.advance(91 * 60000 + 1000)
+  await clock.advance(1000)
+  expect(log.asked.length).toBe(1)
+  expect({ submits: seen.submits, fills, compacts: seen.compacts }).toEqual({ submits: ['Resume'], fills: ['/btw what is X?'], compacts: 1 })
+  expect(seen.toasts.filter((t) => /automatic one/.test(t))).toEqual([])
+})
+
+test('a message put back while the chat is then cleared does not hold the next chat\'s Resume', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+  askLog(on)
+  const { clock, seen, fills } = await coldChat($, on, () => (on('classic.SessionStart', () => ({})), on('classic.StopFailure', () => ({}))))
+  let n = 0
+  seen.duringCompact = () => (++n === 1 ? new Promise(() => {}) : Promise.resolve())
+  await send($, 'one')
+  await clock.advance(15 * 60000 + 1000)
+  expect(fills).toEqual(['one']) // the box holds it
+  await ($ as any).classic.SessionStart({ source: 'clear' })
+  await mainStep($)
+  const t = await clock.now()
+  await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [{ kind: 'five_hour', percentUsed: 100, resetsAt: new Date(t + 5 * 60000).toISOString() }], changed: [] } as never)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  await clock.advance(7 * 60000)
+  expect(seen.submits).toEqual(['Resume'])
+})
+
+test('the give-up toast names the cause of the latest failed try: two tries stopped by the compaction, then two refused sends, say the send was refused', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = await resumeCompacting($, on)
+  let finish: () => void = () => {}
+  let n = 0
+  seen.duringCompact = () => (++n === 1 ? new Promise<void>((r) => { finish = r }) : Promise.resolve())
+  await clock.advance(91 * 60000 + 1000)
+  await clock.advance(15 * 60000 + 1000) // abandoned: try 1
+  await clock.advance(200000) // try 2 finds it still out
+  expect(seen.toasts.filter((t) => /Compaction has not finished|still running/.test(t)).length).toBe(2)
+  finish() // late: the chat is compacted
+  seen.failSubmit = true // from here the Resume is refused both ways
+  await clock.advance(10 * 60000)
+  expect(seen.toasts.filter((t) => /Could not send Resume after four tries/.test(t)).length).toBe(1)
+  expect(seen.toasts.filter((t) => /Compaction did not finish, so the Resume was not sent after four tries/.test(t))).toEqual([])
+})
