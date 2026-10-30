@@ -440,7 +440,7 @@ let dialogsOpen = 0 // cold-send dialogs open for the person: an unattended send
 let dialogsClosed = [] // resolvers of the sends waiting for dialogsOpen to reach 0
 let dialogCancels = 0 // cold-send dialogs the person answered Cancel so far: an unattended send compares it with its start, so only a Cancel (not a Send anyway on a message that does not cancel it) re-arms a Resume whose compaction failed
 let compactDeclined = false // a Resume's failed compaction behind a Cancel was armed again: if the next one fails too it is not sent uncompacted. Cleared by a main-loop request, /clear, a resume or fork, a new arm and a successful compaction
-let compacting = null // this mod's compaction in flight (a promise that settles at COMPACT_LIMIT at worst): a second send needing one waits for it, with no timer of its own, and uses its result
+let compacting = null // this mod's compaction in flight (a promise that settles at COMPACT_LIMIT at worst): a second send needing one waits for it, with no timer of its own, and uses its result (if it is abandoned instead, that send goes back in the prompt box: see abandoned)
 let abandoned = null // the /compact call still out after COMPACT_LIMIT: no send starts another until it settles (its end clears this) or the chat is replaced. A Resume is tried again, the person's and a wake-up's message go back in the prompt box
 let putBackBatch = null // the texts put back in the prompt box because of an abandoned compaction: filled together, in submission order, so the fills do not overwrite each other
 let sendSeq = 0 // submission order of the sends that compact first
@@ -673,7 +673,7 @@ async function runCompactThenSend($, msg, unattended, before, wake) {
     return { t, ok }
   }
   if (cancelled()) {
-    // a message that reached the chat while compacting (another plugin's too), "Send anyway" or "Compact first" on a cold-send dialog, a wake-up that starts compacting, or /clear or a resume, cancels an automatic one (a local command, a dropped send or Cancel does not), and with it the wake-up's turn. A cancelled Resume is armed again when no request starts (resumeAt)
+    // a message that reached the chat while compacting (another plugin's too), "Send anyway" or "Compact first" on a cold-send dialog, a wake-up that starts compacting, or /clear or a resume, cancels an automatic one (a local command such as /btw, which never reaches the chat, a dropped send or Cancel does not), and with it the wake-up's turn. A cancelled Resume is armed again when no request starts (resumeAt)
     lowerWake(wake)
     const { t, ok } = await rearmResume()
     const rearm = !wake && ok
