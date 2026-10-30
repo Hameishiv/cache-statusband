@@ -3395,8 +3395,7 @@ test('a message put back while the chat is then cleared does not hold the next c
   await send($, 'one')
   await clock.advance(15 * 60000 + 1000)
   expect(fills).toEqual(['one']) // the box holds it
-  await ($ as any).classic.SessionStart({ source: 'clear' })
-  await mainStep($)
+  await ($ as any).classic.SessionStart({ source: 'clear' }) // no request has started since: only the clear can lower the hold
   const t = await clock.now()
   await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [{ kind: 'five_hour', percentUsed: 100, resetsAt: new Date(t + 5 * 60000).toISOString() }], changed: [] } as never)
   await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
