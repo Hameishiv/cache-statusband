@@ -3210,12 +3210,12 @@ function askLog(on: any) {
   return { asked, prefer: (label: string) => { prefer = label } }
 }
 
-// A cold big chat where the person's "Compact first" hangs (n === 1), an optional second send waits on it. `hooks` go in beneath the plugins
-async function coldChat($: any, on: any, hooks: (kept: Map<string, unknown>) => void = () => {}) {
+// A cold big chat where the person's "Compact first" hangs (n === 1), an optional second send waits on it. `hooks` go in beneath the plugins; `fill` answers each prompt.fill (the text is recorded in fills first)
+async function coldChat($: any, on: any, hooks: (kept: Map<string, unknown>) => void = () => {}, fill: (e: any, fills: string[]) => unknown = () => ({ isFilled: true })) {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)
   const fills: string[] = []
-  on('prompt.fill', (_: unknown, e: any) => (fills.push(e.text), { isFilled: true }))
+  on('prompt.fill', (_: unknown, e: any) => (fills.push(e.text), fill(e, fills)))
   on('turn.step', async function* () { return { answer: '', toolUses: [], usage: { input_tokens: 10, cache_read_input_tokens: 300000, cache_creation_input_tokens: 0 } } })
   hooks(kept)
   await clock.advance(60000)
@@ -4065,7 +4065,8 @@ test('a /clear while the put-back is being filled leaves nothing tracked for the
   await send($, 'new chat message')
   await clock.advance(31 * 60000)
   expect(fills).toEqual(['old chat secret plan', 'new chat message'])
-  expect(seen.toasts.filter((t) => t.includes('Not sent, because the chat was cleared: old chat secret plan')).length).toBe(1)
+  expect(seen.toasts.filter((t) => t.includes('The chat was cleared while your message was being put back: old chat secret plan')).length).toBe(1)
+  expect(seen.toasts.filter((t) => t.includes('Not sent, because the chat was cleared: old chat secret plan'))).toEqual([]) // it does not say the text is gone: it may be in the box
 })
 
 // A prompt.read the engine has not answered: it answers once `open()` is called (with a draft the mod must no longer be waiting for)
@@ -4077,7 +4078,7 @@ function slowRead(on: any) {
 }
 const realMs = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
-test('a prompt.read the engine has not answered is not waited for: after 2 seconds the tracked text stands and the put-back is filled', SETUP, async ($, on) => {
+test('a prompt.read the engine has not answered is not waited for: after 2 seconds the box is left alone and the message is quoted in a toast', SETUP, async ($, on) => {
   askLog(on)
   const read = slowRead(on)
   const { clock, seen, fills } = await coldChat($, on)
@@ -4085,14 +4086,17 @@ test('a prompt.read the engine has not answered is not waited for: after 2 secon
   await send($, 'one')
   await clock.advance(15 * 60000 + 1000)
   expect(fills).toEqual([]) // the read is out
+  expect(seen.toasts.filter((t) => t.includes('Also not sent: one'))).toEqual([])
   await clock.advance(2000)
-  expect(fills).toEqual(['one'])
+  expect(fills).toEqual([]) // not answered in time: nothing is known about the box, so nothing is written over it
+  expect(seen.toasts.filter((t) => t.includes('Also not sent: one — send it again when ready.')).length).toBe(1)
   read.open() // the late answer is ignored
   await clock.advance(1000)
   await realMs(50)
+  expect(fills).toEqual([])
 })
 
-test('a prompt.read the engine has not answered does not hold a due Resume for good: the put-back is filled without it, and the Resume goes once the hold has lapsed', { options: { autoResume: true } }, async ($, on) => {
+test('a prompt.read the engine has not answered does not hold a due Resume for good: the message is quoted without it, and the Resume goes once the hold has lapsed', { options: { autoResume: true } }, async ($, on) => {
   const box = { asks: 0 }
   const fills: string[] = []
   let read = { open: () => {} }
@@ -4107,7 +4111,8 @@ test('a prompt.read the engine has not answered does not hold a due Resume for g
   await clock.advance(5 * 60000)
   await $.prompt.submit({ text: 'hello', origin: COMPOSER, wait: false } as never)
   await clock.advance(10 * 60000 + 2000 + 2000) // abandoned, then the 2 second read limit
-  expect(fills).toEqual(['hello'])
+  expect(fills).toEqual([])
+  expect(seen.toasts.filter((t) => t.includes('Also not sent: hello — send it again when ready.')).length).toBe(1)
   read.open()
   await realMs(50)
   await clock.advance(16 * 60000)
@@ -4132,4 +4137,240 @@ test('a message sent after a branch, while the compaction started before it is s
   finish()
   await clock.advance(1000)
   expect({ compacts: seen.compacts, submits: seen.submits, fills }).toEqual({ compacts: 1, submits: ['first', 'second'], fills: [] })
+})
+
+// ===== review round 28: the box read and fill, the quoted put-back and a branch =====
+test('a message quoted because the box holds the person\'s own draft holds a due Resume until it is sent or 15 minutes pass', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  const fills: string[] = []
+  on('prompt.fill', (_: unknown, e: any) => (fills.push(e.text), { isFilled: true }))
+  let draft = ''
+  on('prompt.read', () => ({ value: { text: draft, cursor: draft.length } }))
+  answer(on, seen, 'Compact first, then send')
+  on('classic.StopFailure', () => ({}))
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+  await clock.advance(77 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  const t0 = await clock.now()
+  await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [{ kind: 'five_hour', percentUsed: 100, resetsAt: new Date(t0 + 4 * 60000).toISOString() }], changed: [] } as never)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  let finish: () => void = () => {}
+  let n = 0
+  seen.duringCompact = () => (++n === 1 ? new Promise<void>((r) => { finish = r }) : Promise.resolve())
+  await $.prompt.submit({ text: 'stop, do X instead', origin: COMPOSER, wait: false } as never)
+  await clock.advance(60000)
+  draft = 'and also look at Y' // the person types a draft while the compaction runs
+  let quotedAt = 0
+  for (let i = 0; i < 20 && !quotedAt; i++) {
+    await clock.advance(60000)
+    if (seen.toasts.some((t) => t.includes('Also not sent: stop, do X instead'))) quotedAt = await clock.now()
+  }
+  expect(quotedAt).toBeGreaterThan(0)
+  expect(fills).toEqual([]) // the draft is left as it is
+  finish() // the abandoned compaction ends late, successfully: nothing else keeps the Resume back
+  await clock.advance(10 * 60000)
+  expect(seen.submits).toEqual([]) // the Resume does not go ahead of the message still to be sent
+  await clock.advance(6 * 60000) // 15 minutes since the message was quoted
+  expect(seen.submits).toEqual(['Resume'])
+})
+
+test('a message sent during a prompt.read that does not answer is not put back from the text tracked before the read', SETUP, async ($, on) => {
+  const dialogs = heldAsk(on)
+  const ref: { fills: string[] } = { fills: [] }
+  let mode: 'answer' | 'hang' = 'answer'
+  const { clock, seen, fills } = await coldChat($, on, () => {
+    on('prompt.read', () => (mode === 'hang' ? new Promise(() => {}) : { value: { text: ref.fills[ref.fills.length - 1] ?? '', cursor: 0 } }))
+  })
+  ref.fills = fills
+  hang(seen)
+  await send($, 'one')
+  await clock.advance(1000)
+  void send($, 'three') // its dialog stays open
+  await clock.advance(15 * 60000)
+  expect(fills).toEqual(['one'])
+  mode = 'hang'
+  dialogs.release('Compact first, then send') // 'three' is put back: the read does not answer
+  await clock.advance(500)
+  void send($, 'one') // the person presses Enter on the box during the read
+  await clock.advance(10)
+  dialogs.release('Send anyway')
+  await clock.advance(10)
+  await mainStep($) // its request starts
+  await clock.advance(3000)
+  expect(fills).toEqual(['one']) // 'one' was sent: it does not come back in front of 'three'
+  expect(seen.toasts.filter((t) => t.includes('Also not sent: three — send it again when ready.')).length).toBe(1)
+})
+
+test('a prompt.read that fails after the put-back text was sent does not bring the sent text back', SETUP, async ($, on) => {
+  const dialogs = heldAsk(on)
+  let mode: 'answer' | 'fail' = 'answer'
+  let fail: () => void = () => {}
+  const failing = new Promise<never>((_, reject) => { fail = () => reject(new Error('no read')) })
+  failing.catch(() => {})
+  const ref: { fills: string[] } = { fills: [] }
+  const { clock, seen, fills } = await coldChat($, on, () => {
+    on('prompt.read', async () => {
+      if (mode === 'fail') await failing
+      return { value: { text: ref.fills[ref.fills.length - 1] ?? '', cursor: 0 } }
+    })
+  })
+  ref.fills = fills
+  hang(seen)
+  await send($, 'one')
+  await clock.advance(1000)
+  void send($, 'three')
+  await clock.advance(15 * 60000)
+  expect(fills).toEqual(['one'])
+  mode = 'fail'
+  dialogs.release('Compact first, then send') // 'three' is put back: the read is out
+  await clock.advance(300)
+  void send($, 'one') // the person presses Enter on the box during the read
+  await clock.advance(10)
+  dialogs.release('Send anyway')
+  await clock.advance(10)
+  await mainStep($)
+  fail() // the read fails, inside its 2 seconds
+  await clock.advance(500)
+  expect(fills).toEqual(['one', 'three']) // not 'one\n\nthree'
+})
+
+test('a prompt.read that does not answer leaves the person\'s draft alone, and the tracked text is dropped once a read shows the box is not ours', SETUP, async ($, on) => {
+  const dialogs = heldAsk(on)
+  const box: { edit: string | null; hang: boolean } = { edit: null, hang: false }
+  const ref: { fills: string[] } = { fills: [] }
+  const { clock, seen, fills } = await coldChat($, on, () => on('prompt.read', () => {
+    if (box.hang) return new Promise(() => {})
+    const text = box.edit ?? ref.fills[ref.fills.length - 1] ?? ''
+    return { value: { text, cursor: text.length } }
+  }))
+  ref.fills = fills
+  hang(seen)
+  await send($, 'one')
+  await clock.advance(1000)
+  void send($, 'three')
+  await clock.advance(15 * 60000)
+  expect(fills).toEqual(['one'])
+  box.edit = 'my own draft'
+  dialogs.release('Compact first, then send') // a read shows the draft: 'three' is quoted and 'one' is no longer tracked
+  await clock.advance(1000)
+  expect(seen.toasts.filter((t) => t.includes('Also not sent: three'))).toHaveLength(1)
+  expect(fills).toEqual(['one'])
+  box.hang = true // the engine stops answering reads
+  let m = 0
+  seen.duringCompact = () => (++m === 1 ? new Promise(() => {}) : Promise.resolve())
+  await clock.advance(16 * 60000)
+  void send($, 'four') // its dialog: compacts again (hangs), and is put back after 15 minutes
+  await clock.advance(10)
+  dialogs.release('Compact first, then send')
+  await clock.advance(15 * 60000 + 5000)
+  expect(fills).toEqual(['one']) // not 'one\n\nfour': the old text is not the box's
+  expect(seen.toasts.filter((t) => t.includes('Also not sent: four'))).toHaveLength(1)
+})
+
+test('a prompt.read that is missing in the engine leaves the tracked put-back text standing: a later put-back goes behind it', SETUP, async ($, on) => {
+  askLog(on)
+  const { clock, seen, fills } = await coldChat($, on) // no prompt.read hook: the call throws
+  let n = 0
+  seen.duringCompact = () => (++n <= 2 ? new Promise(() => {}) : Promise.resolve())
+  await send($, 'one')
+  await clock.advance(15 * 60000 + 1000)
+  expect(fills).toEqual(['one'])
+  await clock.advance(16 * 60000)
+  await send($, 'two')
+  await clock.advance(15 * 60000 + 1000)
+  expect(fills).toEqual(['one', 'one\n\ntwo'])
+})
+
+test('a box the host gives back with a trailing newline or CRLF is still the put-back text: a later put-back merges with it', SETUP, async ($, on) => {
+  const dialogs = heldAsk(on)
+  const ending = { text: '\n' }
+  const { clock, seen, fills } = await coldChat($, on, () => on('prompt.read', () => { const text = (fills[fills.length - 1] ?? '') + (fills.length ? ending.text : ''); return { value: { text, cursor: text.length } } }))
+  hang(seen)
+  await send($, 'one')
+  await clock.advance(1000)
+  void send($, 'three')
+  await clock.advance(15 * 60000)
+  dialogs.release('Compact first, then send')
+  await clock.advance(1000)
+  expect(fills).toEqual(['one', 'one\n\nthree'])
+  expect(seen.toasts.filter((t) => t.includes('Also not sent'))).toEqual([])
+})
+
+test('a box with CRLF line ends is compared as the put-back text', SETUP, async ($, on) => {
+  const dialogs = heldAsk(on)
+  const { clock, seen, fills } = await coldChat($, on, () => on('prompt.read', () => { const text = (fills[fills.length - 1] ?? '').replace(/\n/g, '\r\n'); return { value: { text, cursor: text.length } } }))
+  hang(seen)
+  await send($, 'one\ntwo')
+  await clock.advance(1000)
+  void send($, 'three')
+  await clock.advance(15 * 60000)
+  dialogs.release('Compact first, then send')
+  await clock.advance(1000)
+  expect(fills).toEqual(['one\ntwo', 'one\ntwo\n\nthree'])
+})
+
+test('a prompt.fill that never answers is not waited for: the message is reported as not put back, and the next put-back is handled', SETUP, async ($, on) => {
+  askLog(on)
+  let asked = 0
+  const { clock, seen } = await coldChat($, on, () => {}, () => (asked++, new Promise(() => {})))
+  let n = 0
+  seen.duringCompact = () => (++n <= 2 ? new Promise(() => {}) : Promise.resolve())
+  await send($, 'one')
+  await clock.advance(15 * 60000 + 1000)
+  expect(asked).toBe(1)
+  await clock.advance(2000)
+  expect(seen.toasts.filter((t) => t.includes('the message could not be put back: one')).length).toBe(1)
+  await clock.advance(16 * 60000)
+  await send($, 'two') // compacts again (hangs) and is put back after 15 minutes
+  await clock.advance(15 * 60000 + 1000)
+  expect(asked).toBe(2)
+  await clock.advance(3000)
+  expect(asked).toBe(2)
+  expect(seen.toasts.filter((t) => t.includes('could not be put back: two')).length).toBe(1)
+})
+
+test('a prompt.fill that never answers does not hold a due Resume for good', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  let asked = 0
+  on('prompt.fill', () => (asked++, new Promise(() => {})))
+  answer(on, seen, 'Compact first, then send')
+  on('classic.StopFailure', () => ({}))
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+  await clock.advance(77 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  const t0 = await clock.now()
+  await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [{ kind: 'five_hour', percentUsed: 100, resetsAt: new Date(t0 + 4 * 60000).toISOString() }], changed: [] } as never)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  let finish: () => void = () => {}
+  let n = 0
+  seen.duringCompact = () => (++n === 1 ? new Promise<void>((r) => { finish = r }) : Promise.resolve())
+  await $.prompt.submit({ text: 'stop, do X instead', origin: COMPOSER, wait: false } as never)
+  await clock.advance(16 * 60000) // the compaction is abandoned and the put-back fill never answers
+  expect(asked).toBe(1)
+  finish() // the compaction ends late, successfully
+  await clock.advance(10 * 60000)
+  expect(seen.submits).toEqual(['Resume'])
+})
+
+test('a /clear while the put-back is being filled still quotes what the fill left out, and does not tell it again', SETUP, async ($, on) => {
+  askLog(on)
+  let clearDuringFill = false
+  const { clock, seen, fills } = await coldChat($, on, () => on('classic.SessionStart', () => ({})), async () => {
+    if (clearDuringFill) { clearDuringFill = false; await ($ as any).classic.SessionStart({ source: 'clear' }) }
+    return { isFilled: true }
+  })
+  hang(seen)
+  clearDuringFill = true
+  await send($, 'one')
+  await clock.advance(1000)
+  await send($, '/merge-pr 1', { name: 'merge-pr', args: '1' }) // waits on the compaction: in the same batch, quoted because a slash command is never joined
+  await clock.advance(15 * 60000 + 1000)
+  expect(fills.length).toBeGreaterThan(0)
+  expect(seen.toasts.filter((t) => t.includes('Also not sent: /merge-pr 1 — send it again when ready.'))).toHaveLength(1)
+  expect(seen.toasts.filter((t) => t.includes('The chat was cleared while your message was being put back: one'))).toHaveLength(1)
+  expect(seen.toasts.filter((t) => t.includes('while your message was being put back: /merge-pr 1'))).toEqual([]) // quoted already
 })

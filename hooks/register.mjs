@@ -452,8 +452,8 @@ let compactSeq = 0 // numbers this mod's /compact runs in the order they start
 const RUN_END_GRACE = 5000
 const liveRuns = new Set() // { chat, seq, at } (the conversation's msgChat, the run's number, when it started) of this mod's /compact runs not settled yet (and for RUN_END_GRACE after), abandoned ones too: an engine compaction mark may be one's end, which says nothing about a conversation since replaced (see staleRunOut) nor about a newer abandoned run (see olderRunOut)
 let abandoned = null // { done, at, batch, seq }: the /compact call still out after COMPACT_LIMIT. No send starts another until it settles (its end clears this), a compaction that started before it succeeds (the person's own too, but an engine compaction mark does not count while an older run of ours is still out and started under two COMPACT_LIMITs ago, as the mark may be that run's end), the chat is replaced, or a second COMPACT_LIMIT has passed. A Resume is tried again, the person's and a wake-up's message go back in the prompt box
-let putBackPending = null // { real, steps, at }: the Resume hold. A message was put back in the prompt box (a successful fill of a message that reaches the chat, not a /btw question, not a failed fill) and nothing has been sent since: a due Resume waits while realSends and stepsSeen are as they were then, for COMPACT_LIMIT at most. Cleared by /clear, a resume or a fork
-let boxText = null // { real, steps, text }: the text a put-back left in the prompt box, unsent (a /btw question too). Not bound by COMPACT_LIMIT: it stays until a message is handed on or a request starts (realSends, stepsSeen), or /clear, a resume or a fork. A later put-back goes in behind it when the box (read when the engine can, within BOX_READ_LIMIT; else this text) still holds exactly this text or nothing, and is quoted in a toast, the box untouched, when it holds anything else: only this text is the mod's to replace
+let putBackPending = null // { real, steps, at }: the Resume hold. A message was put back in the prompt box (a successful fill of a message that reaches the chat, not a /btw question, not a failed fill), or quoted in a toast because the box held the person's own text (it is still theirs to send), and nothing has been sent since: a due Resume waits while realSends and stepsSeen are as they were then, for COMPACT_LIMIT at most. Cleared by /clear, a resume or a fork
+let boxText = null // { real, steps, text }: the text a put-back left in the prompt box, unsent (a /btw question too). Not bound by COMPACT_LIMIT: it stays until a message is handed on or a request starts (realSends, stepsSeen), or /clear, a resume or a fork. A later put-back goes in behind it when the box (read when the engine can, within BOX_LIMIT; else this text) still holds exactly this text or nothing, and is quoted in a toast, the box untouched, when it holds anything else: only this text is the mod's to replace
 let fillChain = Promise.resolve() // put-back fills run one after another: each reads what the last left in the box
 let tryCause = '' // why the most recent Resume try failed: 'refused' (neither submit way took it) or 'compaction' (still out, or not finished), named in the give-up toast
 let sendSeq = 0 // submission order of the sends that compact first
@@ -558,24 +558,41 @@ function boxHeld() {
   return boxText
 }
 
-// What the prompt box holds, as { text, mine }: read from it, so the person's edits are seen and text they deleted does not come back. `mine` says whether the text in it is this mod's to merge with: the box is empty, or holds exactly what the last put-back left there and is still unsent. Anything else (the person's own draft, or their edit of the put-back) is theirs and is never rewritten.
-// The read gets BOX_READ_LIMIT: an engine that cannot read it, or does not answer in time, leaves the tracked put-back text standing (and it is mine).
-const BOX_READ_LIMIT = 2000
-async function boxNow($) {
-  const held = boxHeld()
+// An engine call that is not waited on for ever: resolves to what it answered, or to TIMED_OUT once BOX_LIMIT has passed (the timer is cancelled whichever comes first). A call that throws, or that is missing, rejects as it would unbounded
+const BOX_LIMIT = 2000
+const TIMED_OUT = Symbol('timed out')
+async function bounded($, call) {
   let timer = null
   try {
-    const waited = new Promise((resolve) => { timer = $.clock.after(BOX_READ_LIMIT, () => resolve(null)) })
-    const box = await Promise.race([$.prompt.read(), waited]) // an engine without it throws here
-    if (box && typeof box.text === 'string') {
-      const text = box.text
-      return { text: text.trim() ? text : '', mine: !text.trim() || (!!held && text === held.text) }
-    }
-  } catch {
-    // not readable here: the tracked text stands
+    const waited = new Promise((resolve) => { timer = $.clock.after(BOX_LIMIT, () => resolve(TIMED_OUT)) })
+    return await Promise.race([call(), waited])
   } finally {
-    if (timer) timer.cancel() // nothing is left waiting once the read has answered
+    if (timer) timer.cancel() // nothing is left waiting once the call has answered
   }
+}
+
+// Text compared as the box gives it back: the host may end it with a newline or use CRLF
+const sameText = (a, b) => a.replace(/\r\n/g, '\n').trimEnd() === b.replace(/\r\n/g, '\n').trimEnd()
+
+// What the prompt box holds, as { text, mine }: read from it, so the person's edits are seen and text they deleted does not come back. `mine` says whether the text in it is this mod's to merge with: the box is empty, or holds exactly what the last put-back left there (to a trailing newline) and is still unsent. Anything else (the person's own draft, or their edit of the put-back) is theirs and is never rewritten, and it ends the tracking of the put-back text.
+// An engine with no prompt.read leaves the tracked put-back text standing (and it is mine). A read that exists but does not answer within BOX_LIMIT shows nothing about the box: it is not mine, and nothing is written over it.
+async function boxNow($) {
+  const early = boxHeld() // what the box held when the read began: what its answer is compared with (and only while that put-back is still unsent after the read: a snapshot of text sent meanwhile is not merged)
+  let box
+  try {
+    box = await bounded($, () => $.prompt.read()) // an engine without it throws here
+  } catch {
+    box = undefined
+  }
+  if (box === TIMED_OUT) return { text: '', mine: false }
+  if (box && typeof box.text === 'string') {
+    const text = box.text
+    if (!text.trim()) return { text: '', mine: true }
+    if (early && boxHeld() === early && sameText(text, early.text)) return { text: text.replace(/\r\n/g, '\n').trimEnd(), mine: true }
+    boxText = null // the person's own text: what was put back is no longer in the box
+    return { text, mine: false }
+  }
+  const held = boxHeld() // read again: a put-back may have been handed on, or a request started, while the read was out
   return { text: held ? held.text : '', mine: true }
 }
 
@@ -680,17 +697,17 @@ function staleRunOut() {
 // A slash command is never joined with other text: in a batch, or beside text in the box, it is quoted in a toast instead (alone in an empty box, it is filled as it is). Nothing goes into a box that holds text this mod did not put there: it is quoted (see placeBack).
 // hold: whether a fill starts the Resume hold (see placeBack)
 // chat: the msgChat the message belongs to: in a chat since cleared or replaced by a resumed one nothing is filled.
-// Resolves to { filled, quoted, stale }
+// Resolves to { filled, quoted, stale, inFill }
 function putBack($, msg, batch, chat, hold = true) {
-  if (!batch || batch.closed) return placeBack($, [msg], chat, hold).then((r) => ({ filled: r.filled, quoted: !!r.quoted && r.quoted.has(msg), stale: !!r.stale }))
+  if (!batch || batch.closed) return placeBack($, [msg], chat, hold).then((r) => ({ filled: r.filled, quoted: !!r.quoted && r.quoted.has(msg), stale: !!r.stale, inFill: !!r.inFill }))
   batch.items.push(msg)
-  return batch.flush.then((r) => ({ filled: r.filled, quoted: !!r.quoted && r.quoted.has(msg), stale: !!r.stale }))
+  return batch.flush.then((r) => ({ filled: r.filled, quoted: !!r.quoted && r.quoted.has(msg), stale: !!r.stale, inFill: !!r.inFill }))
 }
 
 // One fill of the prompt box for items, one after another. Text this mod did not put in the box is never rewritten: when the box holds anything but what the last put-back left there (the person's own draft, or their edit of the put-back; boxNow says), nothing is filled and every item is quoted in full in a toast. Otherwise plain texts are joined with a blank line, behind the plain text the box holds (a fill replaces the box, so that text has to be part of it). A slash command is never joined with other text: what cannot go in is quoted in full in a toast, whether it is an item beside other text, or a slash command this mod left in the box when plain text comes (the plain text is filled, the command quoted). A slash command alone, with an empty box, is filled as it is.
 // The text filled is what boxText then tracks (even for a /btw question); only a fill of a message that reaches the chat starts the Resume hold (putBackPending), and only when hold is set: the put-back of an abandoned compaction, not the message of a compaction that finished, whose Resume goes again 2 minutes on.
 // items: the list, or a function giving it once the fill's turn has come and `wait` ms have passed (a batch still collecting its members); an empty list fills nothing
-// chat: the msgChat the items belong to: in a chat since cleared or replaced by a resumed one nothing is filled. Resolves to { filled, quoted, stale }
+// chat: the msgChat the items belong to: in a chat since cleared or replaced by a resumed one nothing is filled. Resolves to { filled, quoted, stale, inFill } (inFill: the chat was replaced while the fill was out; what could not go in is already quoted)
 function placeBack($, list, chat, hold = true, wait = 0) {
   const run = async () => {
     if (wait) await new Promise((resolve) => $.clock.after(wait, resolve))
@@ -731,18 +748,23 @@ function placeBack($, list, chat, hold = true, wait = 0) {
     let filled = false
     if (text) {
       try {
-        filled = !!(await $.prompt.fill({ text })).isFilled
+        const r = await bounded($, () => $.prompt.fill({ text })) // a fill that never answers does not hold the later ones and the Resume for good: it counts as not put back
+        filled = r !== TIMED_OUT && !!r.isFilled
       } catch {
         filled = false
       }
     }
-    const at = filled && hold ? await $.clock.now() : 0
-    if (msgChat !== chat) return { filled: false, stale: true } // /clear or a resume during the fill: nothing is tracked for the new chat, and the items are dropped with the toast of the chat they belonged to
-    if (filled) {
-      boxText = { real: realSends, steps: stepsSeen, text }
-      // the person has to send what is in the box, and until then a Resume waits (not for a failed fill, nor a local command, which never reaches the chat)
-      if (hold) putBackPending = own.local ? null : { real: realSends, steps: stepsSeen, at }
+    // the person has to send what is in the box, and until then a Resume waits (not for a failed fill, nor a local command, which never reaches the chat); the same for a message quoted because the box holds the person's own text: it is still to be sent
+    const holds = hold && (filled ? !own.local : !box.mine && items.some((i) => !i.local))
+    const at = holds ? await $.clock.now() : 0
+    if (msgChat !== chat) {
+      // /clear or a resume during the fill: nothing is tracked for the new chat, and the items are dropped with the toast of the chat they belonged to (what could not go in is quoted all the same)
+      for (const q of quoted) $.ui.toast(`Also not sent: ${q.text} — send it again when ready.`, { timeoutMs: 15000 })
+      return { filled: false, stale: true, quoted: new Set(quoted), inFill: true }
     }
+    if (filled) boxText = { real: realSends, steps: stepsSeen, text }
+    if (hold && filled) putBackPending = own.local ? null : { real: realSends, steps: stepsSeen, at } // a local command in the box replaces the hold
+    else if (holds) putBackPending = { real: realSends, steps: stepsSeen, at }
     for (const q of quoted) $.ui.toast(`Also not sent: ${q.text} — send it again when ready.`, { timeoutMs: 15000 })
     return { filled, quoted: new Set(quoted) }
   }
@@ -761,8 +783,8 @@ async function runCompactThenSend($, msg, unattended, before, wake) {
   let batch = null // the put-back batch of the abandonment this send is part of: its owner, or a send that waited on it
   let waited = false
   // a message of the chat before a /clear or a resume of another chat is not sent into the next one, nor put back in its box (a fork carries the conversation on: its message goes)
-  const staleChat = () => {
-    $.ui.toast(`Not sent, because the chat was ${msgChatCause}: ${msg.text}`, { timeoutMs: 15000 })
+  const staleChat = (inFill = false) => {
+    $.ui.toast(inFill ? `The chat was ${msgChatCause} while your message was being put back: ${msg.text}` : `Not sent, because the chat was ${msgChatCause}: ${msg.text}`, { timeoutMs: 15000 })
     lowerWake(wake)
   }
   // our own compaction of this conversation is already running: wait for it (it settles at COMPACT_LIMIT at worst) and do not compact again if it succeeded. One of a conversation since replaced (/clear, a resume of another chat) is not waited for; a send that waited on one when its chat was replaced stops at its end, and is dropped then, not held on a compaction of the new chat. A fork is the same conversation: its sends keep waiting
@@ -879,7 +901,11 @@ async function runCompactThenSend($, msg, unattended, before, wake) {
   let quoted = false // a slash command shown in a toast instead of the box, as it must not be joined with other text
   // one fill at a time, behind whatever the box holds; a put-back of an abandoned compaction also starts the Resume hold, as the Resume must not go ahead of a message the person still has to send
   const r = await putBack($, msg, stuck ? batch : null, before.msgChat, stuck)
-  if (r.stale) return staleChat()
+  if (r.stale) { // the chat was replaced while it was put back: a message already quoted in a toast is not told again
+    if (r.quoted) lowerWake(wake)
+    else staleChat(r.inFill)
+    return
+  }
   filled = r.filled
   quoted = r.quoted
   lowerWake(wake) // given up: no request of the wake-up's is on its way
@@ -1841,7 +1867,7 @@ export function register(on, options = {}) {
   // A compaction arrives by several roads (typed /compact, auto-compact, a plugin,
   // the desktop host running it inside a turn); each one marks it
   // While one of this mod's /compact runs from a replaced chat is still out, the marks are ignored: they may be its late end, not this chat's compaction (the person's own /compact then goes unmarked until it ends).
-  // While a run older than the abandoned one is out (or just ended), a mark does not forget the abandonment, as it may be that run's end; the chat is still marked compacted
+  // While a run older than the abandoned one is out (or just ended) and started under 30 minutes ago (2 COMPACT_LIMITs: a hung one stops counting), a mark does not forget the abandonment, as it may be that run's end; the chat is still marked compacted
   on('session.compact', async ($, e, next) => {
     now = await $.clock.now()
     const r = await next(e)
