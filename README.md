@@ -22,10 +22,8 @@ The cache half (keep warm, the cold-send guard, rewrite costs) exists only in th
 
 Two MIT-licensed projects made this possible.
 
-- **[Cache Keeper](https://github.com/nateherkai/claude-code-mods) by Nate Herk.** The Claude Code version started from his version 1.0.0, and his code is still its core: the warm/cold tracking, keep warm, the cold-send guard, `/board`, `/handoff`, the session-handoff skill, the pricing table and recording-mode masking. About 93% of his lines are still here, most of them unchanged, and they make up roughly two thirds of the mod's code today (58% counting the tests, which are all new).
+- **[Cache Keeper](https://github.com/nateherkai/claude-code-mods) by Nate Herk.** The Claude Code version started from his version 1.0.0, and his code is still its core: the warm/cold tracking, keep warm, the cold-send guard, `/board`, `/handoff`, the session-handoff skill, the pricing table and recording-mode masking. 
 - **[ccstatusline](https://github.com/sirmalloc/ccstatusline) by Matthew Breedlove (sirmalloc).** The band's look (coloured segments, powerline-style arrows) and the choice of what to show (model, effort, context, 5-hour and weekly usage with reset times) follow ccstatusline. No ccstatusline code is used.
-
-So this is not a rewrite of Cache Keeper. It is Cache Keeper with a large set of new features built on it, plus ports to two other agents.
 
 ## What it adds to Cache Keeper
 
