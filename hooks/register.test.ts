@@ -3528,8 +3528,7 @@ test('a message from before a /clear whose compaction runs out after it is not p
   expect({ submits: seen.submits, fills }).toEqual({ submits: [], fills: [] })
   const stale = seen.toasts.filter((t) => t.includes('Not sent, because the chat was cleared: '))
   expect(stale.length).toBe(1)
-  expect(stale[0]).toContain('x'.repeat(70))
-  expect(stale[0]).not.toContain('x'.repeat(81)) // clipped
+  expect(stale[0]).toContain('x'.repeat(100)) // quoted in full: the person has to type it again
 })
 
 test('a wake-up in the new chat does not wait on the old chat\'s hung compaction', SETUP, async ($, on) => {
@@ -3849,4 +3848,38 @@ test('put-back text is no longer in the box once a request has started: a later 
   dialogs.release('Compact first, then send')
   await clock.advance(1000)
   expect(fills).toEqual(['one', 'three'])
+})
+
+test('a "Compact first" message in flight when the chat is branched is still sent: a fork carries the conversation on', SETUP, async ($, on) => {
+  askLog(on)
+  let finish: () => void = () => {}
+  const { clock, seen, fills } = await coldChat($, on, () => on('classic.SessionStart', () => ({})))
+  let n = 0
+  seen.duringCompact = () => (++n === 1 ? new Promise<void>((r) => { finish = r }) : Promise.resolve())
+  await send($, 'carry on here')
+  await clock.advance(60000)
+  await ($ as any).classic.SessionStart({ source: 'fork', transcript_path: '/h/fork.jsonl' })
+  await clock.advance(60000)
+  finish()
+  await clock.advance(1000)
+  expect({ submits: seen.submits, fills }).toEqual({ submits: ['carry on here'], fills: [] })
+  expect(seen.toasts.filter((t) => /Not sent/.test(t))).toEqual([])
+})
+
+test('a "Compact first" message from before the chat was replaced by a resumed one is not sent into it, and the toast says so, quoting it in full', SETUP, async ($, on) => {
+  askLog(on)
+  let finish: () => void = () => {}
+  const { clock, seen, fills } = await coldChat($, on, () => on('classic.SessionStart', () => ({})))
+  let n = 0
+  seen.duringCompact = () => (++n === 1 ? new Promise<void>((r) => { finish = r }) : Promise.resolve())
+  const long = 'resume the work on the parser, ' + 'and then run the whole test suite twice. '.repeat(3)
+  await send($, long)
+  await clock.advance(60000)
+  await ($ as any).classic.SessionStart({ source: 'resume' })
+  await clock.advance(60000)
+  finish()
+  await clock.advance(1000)
+  expect({ submits: seen.submits, fills }).toEqual({ submits: [], fills: [] })
+  expect(seen.toasts.filter((t) => t.includes(`Not sent, because the chat was replaced by a resumed chat: ${long}`)).length).toBe(1)
+  expect(seen.toasts.filter((t) => /was cleared/.test(t))).toEqual([])
 })
