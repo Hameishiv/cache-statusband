@@ -330,6 +330,7 @@ const USAGE_SPENT = /usage limit|limit reached|hit your limit|out of (extra )?us
 const THROTTLE = /rate[ _-]?limit/i // "rate limit reached" is a short throttle, not spent usage
 const RESUME_FALLBACK = 60 * MIN // no reset time known: try once an hour, three times at most
 let resumeTries = 0
+let submitsSeen = 0 // prompt.submit hooks so far, so an unattended send can tell the person sent something meanwhile
 
 // The windows that are full, from the freshest reading this session has
 export function spentWindows(limits, fable, model) {
@@ -388,16 +389,22 @@ async function resumeStep($) {
 
 function compactThenSend($, e, unattended) {
   const msg = { text: e.text, attachments: e.attachments, slash: !!e.command }
-  $.clock.after(50, () => runCompactThenSend($, msg, unattended).catch(() => {}))
+  const seenBefore = submitsSeen
+  $.clock.after(50, () => runCompactThenSend($, msg, unattended, seenBefore).catch(() => {}))
   return { drop: 'cache-keeper: compacting first on a cold cache; the message is sent again once that finishes' }
 }
 
-async function runCompactThenSend($, msg, unattended) {
+async function runCompactThenSend($, msg, unattended, seenBefore) {
   try {
     await $.command.run({ command: 'compact', args: '' })
     markCompacted($)
   } catch (err) {
     $.ui.toast('Could not compact (' + clip(String((err && err.message) || err), 80) + '), so the message goes as typed.', { timeoutMs: 8000 })
+  }
+  if (unattended && submitsSeen !== seenBefore) {
+    // anything sent while compacting cancels an automatic message, as it would have before
+    $.ui.toast('Compacted. A message was sent meanwhile, so the automatic one was not sent.', { timeoutMs: 8000 })
+    return
   }
   const send = { text: msg.text, ...(msg.attachments ? { attachments: msg.attachments } : {}) }
   // A plugin can't submit a "/" line: those go back in the prompt box
@@ -1032,6 +1039,7 @@ export function register(on, options = {}) {
   // The first prompt names the session on the board
   on('prompt.submit', async ($, e, next) => {
     now = await $.clock.now()
+    if (!(e.command && e.command.name === 'compact')) submitsSeen++ // our own compaction is not the person
     // anything sent to the chat (the person, a rotator's wake-up, our own "Resume") settles a pending resume
     if (S.resumeAt) {
       S.resumeAt = 0
