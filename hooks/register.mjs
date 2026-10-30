@@ -645,6 +645,12 @@ function compactOut() {
 function abandon($, done, gen, seq) {
   if (chatGen !== gen) return null
   const batch = { items: [], flush: null, closed: false, chat: msgChat }
+  // the batch takes its turn in the fill order now, not when its first member arrives: a put-back that arrives in the 50 ms its members take to join goes after it
+  batch.flush = placeBack($, () => {
+    batch.closed = true
+    return [...batch.items].sort((x, y) => x.seq - y.seq)
+  }, batch.chat, true, 50)
+  batch.flush.catch(() => {})
   abandoned = { done, at: now, batch, seq }
   done.then(() => {
     if (abandoned && abandoned.done === done) abandoned = null
@@ -661,7 +667,7 @@ function staleRunOut() {
   return false
 }
 
-// Puts a message back in the prompt box, because compaction is out, or because it cannot be sent as it is (a slash command, a send refused) after one finished. The sends put back when one compaction is abandoned (batch: its owner and those that waited on it) go in one fill, plain texts in submission order joined by a blank line: a second fill would overwrite the first. Once filled the batch is closed: a later put-back fills only its own text, behind whatever the box still holds (boxNow).
+// Puts a message back in the prompt box, because compaction is out, or because it cannot be sent as it is (a slash command, a send refused) after one finished. The sends put back when one compaction is abandoned (batch: its owner and those that waited on it) go in one fill (made 50 ms after the abandonment, in the order fills were asked for), plain texts in submission order joined by a blank line: a second fill would overwrite the first. Once its fill starts the batch is closed: a later put-back fills only its own text, behind whatever the box still holds (boxNow).
 // A slash command is never joined with other text: in a batch, or beside text in the box, it is quoted in a toast instead (alone in an empty box, it is filled as it is).
 // hold: whether a fill starts the Resume hold (see placeBack)
 // chat: the msgChat the message belongs to: in a chat since cleared or replaced by a resumed one nothing is filled.
@@ -669,23 +675,19 @@ function staleRunOut() {
 function putBack($, msg, batch, chat, hold = true) {
   if (!batch || batch.closed) return placeBack($, [msg], chat, hold).then((r) => ({ filled: r.filled, quoted: !!r.quoted && r.quoted.has(msg), stale: !!r.stale }))
   batch.items.push(msg)
-  if (!batch.flush) {
-    batch.flush = new Promise((resolve) => {
-      $.clock.after(50, async () => {
-        batch.closed = true
-        resolve(await placeBack($, [...batch.items].sort((x, y) => x.seq - y.seq), batch.chat))
-      })
-    })
-  }
   return batch.flush.then((r) => ({ filled: r.filled, quoted: !!r.quoted && r.quoted.has(msg), stale: !!r.stale }))
 }
 
 // One fill of the prompt box for items, one after another. Plain texts are joined with a blank line, behind the plain text the box already holds (boxNow): a fill replaces the box, so that text has to be part of it. A slash command is never joined with other text: what cannot go in is quoted in full in a toast, whether it is an item beside other text, or a slash command already in the box when plain text comes (the plain text is filled, the command quoted). A slash command alone, with an empty box, is filled as it is.
 // The text filled is what boxText then tracks (even for a /btw question); only a fill of a message that reaches the chat starts the Resume hold (putBackPending), and only when hold is set: the put-back of an abandoned compaction, not the message of a compaction that finished, whose Resume goes again 2 minutes on.
+// items: the list, or a function giving it once the fill's turn has come and `wait` ms have passed (a batch still collecting its members); an empty list fills nothing
 // chat: the msgChat the items belong to: in a chat since cleared or replaced by a resumed one nothing is filled. Resolves to { filled, quoted, stale }
-function placeBack($, items, chat, hold = true) {
+function placeBack($, list, chat, hold = true, wait = 0) {
   const run = async () => {
-    let t = await $.clock.now()
+    if (wait) await new Promise((resolve) => $.clock.after(wait, resolve))
+    const items = typeof list === 'function' ? list() : list
+    if (!items.length) return { filled: false, quoted: new Set() }
+    const t = await $.clock.now()
     now = t
     if (msgChat !== chat) return { filled: false, stale: true }
     const existing = await boxNow($)

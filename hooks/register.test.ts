@@ -3883,3 +3883,17 @@ test('a "Compact first" message from before the chat was replaced by a resumed o
   expect(seen.toasts.filter((t) => t.includes(`Not sent, because the chat was replaced by a resumed chat: ${long}`)).length).toBe(1)
   expect(seen.toasts.filter((t) => /was cleared/.test(t))).toEqual([])
 })
+
+test('a put-back that arrives while the abandoned batch is still gathering its members goes after the batch, not before it', SETUP, async ($, on) => {
+  const dialogs = heldAsk(on)
+  const { clock, seen, fills } = await coldChat($, on)
+  hang(seen)
+  await send($, 'one') // its compaction starts 50 ms on and is abandoned 15 minutes after that
+  await clock.advance(1000)
+  void send($, 'two') // its dialog stays open
+  await clock.advance(50 + 15 * 60000 - 1000 - 20) // 20 ms before the abandonment
+  dialogs.release('Compact first, then send') // 'two' starts 50 ms on, 30 ms after the abandonment and 20 ms before the batch's fill
+  await clock.advance(200)
+  expect(seen.compacts).toBe(1)
+  expect(fills).toEqual(['one', 'one\n\ntwo'])
+})
