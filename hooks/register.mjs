@@ -433,7 +433,7 @@ const RESUME_FALLBACK = 60 * MIN // no reset time known: try once an hour, three
 let resumeTries = 0
 let staleArmedGen = -1 // the identityGen at which a failure of an earlier request was already given its free minute
 let resumeFromReadings = false // the pending resume rests on plan windows, not on the error's wording (nor, after dropReadings, on a re-arm); cleared wherever resumeAt is
-let submitsSeen = 0 // messages handed on to the chat so far (not dropped, not ours, not a local command), so an unattended send can tell the person sent something meanwhile
+let submitsSeen = 0 // messages handed on to the chat so far (not dropped, not ours, not a local command) and each "Compact first" the person picks, so an unattended send can tell the person sent something meanwhile
 let sendsHeld = 0 // a cold-send dialog is open, any send of the person's is being handed on down the chain, or a compact-then-send is in flight: a due resume waits
 let wakePendingId = 0 // the wakeCount of a rotator wake-up that has arrived and whose own request has not started (0: none): a due resume waits and a drop of the readings does not re-arm it, as the wake-up's turn settles it. A wake-up lowers it only if it is still its own id, so an earlier one giving up cannot release a later one's hold
 let resumeHeld = false // the due resume is waiting for the seat and account to be known: it goes once they are, or at the window's end
@@ -493,7 +493,7 @@ function armResume($, details) {
 
 // From the heartbeat tick: send "Resume" once its time has come, as the person's own word
 async function resumeStep($) {
-  if (!S.resumeAt || now < S.resumeAt || S.working || sendsHeld || wakePendingId) return // a send of the person's is held by the guard or compacting, or a wake-up is on its way: its request settles the resume
+  if (!S.resumeAt || now < S.resumeAt || S.working || sendsHeld || wakePendingId) return // a send of the person's is being handed on or compacting, or a wake-up is on its way: its request settles the resume
   // the seat or the account is not known yet: the send waits until both are (refreshIdentity then brings it forward) or the window closes, without spending a try or compacting
   if (keyUnsure()) {
     S.resumeAt = wakeWindowEnd
@@ -545,7 +545,7 @@ async function runCompactThenSend($, msg, unattended, seenBefore, wake) {
     if (!cancelled()) $.ui.toast('Could not compact (' + clip(String((err && err.message) || err), 80) + '), so the message goes as typed.', { timeoutMs: 8000 })
   }
   if (cancelled()) {
-    // a message that reached the chat while compacting (another plugin's too), or /clear or a resume, cancels an automatic one (a local command or a dropped send does not), and with it the wake-up's turn
+    // a message that reached the chat while compacting (another plugin's too, or the person's own Compact first), or /clear or a resume, cancels an automatic one (a local command or a dropped send does not), and with it the wake-up's turn
     lowerWake(wake)
     $.ui.toast((compacted ? 'Compacted. A message' : 'A message') + ' was sent meanwhile, so the automatic one was not sent.', { timeoutMs: 8000 })
     return
@@ -1338,7 +1338,7 @@ export function register(on, options = {}) {
     const isCold = rotated || (left !== null && left <= 0)
     // These run locally or start afresh: a cold cache costs them nothing
     const local = e.command && ['compact', 'clear', names.cache, names.keepwarm, names.board, names.handoff].includes(e.command.name)
-    // a message handed on and not dropped by a later hook reaches the chat: the unattended sends see it. Not a local command, nor this mod's own Resume or send. Whether it settles a pending resume is up to its request (turn.step)
+    // a message handed on and not dropped by a later hook reaches the chat: the unattended sends see it. Not a local command (LOCAL_BUILTINS), nor this mod's own Resume or send. Whether it settles a pending resume is up to its request (turn.step)
     const counts = !local && !(e.command && LOCAL_BUILTINS.has(e.command.name)) && !(e.origin && e.origin.kind === 'plugin' && e.origin.name === $.plugin.name)
     const mine = counts || fromUser // a send of the person's: a due resume waits while it is handed on, whether or not the guard asked
     const through = async () => {
