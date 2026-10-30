@@ -446,14 +446,14 @@ let submitsSeen = 0 // messages handed on to the chat so far (not dropped, not o
 let dialogsOpen = 0 // cold-send dialogs open for the person: an unattended send that has compacted waits for them to close before it judges whether it was cancelled (Cancel lets it go, except a Resume whose own compaction failed, which is armed again, once: compactDeclined; Send anyway or Compact first cancels it, and a /btw question does not, as it never reaches the chat)
 let dialogsClosed = [] // resolvers of the sends waiting for dialogsOpen to reach 0
 let dialogCancels = 0 // cold-send dialogs the person answered Cancel so far: an unattended send compares it with its start, so only a Cancel (not a Send anyway on a message that does not cancel it) re-arms a Resume whose compaction failed
-let compactDeclined = false // a Resume's failed compaction behind a Cancel was armed again: if the next one fails too it is not sent uncompacted. Cleared by a main-loop request, /clear, a resume or fork, a new arm and a successful compaction
+let compactDeclined = false // a Resume's failed compaction behind a Cancel was armed again: if the next one fails too it is not sent uncompacted. Cleared by a main-loop request, /clear, a resume, a new arm and a successful compaction
 let compacting = null // { run, chat }: this mod's compaction in flight (run settles at COMPACT_LIMIT at worst), started in conversation `chat` (msgChat): a second send in that conversation needing one waits for it, with no timer of its own, and uses its result (if it is abandoned instead, that send goes back in the prompt box: see abandoned). A fork is the same conversation and waits too; a send after a /clear or a resume of another chat does not wait for it
 let compactSeq = 0 // numbers this mod's /compact runs in the order they start
 const RUN_END_GRACE = 5000
 const liveRuns = new Set() // { chat, seq, at } (the conversation's msgChat, the run's number, when it started) of this mod's /compact runs not settled yet (and for RUN_END_GRACE after), abandoned ones too: an engine compaction mark may be one's end, which says nothing about a conversation since replaced (see staleRunOut) nor about a newer abandoned run (see olderRunOut)
 let abandoned = null // { done, at, batch, seq }: the /compact call still out after COMPACT_LIMIT. No send starts another until it settles (its end clears this), a compaction that started before it succeeds (the person's own too, but an engine compaction mark does not count while an older run of ours is still out and started under two COMPACT_LIMITs ago, as the mark may be that run's end), the chat is replaced, or a second COMPACT_LIMIT has passed. A Resume is tried again, the person's and a wake-up's message go back in the prompt box
-let putBackPending = null // { real, steps, at }: the Resume hold. A message was put back in the prompt box (a successful fill of a message that reaches the chat, not a /btw question, not a failed fill), or quoted in a toast because the box held the person's own text (it is still theirs to send), and nothing has been sent since: a due Resume waits while realSends and stepsSeen are as they were then, for COMPACT_LIMIT at most. Cleared by /clear, a resume or a fork
-let boxText = null // { real, steps, text }: the text a put-back left in the prompt box, unsent (a /btw question too). Not bound by COMPACT_LIMIT: it stays until a message is handed on or a request starts (realSends, stepsSeen), or /clear, a resume or a fork. A later put-back goes in behind it when the box (read when the engine can, within BOX_LIMIT; else this text) still holds exactly this text or nothing, and is quoted in a toast, the box untouched, when it holds anything else: only this text is the mod's to replace
+let putBackPending = null // { real, steps, at }: the Resume hold. A message was put back in the prompt box (a successful fill of a message that reaches the chat, not a /btw question, not a failed fill), or quoted in a toast because the box held the person's own text (it is still theirs to send), and nothing has been sent since: a due Resume waits while realSends and stepsSeen are as they were then, for COMPACT_LIMIT at most. Cleared by /clear or a resume (a fork keeps it)
+let boxText = null // { real, steps, text }: the text a put-back left in the prompt box, unsent (a /btw question too). Not bound by COMPACT_LIMIT: it stays until a message is handed on or a request starts (realSends, stepsSeen), or /clear or a resume (a fork keeps it). A later put-back goes in behind it when the box (read when the engine can, within BOX_LIMIT; else this text) still holds exactly this text or nothing, and is quoted in a toast, the box untouched, when it holds anything else: only this text is the mod's to replace
 let fillChain = Promise.resolve() // put-back fills run one after another: each reads what the last left in the box
 let tryCause = '' // why the most recent Resume try failed: 'refused' (neither submit way took it) or 'compaction' (still out, or not finished), named in the give-up toast
 let sendSeq = 0 // submission order of the sends that compact first
@@ -463,8 +463,7 @@ let sendPending = new Map() // id -> deadline: a send handed on that is not this
 let sendPendingId = 0
 let stepsSeen = 0 // main-loop requests started so far
 let realSends = 0 // messages handed on to the chat (submitsSeen without "Compact first" answers, wake-ups and /clear)
-let chatGen = 0 // bumped when the session id changes: /clear, resuming another chat, and a fork. What a Resume's re-arm and a send's settling check ("is this still the chat it was for?"); not what a compaction belongs to (msgChat)
-let msgChat = 0 // the conversation: chatGen without the forks, as a fork carries the conversation on. A message from before a fork is still the new chat's, and so is a compaction in flight (it is waited for, and its success or abandonment is recorded: compacting, liveRuns, abandoned); /clear and resuming another chat start another conversation, where neither is sent or recorded
+let msgChat = 0 // the conversation, bumped by /clear and by resuming another chat, not by a fork, which carries the conversation on. A message from before a fork is still the new chat's, so is a pending Resume (and one compacting, or being re-armed), and so is a compaction in flight (it is waited for, and its success or abandonment is recorded: compacting, liveRuns, abandoned); /clear and resuming another chat start another conversation, where neither is sent or recorded
 let msgChatCause = '' // why msgChat last moved, in words for the toast: 'cleared' or 'replaced by a resumed chat'
 const CANCEL_REARM = 2 * MIN // a cancelled Resume with no request started since, a Resume neither submit way could send, one whose compaction did not finish in COMPACT_LIMIT, and one whose compaction failed behind a cancelled dialog are armed again this long after (tries kept)
 const SEND_SAFETY = 2 * MIN
@@ -614,7 +613,7 @@ async function resumeStep($) {
     compactThenSend($, { text: 'Resume' }, true)
     return
   }
-  const before = { chat: chatGen, steps: stepsSeen }
+  const before = { chat: msgChat, steps: stepsSeen }
   for (const asUser of [true, false]) {
     try {
       await $.prompt.submit({ text: 'Resume', ...(asUser ? { asUser } : {}) })
@@ -628,11 +627,11 @@ async function resumeStep($) {
 }
 
 // A Resume neither submit way could send (the direct send and the unattended one after compacting), or whose compaction did not finish in COMPACT_LIMIT (or is still out from an earlier send): tried again 2 minutes on, four attempts in all, so it is not lost to one refusal.
-// before: chatGen and stepsSeen from before the submits. A request that started or a chat replaced meanwhile settled it, and a re-arm made meanwhile stands: nothing is armed over either.
+// before: msgChat and stepsSeen from before the submits. A request that started or a chat replaced meanwhile settled it, and a re-arm made meanwhile stands: nothing is armed over either.
 // cause: why this try failed, 'refused' or 'compaction' (tryCause keeps the latest, which the toast after the fourth try names). lead: what the toast says went wrong
 async function sendRefused($, before, cause = 'refused', lead = 'Could not send Resume.') {
   const t = await $.clock.now() // read first: the check and the arm follow with no await between
-  if (chatGen !== before.chat || stepsSeen !== before.steps || S.resumeAt) return
+  if (msgChat !== before.chat || stepsSeen !== before.steps || S.resumeAt) return
   tryCause = cause
   if (++sendFailures > 3) {
     sendFailures = 0
@@ -648,7 +647,7 @@ async function sendRefused($, before, cause = 'refused', lead = 'Could not send 
 // wake: the id of the rotator wake-up this send is (0 for any other send)
 function compactThenSend($, e, unattended, wake = 0) {
   const msg = { text: e.text, attachments: e.attachments, slash: !!e.command, local: isLocalBuiltin(e.command), seq: ++sendSeq }
-  const before = { seen: submitsSeen, real: realSends, chat: chatGen, msgChat, steps: stepsSeen, cancels: dialogCancels }
+  const before = { seen: submitsSeen, real: realSends, msgChat, steps: stepsSeen, cancels: dialogCancels }
   sendsHeld++
   $.clock.after(50, () => runCompactThenSend($, msg, unattended, before, wake).catch(() => {}).finally(() => sendsHeld--))
   return { drop: 'cache-keeper: compacting first on a cold cache; the message is sent again once that finishes' }
@@ -833,7 +832,7 @@ async function runCompactThenSend($, msg, unattended, before, wake) {
   // the Resume goes again 2 minutes on (resumeAt, shown in the band) unless another request starts, the chat is replaced or it is armed already. The time is read before the check: nothing that clears the re-arm can run between the check and the assignment
   const rearmResume = async () => {
     const t = await $.clock.now()
-    const ok = chatGen === before.chat && stepsSeen === before.steps
+    const ok = msgChat === before.msgChat && stepsSeen === before.steps
     if (ok && !S.resumeAt) {
       S.resumeAt = t + CANCEL_REARM
       $.ui.invalidate('ui.render')
@@ -857,7 +856,7 @@ async function runCompactThenSend($, msg, unattended, before, wake) {
     // The Resume is tried again (a counted try); the person's message and a wake-up's go back in the prompt box below
     if (resume) {
       const lead = timedOut ? 'Compaction has not finished after 15 minutes; the Resume was not sent.' : 'The earlier compaction is still running; the Resume was not sent.'
-      await sendRefused($, { chat: before.chat, steps: before.steps }, 'compaction', lead)
+      await sendRefused($, { chat: before.msgChat, steps: before.steps }, 'compaction', lead)
       return
     }
   } else if (resume && !compacted && compactDeclined) {
@@ -878,7 +877,7 @@ async function runCompactThenSend($, msg, unattended, before, wake) {
   const send = { text: msg.text, ...(msg.attachments ? { attachments: msg.attachments } : {}) }
   // A plugin can't submit a "/" line: those go back in the prompt box
   if (!msg.slash && !stuck) {
-    const tried = { chat: chatGen, steps: stepsSeen }
+    const tried = { chat: msgChat, steps: stepsSeen }
     for (const asUser of unattended ? [true, false] : [true]) {
       try {
         const stepsBefore = stepsSeen
@@ -1606,23 +1605,23 @@ export function register(on, options = {}) {
     S.keepWarm = false
     H.armed = false
     S.coldRestarts = [] // a resumed chat's own come back with its seed
-    // a resume armed in the last chat must not fire into this one
-    S.resumeAt = 0
-    resumeFromReadings = false
-    resumeHeld = false
-    wakePendingId = 0
-    putBackPending = null // the box's text belongs to the chat this one replaces (a fork's too)
-    boxText = null
-    sendPending.clear()
-    chatGen++
+    // The box text and its put-back hold stay with a fork, which is the same conversation: the text put back before the branch is still in the box, to be sent
     if (e.source !== 'fork') {
+      // a resume armed in the last chat must not fire into this one (a fork keeps its pending Resume, and one compacting)
+      S.resumeAt = 0
+      resumeFromReadings = false
+      resumeHeld = false
+      wakePendingId = 0
+      putBackPending = null // the box's text belongs to the chat this one replaces
+      boxText = null
+      sendPending.clear()
       msgChat++
       msgChatCause = e.source === 'clear' ? 'cleared' : 'replaced by a resumed chat'
+      resumeTries = 0
+      sendFailures = 0
+      compactDeclined = false
+      submitsSeen++ // the chat is replaced: an unattended send still compacting (our Resume, a wake-up) must not go into the new one
     }
-    resumeTries = 0
-    sendFailures = 0
-    compactDeclined = false
-    submitsSeen++ // the chat is replaced: an unattended send still compacting (our Resume, a wake-up) must not go into the new one
     $.ui.invalidate('ui.render')
     try {
       S.id = (await $.session.id()) || S.id

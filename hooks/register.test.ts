@@ -4374,3 +4374,38 @@ test('a /clear while the put-back is being filled still quotes what the fill lef
   expect(seen.toasts.filter((t) => t.includes('The chat was cleared while your message was being put back: one'))).toHaveLength(1)
   expect(seen.toasts.filter((t) => t.includes('while your message was being put back: /merge-pr 1'))).toEqual([]) // quoted already
 })
+
+// ----- a branch carries the conversation on: the Resume with it -----
+async function resumeBranching($: any, on: any, before?: () => void) {
+  return resumeCompacting($, on, () => { on('classic.SessionStart', () => ({})); before?.() })
+}
+
+test('a pending Resume survives a /branch and goes', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = await resumeBranching($, on)
+  await clock.advance(30 * 60000)
+  await ($ as any).classic.SessionStart({ source: 'fork', transcript_path: '/h/fork.jsonl' })
+  expect(await bandResume($)).not.toBe(null) // still pending in the fork
+  await clock.advance(62 * 60000)
+  expect(seen.submits).toEqual(['Resume'])
+})
+
+test('a Resume compacting when the chat is branched still goes into the fork', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = await resumeBranching($, on)
+  let n = 0
+  seen.duringCompact = async () => { if (++n === 1) await ($ as any).classic.SessionStart({ source: 'fork', transcript_path: '/h/fork.jsonl' }) }
+  await clock.advance(91 * 60000 + 1000)
+  await clock.advance(10000)
+  expect(seen.submits).toEqual(['Resume'])
+  expect(seen.toasts.filter((t) => /the automatic one/.test(t))).toEqual([])
+})
+
+for (const source of ['clear', 'resume']) {
+  test(`a ${source === 'clear' ? '/clear' : 'resume of another chat'} still cancels a pending Resume`, { options: { autoResume: true } }, async ($, on) => {
+    const { clock, seen } = await resumeBranching($, on)
+    await clock.advance(30 * 60000)
+    await ($ as any).classic.SessionStart({ source, transcript_path: '/h/other.jsonl' })
+    expect(await bandResume($)).toBe(null)
+    await clock.advance(62 * 60000)
+    expect(seen.submits).toEqual([])
+  })
+}
