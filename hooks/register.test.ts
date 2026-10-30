@@ -318,11 +318,13 @@ test('an automatic message cancelled by one sent meanwhile says so once, even wh
   const { clock, seen } = engine($, on)
   seen.failCompact = true
   on('classic.StopFailure', () => ({}))
+  on('turn.step', async function* () { return { answer: '', toolUses: [], usage: null } })
   await start($, 300000, clock)
   const resetsAt = new Date(60000 + 30 * 60000).toISOString()
   await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [{ kind: 'five_hour', percentUsed: 100, resetsAt }], changed: [] } as never)
   await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
   seen.duringCompact = () => $.prompt.submit({ text: 'hold on', origin: COMPOSER, wait: false } as never)
+  await cancelledThenRequest($, clock, seen)
   await clock.advance(40 * 60000)
   expect(seen.submits).toEqual([])
   expect(seen.toasts.filter((t) => /Could not compact/.test(t))).toEqual([])
@@ -344,12 +346,14 @@ test('a /clear drops the resume armed in the last chat', { options: { autoResume
 test('a message sent while a big chat compacts for its resume cancels the "Resume"', { options: { autoResume: true } }, async ($, on) => {
   const { clock, seen } = engine($, on)
   on('classic.StopFailure', () => ({}))
+  on('turn.step', async function* () { return { answer: '', toolUses: [], usage: null } })
   await start($, 300000, clock)
   const resetsAt = new Date(60000 + 30 * 60000).toISOString()
   await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [{ kind: 'five_hour', percentUsed: 100, resetsAt }], changed: [] } as never)
   await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
   // the person types while the compaction runs
   seen.duringCompact = () => $.prompt.submit({ text: 'hold on', origin: COMPOSER, wait: false } as never)
+  await cancelledThenRequest($, clock, seen)
   await clock.advance(40 * 60000)
   expect(seen.compacts).toBe(1)
   expect(seen.submits).toEqual([])
@@ -470,6 +474,11 @@ async function mainStep($: any, agentId?: string) {
   const it = ($ as any).turn.step({ model: 'claude-opus-5-5', messages: [], ...(agentId ? { agentId } : {}) })
   if (it && typeof it[Symbol.asyncIterator] === 'function') for await (const _ of it) void _
   else await it
+}
+// The Resume's compact-then-send was cancelled: the message that did it has its own request start (the Resume goes again if none does)
+async function cancelledThenRequest($: any, clock: any, seen: { toasts: string[] }) {
+  for (let i = 0; i < 300 && !seen.toasts.some((t) => /automatic one/.test(t)); i++) await clock.advance(60000)
+  await mainStep($)
 }
 const ROTATE = 'Usage reset: the CLI account was rotated to B. Go on.'
 
@@ -2241,11 +2250,13 @@ test('/clear typed while the Resume compacts cancels it: no Resume into the clea
 test("another plugin's prompt that reaches the chat while the Resume compacts cancels it", { options: { autoResume: true } }, async ($, on) => {
   const { clock, seen } = engine($, on)
   on('classic.StopFailure', () => ({}))
+  on('turn.step', async function* () { return { answer: '', toolUses: [], usage: null } })
   await start($, 300000, clock)
   const t0 = await clock.now()
   await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: fiveFull(t0), changed: [] } as never)
   await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
   seen.duringCompact = () => $.prompt.submit({ text: 'from elsewhere', origin: { kind: 'plugin', name: 'some-other-plugin' }, wait: false } as never)
+  await cancelledThenRequest($, clock, seen)
   await clock.advance(3 * 60 * 60000)
   expect(seen.compacts).toBe(1)
   expect(seen.submits).toEqual(['from elsewhere'])
@@ -2321,6 +2332,7 @@ test('Compact first while the Resume compacts cancels the Resume: only the perso
   await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
   let n = 0
   seen.duringCompact = async () => { if (++n === 1) await $.prompt.submit({ text: 'hold on', origin: COMPOSER, wait: false } as never) } // the Resume is compacting when the person sends into the cold chat
+  await cancelledThenRequest($, clock, seen)
   await clock.advance(3 * 60 * 60000)
   expect({ asks: seen.asks, submits: seen.submits }).toEqual({ asks: 1, submits: ['hold on'] })
 })
@@ -2371,12 +2383,14 @@ for (const [args, goes] of [['fix x', false], ['', true], ['open', true]] as con
   test(`"/plan ${args}" typed while the Resume compacts ${goes ? 'leaves it going' : 'cancels it, as it reaches the model'}`, { options: { autoResume: true } }, async ($, on) => {
     const { clock, seen } = engine($, on)
     on('classic.StopFailure', () => ({}))
+    on('turn.step', async function* () { return { answer: '', toolUses: [], usage: null } })
     await start($, 300000, clock)
     const t0 = await clock.now()
     await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: fiveFull(t0), changed: [] } as never)
     await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
     let n = 0
     seen.duringCompact = async () => { if (++n === 1) await $.prompt.submit({ text: `/plan ${args}`.trim(), command: { name: 'plan', args }, origin: COMPOSER, wait: false } as never) }
+    if (!goes) await cancelledThenRequest($, clock, seen)
     await clock.advance(3 * 60 * 60000)
     expect(seen.submits).toEqual(goes ? ['Resume'] : [])
   })
@@ -2431,4 +2445,50 @@ test('the person\'s message sent again after "Compact first" whose request start
   await mainStep($)
   await clock.advance(5 * 60000)
   expect(seen.submits).toEqual(['hello'])
+})
+
+async function resumeCompactingThenCompactFirst($: any, on: any) {
+  const { clock, seen } = engine($, on)
+  answer(on, seen, 'Compact first, then send')
+  const fills: string[] = []
+  on('prompt.fill', (_: unknown, e: any) => (fills.push(e.text), { isFilled: true }))
+  on('classic.StopFailure', () => ({}))
+  on('turn.step', async function* () { return { answer: '', toolUses: [], usage: { input_tokens: 10, cache_read_input_tokens: 300000, cache_creation_input_tokens: 0 } } })
+  await start($, 300000, clock)
+  const t0 = await clock.now()
+  await mainStep($)
+  await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [{ kind: 'five_hour', percentUsed: 100, resetsAt: new Date(t0 + 90 * 60000).toISOString() }], changed: [] } as never)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  let n = 0
+  seen.duringCompact = async () => { if (++n === 1) await $.prompt.submit({ text: '/merge-pr 1', command: { name: 'merge-pr', args: '1' }, origin: COMPOSER, wait: false } as never) } // the Resume is compacting when the person answers "Compact first" on a slash message
+  return { clock, seen, fills }
+}
+
+test('the Resume cancelled by "Compact first" on a slash message (put back in the prompt box, never sent) goes again 2 minutes later', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen, fills } = await resumeCompactingThenCompactFirst($, on)
+  await clock.advance(91 * 60000 + 1000) // the resume falls due and compacts, and the person's message cancels it
+  expect(seen.toasts.filter((t) => /Something else was sent or chosen meanwhile, so the automatic one waits/.test(t)).length).toBe(1)
+  expect(seen.toasts.filter((t) => /A message was sent meanwhile/.test(t))).toEqual([])
+  await clock.advance(60000)
+  expect(seen.submits).toEqual([]) // still inside the 2 minutes
+  await clock.advance(100000) // past it, at the next tick
+  expect({ fills, submits: seen.submits }).toEqual({ fills: ['/merge-pr 1'], submits: ['Resume'] })
+})
+
+test('the Resume cancelled by "Compact first" is not armed again once a request of the main loop starts', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = await resumeCompactingThenCompactFirst($, on)
+  await clock.advance(91 * 60000 + 1000) // the resume falls due and compacts, and the person's message cancels it
+  await clock.advance(30000)
+  await mainStep($) // some request starts within the 2 minutes
+  await clock.advance(10 * 60000)
+  expect(seen.submits).toEqual([])
+})
+
+test('the Resume cancelled by a /clear is not armed again', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = await resumeCompactingThenCompactFirst($, on)
+  seen.duringCompact = async () => { await ($ as any).classic.SessionStart({ source: 'clear' }) }
+  await clock.advance(91 * 60000 + 1000) // the resume falls due and compacts, and the person's message cancels it
+  expect(seen.toasts.filter((t) => /so the automatic one was not sent/.test(t)).length).toBe(1)
+  await clock.advance(10 * 60000)
+  expect(seen.submits).toEqual([])
 })

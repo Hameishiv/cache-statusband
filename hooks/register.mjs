@@ -439,6 +439,10 @@ let wakePendingId = 0 // the wakeCount of a rotator wake-up that has arrived and
 let sendPending = new Map() // id -> deadline: a send of the person's (or another plugin's) that was handed on and whose request has not started: a due resume waits. A main-loop request, /clear or resuming another chat lowers all; the deadline (SEND_SAFETY after hand-over) covers a send that never starts a request
 let sendPendingId = 0
 let stepsSeen = 0 // main-loop requests started so far
+let realSends = 0 // messages handed on to the chat (submitsSeen without the "Compact first" picks)
+let chatGen = 0 // bumped when the chat is replaced (/clear, resuming another chat)
+let resumeCancelledAt = 0 // when the Resume's own compact-then-send was cancelled while no request of anything else had started (0: none): with no main-loop request 2 minutes on, the Resume is armed again (tries kept)
+const CANCEL_REARM = 2 * MIN
 const SEND_SAFETY = 2 * MIN
 let resumeHeld = false // the due resume is waiting for the seat and account to be known: it goes once they are, or at the window's end
 // Built-in commands that run locally: they neither settle a pending resume nor cancel an unattended send.
@@ -490,6 +494,7 @@ function armResume($, details) {
   if (requestGen !== identityGen && staleArmedGen !== identityGen) {
     staleArmedGen = identityGen
     S.resumeAt = now + MIN
+    resumeCancelledAt = 0
     resumeHeld = false
     resumeFromReadings = false // it rests on no reading
     $.ui.toast(`Out of usage. This chat resumes on its own at ${resumeText(S.resumeAt, now)}.`, { timeoutMs: 15000 })
@@ -502,6 +507,7 @@ function armResume($, details) {
     return
   }
   S.resumeAt = at || now + RESUME_FALLBACK
+  resumeCancelledAt = 0
   resumeHeld = false
   resumeFromReadings = full.length > 0
   if (!at) resumeTries++
@@ -511,6 +517,12 @@ function armResume($, details) {
 
 // From the heartbeat tick: send "Resume" once its time has come, as the person's own word
 async function resumeStep($) {
+  if (resumeCancelledAt && !S.resumeAt && now - resumeCancelledAt >= CANCEL_REARM) {
+    // what cancelled the Resume's send started no request (a slash message put back in the prompt box, a send that failed): the Resume is still owed
+    resumeCancelledAt = 0
+    S.resumeAt = now
+    $.ui.invalidate('ui.render')
+  }
   if (!S.resumeAt || now < S.resumeAt || S.working || sendsHeld || wakePendingId || sendIsPending()) return // a send is being handed on or compacting, one was handed on and its request has not started, or a wake-up is on its way: its request settles the resume
   // the seat or the account is not known yet: the send waits until both are (refreshIdentity then brings it forward) or the window closes, without spending a try or compacting
   if (keyUnsure()) {
@@ -540,9 +552,9 @@ async function resumeStep($) {
 // wake: the id of the rotator wake-up this send is (0 for any other send)
 function compactThenSend($, e, unattended, wake = 0) {
   const msg = { text: e.text, attachments: e.attachments, slash: !!e.command }
-  const seenBefore = submitsSeen
+  const before = { seen: submitsSeen, real: realSends, chat: chatGen, steps: stepsSeen }
   sendsHeld++
-  $.clock.after(50, () => runCompactThenSend($, msg, unattended, seenBefore, wake).catch(() => {}).finally(() => sendsHeld--))
+  $.clock.after(50, () => runCompactThenSend($, msg, unattended, before, wake).catch(() => {}).finally(() => sendsHeld--))
   return { drop: 'cache-keeper: compacting first on a cold cache; the message is sent again once that finishes' }
 }
 
@@ -551,8 +563,8 @@ function lowerWake(id) {
   if (id && wakePendingId === id) wakePendingId = 0
 }
 
-async function runCompactThenSend($, msg, unattended, seenBefore, wake) {
-  const cancelled = () => unattended && submitsSeen !== seenBefore
+async function runCompactThenSend($, msg, unattended, before, wake) {
+  const cancelled = () => unattended && submitsSeen !== before.seen
   let compacted = false
   try {
     await $.command.run({ command: 'compact', args: '' })
@@ -565,7 +577,11 @@ async function runCompactThenSend($, msg, unattended, seenBefore, wake) {
   if (cancelled()) {
     // a message that reached the chat while compacting (another plugin's too, or the person's own Compact first), or /clear or a resume, cancels an automatic one (a local command or a dropped send does not), and with it the wake-up's turn
     lowerWake(wake)
-    $.ui.toast((compacted ? 'Compacted. A message' : 'A message') + ' was sent meanwhile, so the automatic one was not sent.', { timeoutMs: 8000 })
+    // the Resume's send goes again unless another request starts or the chat is replaced
+    const rearm = !wake && chatGen === before.chat && stepsSeen === before.steps
+    if (rearm) resumeCancelledAt = await $.clock.now()
+    const text = realSends !== before.real ? 'A message was sent meanwhile, so the automatic one was not sent.' : rearm ? 'Something else was sent or chosen meanwhile, so the automatic one waits.' : 'Something else was sent or chosen meanwhile, so the automatic one was not sent.'
+    $.ui.toast((compacted ? 'Compacted. ' : '') + text, { timeoutMs: 8000 })
     return
   }
   const send = { text: msg.text, ...(msg.attachments ? { attachments: msg.attachments } : {}) }
@@ -1288,6 +1304,8 @@ export function register(on, options = {}) {
     resumeHeld = false
     wakePendingId = 0
     sendPending.clear()
+    resumeCancelledAt = 0
+    chatGen++
     resumeTries = 0
     submitsSeen++ // the chat is replaced: an unattended send still compacting (our Resume, a wake-up) must not go into the new one
     $.ui.invalidate('ui.render')
@@ -1372,6 +1390,7 @@ export function register(on, options = {}) {
         const r = await next(e)
         if (counts && !(r && r.drop)) {
           submitsSeen++
+          realSends++
           handed = true
         } else if (wake && r && r.drop) lowerWake(wakeId) // dropped further down: no request of the wake-up's is on its way
         return r
@@ -1431,6 +1450,7 @@ export function register(on, options = {}) {
       wakePendingId = 0
       sendPending.clear()
       stepsSeen++
+      resumeCancelledAt = 0
       resumeHeld = false
       resumeFromReadings = false // settled: a later account change must not bring it back
       if (S.resumeAt) {
