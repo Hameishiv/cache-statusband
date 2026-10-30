@@ -149,7 +149,7 @@ node .\bin\cache-statusband-codex.mjs board --limit 2
 Pop-Location
 ```
 
-The current Node suite has 18 tests covering malformed/in-progress JSONL, latest-token selection, bounded large-transcript parsing, persisted context fallback, out-of-order state protection, active/archived discovery, the resume/stop hooks, account/token/ID sanitization, immutable session identity, per-account five-minute caching, last-good failure behavior, the one-hour `Retry-After` cap, first-word capitalization, the documented app-server protocol, compact reset/age formatting, absolute local expiration formatting, and missing-detail handling. The PowerShell test separately proves that installation replaces a multiline footer under a commented `[tui]` header, preserves unrelated TOML, validates the candidate, and leaves the live file unchanged after rejection.
+The Node suite covers malformed/in-progress JSONL, latest-token selection, bounded large-transcript parsing, persisted context fallback, out-of-order state protection, active/archived discovery, the resume/stop hooks, account/token/ID sanitization, immutable session identity, per-account five-minute caching, last-good failure behavior, the one-hour `Retry-After` cap, first-word capitalization, the seat-file fallback, plain spaces in formatted times, the documented app-server protocol, compact reset/age formatting, absolute local expiration formatting, and missing-detail handling. The PowerShell test separately proves that installation replaces a multiline footer under a commented `[tui]` header, preserves unrelated TOML, validates the candidate, and leaves the live file unchanged after rejection.
 
 ## Credits
 

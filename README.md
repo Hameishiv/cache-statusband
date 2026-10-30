@@ -80,7 +80,7 @@ Everything below is off by default. Set the values in Claude Code's config menu,
 
 | Setting | What it does |
 |---|---|
-| `seatFileTerminal` | For account rotators: a file holding the active seat's label (e.g. `~/.claude-cli-accounts/.active`). Read when a session starts: the band shows `seat <label>` in place of the account email. A running session keeps the account it signed in with, so a change counts (and marks the cache cold) only once the rotator's wake-up prompt reaches that session. |
+| `seatFileTerminal` | For account rotators: a file holding the active seat's label (e.g. `~/.claude-cli-accounts/.active`). Read when a session starts: the band shows `Seat <label>` in place of the account email (the label is masked in recording mode, like the email). A running session keeps the account it signed in with, so a change counts (and marks the cache cold) only once the rotator's wake-up prompt reaches that session. |
 | `seatFileDesktop` | The same for sessions the Desktop app runs, so each seat keeps its own usage reading. |
 | `rotatorWakePattern` | A regular expression matching the prompt an unattended account rotator types after rotating. That prompt is compacted first without asking, since nobody is there to answer. |
 | `autoResume` | `true` to turn on auto-resume (above). Off by default because it spends usage without asking. |

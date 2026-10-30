@@ -7,7 +7,7 @@
  * Weekly usage is not in that JSON. /usage reads it from the credits config
  * Grok logs as "billing: fetched credits config". This script reads the last
  * of those lines and shows the percent and reset only when the period is
- * weekly and still open. It does not use the network and does not read a token.
+ * weekly, still open, and fetched within the last day. It does not use the network and does not read a token.
  */
 
 import { closeSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, statSync, writeFileSync } from "node:fs";
