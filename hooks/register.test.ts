@@ -238,18 +238,24 @@ test('a reopened chat borrows plan windows from the freshest session on the same
   expect(borrowedLimits(list, { seat: '', desktop: true }, at)).toEqual([]) // an unseated session does not borrow a seated one's
   expect(borrowedLimits([{ seat: 'A', desktop: false, updatedAt: at, rateLimits: five(80, '2026-10-29T09:00:00Z') }], { seat: 'A', desktop: false }, at)).toEqual([])
   // a seated and an unseated session on one surface are not known to share an account
-  const mixed = [{ seat: '', desktop: true, updatedAt: at, rateLimits: five(70, '2026-10-29T12:00:00Z') }, { seat: 'B', desktop: true, updatedAt: at, rateLimits: five(90, '2026-10-29T12:00:00Z') }]
-  expect(borrowedLimits(mixed, { seat: 'A', desktop: true }, at)).toEqual([])
-  expect(borrowedLimits(mixed.slice(1), { seat: '', desktop: true }, at)).toEqual([])
-  expect(borrowedLimits(mixed, { seat: '', desktop: true }, at)[0].percentUsed).toBe(70)
+  const mixed = [{ seat: '', account: 'a@x', desktop: true, updatedAt: at, rateLimits: five(70, '2026-10-29T12:00:00Z') }, { seat: 'B', desktop: true, updatedAt: at, rateLimits: five(90, '2026-10-29T12:00:00Z') }]
+  expect(borrowedLimits(mixed, { seat: 'A', account: 'a@x', desktop: true }, at)).toEqual([])
+  expect(borrowedLimits(mixed.slice(1), { seat: '', account: 'a@x', desktop: true }, at)).toEqual([])
+  expect(borrowedLimits(mixed, { seat: '', account: 'a@x', desktop: true }, at)[0].percentUsed).toBe(70)
+  // with no seat on either side the accounts decide: another account, or one unknown on either side, borrows nothing
+  expect(borrowedLimits(mixed, { seat: '', account: 'b@x', desktop: true }, at)).toEqual([])
+  expect(borrowedLimits(mixed, { seat: '', account: '', desktop: true }, at)).toEqual([])
+  expect(borrowedLimits(mixed, { seat: '', desktop: true }, at)).toEqual([])
+  expect(borrowedLimits([{ ...mixed[0], account: undefined }], { seat: '', account: 'a@x', desktop: true }, at)).toEqual([])
+  expect(borrowedLimits([{ ...mixed[0], account: undefined }], { seat: '', account: '', desktop: true }, at)).toEqual([])
   // the terminal's and the app's rotators name seats alone: the same name on another surface is not the same account
   const surfaces = [{ seat: 'A', desktop: true, updatedAt: at, rateLimits: five(60, '2026-10-29T12:00:00Z') }]
   expect(borrowedLimits(surfaces, { seat: 'A', desktop: false }, at)).toEqual([])
   expect(borrowedLimits(surfaces, { seat: 'A', desktop: true }, at)[0].percentUsed).toBe(60)
   // an API-key session's windows are not an account's
-  const keyed = [{ seat: '', desktop: false, signedIn: false, updatedAt: at, rateLimits: five(30, '2026-10-29T12:00:00Z') }]
-  expect(borrowedLimits(keyed, { seat: '', desktop: false }, at)).toEqual([])
-  expect(borrowedLimits([{ ...keyed[0], signedIn: true }], { seat: '', desktop: false }, at)[0].percentUsed).toBe(30)
+  const keyed = [{ seat: '', account: 'a@x', desktop: false, signedIn: false, updatedAt: at, rateLimits: five(30, '2026-10-29T12:00:00Z') }]
+  expect(borrowedLimits(keyed, { seat: '', account: 'a@x', desktop: false }, at)).toEqual([])
+  expect(borrowedLimits([{ ...keyed[0], signedIn: true }], { seat: '', account: 'a@x', desktop: false }, at)[0].percentUsed).toBe(30)
 })
 
 test('auto-resume waits for the last full window to reset, and only for usage', async () => {
@@ -1337,7 +1343,7 @@ test('a request right after the window closes, before any tick sees it close, al
   expect(rec.account).toBe('b@x')
 })
 
-test('only the first late field can re-mark the cache cold: a second one arriving on a later tick does not', SETUP, async ($, on) => {
+test('an account adopted late re-marks the cache cold even after a late seat: the label may be written before the credential switches', SETUP, async ($, on) => {
   const kept = new Map<string, unknown>()
   const seat = { label: 'A' }
   const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
@@ -1355,10 +1361,38 @@ test('only the first late field can re-mark the cache cold: a second one arrivin
   expect(r.text).toMatch(/account rotated/)
   await $.prompt.submit({ text: 'carry on', origin: COMPOSER, wait: false } as never)
   expect(seen.asks).toBe(1)
-  await step(usage({ cache_creation_input_tokens: 300000 })) // that request ran on the new account: the cache is warm
+  await step(usage({ cache_creation_input_tokens: 300000 })) // the credential may not have switched yet: this request may have run on the old account
   await clock.advance(30000)
   disk.files['.claude.json'] = account('b@x')
-  await clock.advance(30000) // the account is adopted, but it is the same rotation
+  await clock.advance(30000) // the account is adopted: the cache is cold again
+  r = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/account rotated/)
+  await $.prompt.submit({ text: 'and again', origin: COMPOSER, wait: false } as never)
+  expect(seen.asks).toBe(2)
+})
+
+test('a seat adopted late after the account was already adopted does not re-mark the cache cold: that request ran on the new account', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const seat = { label: 'A' }
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock, seen } = engine($, on, seat, kept, undefined, disk)
+  answer(on, seen, 'Send anyway')
+  const step = stepper($, on)
+  await start($, 300000, clock)
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never) // nothing written yet
+  await clock.advance(1000)
+  await step(usage({ cache_read_input_tokens: 300000 })) // the wake-up's request lands, perhaps on the old account
+  await clock.advance(30000)
+  disk.files['.claude.json'] = account('b@x')
+  await clock.advance(30000) // the account is adopted: the cache is cold
+  let r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/account rotated/)
+  await $.prompt.submit({ text: 'carry on', origin: COMPOSER, wait: false } as never)
+  expect(seen.asks).toBe(1)
+  await step(usage({ cache_creation_input_tokens: 300000 })) // that request ran on the new account: the cache is warm
+  await clock.advance(30000)
+  seat.label = 'B'
+  await clock.advance(30000) // the seat is adopted, but it is the same rotation
   r = await $.command.run({ command: 'cache', args: '' })
   expect(r.text).not.toMatch(/account rotated/)
   await $.prompt.submit({ text: 'and again', origin: COMPOSER, wait: false } as never)
@@ -1445,7 +1479,7 @@ test('a wake-up that already shows a new account drops the shared windows, which
   on('session.authorize', () => ({ value: { handle: 'h' } }))
   await clock.advance(60000)
   const t0 = await clock.now()
-  kept.set('plan', { at: t0, next: t0 + 60 * 60000, fable: null, windows: fullWeek(t0), why: 'ok' })
+  kept.set('plan:account:a@x', { at: t0, next: t0 + 60 * 60000, fable: null, windows: fullWeek(t0), why: 'ok' })
   await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
   await clock.advance(30000)
   disk.files['.claude.json'] = account('b@x')
@@ -1498,4 +1532,173 @@ test('with no seat file, no plan reading is fetched while the account is unknown
   await clock.advance(30000) // the new account is adopted and read under its own key
   expect(fetches).toBeGreaterThan(before)
   expect(kept.get('plan:account:b@x')).toBeTruthy()
+})
+
+// No seat file: the readings are the signed-in account's, which .claude.json names
+const RESUME_WAKE = { options: { rotatorWakePattern: WAKE.options.rotatorWakePattern, autoResume: true } }
+const throttle = { error: 'rate_limit', error_details: 'Too many requests, slow down' }
+const fiveFull = (at: number) => [{ kind: 'five_hour', percentUsed: 100, resetsAt: new Date(at + 2 * 60 * 60000).toISOString() }]
+
+test('with no seat file, the old account\'s full week arms no resume while the account is unknown, nor once the new account is adopted', RESUME_WAKE, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  on('classic.StopFailure', () => ({}))
+  on('session.authorize', () => ({ value: { handle: 'h' } }))
+  await clock.advance(60000)
+  const t0 = await clock.now()
+  kept.set('plan:account:a@x', { at: t0, next: t0 + 60 * 60000, fable: null, windows: fullWeek(t0), why: 'ok' })
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await clock.advance(30000) // the tick takes the stored reading
+  expect((kept.get('hb:sid-test') as any).account).toBe('a@x')
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never) // .claude.json not rewritten yet
+  await ($ as any).classic.StopFailure(throttle)
+  await clock.advance(30000)
+  expect((kept.get('hb:sid-test') as any).account).toBeUndefined() // the account is unknown: it names no one's windows
+  disk.files['.claude.json'] = account('b@x')
+  await clock.advance(30000)
+  expect((kept.get('hb:sid-test') as any).account).toBe('b@x')
+  await clock.advance(60 * 60000)
+  expect(seen.submits).toEqual([])
+})
+
+test('a resume armed from the old account\'s own windows while the account is unknown is dropped once the new account is adopted', RESUME_WAKE, async ($, on) => {
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock, seen } = engine($, on, { label: 'A' }, undefined, undefined, disk)
+  on('classic.StopFailure', () => ({}))
+  await start($, 50000, clock)
+  const t0 = await clock.now()
+  await $.session.measure({ context: { tokens: 50000, window: 1000000, percent: 5 }, rateLimits: fiveFull(t0), changed: [] } as never)
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never) // .claude.json not rewritten yet
+  await $.session.measure({ context: { tokens: 50000, window: 1000000, percent: 5 }, rateLimits: fiveFull(t0), changed: [] } as never)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" }) // armed from the old account's window
+  disk.files['.claude.json'] = account('b@x')
+  await clock.advance(30000)
+  await clock.advance(3 * 60 * 60000)
+  expect(seen.submits).toEqual([])
+})
+
+test('a wake-up that already shows a new account drops the old account\'s own 5h window: no resume, and /cache does not show it', RESUME_WAKE, async ($, on) => {
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock, seen } = engine($, on, { label: 'A' }, undefined, undefined, disk)
+  on('classic.StopFailure', () => ({}))
+  await start($, 50000, clock)
+  const t0 = await clock.now()
+  await $.session.measure({ context: { tokens: 50000, window: 1000000, percent: 5 }, rateLimits: fiveFull(t0), changed: [] } as never)
+  disk.files['.claude.json'] = account('b@x')
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/5h 100%/)
+  await ($ as any).classic.StopFailure(throttle)
+  await clock.advance(3 * 60 * 60000)
+  expect(seen.submits).toEqual([])
+})
+
+test('an account adopted after the wake-up drops the old account\'s own 5h window too', RESUME_WAKE, async ($, on) => {
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock, seen } = engine($, on, { label: 'A' }, undefined, undefined, disk)
+  on('classic.StopFailure', () => ({}))
+  await start($, 50000, clock)
+  const t0 = await clock.now()
+  await $.session.measure({ context: { tokens: 50000, window: 1000000, percent: 5 }, rateLimits: fiveFull(t0), changed: [] } as never)
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  disk.files['.claude.json'] = account('b@x')
+  await clock.advance(30000)
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/5h 100%/)
+  await ($ as any).classic.StopFailure(throttle)
+  await clock.advance(3 * 60 * 60000)
+  expect(seen.submits).toEqual([])
+})
+
+// Two unseated sessions on one surface: another session's heartbeat in the store
+const otherHb = (account: string | undefined, at: number) => ({ id: 'other', label: 'other', desktop: false, signedIn: true, seat: '', ...(account ? { account } : {}), updatedAt: at, rateLimits: [{ kind: 'five_hour', percentUsed: 100, resetsAt: new Date(at + 30 * 60000).toISOString() }] })
+
+for (const [theirs, borrows] of [['b@x', false], ['a@x', true], [undefined, false]] as const) {
+  test(`with no seat file, a session on a@x ${borrows ? 'borrows' : 'does not borrow'} the windows of one on ${theirs ?? 'an unknown account'}`, { options: { autoResume: true } }, async ($, on) => {
+    const kept = new Map<string, unknown>()
+    const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+    const { clock, seen } = engine($, on, { label: 'A' }, kept, undefined, disk)
+    on('classic.StopFailure', () => ({}))
+    await start($, 50000, clock)
+    kept.set('hb:other', otherHb(theirs, await clock.now()))
+    await clock.advance(30000) // the tick reads the fleet
+    await ($ as any).classic.StopFailure(throttle)
+    await clock.advance(40 * 60000)
+    expect(seen.submits).toEqual(borrows ? ['Resume'] : [])
+  })
+}
+
+test('a seat file naming a new seat at the wake-up, with .claude.json unchanged, holds the plan fetch until the account is adopted', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const seat = { label: 'A' }
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock } = engine($, on, seat, kept, undefined, disk)
+  kept.set('plan:cli:A', { at: 1, next: 2, windows: [], why: 'ok' }) // a reading long past due
+  on('session.authorize', () => ({ value: { handle: 'h' } }))
+  let fetches = 0
+  on('http.fetch', () => (fetches++, { value: { ok: true, status: 200, headers: {}, text: JSON.stringify({ five_hour: { utilization: 7, resets_at: 9999999999 } }) } }))
+  await clock.advance(60000)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await clock.advance(31000) // the first tick reads A's plan
+  expect(kept.get('plan:cli:A')).toBeTruthy()
+  await clock.advance(3 * 60000)
+  seat.label = 'B' // the seat is written, the credential may not have switched
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  const before = fetches
+  await clock.advance(90000)
+  expect(fetches).toBe(before)
+  expect(kept.get('plan:cli:B')).toBeUndefined()
+  disk.files['.claude.json'] = account('b@x')
+  await clock.advance(30000)
+  expect(fetches).toBeGreaterThan(before)
+  expect(kept.get('plan:cli:B')).toBeTruthy()
+})
+
+test('a seat file naming a new seat at the wake-up, with .claude.json unchanged, takes the plan fetch once the window closes', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const seat = { label: 'A' }
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock } = engine($, on, seat, kept, undefined, disk)
+  kept.set('plan:cli:A', { at: 1, next: 2, windows: [], why: 'ok' }) // a reading long past due
+  on('session.authorize', () => ({ value: { handle: 'h' } }))
+  let fetches = 0
+  on('http.fetch', () => (fetches++, { value: { ok: true, status: 200, headers: {}, text: JSON.stringify({ five_hour: { utilization: 7, resets_at: 9999999999 } }) } }))
+  await clock.advance(60000)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await clock.advance(31000)
+  await clock.advance(3 * 60000)
+  seat.label = 'B'
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  const before = fetches
+  await clock.advance(2 * 60000)
+  expect(fetches).toBe(before)
+  await clock.advance(90000) // the window is over: the account stands as it is
+  expect(fetches).toBeGreaterThan(before)
+  expect(kept.get('plan:cli:B')).toBeTruthy()
+})
+
+test('a seat that appears at the wake-up, where the session had none, drops the readings the session held', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const seat = { label: '' } // the seat file is empty when the session starts
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock } = engine($, on, seat, kept, undefined, disk)
+  kept.set('plan:account:a@x', { at: 1, next: 2, windows: [], why: 'ok' }) // a reading long past due
+  on('session.authorize', () => ({ value: { handle: 'h' } }))
+  let down = false
+  on('http.fetch', () => ({ value: down ? { ok: false, status: 500, headers: {}, text: '' } : { ok: true, status: 200, headers: {}, text: JSON.stringify({ five_hour: { utilization: 61, resets_at: 9999999999 }, limits: [{ kind: 'weekly_scoped', scope: { model: { display_name: 'Fable' } }, percent: 61 }] }) } }))
+  await clock.advance(60000)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await $.session.measure({ context: { tokens: 100000, window: 1000000, percent: 10 }, rateLimits: [{ kind: 'five_hour', percentUsed: 40, resetsAt: '2099-01-01T00:00:00Z' }], changed: [] } as never)
+  await clock.advance(31000) // the first tick reads the account's plan
+  expect((kept.get('plan:account:a@x') as any).fable.percentUsed).toBe(61)
+  down = true // B's own check fails, so only what the session held could fill its reading
+  seat.label = 'B'
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  await clock.advance(4 * 60000) // the window closes, and B's slot comes due
+  const b = kept.get('plan:cli:B') as any
+  expect(b).toBeTruthy()
+  expect(b.windows).toEqual([])
+  expect(b.fable ?? null).toBe(null)
+  expect((kept.get('hb:sid-test') as any).rateLimits).toEqual([])
 })

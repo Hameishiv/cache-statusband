@@ -79,7 +79,8 @@ const WAKE_WINDOW = 3 * MIN // how long after a wake-up a late rewrite of the se
 let seatUnknown = false // after a wake-up, until the seat file names a new seat: the rotator may not have written it yet, so S.seat may be the old one: its plan fetch, borrowing and lending of usage windows, and the shared windows and Fable reading it shows wait for it
 let accountUnknown = false // likewise for the account in .claude.json; a read with no account is not a change
 let wakeWindowEnd = 0 // when the wake-up's window closes; 0 = no window
-let identityMoved = false // the wake-up's re-read, or a late adoption since, has shown the seat or the account change: a field arriving after that is not a new rotation
+let accountMoved = false // the wake-up's re-read, or a late adoption since, has shown the account change: a seat label arriving after that is not a new rotation
+let seatMoved = false // the wake-up's re-read already showed the seat change. A seat adopted late does not count: its label may be written before the credential switches, so the account can still arrive after it
 let wakeCount = 0 // rotator wake-ups so far: a plan fetch that straddles one is dropped
 
 // A field is unknown only while the window is open: a closed one stands even before the tick that clears the flags
@@ -88,6 +89,11 @@ function seatUnsure() {
 }
 function accountUnsure() {
   return accountUnknown && now < wakeWindowEnd
+}
+// Whether the plan key, and the readings borrowed, lent or shown under it, may still be the old account's:
+// the seat file and .claude.json are written separately, and the credential may not have switched when either has
+function keyUnsure() {
+  return seatUnsure() || accountUnsure()
 }
 let wakeSeat = '' // the seat and account as they were when that wake-up came
 let wakeAccount = ''
@@ -382,19 +388,30 @@ async function readSeat($, adopt = false) {
   } catch {
     return
   }
-  if (S.seat && seat && seat !== S.seat) {
+  // at a wake-up a seat appearing where there was none is a change too
+  if (seat && seat !== S.seat && (S.seat || adopt)) {
     S.seatChangedAt = now
     rotationSeenAt = now
     rotatedPending = true
-    // the old account's readings: borrow or fetch the new one's until a request measures them
-    S.rateLimits = []
-    S.fable = null
-    S.planWindows = []
-    planNext = 0
+    dropReadings()
     S.seat = seat // before the await: planKey must name the new account while it runs
     await readAccount($, true)
   }
   if (seat) S.seat = seat
+}
+
+// The old account's readings, dropped once the account or seat moves: the new one's are borrowed or fetched until a request measures them.
+// A resume armed from them goes too, and re-arms from fresh readings.
+function dropReadings() {
+  S.rateLimits = []
+  S.fable = null
+  S.planWindows = []
+  planNext = 0
+  if (resumeFromReadings) {
+    S.resumeAt = 0
+    resumeTries = 0
+    resumeFromReadings = false
+  }
 }
 
 // Compacting on a cold cache pays only when it frees a real share of the context
@@ -410,6 +427,7 @@ const THROTTLE = /rate[ _-]?limit/i // "rate limit reached" is a short throttle,
 const USAGE_MARKER = /usage limit|hit your limit|out of (extra )?usage|5-hour|weekly/i // a throttle's wording beside one of these is still spent usage
 const RESUME_FALLBACK = 60 * MIN // no reset time known: try once an hour, three times at most
 let resumeTries = 0
+let resumeFromReadings = false // the armed resume came from plan windows, not from the error's wording
 let submitsSeen = 0 // prompt.submit hooks so far, so an unattended send can tell the person sent something meanwhile
 
 // The windows that are full, from the freshest reading this session has
@@ -431,10 +449,11 @@ export function resumeText(at, from) {
 }
 
 function armResume($, details) {
+  const unsure = keyUnsure()
   let limits = stillOpen(S.rateLimits, now)
-  if (!limits.length && signedIn !== false && !seatUnsure()) limits = borrowedLimits(fleet, { seat: S.seat, desktop: !onTerminal }, now) // not while the seat is unknown: S.seat may be the old one
-  if (!limits.length && !seatUnsure()) limits = stillOpen(S.planWindows, now) // nor the shared windows or Fable reading while the seat is unknown: the old seat's
-  const full = spentWindows(limits, seatUnsure() ? null : S.fable, S.model)
+  if (!limits.length && signedIn !== false && !unsure) limits = borrowedLimits(fleet, { seat: S.seat, account: S.account, desktop: !onTerminal }, now) // not while the seat or account is unknown: the key may name the old one
+  if (!limits.length && !unsure) limits = stillOpen(S.planWindows, now) // nor the shared windows or Fable reading while it is unknown: the old account's
+  const full = spentWindows(limits, unsure ? null : S.fable, S.model)
   const text = String(details || '')
   if (!full.length && !(USAGE_SPENT.test(text) && (!THROTTLE.test(text) || USAGE_MARKER.test(text)))) return // not usage exhaustion
   const at = resumeTime(full, now)
@@ -443,6 +462,7 @@ function armResume($, details) {
     return
   }
   S.resumeAt = at || now + RESUME_FALLBACK
+  resumeFromReadings = full.length > 0
   if (!at) resumeTries++
   $.ui.toast(`Out of usage. This chat resumes on its own at ${resumeText(S.resumeAt, now)}.`, { timeoutMs: 15000 })
   $.ui.invalidate('ui.render')
@@ -581,9 +601,10 @@ function myHeartbeat() {
     agentsRunning: S.agentsRunning,
     lastTurnEnd: S.lastTurnEnd,
     seat: S.seat,
+    ...(S.account && !accountUnsure() ? { account: S.account } : {}), // what an unseated session's windows are borrowed by; left out while unknown after a wake-up
     desktop: !onTerminal,
     signedIn, // an API-key session's windows are not an account's: others must not borrow them
-    rateLimits: seatUnsure() ? [] : S.rateLimits, // the engine's own reading, which a reopened chat borrows; none while the seat is unknown, as it may be the old account's
+    rateLimits: keyUnsure() ? [] : S.rateLimits, // the engine's own reading, which a reopened chat borrows; none while the seat or account is unknown, as it may be the old account's
     updatedAt: now,
   }
 }
@@ -595,8 +616,9 @@ export function stillOpen(limits, at) {
 }
 
 export function borrowedLimits(list, self, at) {
-  // a seat on either side must match, on the same surface (each rotator names its seats alone): a seated and an unseated session are not known to share an account
-  const same = (hb) => (self.seat || hb.seat ? hb.seat === self.seat && hb.desktop === self.desktop : hb.desktop === self.desktop)
+  // a seat on either side must match, on the same surface (each rotator names its seats alone): a seated and an unseated session are not known to share an account.
+  // With no seat on either side the signed-in accounts decide: both must be known, and equal
+  const same = (hb) => hb.desktop === self.desktop && (self.seat || hb.seat ? hb.seat === self.seat : !!self.account && hb.account === self.account)
   const best = list
     .filter((hb) => !hb.self && hb.signedIn !== false && Array.isArray(hb.rateLimits) && hb.rateLimits.length && same(hb))
     .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))[0]
@@ -667,11 +689,6 @@ const PLAN_KEY = 'plan'
 function planKey() {
   if (S.seat) return `${PLAN_KEY}:${onTerminal ? 'cli' : 'app'}:${S.seat}`
   return S.account ? `${PLAN_KEY}:account:${S.account}` : PLAN_KEY
-}
-
-// Whether planKey may still name the old account after a wake-up
-function keyUnsure() {
-  return seatUnsure() || (!S.seat && accountUnsure())
 }
 
 async function refreshPlan($) {
@@ -998,9 +1015,10 @@ function warnStep($) {
 // The rotator writes .claude.json and the seat file separately, at times we don't know. So for WAKE_WINDOW after a
 // wake-up, a field still unchanged (or an account that reads empty) is unknown and the ticks look again, each file on its own; once the window is over
 // the session keeps the seat and account it has. Outside a window a change is never taken: only a wake-up carries one.
-// A request that landed since the wake-up may have run on the old account: adopting then marks the cache cold,
-// but only for the first field to move. If the wake-up already showed a change, or an earlier adoption did, the rotation
-// had reached this session and later requests ran on the new account: a second field arriving never re-marks.
+// A request that landed since the wake-up may have run on the old account: adopting then marks the cache cold.
+// The account is what switches the credential, and the seat label can be written before it, so an account adopted late re-marks
+// whatever the seat did, unless the wake-up already showed the seat change. A seat adopted after the account was already known
+// never re-marks: that request ran on the new account.
 async function refreshIdentity($) {
   if (!wakeWindowEnd) return
   if (now >= wakeWindowEnd) {
@@ -1011,23 +1029,20 @@ async function refreshIdentity($) {
   }
   if (!seatUnknown && !accountUnknown) return
   let adopted = false
+  let accountAdopted = false
   try {
     if (accountUnknown && (await readAccount($, true)) && S.account !== wakeAccount) {
-      // the shared readings were the old account's, as at a wake-up that already shows the new one
-      S.fable = null
-      S.planWindows = []
-      planNext = 0
+      // the readings were the old account's, as at a wake-up that already shows the new one
+      dropReadings()
       accountUnknown = false
       adopted = true
+      accountAdopted = true
     }
     if (seatUnknown && (await $.fs.exists(seatFile))) {
       const seat = String(await $.fs.read(seatFile)).trim()
       if (seat && seat !== wakeSeat) {
-        // the old account's readings, as readSeat drops them: borrow or fetch the new one's
-        S.rateLimits = []
-        S.fable = null
-        S.planWindows = []
-        planNext = 0
+        // the old account's readings, as readSeat drops them
+        dropReadings()
         S.seat = seat
         seatUnknown = false
         adopted = true
@@ -1037,12 +1052,12 @@ async function refreshIdentity($) {
     // unreadable now: the next tick looks again
   }
   if (adopted) {
-    if (!identityMoved && S.lastActivity > rotationSeenAt) {
+    if ((accountAdopted ? !seatMoved : !accountMoved) && S.lastActivity > rotationSeenAt) {
       rotatedPending = true
       S.seatChangedAt = now
       rotationSeenAt = now
     }
-    identityMoved = true // only the first field to arrive can re-mark: the second finds the rotation already reached
+    if (accountAdopted) accountMoved = true
   }
 }
 
@@ -1089,7 +1104,7 @@ function statusText() {
   if (rotatedCold()) lines.push(`The account rotated${rotatedAgo()} (now ${mask(S.seat || S.account)}), so the cache is cold.`)
   if (S.keepWarm) lines.push(`Keep warm is on until ${clock(S.keepWarmUntil)}: ${S.pings} ping(s), ${money(S.pingUsd)} so far.`)
   if (S.rateLimits.length) lines.push(`Plan limits used: ${limitsText(S.rateLimits)}.`)
-  if (seatUnsure()) lines.push('Fable weekly: waiting for the rotator to name the new seat.')
+  if (keyUnsure()) lines.push('Fable weekly: waiting for the rotator to name the new seat or account.')
   else lines.push(S.fable ? `Fable weekly: ${Math.round(S.fable.percentUsed)}% used.` : `Fable weekly: no reading yet${planWhy && planWhy !== 'ok' ? ` (last check: ${planWhy})` : ''}.`)
   lines.push(`Session cost so far: ${money(S.costUsd)}. Cold restarts this session: ${S.coldRestarts.length} (${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))}).`)
   lines.push(`Cold-send guard: ${settings.guard ? 'on' : 'off'} for contexts over ${tokens(settings.bigTokens)} tokens. Alerts: ${settings.alerts ? 'on' : 'off'}.`)
@@ -1251,13 +1266,9 @@ export function register(on, options = {}) {
       // a field still as it was, or an account that read empty, is unknown: the rotator may not have written it yet, the ticks look again for the window
       seatUnknown = !!seatFile && S.seat === wakeSeat
       accountUnknown = !S.account || S.account === wakeAccount
-      identityMoved = (!!seatFile && S.seat !== wakeSeat) || !accountUnknown
-      if (!accountUnknown) {
-        // the account is known to have moved: the shared windows and Fable reading are the old account's, as on a seat change
-        S.fable = null
-        S.planWindows = []
-        planNext = 0
-      }
+      seatMoved = !!seatFile && S.seat !== wakeSeat
+      accountMoved = !accountUnknown
+      if (accountMoved) dropReadings() // the account is known to have moved: the readings are the old account's, as on a seat change
       S.seatChangedAt = now // a second wake-up of an already rotated chat dates it anew
       rotatedPending = true
     }
@@ -1655,14 +1666,14 @@ function bandSegments() {
   if (S.coldRestarts.length) out.push([`Cold rewrites ${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))} (${S.coldRestarts.length})`, 'gray'])
   // the engine's own reading once a request has run; before that another session's on the same account, then the shared usage reading
   let limits = stillOpen(S.rateLimits, now) // a window that reset since is stale
-  if (!limits.length && signedIn !== false && !seatUnsure()) limits = borrowedLimits(fleet, { seat: S.seat, desktop: !onTerminal }, now) // not while the seat is unknown: S.seat may be the old one
-  if (!limits.length && !seatUnsure()) limits = S.planWindows // the shared reading waits for the seat too: it may be the old account's
+  if (!limits.length && signedIn !== false && !keyUnsure()) limits = borrowedLimits(fleet, { seat: S.seat, account: S.account, desktop: !onTerminal }, now) // not while the seat or account is unknown: the key may name the old one
+  if (!limits.length && !keyUnsure()) limits = S.planWindows // the shared reading waits for it too: it may be the old account's
   const five = limits.find((l) => l.kind === 'five_hour')
   const week = limits.find((l) => l.kind === 'seven_day')
   if (five) out.push(limitSegment('5h', five, 'purple'))
   if (week) out.push(limitSegment('Week', week, 'green'))
   // its reset is the weekly one's, already shown; the reading waits for the seat like the windows
-  if (S.fable && !seatUnsure()) out.push(limitSegment('Fable', S.fable, 'pink', false))
+  if (S.fable && !keyUnsure()) out.push(limitSegment('Fable', S.fable, 'pink', false))
   for (const l of S.rateLimits) if (l.kind !== 'five_hour' && l.kind !== 'seven_day') out.push(limitSegment(LIMIT_LABEL[l.kind] || l.kind, l, 'gray'))
   out.push([`session ${money(S.costUsd)}`, 'salmon'])
   if (S.resumeAt) out.push([`⏸ resumes ${resumeText(S.resumeAt, now)}`, WARN])
