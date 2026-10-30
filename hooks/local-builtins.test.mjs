@@ -1,20 +1,24 @@
 // Run with `node --test hooks/local-builtins.test.mjs`: it reads the installed engine, which `claude plugin test` cannot.
+// It checks only each command's top-level type (local, local-jsx or prompt). A local command that can also query the model, like `/plan <text>`, is handled in register.mjs (isLocalBuiltin).
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readdirSync, readFileSync } from 'node:fs'
+import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { LOCAL_BUILTINS } from './register.mjs'
 
 const dir = join(homedir(), '.local', 'share', 'claude', 'versions')
-let bin = ''
+let src = ''
+let skipWhy = ''
 try {
-  const found = readdirSync(dir).sort((a, b) => a.localeCompare(b, undefined, { numeric: true })).pop()
-  if (found) bin = join(dir, found)
-} catch {
-  // no engine install in the usual place
+  const versions = readdirSync(dir)
+    .filter((n) => /^\d+\.\d+\.\d+$/.test(n) && statSync(join(dir, n)).isFile())
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
+  if (!versions.length) skipWhy = 'no engine version file in ' + dir
+  else src = readFileSync(join(dir, versions[versions.length - 1]), 'latin1')
+} catch (err) {
+  skipWhy = 'the engine could not be read: ' + (err && err.message)
 }
-const src = bin ? readFileSync(bin, 'latin1') : ''
 
 // The `type:"..."` of each object literal holding `name:"<name>"`
 function typesOf(name) {
@@ -52,7 +56,7 @@ function typesOf(name) {
   return out
 }
 
-test('every LOCAL_BUILTINS entry is a local or local-jsx command in the installed engine, never a prompt', { skip: !bin || typesOf('compact').length === 0 ? 'the engine\'s command definitions are not readable here' : false }, () => {
+test('every LOCAL_BUILTINS entry is a local or local-jsx command in the installed engine, never a prompt', { skip: skipWhy || (typesOf('compact').length === 0 ? 'the engine\'s command definitions are not readable here' : false) }, () => {
   const wrong = [...LOCAL_BUILTINS].filter((n) => {
     const t = typesOf(n)
     return !t.some((x) => x === 'local' || x === 'local-jsx') || t.includes('prompt')
