@@ -105,12 +105,13 @@ function appServerLaunch(command, args) {
   return { command, args };
 }
 
-// child.kill() ends cmd.exe but not the codex it started, which keeps the pipes open and the hook alive.
+// On a timeout or failure child.kill() ends cmd.exe but not the codex it started, which keeps the pipes open and the hook alive.
 // The tree goes first: once cmd.exe is gone, taskkill /T can no longer find the codex under it.
-function stopChild(child, launch, command) {
-  if (process.platform === "win32" && launch.command !== command && child.pid) {
+// A finished read only closes stdin, which ends codex, so it skips the tree kill.
+function stopChild(child, launch, command, abort) {
+  if (abort && process.platform === "win32" && launch.command !== command && child.pid) {
     try {
-      spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+      spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true, timeout: 3000 });
     } catch {}
   }
   child.kill();
@@ -143,7 +144,7 @@ export async function readAccountViaAppServer({
       clearTimeout(timer);
       lines.close();
       child.stdin.end();
-      stopChild(child, launch, command);
+      stopChild(child, launch, command, callback === reject);
       callback(value);
     };
     const timer = setTimeout(() => finish(reject, new Error("Codex account read timed out")), timeoutMs);
@@ -205,7 +206,7 @@ export async function fetchRateLimitsViaAppServer({
       clearTimeout(timer);
       lines.close();
       child.stdin.end();
-      stopChild(child, launch, command);
+      stopChild(child, launch, command, callback === reject);
       callback(value);
     };
     const timer = setTimeout(() => finish(reject, new Error("Codex rate-limit read timed out")), timeoutMs);

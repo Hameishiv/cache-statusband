@@ -35,7 +35,7 @@
     "autoResume": {
       "type": "boolean",
       "title": "Auto-resume after usage renews",
-      "description": "When a chat's turn is cut short because the plan's usage ran out, send it \"Resume\" a minute after the full window resets. Spends usage without asking, so it is off by default. Anything you send first cancels it.",
+      "description": "When a chat's turn is cut short because the plan's usage ran out, send it \"Resume\" a minute after the full window resets. Spends usage without asking, so it is off by default. A big chat is compacted first. With no known reset time it tries hourly, three times at most. Anything you send first cancels it.",
       "default": false
     }
   }

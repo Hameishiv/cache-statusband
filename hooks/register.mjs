@@ -1041,8 +1041,8 @@ export function register(on, options = {}) {
     return next(e)
   })
 
-  // /clear, /resume and /branch start from an unknown cache. The process goes
-  // on under a new session id, and no session.start fires for it.
+  // /clear starts from an unknown cache; /resume and /branch are seeded from their transcript.
+  // The process goes on under a new session id, and no session.start fires for it.
   on('classic.SessionStart', { source: ['clear', 'resume', 'fork'] }, async ($, e, next) => {
     S.lastActivity = 0
     rotatedPending = false // a cleared chat starts afresh; a resumed or forked one is judged below, once seeded
