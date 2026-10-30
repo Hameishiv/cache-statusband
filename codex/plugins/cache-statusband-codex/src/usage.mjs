@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -105,6 +105,18 @@ function appServerLaunch(command, args) {
   return { command, args };
 }
 
+// child.kill() ends cmd.exe but not the codex it started, which keeps the pipes open and the hook alive
+function stopChild(child, launch, command) {
+  child.kill();
+  if (process.platform === "win32" && launch.command !== command && child.pid) {
+    try {
+      spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+    } catch {}
+  }
+  child.stdout?.destroy?.();
+  child.stderr?.destroy?.();
+}
+
 export async function readAccountViaAppServer({
   codexHome,
   command = process.env.CODEX_BIN || "codex",
@@ -130,7 +142,7 @@ export async function readAccountViaAppServer({
       clearTimeout(timer);
       lines.close();
       child.stdin.end();
-      child.kill();
+      stopChild(child, launch, command);
       callback(value);
     };
     const timer = setTimeout(() => finish(reject, new Error("Codex account read timed out")), timeoutMs);
@@ -192,7 +204,7 @@ export async function fetchRateLimitsViaAppServer({
       clearTimeout(timer);
       lines.close();
       child.stdin.end();
-      child.kill();
+      stopChild(child, launch, command);
       callback(value);
     };
     const timer = setTimeout(() => finish(reject, new Error("Codex rate-limit read timed out")), timeoutMs);

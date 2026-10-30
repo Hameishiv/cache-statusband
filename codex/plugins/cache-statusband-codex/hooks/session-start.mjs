@@ -56,10 +56,15 @@ async function main() {
   try {
     const raw = await readStdin(1024 * 1024);
     const input = JSON.parse(raw || "{}");
-    process.stdout.write(`${JSON.stringify(await handleSessionStart(input))}\n`);
+    process.stdout.write(`${JSON.stringify(await handleSessionStart(input))}\n`, exit);
   } catch {
-    process.stdout.write("{}\n");
+    process.stdout.write("{}\n", exit);
   }
+}
+
+// A handle left open by a child that outlived its kill must not hold the hook past its output.
+function exit() {
+  process.exit(0);
 }
 
 async function readStdin(limit) {
