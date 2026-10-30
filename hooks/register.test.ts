@@ -4115,3 +4115,21 @@ test('a prompt.read the engine has not answered does not hold a due Resume for g
   await clock.advance(1000)
   expect(seen.submits).toEqual(['Resume'])
 })
+
+test('a message sent after a branch, while the compaction started before it is still running, waits for that compaction instead of starting a second /compact beside it', SETUP, async ($, on) => {
+  askLog(on)
+  let finish: () => void = () => {}
+  const { clock, seen, fills } = await coldChat($, on, () => on('classic.SessionStart', () => ({})))
+  let n = 0
+  seen.duringCompact = () => (++n === 1 ? new Promise<void>((r) => { finish = r }) : Promise.resolve())
+  await send($, 'first')
+  await clock.advance(1000)
+  await ($ as any).classic.SessionStart({ source: 'fork', transcript_path: '/h/fork.jsonl' })
+  await clock.advance(1000)
+  await send($, 'second') // the fork's own message: the same conversation, so it waits
+  await clock.advance(60000)
+  expect(seen.compacts).toBe(1)
+  finish()
+  await clock.advance(1000)
+  expect({ compacts: seen.compacts, submits: seen.submits, fills }).toEqual({ compacts: 1, submits: ['first', 'second'], fills: [] })
+})
