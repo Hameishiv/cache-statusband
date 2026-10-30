@@ -572,7 +572,7 @@ async function boxNow($) {
 
 // From the heartbeat tick: send "Resume" once its time has come, as the person's own word
 async function resumeStep($) {
-  if (!S.resumeAt || now < S.resumeAt || S.working || sendsHeld || wakePendingId || sendIsPending() || putBackHeld()) return // a send is being handed on or compacting, one was handed on and its request has not started, a wake-up is on its way (its request settles the resume), or a message put back in the prompt box is still unsent
+  if (!cfg.autoResume || !S.resumeAt || now < S.resumeAt || S.working || sendsHeld || wakePendingId || sendIsPending() || putBackHeld()) return // a send is being handed on or compacting, one was handed on and its request has not started, a wake-up is on its way (its request settles the resume), or a message put back in the prompt box is still unsent
   // the seat or the account is not known yet: the send waits until both are (refreshIdentity then brings it forward) or the window closes, without spending a try or compacting
   if (keyUnsure()) {
     S.resumeAt = wakeWindowEnd
@@ -806,8 +806,8 @@ async function runCompactThenSend($, msg, unattended, before, wake) {
   if (cancelled()) {
     // a message that reached the chat while compacting (another plugin's too), "Send anyway" or "Compact first" on a cold-send dialog, a wake-up that starts compacting, or /clear or a resume, cancels an automatic one (a local command such as /btw, which never reaches the chat, even answered Compact first, a dropped send or Cancel does not), and with it the wake-up's turn. A cancelled Resume is armed again when no request starts (resumeAt)
     lowerWake(wake)
-    const { t, ok } = await rearmResume()
-    const rearm = !wake && ok
+    const { t, ok } = resume ? await rearmResume() : { t: await $.clock.now(), ok: false } // a cancelled wake-up arms nothing: its turn is over, and a Resume sent in its place was never asked for (autoResume may be off)
+    const rearm = ok
     const handed = realSends !== before.real // a real message reached the chat
     const text = rearm
       ? handed ? `A message was sent meanwhile, so the automatic one waits until ${resumeText(S.resumeAt, t)} unless that message's request starts.` : `Something else was sent or chosen meanwhile, so the automatic one waits until ${resumeText(S.resumeAt, t)}.`

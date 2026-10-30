@@ -3897,3 +3897,24 @@ test('a put-back that arrives while the abandoned batch is still gathering its m
   expect(seen.compacts).toBe(1)
   expect(fills).toEqual(['one', 'one\n\ntwo'])
 })
+
+// ===== review round 28: wake-ups, forks, the person's own text in the box =====
+test('a wake-up cancelled by the person\'s message arms no Resume: with autoResume off none is ever sent, and the band shows none', SETUP, async ($, on) => {
+  const log = askLog(on)
+  log.prefer('Send anyway')
+  let finish: () => void = () => {}
+  const { clock, seen } = await coldChat($, on, () => on('ui.render', engineDraws))
+  let n = 0
+  seen.duringCompact = () => (++n === 1 ? new Promise<void>((r) => { finish = r }) : Promise.resolve())
+  await send($, WAKE_TEXT) // the wake-up compacts first, no dialog
+  await clock.advance(1000)
+  await send($, 'my own message') // Send anyway: handed on while the wake-up compacts
+  await clock.advance(1000)
+  finish()
+  await clock.advance(1000)
+  expect(seen.toasts.filter((t) => /the automatic one was not sent/.test(t)).length).toBe(1)
+  expect(await bandText($, /⏸ Resumes? /)).toBeNull()
+  await clock.advance(3 * 60000) // past the 2 minutes a re-armed Resume would wait; the person's request has not started
+  expect(seen.submits).toEqual([])
+  expect(seen.compacts).toBe(1)
+})
