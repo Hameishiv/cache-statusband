@@ -11,13 +11,13 @@
     "seatFileTerminal": {
       "type": "string",
       "title": "Seat file (terminal)",
-      "description": "For account rotators: a file holding the active seat's label (e.g. ~/.claude-cli-accounts/.active). The band then shows that label in place of the account email, and a change marks the cache cold. Leave empty to show the account email.",
+      "description": "For account rotators: a file holding the active seat's label (e.g. ~/.claude-cli-accounts/.active). Read when a session starts: the band shows that label in place of the account email. A running session keeps its account, so a change counts only once the rotator's wake-up prompt (below) reaches it. Leave empty to show the account email.",
       "default": ""
     },
     "seatFileDesktop": {
       "type": "string",
       "title": "Seat file (desktop app)",
-      "description": "The same for sessions the desktop app runs. Only used to notice a rotation; the app's band doesn't show it. Leave empty to turn off.",
+      "description": "The same for sessions the desktop app runs, so each seat keeps its own usage reading. The app's band doesn't show it. Leave empty to turn off.",
       "default": ""
     },
     "rotatorWakePattern": {

@@ -272,8 +272,11 @@ async function readAccount($) {
   }
 }
 
-async function readSeat($) {
-  if (!seatFile) return
+// A running session keeps the account it signed in with: the seat file names the account the
+// rotator moved to, which reaches only a session it then wakes. So the seat is read at start,
+// and a change is taken only from the wake-up prompt (`adopt`)
+async function readSeat($, adopt = false) {
+  if (!seatFile || (S.seat && !adopt)) return
   let seat = ''
   try {
     if (!(await $.fs.exists(seatFile))) return
@@ -811,7 +814,6 @@ async function tick($) {
     await resumeStep($)
     await refreshPlan($)
     await loadSettings($) // /cache set in another session applies here too
-    await readSeat($)
     await readRecording($)
     await applyRemoteCommands($)
     await keepWarmStep($)
@@ -876,7 +878,8 @@ export function register(on, options = {}) {
       surface = null
     }
     onTerminal = surface === 'terminal'
-    const seatPath = surface === 'desktop' ? cfg.seatFileDesktop : cfg.seatFileTerminal
+    // the app starts a session with no surface yet (null), so only 'terminal' means the CLI's rotator
+    const seatPath = onTerminal ? cfg.seatFileTerminal : cfg.seatFileDesktop
     seatFile = seatPath ? seatPath.replace(/^~(?=[\\/])/, home).replace(/\\/g, '/') : ''
     await readSeat($)
     await readAccount($)
@@ -961,8 +964,8 @@ export function register(on, options = {}) {
     const fromUser = e.origin && (e.origin.kind === 'composer' || e.origin.kind === 'bridge')
     const wake = fromUser && !!cfg.rotatorWake && cfg.rotatorWake.test(String(e.text || ''))
     if (wake) {
-      // The wake-up itself proves the rotation, even before the seat file is read again
-      await readSeat($)
+      // The wake-up is the rotation reaching this session: take the new seat now
+      await readSeat($, true)
       if (!rotatedCold()) S.seatChangedAt = now
     }
     const ttl = ttlMin()

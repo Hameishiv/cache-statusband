@@ -81,18 +81,31 @@ test('a small context woken by the rotator is sent as is', SETUP, async ($, on) 
 })
 
 test('"Compact first, then send" really compacts, then sends the message', SETUP, async ($, on) => {
-  const seat = { label: 'A' }
-  const { clock, seen } = engine($, on, seat)
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
   answer(on, seen, 'Compact first, then send')
-  await start($, 300000, clock)
-  seat.label = 'B' // the rotator moved this session to another account
-  await clock.advance(31000)
+  await clock.advance(60000)
+  // the chat's last reply, 77 minutes ago: past the 1-hour cache
+  kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+  await clock.advance(77 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
   const r = await $.prompt.submit({ text: 'approve, B', origin: COMPOSER, wait: false } as never)
   expect(seen.asks).toBe(1)
   expect('drop' in (r as object)).toBe(true)
   await clock.advance(100)
   expect(seen.compacts).toBe(1)
   expect(seen.submits).toEqual(['approve, B'])
+})
+
+test('the rotator changing the seat file leaves a running chat alone: only its wake-up moves it', SETUP, async ($, on) => {
+  const seat = { label: 'A' }
+  const { clock, seen } = engine($, on, seat)
+  answer(on, seen, 'Send anyway')
+  await start($, 300000, clock)
+  seat.label = 'H' // the rotator moved the merge-pr sessions to another account
+  await clock.advance(5 * 60000)
+  await $.prompt.submit({ text: 'what would it take?', origin: COMPOSER, wait: false } as never)
+  expect(seen.asks).toBe(0)
 })
 
 test('no compact prompt right after a compaction, nor for /compact itself', async ($, on) => {
