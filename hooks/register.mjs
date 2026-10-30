@@ -43,21 +43,55 @@ const S = {
   warnedFor: 0,
   agentsRunning: 0,
   rateLimits: [],
+  seat: '', // the signed-in account label the rotator last wrote
+  seatChangedAt: 0, // when that label last changed: the new account's cache is empty
+  floor: 0, // context size right after the last compaction: what compacting can't shrink
+  autoWarm: true, // false once keep warm is turned off by hand in this session
+  pr: 0, // a merge-pr session's PR: keep warm stops once it merges or closes
+  prCheckedAt: 0,
+  effort: '', // the main loop's effort, as its last request named it
+  account: '', // the signed-in account's email, shown when no seat file is configured
+  resumeAt: 0, // when an out-of-usage chat sends itself "Resume"; 0 when none is pending
+  fable: null, // { percentUsed, resetsAt } from the plan's per-model weekly limits
+  planWindows: [], // 5h and weekly from the same reading, for a session that has sent nothing yet
 }
 
-const settings = { bigTokens: 150000, guard: true, ttlMin: 0, alerts: true, keepWarmHours: 4 }
+const settings = { bigTokens: 150000, guard: true, ttlMin: 0, alerts: true, keepWarmHours: 4, autoWarmHours: 8 }
 const names = { cache: 'cache', keepwarm: 'keepwarm', board: 'board', handoff: 'handoff' }
 
 let now = 0
 let home = ''
 let lastHeartbeat = 0
+let lastPrune = 0
 let rec = { on: false, strict: false }
 let mask = (s) => s
 let fleet = [] // heartbeats of every session, this one included
 const alerted = new Map() // sessionId -> state or warning key already announced
 let paneOpen = false
 let justCompacted = false
+let compactedCold = false
 let handoffPending = false
+let seatFile = ''
+let onTerminal = false
+
+// Setup-specific behaviour, all off unless the plugin's userConfig turns it on (see README)
+const cfg = {
+  seatFileTerminal: '', // a file holding the signed-in account's label, as an account rotator writes it
+  seatFileDesktop: '',
+  rotatorWake: null, // the prompt an unattended account rotator types after rotating: compact without asking
+  prPattern: null, // a first prompt naming a PR: keep warm stops once that PR merges or closes
+  autoResume: false, // send "Resume" to a chat cut short by exhausted usage once it renews
+}
+
+// A bad pattern in the settings turns that feature off rather than failing the load
+export function pattern(text, flags) {
+  if (!text) return null
+  try {
+    return new RegExp(text, flags)
+  } catch {
+    return null
+  }
+}
 
 // The handoff flow. When /session-handoff runs (the band's button, /handoff, a
 // typed command, or Claude calling the skill), the answer of the turn it starts
@@ -211,18 +245,170 @@ function ttlMin() {
   return settings.ttlMin || S.ttlMin
 }
 
+// A rotation moves the session to another account, whose cache is empty
+function rotatedCold() {
+  return S.seatChangedAt > S.lastActivity
+}
+
+// The next request writes the shorter context: no TTL evidence and nothing to warn about
+function markCompacted() {
+  // a compaction of a cold cache (Claude Code auto-compacts a big chat as it is sent) still pays a rewrite
+  const left = msLeft(S.lastActivity, ttlMin())
+  compactedCold = compactedCold || (left !== null && left <= 0) || rotatedCold()
+  justCompacted = true
+  S.lastActivity = 0
+}
+
+// Terminal sessions run on the CLI rotator's accounts, desktop ones on the app rotator's seats
+// The signed-in account, as Claude Code keeps it in .claude.json: what the band shows
+// in place of a seat when no seat file is configured
+async function readAccount($) {
+  try {
+    const dir = await $.env.get('CLAUDE_CONFIG_DIR')
+    const o = JSON.parse(String(await $.fs.read(`${(dir || home).replace(/\\/g, '/')}/.claude.json`))).oauthAccount || {}
+    S.account = String(o.emailAddress || o.displayName || '')
+  } catch {
+    // an API-key session, or no file: no account to show
+  }
+}
+
+// A running session keeps the account it signed in with: the seat file names the account the
+// rotator moved to, which reaches only a session it then wakes. So the seat is read at start,
+// and a change is taken only from the wake-up prompt (`adopt`)
+async function readSeat($, adopt = false) {
+  if (!seatFile || (S.seat && !adopt)) return
+  let seat = ''
+  try {
+    if (!(await $.fs.exists(seatFile))) return
+    seat = String(await $.fs.read(seatFile)).trim()
+  } catch {
+    return
+  }
+  if (S.seat && seat && seat !== S.seat) {
+    S.seatChangedAt = now
+    // the old account's readings: borrow or fetch the new one's until a request measures them
+    S.rateLimits = []
+    S.fable = null
+    S.planWindows = []
+    planNext = 0
+    await readAccount($)
+  }
+  if (seat) S.seat = seat
+}
+
+// Compacting on a cold cache pays only when it frees a real share of the context
+function worthCompacting() {
+  return S.ctx >= settings.bigTokens && S.ctx - S.floor >= 100000
+}
+
+// Run off the hook: a command started inside a hook the session waits on is refused
+// Auto-resume: a turn cut short by an exhausted plan window gets "Resume" once it renews.
+// Only usage exhaustion: a short throttle, an overload or any other error is left alone.
+const USAGE_SPENT = /usage limit|limit reached|hit your limit|out of (extra )?usage|limit will reset|resets? (at|in)\b/i
+const RESUME_FALLBACK = 60 * MIN // no reset time known: try once an hour, three times at most
+let resumeTries = 0
+
+// The windows that are full, from the freshest reading this session has
+export function spentWindows(limits, fable, model) {
+  const full = limits.filter((l) => (l.percentUsed || 0) >= 100)
+  if (fable && fable.percentUsed >= 100 && /fable/i.test(String(model))) full.push({ kind: 'fable', ...fable })
+  return full
+}
+
+// When to resume: a minute after the last full window resets; null when no reset time is known
+export function resumeTime(full, at) {
+  const times = full.map((l) => Date.parse(l.resetsAt || '')).filter((t) => t > at)
+  return times.length ? Math.max(...times) + MIN : null
+}
+
+function armResume($, details) {
+  let limits = S.rateLimits.length ? S.rateLimits : borrowedLimits(fleet, { seat: S.seat, desktop: !onTerminal }, now)
+  if (!limits.length) limits = S.planWindows
+  const full = spentWindows(limits, S.fable, S.model)
+  if (!full.length && !USAGE_SPENT.test(String(details || ''))) return // not usage exhaustion
+  const at = resumeTime(full, now)
+  if (!at && resumeTries >= 3) {
+    $.ui.toast('Auto-resume gave up: no reset time is known. Send a message once usage renews.', { timeoutMs: 15000 })
+    return
+  }
+  S.resumeAt = at || now + RESUME_FALLBACK
+  if (!at) resumeTries++
+  $.ui.toast(`Out of usage. This chat resumes on its own at ${clock(S.resumeAt)}.`, { timeoutMs: 15000 })
+  $.ui.invalidate('ui.render')
+}
+
+// From the heartbeat tick: send "Resume" once its time has come, as the person's own word
+async function resumeStep($) {
+  if (!S.resumeAt || now < S.resumeAt || S.working) return
+  S.resumeAt = 0
+  $.ui.invalidate('ui.render')
+  if (worthCompacting()) {
+    compactThenSend($, { text: 'Resume' }, true)
+    return
+  }
+  for (const asUser of [true, false]) {
+    try {
+      await $.prompt.submit({ text: 'Resume', ...(asUser ? { asUser } : {}) })
+      return
+    } catch {
+      // try the plugin's own voice next
+    }
+  }
+}
+
+function compactThenSend($, e, unattended) {
+  const msg = { text: e.text, attachments: e.attachments, slash: !!e.command }
+  $.clock.after(50, () => runCompactThenSend($, msg, unattended).catch(() => {}))
+  return { drop: 'cache-keeper: compacting first on a cold cache; the message is sent again once that finishes' }
+}
+
+async function runCompactThenSend($, msg, unattended) {
+  try {
+    await $.command.run({ command: 'compact', args: '' })
+    markCompacted()
+  } catch (err) {
+    $.ui.toast('Could not compact (' + clip(String((err && err.message) || err), 80) + '), so the message goes as typed.', { timeoutMs: 8000 })
+  }
+  const send = { text: msg.text, ...(msg.attachments ? { attachments: msg.attachments } : {}) }
+  // A plugin can't submit a "/" line: those go back in the prompt box
+  if (!msg.slash) {
+    for (const asUser of unattended ? [true, false] : [true]) {
+      try {
+        await $.prompt.submit({ ...send, asUser })
+        return
+      } catch {
+        // try the next way, then the prompt box
+      }
+    }
+  }
+  let filled = false
+  try {
+    filled = !!(await $.prompt.fill({ text: msg.text })).isFilled
+  } catch {
+    filled = false
+  }
+  $.ui.toast(filled ? 'Compacted. Your message is back in the prompt box: press Enter to send it.' : 'Compacted, but the message could not be sent again: ' + clip(msg.text, 80), { timeoutMs: 15000 })
+}
+
+function findPr(text) {
+  const m = cfg.prPattern && String(text || '').match(cfg.prPattern)
+  return m && m[1] ? Number(m[1]) || 0 : 0
+}
+
+async function prState($) {
+  try {
+    const r = await $.process.run(['gh', 'pr', 'view', String(S.pr), '--json', 'state', '-q', '.state'], { cwd: S.cwd, timeoutMs: 20000 })
+    return r.exitCode === 0 ? String(r.stdout).trim() : ''
+  } catch {
+    return ''
+  }
+}
+
 // Plan limit windows as the API reports them: five_hour, seven_day, spend_limit
 const LIMIT_LABEL = { five_hour: '5h', seven_day: 'week', spend_limit: 'spend' }
 
 function limitsText(limits) {
   return limits.map((l) => `${LIMIT_LABEL[l.kind] || l.kind} ${Math.round(l.percentUsed)}%`).join(' · ')
-}
-
-function limitTone(limits, extra) {
-  const top = Math.max(...limits.map((l) => l.percentUsed || 0))
-  if (top >= 95) return { ...extra, color: 'red', bold: true }
-  if (top >= 80) return { ...extra, color: 'yellow' }
-  return { ...extra, dimColor: true }
 }
 
 function money(v) {
@@ -235,6 +421,7 @@ function msLeft(lastActivity, ttl) {
 }
 
 function cacheState(hb) {
+  if (hb.rotated) return { kind: 'cold', left: (hb.seatChangedAt || now) - now }
   const left = msLeft(hb.lastActivity, hb.ttlMin)
   if (left === null) return { kind: 'unknown', left: 0 }
   if (hb.keepWarm) return { kind: 'kept', left }
@@ -260,6 +447,8 @@ function myHeartbeat() {
     window: S.window,
     ttlMin: ttlMin(),
     lastActivity: S.lastActivity,
+    rotated: rotatedCold(),
+    seatChangedAt: S.seatChangedAt,
     keepWarm: S.keepWarm,
     keepWarmUntil: S.keepWarmUntil,
     pings: S.pings,
@@ -269,8 +458,22 @@ function myHeartbeat() {
     coldUsd,
     agentsRunning: S.agentsRunning,
     lastTurnEnd: S.lastTurnEnd,
+    seat: S.seat,
+    desktop: !onTerminal,
+    rateLimits: S.rateLimits, // the engine's own reading, which a reopened chat borrows
     updatedAt: now,
   }
+}
+
+// A session that has sent nothing has no plan windows of its own: borrow the freshest
+// reading another session on the same account took, dropping a window that has since reset
+export function borrowedLimits(list, self, at) {
+  const same = (hb) => (self.seat && hb.seat ? hb.seat === self.seat : hb.desktop === self.desktop)
+  const best = list
+    .filter((hb) => !hb.self && Array.isArray(hb.rateLimits) && hb.rateLimits.length && same(hb))
+    .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))[0]
+  if (!best) return []
+  return best.rateLimits.filter((l) => !l.resetsAt || Date.parse(l.resetsAt) > at)
 }
 
 async function registerCommand($, name, description, argumentHint, immediate) {
@@ -313,11 +516,193 @@ async function heartbeat($, force) {
   } catch {
     // agent list unavailable: keep the last count
   }
-  await $.store.set('hb:' + S.id, myHeartbeat())
+  try {
+    await $.store.set('hb:' + S.id, myHeartbeat())
+  } catch {
+    // another session holds the store's lock: the next beat writes it
+  }
+}
+
+// The plan's per-model weekly limits (Fable) aren't in session.measure, so read the
+// usage endpoint the app's usage card reads. One fetch per 5 minutes across every
+// session, shared through the store; a 429 backs every session off the same 5 minutes.
+const PLAN_EVERY = 5 * MIN
+const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
+let planWhy = ''
+let planNext = 0
+// One reading for every session: the endpoint rate-limits a second schedule within seconds.
+// A session still on an older version writes it without `windows`; those stay as they were.
+const PLAN_KEY = 'plan'
+
+// Each account has its own limits: with a seat file configured, a reading per surface and seat
+// (the terminal's and the app's rotators name their seats independently)
+function planKey() {
+  return S.seat ? `${PLAN_KEY}:${onTerminal ? 'cli' : 'app'}:${S.seat}` : PLAN_KEY
+}
+
+async function refreshPlan($) {
+  let cached = null
+  try {
+    cached = await $.store.get(planKey())
+  } catch {
+    cached = null
+  }
+  const prior = cached && typeof cached === 'object' ? cached : {}
+  if (Array.isArray(prior.windows) && prior.windows.length) S.planWindows = prior.windows
+  // an older version writes null after a failed check: never let that wipe a good reading
+  if (prior.fable) S.fable = prior.fable
+  planWhy = prior.why || planWhy
+  // the store's backoff, or this session's own where a held lock kept it out of the store
+  if (now < Math.max(prior.next || (prior.at || 0) + PLAN_EVERY, planNext)) return
+  planNext = now + PLAN_EVERY
+  let fable = prior.fable || S.fable
+  let windows = Array.isArray(prior.windows) && prior.windows.length ? prior.windows : S.planWindows
+  let at = prior.at || 0 // when the reading was taken: a failure keeps the last good one
+  let next = now + PLAN_EVERY
+  let why = 'ok' // the last attempt's outcome, kept with the reading for /cache
+  try {
+    const auth = await $.session.authorize()
+    if (!auth) why = 'no first-party sign-in'
+    else {
+      const r = await $.http.fetch(USAGE_URL, { auth: auth.handle, headers: { 'anthropic-beta': 'oauth-2025-04-20' } })
+      if (r.ok) {
+        const body = JSON.parse(r.text)
+        fable = fableLimit(body)
+        windows = planWindows(body)
+        at = now
+      } else why = 'HTTP ' + r.status
+      // a 429 names how long to stay away; every session waits it out, an hour at most
+      const wait = Number(r.headers && r.headers['retry-after'])
+      if (!r.ok && wait > 0) next = now + Math.min(60 * MIN, Math.max(PLAN_EVERY, wait * 1000))
+    }
+  } catch (err) {
+    why = clip(String((err && err.message) || err), 120) // offline or refused: keep the last reading
+  }
+  planNext = next
+  S.fable = fable
+  S.planWindows = windows
+  planWhy = why
+  try {
+    await $.store.set(planKey(), { at, next, fable, windows, why })
+  } catch {
+    // lock held: another session is writing the same reading
+  }
+}
+
+// An opened or resumed session has sent nothing yet, so measure its first request from the
+// transcript: the last main-loop reply's usage is what that request re-reads, and its time
+// says how long the cache has been idle. A compaction after it leaves its own smaller size.
+export function lastContext(lines) {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    let j
+    try {
+      j = JSON.parse(lines[i])
+    } catch {
+      continue // the tail's first line is cut mid-row
+    }
+    if (!j || j.isSidechain) continue
+    const at = Date.parse(j.timestamp || '') || 0
+    const meta = j.compactMetadata
+    if (j.type === 'system' && j.subtype === 'compact_boundary' && meta && meta.postTokens) return { ctx: meta.postTokens, at, compacted: true }
+    const u = j.type === 'assistant' && j.message && j.message.usage
+    // the next request re-reads that reply too, so its output counts
+    if (u && totalInput(u) > 0) return { ctx: totalInput(u) + (u.output_tokens || 0), at, model: j.message.model, effort: typeof j.effort === 'string' ? j.effort : '' }
+  }
+  return null
+}
+
+const TAIL_BYTES = 1024 * 1024
+// $.fs.read stops at 4 MiB and has no offset, so a long transcript's tail comes through node
+const TAIL_JS = "const fs=require('fs'),p=process.argv[1],s=fs.statSync(p).size,n=Math.min(s," + TAIL_BYTES + "),b=Buffer.alloc(n),fd=fs.openSync(p,'r');fs.readSync(fd,b,0,n,s-n);process.stdout.write(b)"
+
+// A chat's last request, kept past the session: the app has no $.process.run, so it cannot
+// read a transcript over 4 MiB, and a big chat is exactly the one the cold-send guard is for
+const LAST_KEEP = 30 * 24 * 60 * MIN
+async function rememberLast($) {
+  if (!S.id || !S.ctx) return
+  try {
+    // the chat's cold rewrites too, so their cost survives a reopen
+    await $.store.set('last:' + S.id, { ctx: S.ctx, at: S.lastActivity, model: S.model, effort: S.effort, cold: S.coldRestarts.slice(-50) })
+  } catch {
+    // another session holds the store's lock: the next request writes it
+  }
+}
+
+async function seedFromTranscript($, path) {
+  let found = null
+  try {
+    const st = await $.fs.stat(path)
+    if (st.kind === 'file' && st.size) {
+      const text = st.size <= 4 * 1024 * 1024 ? String(await $.fs.read(path)) : (await $.process.run(['node', '-e', TAIL_JS, path], { timeoutMs: 15000 })).stdout
+      found = lastContext(String(text).split('\n'))
+    }
+  } catch {
+    // no transcript yet, or too big to read here (the app): fall back on what this mod kept
+  }
+  let last = null
+  try {
+    last = S.id ? await $.store.get('last:' + S.id) : null
+  } catch {
+    last = null
+  }
+  if (last && Array.isArray(last.cold) && !S.coldRestarts.length) S.coldRestarts = last.cold
+  if (!found && S.id) {
+    try {
+      // before its first record, a chat open under an earlier version still has its heartbeat
+      const hb = last ? null : await $.store.get('hb:' + S.id)
+      const r = last || (hb && { ctx: hb.ctx, at: hb.lastActivity, model: hb.model, effort: hb.effort })
+      // an `at` of 0 was written between a compaction and the next request
+      if (r && r.ctx) found = { ctx: r.ctx, at: r.at, model: r.model, effort: r.effort, compacted: !r.at }
+    } catch {
+      // store unavailable: the first request measures it
+    }
+  }
+  if (!found) return
+  S.ctx = found.ctx
+  if (found.model && !S.model) S.model = found.model // the session's own model wins: it may have been switched
+  if (found.effort) S.effort = found.effort
+  if (found.compacted) {
+    // the next request writes the compacted context whatever happens: nothing to ask
+    S.floor = found.ctx
+    markCompacted()
+  } else {
+    S.lastActivity = found.at // the cache's real age: the band and the cold-send guard read it
+  }
+  $.ui.invalidate('ui.render')
+}
+
+// The response's `limits` carries { kind: 'weekly_scoped', scope: { model: { display_name } }, percent, resets_at }
+// The same response's five_hour and seven_day, as { utilization, resets_at }, in session.measure's shape
+export function planWindows(body) {
+  return ['five_hour', 'seven_day'].flatMap((kind) => {
+    const w = body && body[kind]
+    if (!w || typeof w.utilization !== 'number') return []
+    return [{ kind, percentUsed: w.utilization, resetsAt: resetIso(w.resets_at) }]
+  })
+}
+
+function resetIso(at) {
+  return typeof at === 'number' ? new Date(at * 1000).toISOString() : typeof at === 'string' ? at : undefined
+}
+
+export function fableLimit(body) {
+  const list = body && Array.isArray(body.limits) ? body.limits : []
+  const hit = list.find((l) => l && l.kind === 'weekly_scoped' && /fable/i.test(String(l.scope && l.scope.model && l.scope.model.display_name)))
+  if (!hit || typeof hit.percent !== 'number') return null
+  return { percentUsed: hit.percent, resetsAt: resetIso(hit.resets_at) }
 }
 
 async function readFleet($) {
-  const keys = (await $.store.keys()).filter((k) => k.startsWith('hb:'))
+  const all = await $.store.keys()
+  // a chat untouched for a month will not be reopened to send: drop its record
+  if (now - lastPrune > 60 * MIN) {
+    lastPrune = now
+    for (const k of all.filter((k) => k.startsWith('last:'))) {
+      const r = await $.store.get(k)
+      if (!r || now - (r.at || now) > LAST_KEEP) await $.store.delete(k)
+    }
+  }
+  const keys = all.filter((k) => k.startsWith('hb:'))
   const list = []
   for (const k of keys) {
     const hb = await $.store.get(k)
@@ -339,8 +724,14 @@ async function applyRemoteCommands($) {
   const c = await $.store.get('cmd:' + S.id)
   if (!c) return
   await $.store.delete('cmd:' + S.id)
-  if (c.keepWarm === true) startKeepWarm($, settings.keepWarmHours)
-  if (c.keepWarm === false) stopKeepWarm($, 'stopped from the board')
+  if (c.keepWarm === true) {
+    S.autoWarm = true
+    startKeepWarm($, settings.keepWarmHours)
+  }
+  if (c.keepWarm === false) {
+    S.autoWarm = false
+    stopKeepWarm($, 'stopped from the board')
+  }
 }
 
 function startKeepWarm($, hours) {
@@ -358,7 +749,16 @@ function stopKeepWarm($, why) {
 async function keepWarmStep($) {
   if (!S.keepWarm) return
   if (now >= S.keepWarmUntil) return stopKeepWarm($, 'time limit reached')
-  if (S.working || !S.lastActivity) return
+  if (S.pr && now - S.prCheckedAt > 15 * MIN) {
+    S.prCheckedAt = now
+    const state = await prState($)
+    if (state === 'MERGED' || state === 'CLOSED') {
+      S.autoWarm = false
+      return stopKeepWarm($, `PR #${S.pr} is ${state.toLowerCase()}`)
+    }
+  }
+  // After a rotation a ping would pay the whole rewrite: leave that to the next real turn
+  if (S.working || !S.lastActivity || rotatedCold()) return
   const ttl = ttlMin()
   const margin = ttl >= 60 ? 8 * MIN : 90000
   if (now - S.lastActivity < ttl * MIN - margin) return
@@ -380,6 +780,7 @@ async function keepWarmStep($) {
     return stopKeepWarm($, `the ping wrote ${tokens(u.cache_creation_input_tokens)} tokens instead of reading the cache`)
   }
   S.lastActivity = now
+  await rememberLast($)
 }
 
 function warnStep($) {
@@ -409,13 +810,20 @@ function warnStep($) {
 
 async function tick($) {
   now = await $.clock.now()
-  await readRecording($)
-  await applyRemoteCommands($)
-  await keepWarmStep($)
-  await heartbeat($, true)
-  await readFleet($)
-  warnStep($)
-  $.ui.invalidate('ui.render')
+  try {
+    await resumeStep($)
+    await refreshPlan($)
+    await loadSettings($) // /cache set in another session applies here too
+    await readRecording($)
+    await applyRemoteCommands($)
+    await keepWarmStep($)
+    await heartbeat($, true)
+    await readFleet($)
+    warnStep($)
+  } finally {
+    // a store lock held by another session must not freeze the band's clocks
+    $.ui.invalidate('ui.render')
+  }
 }
 
 async function loadSettings($) {
@@ -431,11 +839,14 @@ function statusText() {
   if (st.kind === 'unknown') lines.push('No request yet this session, so the cache state is unknown.')
   if (st.kind === 'warm' || st.kind === 'cooling') lines.push(`Cache is warm for about ${minutes(st.left)} more.`)
   if (st.kind === 'cold') lines.push(`Cache went cold ${minutes(-st.left)} ago. The next message rewrites it for about ${money(rewriteCost(S.ctx, S.model, ttl))}.`)
+  if (rotatedCold()) lines.push(`The account rotated ${minutes(now - S.seatChangedAt)} ago (now ${S.seat}), so the cache is cold.`)
   if (S.keepWarm) lines.push(`Keep warm is on until ${clock(S.keepWarmUntil)}: ${S.pings} ping(s), ${money(S.pingUsd)} so far.`)
   if (S.rateLimits.length) lines.push(`Plan limits used: ${limitsText(S.rateLimits)}.`)
+  lines.push(S.fable ? `Fable weekly: ${Math.round(S.fable.percentUsed)}% used.` : `Fable weekly: no reading yet${planWhy && planWhy !== 'ok' ? ` (last check: ${planWhy})` : ''}.`)
   lines.push(`Session cost so far: ${money(S.costUsd)}. Cold restarts this session: ${S.coldRestarts.length} (${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))}).`)
   lines.push(`Cold-send guard: ${settings.guard ? 'on' : 'off'} for contexts over ${tokens(settings.bigTokens)} tokens. Alerts: ${settings.alerts ? 'on' : 'off'}.`)
-  lines.push(`Settings: /${names.cache} ttl 5|60|auto, /${names.cache} guard on|off, /${names.cache} big 150k, /${names.cache} alerts on|off. Board: /${names.board}.`)
+  lines.push(`Auto keep warm: ${settings.autoWarmHours ? `on, until ${settings.autoWarmHours}h after the last turn, for contexts over ${tokens(settings.bigTokens)}${S.autoWarm ? '' : ' (off in this session)'}` : 'off'}.`)
+  lines.push(`Settings: /${names.cache} ttl 5|60|auto, /${names.cache} guard on|off, /${names.cache} big 150k, /${names.cache} alerts on|off, /${names.cache} autowarm 8|off. Board: /${names.board}.`)
   return lines.join('\n')
 }
 
@@ -445,7 +856,12 @@ function parseTokens(text) {
   return Math.round(Number(m[1]) * (m[2] === 'm' ? 1e6 : m[2] === 'k' ? 1e3 : 1))
 }
 
-export function register(on) {
+export function register(on, options = {}) {
+  cfg.seatFileTerminal = String(options.seatFileTerminal || '')
+  cfg.seatFileDesktop = String(options.seatFileDesktop || '')
+  cfg.rotatorWake = pattern(options.rotatorWakePattern, 'i')
+  cfg.prPattern = pattern(options.prPattern)
+  cfg.autoResume = options.autoResume === true
   on('session.start', async ($, e, next) => {
     now = await $.clock.now()
     home = (await $.env.get('USERPROFILE')) || (await $.env.get('HOME')) || ''
@@ -455,12 +871,43 @@ export function register(on) {
     S.model = await $.session.model()
     await loadSettings($)
     await readRecording($)
+    let surface = null
+    try {
+      surface = e.surface || (await $.session.surface())
+    } catch {
+      surface = null
+    }
+    onTerminal = surface === 'terminal'
+    // the app starts a session with no surface yet (null), so only 'terminal' means the CLI's rotator
+    const seatPath = onTerminal ? cfg.seatFileTerminal : cfg.seatFileDesktop
+    seatFile = seatPath ? seatPath.replace(/^~(?=[\\/])/, home).replace(/\\/g, '/') : ''
+    await readSeat($)
+    await readAccount($)
+    try {
+      // the plan windows the status line already holds: free, and there before the first send
+      const usage = await $.session.usage()
+      if (Array.isArray(usage.rateLimits) && usage.rateLimits.length) S.rateLimits = usage.rateLimits
+    } catch {
+      // none yet: the first measure fills them
+    }
+    try {
+      const first = (await $.session.messages()).find((m) => m.role === 'user' && findPr(m.text))
+      if (first) S.pr = findPr(first.text)
+    } catch {
+      // no transcript yet: the first prompt sets it
+    }
     names.cache = (await registerCommand($, 'cache', 'Cache Keeper status and settings', '[ttl 5|60|auto] [guard on|off] [big 150k] [alerts on|off]')) || names.cache
-    names.keepwarm = (await registerCommand($, 'keepwarm', 'Keep this session\'s prompt cache warm (default 4 hours), or /keepwarm off', '[hours|off]', true)) || names.keepwarm
+    names.keepwarm = (await registerCommand($, 'keepwarm', 'Keep this session\'s prompt cache warm (default 4 hours), or /keepwarm off (also stops auto keep warm here)', '[hours|off]', true)) || names.keepwarm
     names.board = (await registerCommand($, 'board', 'Every local Claude Code session: state, context, cache, cost', '', true)) || names.board
     names.handoff = (await registerCommand($, 'handoff', 'Session handoff, then clear this chat and continue with it (/handoff continue)', '[continue]')) || names.handoff
     $.clock.every(HEARTBEAT_EVERY, () => tick($).catch(() => {}))
     await heartbeat($, true)
+    $.clock.after(0, () => readFleet($).catch(() => {}).then(() => refreshPlan($)).then(() => $.ui.invalidate('ui.render')).catch(() => {}))
+    // The app reopens a chat without a SessionStart that names the transcript: find it by id
+    if (!S.ctx && S.id && S.cwd) {
+      const config = ((await $.env.get('CLAUDE_CONFIG_DIR')) || `${home}/.claude`).replace(/\\/g, '/')
+      await seedFromTranscript($, `${config}/projects/${S.cwd.replace(/[^a-zA-Z0-9]/g, '-')}/${S.id}.jsonl`)
+    }
     return next(e)
   })
 
@@ -470,12 +917,24 @@ export function register(on) {
     S.lastActivity = 0
     S.keepWarm = false
     H.armed = false
+    // the last chat's compaction says nothing about this one, and would mute its cold-send guard
+    justCompacted = false
+    compactedCold = false
+    S.floor = 0
+    S.coldRestarts = [] // the new chat's own, from its record below
     try {
       S.id = (await $.session.id()) || S.id
     } catch {
       // keep the old id
     }
     S.label = basename(S.cwd)
+    if (e.source === 'resume') await seedFromTranscript($, e.transcript_path)
+    return next(e)
+  })
+
+  // A session opened with its history (the app reopening an old chat, claude --continue)
+  on('classic.SessionStart', { source: ['startup'] }, async ($, e, next) => {
+    await seedFromTranscript($, e.transcript_path)
     return next(e)
   })
 
@@ -487,6 +946,11 @@ export function register(on) {
   // The first prompt names the session on the board
   on('prompt.submit', async ($, e, next) => {
     now = await $.clock.now()
+    // anything sent to the chat (the person, a rotator's wake-up, our own "Resume") settles a pending resume
+    if (S.resumeAt) {
+      S.resumeAt = 0
+      $.ui.invalidate('ui.render')
+    }
     if (S.label === basename(S.cwd) && e.origin && e.origin.kind === 'composer' && e.text) {
       S.label = basename(S.cwd) + ' · ' + clip(e.text, 40)
     }
@@ -496,30 +960,39 @@ export function register(on) {
       H.path = ''
       $.ui.invalidate('ui.render')
     }
+    if (!S.pr) S.pr = findPr(e.command ? `/${e.command.name} ${e.command.args}` : e.text)
+    const fromUser = e.origin && (e.origin.kind === 'composer' || e.origin.kind === 'bridge')
+    const wake = fromUser && !!cfg.rotatorWake && cfg.rotatorWake.test(String(e.text || ''))
+    if (wake) {
+      // The wake-up is the rotation reaching this session: take the new seat now
+      await readSeat($, true)
+      if (!rotatedCold()) S.seatChangedAt = now
+    }
     const ttl = ttlMin()
     const left = msLeft(S.lastActivity, ttl)
-    const isCold = left !== null && left <= 0
-    const fromUser = e.origin && (e.origin.kind === 'composer' || e.origin.kind === 'bridge')
-    if (!settings.guard || !fromUser || !isCold || S.ctx < settings.bigTokens || e.turnId) return next(e)
+    const rotated = rotatedCold()
+    const isCold = rotated || (left !== null && left <= 0)
+    // These run locally or start afresh: a cold cache costs them nothing
+    const local = e.command && ['compact', 'clear', names.cache, names.keepwarm, names.board, names.handoff].includes(e.command.name)
+    if (!settings.guard || !fromUser || !isCold || local || justCompacted || S.ctx < settings.bigTokens || e.turnId) return next(e)
+    // an attachment's handle lives only while this submit is in flight: a resend after compacting would drop it
+    const media = Array.isArray(e.attachments) && e.attachments.length > 0
+    if (wake) return worthCompacting() && !media ? compactThenSend($, e, true) : next(e)
     const cost = money(rewriteCost(S.ctx, S.model, ttl))
+    const why = rotated ? `The account rotated to ${S.seat || 'another seat'} ${minutes(now - S.seatChangedAt)} ago, so the cache is cold.` : `Cache went cold ${minutes(-left)} ago.`
+    const floor = S.floor ? ` Compacting last left ${tokens(S.floor)}.` : ''
     let answer = 'Send anyway'
     try {
       answer = await $.ui.ask(
-        `Cache went cold ${minutes(-left)} ago. Sending now rewrites ${tokens(S.ctx)} tokens of context (about ${cost}). What should happen?`,
-        ['Send anyway', 'Compact first, then send', 'Cancel'],
+        `${why} Sending now rewrites ${tokens(S.ctx)} tokens of context (about ${cost}).${floor}${media ? ' (Compacting first would drop the attachment: run /compact yourself, then send again.)' : ''} What should happen?`,
+        media ? ['Send anyway', 'Cancel'] : ['Send anyway', 'Compact first, then send', 'Cancel'],
       )
     } catch {
       // nobody to ask (a -p run, or the dialog was dismissed): send as typed
       return next(e)
     }
-    if (answer === 'Compact first, then send') {
-      try {
-        await $.session.compact()
-      } catch {
-        // compaction refused or failed: send anyway
-      }
-      return next(e)
-    }
+    // $.session.compact() is refused on SDK hosts (the desktop app), so this queues /compact
+    if (answer === 'Compact first, then send') return compactThenSend($, e, false)
     if (answer === 'Send anyway') return next(e)
     $.ui.toast('Not sent. A fresh session with a short handoff avoids the rewrite entirely.', { timeoutMs: 8000 })
     return { drop: 'Cancelled by cache-keeper before a cold cache rewrite' }
@@ -536,6 +1009,10 @@ export function register(on) {
   // Each main-loop request: did it read the cache, or rewrite it?
   on('turn.step', async function* ($, e, next) {
     const startedAt = await $.clock.now()
+    if (!e.agentId) {
+      S.model = e.model || S.model
+      S.effort = e.effort === undefined ? '' : String(e.effort)
+    }
     const result = yield* next(e)
     if (e.agentId || !result || !result.usage) return result
     now = await $.clock.now()
@@ -546,11 +1023,23 @@ export function register(on) {
     S.model = u.model || S.model
     const afterCompact = justCompacted
     justCompacted = false
+    // The API names the TTL each write used: that beats any guess from idle gaps
+    const split = u.cache_creation
+    if (split && !settings.ttlMin) {
+      if ((split.ephemeral_1h_input_tokens || 0) > 0) S.ttlMin = 60
+      else if ((split.ephemeral_5m_input_tokens || 0) > 0) S.ttlMin = 5
+      if (written > 0) S.ttlSource = 'reported by the API'
+    }
     if (afterCompact) {
-      // the first request after a compaction writes the new, shorter context: expected
+      // the first request after a compaction writes the new, shorter context: expected,
+      // but on a cache that had gone cold it is the cold rewrite, only smaller
+      S.floor = total
+      if (compactedCold && written > 30000) S.coldRestarts.push({ at: now, tokens: written, usd: rewriteCost(written, S.model, ttlMin()), gapMin: 0 })
+      compactedCold = false
     } else if (S.lastActivity && total > 30000 && written / total > 0.5) {
-      // A rewrite after 5-60 idle minutes means this session runs on the 5-minute TTL
-      if (!settings.ttlMin && gap > 5.5 * MIN && gap < S.ttlMin * MIN) {
+      // Without the API's word: a rewrite after 5-60 idle minutes suggests the 5-minute TTL,
+      // unless a rotation emptied the cache (a compaction already cleared lastActivity)
+      if (!settings.ttlMin && !split && !rotatedCold() && gap > 5.5 * MIN && gap < S.ttlMin * MIN) {
         S.ttlMin = 5
         S.ttlSource = 'measured'
       }
@@ -564,6 +1053,7 @@ export function register(on) {
     }
     S.ctx = total
     S.lastActivity = now
+    await rememberLast($)
     return result
   })
 
@@ -575,6 +1065,7 @@ export function register(on) {
     S.waitingSince = 0
     S.tool = ''
     S.lastTurnEnd = now
+    if (e.reason === 'answer') resumeTries = 0 // usage is back: a later cap starts its fallback tries afresh
     try {
       const usage = await $.session.usage()
       if (usage.context && usage.context.tokens) S.ctx = usage.context.tokens
@@ -585,15 +1076,46 @@ export function register(on) {
       // usage unavailable: keep the per-request figures
     }
     if (H.armed && e.turnId !== H.notTurn) await captureHandoff($, e)
+    // Auto keep warm: a big chat stays warm until autoWarmHours after its last turn
+    if (settings.autoWarmHours > 0 && S.autoWarm && S.ctx >= settings.bigTokens) {
+      if (!S.keepWarm) startKeepWarm($, settings.autoWarmHours)
+      S.keepWarmUntil = Math.max(S.keepWarmUntil, now + settings.autoWarmHours * 60 * MIN)
+    }
     await heartbeat($, true)
     $.ui.invalidate('ui.render')
     return r
   })
 
+  // A compaction arrives by several roads (typed /compact, auto-compact, a plugin,
+  // the desktop host running it inside a turn); each one marks it
   on('session.compact', async ($, e, next) => {
+    now = await $.clock.now()
     const r = await next(e)
-    justCompacted = true
+    if (!e.agentId) markCompacted()
     return r
+  })
+  on('classic.PostCompact', async ($, e, next) => {
+    markCompacted()
+    return next(e)
+  })
+  on('classic.SessionStart', { source: ['compact'] }, async ($, e, next) => {
+    markCompacted()
+    return next(e)
+  })
+  on('command.run', { command: ['compact'] }, async ($, e, next) => {
+    const r = await next(e)
+    markCompacted()
+    return r
+  })
+
+  // A main-loop turn the API cut short: arm a resume if what ran out was the plan's usage
+  on('classic.StopFailure', async ($, e, next) => {
+    // a usage cap may be classified rate_limit or unknown; armResume checks it really is usage
+    if (cfg.autoResume && !e.agent_id && (e.error === 'rate_limit' || e.error === 'unknown')) {
+      now = await $.clock.now()
+      armResume($, e.error_details)
+    }
+    return next(e)
   })
 
   on('session.measure', async ($, e, next) => {
@@ -664,6 +1186,8 @@ export function register(on) {
       settings.ttlMin = value === '5' ? 5 : value === '60' ? 60 : 0
     } else if (key === 'guard' || key === 'alerts') {
       settings[key] = value !== 'off'
+    } else if (key === 'autowarm') {
+      settings.autoWarmHours = value === 'off' || value === '0' ? 0 : Number(value) > 0 ? Math.min(24, Number(value)) : 8
     } else if (key === 'big') {
       const n = parseTokens(value)
       if (n) settings.bigTokens = n
@@ -679,8 +1203,10 @@ export function register(on) {
     now = await $.clock.now()
     const arg = String(e.args || '').trim().toLowerCase()
     if (arg === 'off' || (arg === '' && S.keepWarm)) {
+      S.autoWarm = false
       stopKeepWarm($, 'turned off')
     } else {
+      S.autoWarm = true
       const hours = Number(arg) > 0 ? Math.min(24, Number(arg)) : settings.keepWarmHours
       startKeepWarm($, hours)
     }
@@ -708,42 +1234,37 @@ export function register(on) {
   // The band above the prompt: this session's cache at a glance
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const below = await next(e)
+    // Drawn whenever there's no survey: an unknown cache (a new chat, or just after
+    // /clear, /resume or a compaction) still has a model, an effort and plan limits
     if (e.props && e.props.hasSurvey) return below
-    if (!S.lastActivity && !S.keepWarm) return below
     const { Box, Text, Button } = $.ui.resolve(e)
-    const hb = myHeartbeat()
-    const st = cacheState(hb)
-    const ttl = ttlMin()
+    // Powerline look: each segment ends in an arrow in its own colour, on the next one's.
+    // ▶, not the Powerline glyph U+E0B0, which neither the app's font nor the terminal's has
+    const segs = bandSegments()
+    const parts = segs.map(([text, bg, fg], i) => Box({ flexDirection: 'row', flexShrink: 0, children: [
+      Text({ backgroundColor: bg, color: fg, children: [` ${text} `] }),
+      // the last segment ends square
+      ...(segs[i + 1] ? [Text({ color: bg, backgroundColor: segs[i + 1][1], children: ['▶'] })] : []),
+    ] }))
+    const left = Box({ flexDirection: 'row', flexWrap: 'wrap', flexShrink: 1, children: parts })
+    // the buttons stay together on one row, however the segments wrap
+    const actions = []
+    const st = cacheState(myHeartbeat())
     const big = S.ctx >= settings.bigTokens
-    const parts = []
-    if (st.kind === 'kept') parts.push(Text({ color: 'cyan', children: [`◆ kept warm · ${S.pings} ping${S.pings === 1 ? '' : 's'} ${money(S.pingUsd)} · until ${clock(S.keepWarmUntil)}`] }))
-    else if (st.kind === 'warm') parts.push(Text({ color: 'green', children: [`● cache warm ${minutes(st.left)}`] }))
-    else if (st.kind === 'cooling') parts.push(Text({ color: 'yellow', bold: true, children: [`◐ cache cools in ${minutes(st.left)}`] }))
-    else if (st.kind === 'cold') parts.push(Text(big ? { color: 'red', bold: true, children: [`○ cache cold ${minutes(-st.left)}`] } : { dimColor: true, children: [`○ cache cold ${minutes(-st.left)}`] }))
-    parts.push(Text({ dimColor: true, children: [` │ ctx ${tokens(S.ctx)}`] }))
-    if (st.kind === 'cold' && big) parts.push(Text({ color: 'red', children: [` │ next send rewrites it ≈ ${money(rewriteCost(S.ctx, S.model, ttl))}`] }))
-    else parts.push(Text({ dimColor: true, children: [` │ rewrite ≈ ${money(rewriteCost(S.ctx, S.model, ttl))}`] }))
-    if (S.rateLimits.length) parts.push(Text(limitTone(S.rateLimits, { children: [' │ ' + limitsText(S.rateLimits)] })))
-    parts.push(Text({ dimColor: true, children: [` │ session ${money(S.costUsd)}`] }))
-    if (S.coldRestarts.length) parts.push(Text({ dimColor: true, children: [` │ ${S.coldRestarts.length} cold restart${S.coldRestarts.length === 1 ? '' : 's'} ${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))}`] }))
-    const row = [Box({ flexDirection: 'row', children: parts })]
     if (st.kind === 'cooling' && big) {
-      row.push(Button({ key: 'keepwarm', label: 'keep warm', hotkey: '1', plain: true, onPress: async () => { now = await $.clock.now(); startKeepWarm($, settings.keepWarmHours); await heartbeat($, true); $.ui.invalidate('ui.render') } }))
+      actions.push(Button({ key: 'keepwarm', label: 'K.W.', hotkey: '1', plain: true, onPress: async () => { now = await $.clock.now(); S.autoWarm = true; startKeepWarm($, settings.keepWarmHours); await heartbeat($, true); $.ui.invalidate('ui.render') } }))
     } else if (st.kind === 'kept') {
-      row.push(Button({ key: 'keepwarm', label: 'stop warm', hotkey: '1', plain: true, onPress: async () => { now = await $.clock.now(); stopKeepWarm($, 'turned off'); await heartbeat($, true); $.ui.invalidate('ui.render') } }))
+      actions.push(Button({ key: 'keepwarm', label: 'Stop K.W.', hotkey: '1', plain: true, onPress: async () => { now = await $.clock.now(); S.autoWarm = false; stopKeepWarm($, 'turned off'); await heartbeat($, true); $.ui.invalidate('ui.render') } }))
     }
-    const left = Box({ flexDirection: 'row', columnGap: 2, children: row })
     // Right edge: one click runs /session-handoff (h while the band has the focus;
     // a letter never fires from the prompt box, unlike a digit). Once a handoff
     // is in, c clears this chat and sends it as the fresh chat's first prompt.
     const busy = handoffPending || H.armed
-    const handoff = Button({ key: 'handoff', label: handoffPending ? 'handoff queued' : H.armed ? 'handoff running' : 'handoff', hotkey: 'h', plain: true, dimColor: busy, onPress: () => runHandoff($) })
-    let right = handoff
-    if (H.text || H.continuing) {
-      const go = Button({ key: 'continue', label: H.continuing ? 'clearing' : 'clear and continue', hotkey: 'c', plain: true, onPress: () => clearAndContinue($) })
-      right = Box({ flexDirection: 'row', columnGap: 2, children: [go, handoff] })
-    }
-    const mine = Box({ flexDirection: 'row', justifyContent: 'space-between', width: '100%', columnGap: 2, children: [left, right] })
+    const handoff = Button({ key: 'handoff', label: handoffPending ? 'Handoff queued' : H.armed ? 'Handoff running' : 'Handoff', hotkey: 'h', plain: true, dimColor: busy, onPress: () => runHandoff($) })
+    if (H.text || H.continuing) actions.push(Button({ key: 'continue', label: H.continuing ? 'Clearing' : 'Clear and continue', hotkey: 'c', plain: true, onPress: () => clearAndContinue($) }))
+    actions.push(handoff)
+    const right = Box({ flexDirection: 'row', flexShrink: 0, columnGap: 2, children: actions })
+    const mine = Box({ flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', width: '100%', columnGap: 2, children: [left, right] })
     return Box({ flexDirection: 'column', children: below ? [mine, below] : [mine] })
   })
 
@@ -760,6 +1281,100 @@ export function register(on) {
     const modes = Array.isArray(e.props && e.props.modes) ? e.props.modes : []
     return next({ ...e, props: { ...e.props, modes: [...modes, label] } })
   })
+}
+
+// The band's segments, ccstatusline style: each names a hue, and paint() picks that hue's
+// dark or light shade by position, alternating, so neighbours always contrast
+const LIGHT = '#ffffff'
+const DARK = '#1e1e1e'
+export const HUES = {
+  red: ['#a51d2d', '#ffa3a3'],
+  yellow: ['#6b4b00', '#f6d32d'],
+  blue: ['#1a4f99', '#99c1f1'],
+  green: ['#1d5c3d', '#8ff0a4'],
+  cyan: ['#0a5960', '#7fe0e0'],
+  gray: ['#4a4950', '#c0bfbc'],
+  purple: ['#5a3d8a', '#c9a8f0'],
+  pink: ['#74305f', '#f0a8dc'],
+  salmon: ['#7f302a', '#f5a99f'],
+  orange: ['#8a3700', '#ffbe6f'],
+  teal: ['#175858', '#88d8c8'],
+}
+const WARN = 'orange'
+const HOT = 'red'
+
+// Every segment's first word capitalised, past a leading symbol (● cache → ● Cache); "5h" stays
+export function capFirst(text) {
+  if (/^\S+@\S+$/.test(text)) return text // an email stays as written
+  return String(text).replace(/^([^\p{L}\p{N}]*)(\p{Ll})/u, (_, lead, letter) => lead + letter.toUpperCase())
+}
+
+// [text, hue] -> [text, background, foreground], dark and light shades in turn
+export function paint(segs) {
+  return segs.map(([text, hue], i) => {
+    const dark = i % 2 === 0
+    return [capFirst(text), (HUES[hue] || HUES.gray)[dark ? 0 : 1], dark ? LIGHT : DARK]
+  })
+}
+
+export function modelName(id) {
+  const m = String(id || '').toLowerCase().match(/(opus|sonnet|haiku|fable)-(\d+)(?:-(\d+))?/)
+  if (!m) return String(id || '') || 'model ?'
+  return m[1][0].toUpperCase() + m[1].slice(1) + ' ' + m[2] + (m[3] ? '.' + m[3] : '')
+}
+
+// 42m, 3h30m, 7d9h: days once past a day
+export function ago(ms) {
+  const h = Math.floor(ms / (60 * MIN))
+  return h >= 24 ? Math.floor(h / 24) + 'd' + (h % 24) + 'h' : minutes(ms)
+}
+
+// "3h30m", "6d14h"; '' when the time is unknown or past
+export function untilText(iso, at) {
+  const ms = Date.parse(iso || '') - at
+  return ms > 0 ? ago(ms) : ''
+}
+
+function limitSegment(label, limit, hue, showReset = true) {
+  const pct = limit.percentUsed || 0
+  const left = showReset ? untilText(limit.resetsAt, now) : ''
+  return [`${label} ${Math.round(pct)}%${left ? ' · ' + left : ''}`, pct >= 95 ? HOT : pct >= 80 ? WARN : hue]
+}
+
+function bandSegments() {
+  const st = cacheState(myHeartbeat())
+  const ttl = ttlMin()
+  const big = S.ctx >= settings.bigTokens
+  const out = []
+  // the app's composer already shows the model and effort
+  if (onTerminal) out.push([modelName(S.model), 'red'])
+  if (onTerminal && S.effort) out.push([S.effort, 'yellow'])
+  const rewrite = money(rewriteCost(S.ctx, S.model, ttl))
+  out.push([`Ctx ${tokens(S.ctx)} · ${st.kind === 'cold' && big ? 'Next send rewrites ≈ ' : 'Rewrite ≈ '}${rewrite}`, st.kind === 'cold' && big ? HOT : 'blue'])
+  if (st.kind === 'kept') out.push([`◆ K.W. until ${clock(S.keepWarmUntil)} · ${S.pings} ping${S.pings === 1 ? '' : 's'} ${money(S.pingUsd)}`, 'cyan'])
+  else if (st.kind === 'warm') out.push([`● cache warm ${minutes(st.left)}`, 'green'])
+  else if (st.kind === 'cooling') out.push([`◐ cache cools in ${minutes(st.left)}`, WARN])
+  else if (st.kind === 'cold') out.push([`○ cache cold ${ago(-st.left)}`, big ? HOT : 'gray'])
+  else out.push(['cache –', 'gray'])
+  // what this chat has already paid to rewrite cold caches, beside the next send's estimate
+  if (S.coldRestarts.length) out.push([`Cold rewrites ${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))} (${S.coldRestarts.length})`, 'gray'])
+  // the engine's own reading once a request has run; before that another session's on the same account, then the shared usage reading
+  let limits = S.rateLimits.filter((l) => !l.resetsAt || Date.parse(l.resetsAt) > now) // a window that reset since is stale
+  if (!limits.length) limits = borrowedLimits(fleet, { seat: S.seat, desktop: !onTerminal }, now)
+  if (!limits.length) limits = S.planWindows
+  const five = limits.find((l) => l.kind === 'five_hour')
+  const week = limits.find((l) => l.kind === 'seven_day')
+  if (five) out.push(limitSegment('5h', five, 'purple'))
+  if (week) out.push(limitSegment('Week', week, 'green'))
+  // its reset is the weekly one's, already shown
+  if (S.fable) out.push(limitSegment('Fable', S.fable, 'pink', false))
+  for (const l of S.rateLimits) if (l.kind !== 'five_hour' && l.kind !== 'seven_day') out.push(limitSegment(LIMIT_LABEL[l.kind] || l.kind, l, 'gray'))
+  out.push([`session ${money(S.costUsd)}`, 'salmon'])
+  if (S.resumeAt) out.push([`⏸ resumes ${clock(S.resumeAt)}`, WARN])
+  // who the terminal session runs as: a configured seat's label, else the signed-in account
+  const who = S.seat ? `seat ${S.seat}` : S.account ? mask(S.account) : ''
+  if (onTerminal && who) out.push([who, 'teal'])
+  return paint(out)
 }
 
 function footerLabel() {
@@ -847,6 +1462,7 @@ function drawBoard($, e) {
           onPress: async () => {
             now = await $.clock.now()
             if (hb.self) {
+              S.autoWarm = !S.keepWarm
               if (S.keepWarm) stopKeepWarm($, 'turned off')
               else startKeepWarm($, settings.keepWarmHours)
               await heartbeat($, true)
