@@ -1250,3 +1250,89 @@ test('a seat adopted after a request landed since the wake-up marks the cache co
   await $.prompt.submit({ text: 'carry on', origin: COMPOSER, wait: false } as never)
   expect(seen.asks).toBe(1)
 })
+
+test('while the seat is unknown after a wake-up, the old seat gets no new plan reading and the heartbeat offers no windows', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const seat = { label: 'A' }
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock } = engine($, on, seat, kept, undefined, disk)
+  on('session.authorize', () => ({ value: { handle: 'h' } }))
+  let fetches = 0
+  on('http.fetch', () => {
+    fetches++
+    return { value: { ok: true, status: 200, headers: {}, text: JSON.stringify({ five_hour: { utilization: 88, resets_at: 9999999999 }, limits: [{ kind: 'weekly_scoped', scope: { model: { display_name: 'Fable' } }, percent: 88 }] }) } }
+  })
+  await clock.advance(60000)
+  const t0 = await clock.now()
+  const reading = { at: t0, next: t0 + 5 * 60000, fable: { percentUsed: 11 }, windows: [], why: 'ok' }
+  kept.set('plan:cli:A', reading)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await $.session.measure({ context: { tokens: 100000, window: 1000000, percent: 10 }, rateLimits: [{ kind: 'five_hour', percentUsed: 40, resetsAt: '2099-01-01T00:00:00Z' }], changed: [] } as never)
+  await clock.advance(30000)
+  expect((kept.get('hb:sid-test') as any).rateLimits.length).toBe(1) // known seat: its own reading is offered
+  await clock.advance(3.5 * 60000)
+  const before = fetches
+  disk.files['.claude.json'] = account('b@x') // the account moved; the seat file is not written yet
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  await clock.advance(90000) // inside the window, and A's plan slot comes due
+  expect(fetches).toBe(before)
+  expect(kept.get('plan:cli:A')).toEqual(reading)
+  expect((kept.get('hb:sid-test') as any).rateLimits).toEqual([])
+  seat.label = 'B'
+  await clock.advance(30000) // the seat is known now: the first tick reads B's plan
+  expect(fetches).toBeGreaterThan(before)
+  expect(kept.get('plan:cli:A')).toEqual(reading)
+})
+
+test('an account read with no account inside the window is not a change: the real account is taken when it arrives', WAKE, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  const step = stepper($, on)
+  await start($, 100000, clock)
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  disk.files['.claude.json'] = '{}' // mid-rotation: signed out
+  await clock.advance(30000)
+  disk.files['.claude.json'] = account('b@x')
+  await clock.advance(60000)
+  await clock.advance(10 * 60000)
+  await step(usage({ cache_read_input_tokens: 100000 }))
+  expect((kept.get('last:sid-test') as any).account).toBe('b@x')
+})
+
+test('a wake-up that already showed the seat changed is not marked cold again when the account arrives late', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const seat = { label: 'A' }
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock, seen } = engine($, on, seat, kept, undefined, disk)
+  answer(on, seen, 'Send anyway')
+  const step = stepper($, on)
+  await start($, 300000, clock)
+  seat.label = 'B'
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  await clock.advance(1000)
+  await step(usage({ cache_creation_input_tokens: 300000 })) // the wake-up's request ran on the new account
+  await clock.advance(30000)
+  disk.files['.claude.json'] = account('b@x')
+  await clock.advance(30000)
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/account rotated/)
+  await $.prompt.submit({ text: 'carry on', origin: COMPOSER, wait: false } as never)
+  expect(seen.asks).toBe(0)
+})
+
+test('a request right after the window closes, before any tick sees it close, already carries seat and account', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('b@x') } }
+  const { clock } = engine($, on, { label: 'B' }, kept, undefined, disk)
+  const step = stepper($, on)
+  await start($, 100000, clock) // ticks fall 30s apart from the start
+  await clock.advance(1000) // the wake-up is off the tick grid: its window ends 1s after a tick
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never) // no change
+  await clock.advance(180000) // the last tick inside the window ran at +179s; the next is 29s off
+  await clock.advance(1500) // past the window's end, no tick since
+  await step(usage({ cache_read_input_tokens: 100000 }))
+  const rec = kept.get('last:sid-test') as any
+  expect(rec.seat).toBe('B')
+  expect(rec.account).toBe('b@x')
+})

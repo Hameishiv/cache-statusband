@@ -76,9 +76,10 @@ let identityRead = false // session.start has read the seat and account: a chat'
 let pendingSeed = null // a startup or resume SessionStart's transcript that came before that, seeded once it has
 let rotationSeenAt = 0 // when this process last saw a rotation: a process fact, kept across /clear, resume and fork
 const WAKE_WINDOW = 3 * MIN // how long after a wake-up a late rewrite of the seat file or .claude.json is still taken as that rotation
-let seatUnknown = false // after a wake-up, until the seat file names a new seat: the rotator may not have written it yet, so S.seat may be the old one
-let accountUnknown = false // likewise for the account in .claude.json
+let seatUnknown = false // after a wake-up, until the seat file names a new seat: the rotator may not have written it yet, so S.seat may be the old one, and this session's usage readings wait for it
+let accountUnknown = false // likewise for the account in .claude.json; a read with no account is not a change
 let wakeWindowEnd = 0 // when the wake-up's window closes; 0 = no window
+let wakeShowedChange = false // the wake-up's own re-read already found the seat or the account changed
 
 // A field is unknown only while the window is open: a closed one stands even before the tick that clears the flags
 function seatUnsure() {
@@ -352,12 +353,14 @@ async function rememberCompacted($) {
 }
 
 // The signed-in account, as Claude Code keeps it in .claude.json: what the band shows
-// in place of a seat when no seat file is configured; false when it could not be read
-async function readAccount($) {
+// in place of a seat when no seat file is configured; false when it could not be read.
+// A re-read after a wake-up (`keep`) that finds no account leaves the one it has: that is a file mid-rewrite, not a change.
+async function readAccount($, keep = false) {
   try {
     const dir = await $.env.get('CLAUDE_CONFIG_DIR')
     const o = JSON.parse(String(await $.fs.read(`${(dir || home).replace(/\\/g, '/')}/.claude.json`))).oauthAccount || {}
-    S.account = String(o.emailAddress || o.displayName || '')
+    const account = String(o.emailAddress || o.displayName || '')
+    if (account || !keep) S.account = account
     return true
   } catch {
     // an API-key session, or no file: no account to show
@@ -388,7 +391,7 @@ async function readSeat($, adopt = false) {
     S.planWindows = []
     planNext = 0
     S.seat = seat // before the await: planKey must name the new account while it runs
-    await readAccount($)
+    await readAccount($, true)
   }
   if (seat) S.seat = seat
 }
@@ -428,7 +431,7 @@ export function resumeText(at, from) {
 
 function armResume($, details) {
   let limits = stillOpen(S.rateLimits, now)
-  if (!limits.length && signedIn !== false) limits = borrowedLimits(fleet, { seat: S.seat, desktop: !onTerminal }, now)
+  if (!limits.length && signedIn !== false && !seatUnsure()) limits = borrowedLimits(fleet, { seat: S.seat, desktop: !onTerminal }, now) // not while the seat is unknown: S.seat may be the old one
   if (!limits.length) limits = stillOpen(S.planWindows, now)
   const full = spentWindows(limits, S.fable, S.model)
   const text = String(details || '')
@@ -579,7 +582,7 @@ function myHeartbeat() {
     seat: S.seat,
     desktop: !onTerminal,
     signedIn, // an API-key session's windows are not an account's: others must not borrow them
-    rateLimits: S.rateLimits, // the engine's own reading, which a reopened chat borrows
+    rateLimits: seatUnsure() ? [] : S.rateLimits, // the engine's own reading, which a reopened chat borrows; none while the seat is unknown, as it may be the old account's
     updatedAt: now,
   }
 }
@@ -665,6 +668,7 @@ function planKey() {
 }
 
 async function refreshPlan($) {
+  if (seatUnsure()) return // the seat may be the old one: its key would take the new account's reading, and planNext waits for the real seat
   const key = planKey() // one account's reading throughout, though the seat can change while the fetch is out
   // An API-key session has no first-party sign-in: the shared reading is another account's
   if (signedIn === null || (signedIn === false && now >= signCheckAt)) {
@@ -982,9 +986,10 @@ function warnStep($) {
 }
 
 // The rotator writes .claude.json and the seat file separately, at times we don't know. So for WAKE_WINDOW after a
-// wake-up, a field still unchanged is unknown and the ticks look again, each file on its own; once the window is over
+// wake-up, a field still unchanged (or an account that reads empty) is unknown and the ticks look again, each file on its own; once the window is over
 // the session keeps the seat and account it has. Outside a window a change is never taken: only a wake-up carries one.
-// A request that landed since the wake-up may have run on the old account: adopting then marks the cache cold.
+// A request that landed since the wake-up may have run on the old account: adopting then marks the cache cold,
+// unless the wake-up already showed a change in the other field: then the rotation had reached it and the request ran on the new account.
 async function refreshIdentity($) {
   if (!wakeWindowEnd) return
   if (now >= wakeWindowEnd) {
@@ -996,7 +1001,7 @@ async function refreshIdentity($) {
   if (!seatUnknown && !accountUnknown) return
   let adopted = false
   try {
-    if (accountUnknown && (await readAccount($)) && S.account !== wakeAccount) {
+    if (accountUnknown && (await readAccount($, true)) && S.account !== wakeAccount) {
       accountUnknown = false
       adopted = true
     }
@@ -1016,7 +1021,7 @@ async function refreshIdentity($) {
   } catch {
     // unreadable now: the next tick looks again
   }
-  if (adopted && S.lastActivity > rotationSeenAt) {
+  if (adopted && !wakeShowedChange && S.lastActivity > rotationSeenAt) {
     rotatedPending = true
     S.seatChangedAt = now
     rotationSeenAt = now
@@ -1222,10 +1227,11 @@ export function register(on, options = {}) {
       await readSeat($, true)
       rotationSeenAt = now
       // the seat file may be absent or unchanged: the account is what moved
-      await readAccount($)
-      // a field still as it was is unknown: the rotator may not have written it yet, the ticks look again for the window
+      await readAccount($, true)
+      // a field still as it was, or an account that read empty, is unknown: the rotator may not have written it yet, the ticks look again for the window
       seatUnknown = !!seatFile && S.seat === wakeSeat
-      accountUnknown = S.account === wakeAccount
+      accountUnknown = !S.account || S.account === wakeAccount
+      wakeShowedChange = (!!seatFile && S.seat !== wakeSeat) || !accountUnknown
       S.seatChangedAt = now // a second wake-up of an already rotated chat dates it anew
       rotatedPending = true
     }
@@ -1623,7 +1629,7 @@ function bandSegments() {
   if (S.coldRestarts.length) out.push([`Cold rewrites ${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))} (${S.coldRestarts.length})`, 'gray'])
   // the engine's own reading once a request has run; before that another session's on the same account, then the shared usage reading
   let limits = stillOpen(S.rateLimits, now) // a window that reset since is stale
-  if (!limits.length && signedIn !== false) limits = borrowedLimits(fleet, { seat: S.seat, desktop: !onTerminal }, now)
+  if (!limits.length && signedIn !== false && !seatUnsure()) limits = borrowedLimits(fleet, { seat: S.seat, desktop: !onTerminal }, now) // not while the seat is unknown: S.seat may be the old one
   if (!limits.length) limits = S.planWindows
   const five = limits.find((l) => l.kind === 'five_hour')
   const week = limits.find((l) => l.kind === 'seven_day')
