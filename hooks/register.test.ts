@@ -4269,6 +4269,73 @@ test('a prompt.read that does not answer leaves the person\'s draft alone, and t
   expect(seen.toasts.filter((t) => t.includes('Also not sent: four'))).toHaveLength(1)
 })
 
+test('a read that showed the person\'s draft ends the tracking of the put-back text: a later read that fails does not bring it back', SETUP, async ($, on) => {
+  const dialogs = heldAsk(on)
+  const box: { edit: string | null; hang: boolean; broken: boolean } = { edit: null, hang: false, broken: false }
+  const ref: { fills: string[] } = { fills: [] }
+  const { clock, seen, fills } = await coldChat($, on, () => on('prompt.read', () => {
+    if (box.hang) return new Promise(() => {})
+    if (box.broken) throw new Error('no read')
+    const text = box.edit ?? ref.fills[ref.fills.length - 1] ?? ''
+    return { value: { text, cursor: text.length } }
+  }))
+  ref.fills = fills
+  hang(seen)
+  await send($, 'one')
+  await clock.advance(1000)
+  void send($, 'three')
+  await clock.advance(15 * 60000)
+  expect(fills).toEqual(['one'])
+  box.edit = 'my own draft'
+  dialogs.release('Compact first, then send') // a read shows the draft: 'three' is quoted and 'one' is no longer tracked
+  await clock.advance(1000)
+  expect(seen.toasts.filter((t) => t.includes('Also not sent: three'))).toHaveLength(1)
+  expect(fills).toEqual(['one'])
+  box.broken = true // the engine can no longer read the box
+  let m = 0
+  seen.duringCompact = () => (++m === 1 ? new Promise(() => {}) : Promise.resolve())
+  await clock.advance(16 * 60000)
+  void send($, 'four') // its dialog: compacts again (hangs), and is put back after 15 minutes
+  await clock.advance(10)
+  dialogs.release('Compact first, then send')
+  await clock.advance(15 * 60000 + 5000)
+  expect(fills).toEqual(['one', 'four']) // not 'one\n\nfour': the old text is not the box's
+})
+
+test('a prompt.read that answers with the put-back text after it was sent does not merge the sent text again', SETUP, async ($, on) => {
+  const dialogs = heldAsk(on)
+  const ref: { fills: string[] } = { fills: [] }
+  let slow = false
+  let open: () => void = () => {}
+  const gate = new Promise<void>((resolve) => { open = resolve })
+  const { clock, seen, fills } = await coldChat($, on, () => {
+    on('prompt.read', async () => {
+      const text = ref.fills[ref.fills.length - 1] ?? '' // what the box held when the read began
+      if (slow) await gate
+      return { value: { text, cursor: text.length } }
+    })
+  })
+  ref.fills = fills
+  hang(seen)
+  await send($, 'one')
+  await clock.advance(1000)
+  void send($, 'three')
+  await clock.advance(15 * 60000)
+  expect(fills).toEqual(['one'])
+  slow = true
+  dialogs.release('Compact first, then send') // 'three' is put back: the read is out
+  await clock.advance(300)
+  void send($, 'one') // the person presses Enter on the box during the read
+  await clock.advance(10)
+  dialogs.release('Send anyway')
+  await clock.advance(10)
+  await mainStep($)
+  open() // the read answers, inside its 2 seconds, with the text that has been sent
+  await clock.advance(500)
+  expect(fills).toEqual(['one']) // not 'one\n\nthree'
+  expect(seen.toasts.filter((t) => t.includes('Also not sent: three — send it again when ready.')).length).toBe(1)
+})
+
 test('a prompt.read that is missing in the engine leaves the tracked put-back text standing: a later put-back goes behind it', SETUP, async ($, on) => {
   askLog(on)
   const { clock, seen, fills } = await coldChat($, on) // no prompt.read hook: the call throws
