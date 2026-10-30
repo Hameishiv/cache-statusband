@@ -401,7 +401,7 @@ async function readSeat($, adopt = false) {
 }
 
 // The old account's readings, dropped once the account or seat moves: the new one's are borrowed or fetched until a request measures them.
-// A resume armed from them is not cancelled: it moves to a minute from now, when the new account presumably has usage, keeping its tries.
+// A resume still pending that was armed from them is not cancelled: it moves to a minute from now, when the new account presumably has usage, keeping its tries. One already settled, sent or cleared is not revived.
 // A request that started before the drop reports the old account's windows: identityGen lets its readings be told apart.
 let identityGen = 0
 let requestGen = 0 // identityGen as the latest request started: session.measure names no request, so the latest start stands for the one that reports
@@ -431,7 +431,7 @@ const USAGE_MARKER = /usage limit|hit your limit|out of (extra )?usage|5-hour|we
 const RESUME_FALLBACK = 60 * MIN // no reset time known: try once an hour, three times at most
 let resumeTries = 0
 let staleArmedGen = -1 // the identityGen at which a failure of an earlier request was already given its free minute
-let resumeFromReadings = false // the armed resume rests on plan windows, not on the error's wording (nor, after dropReadings, on a re-arm)
+let resumeFromReadings = false // the pending resume rests on plan windows, not on the error's wording (nor, after dropReadings, on a re-arm); cleared wherever resumeAt is
 let submitsSeen = 0 // prompt.submit hooks so far, so an unattended send can tell the person sent something meanwhile
 
 // The windows that are full, from the freshest reading this session has
