@@ -713,7 +713,7 @@ async function runCompactThenSend($, msg, unattended, before, wake) {
     return { t, ok }
   }
   if (cancelled()) {
-    // a message that reached the chat while compacting (another plugin's too), "Send anyway" or "Compact first" on a cold-send dialog, a wake-up that starts compacting, or /clear or a resume, cancels an automatic one (a local command such as /btw, which never reaches the chat, a dropped send or Cancel does not), and with it the wake-up's turn. A cancelled Resume is armed again when no request starts (resumeAt)
+    // a message that reached the chat while compacting (another plugin's too), "Send anyway" or "Compact first" on a cold-send dialog, a wake-up that starts compacting, or /clear or a resume, cancels an automatic one (a local command such as /btw, which never reaches the chat, even answered Compact first, a dropped send or Cancel does not), and with it the wake-up's turn. A cancelled Resume is armed again when no request starts (resumeAt)
     lowerWake(wake)
     const { t, ok } = await rearmResume()
     const rearm = !wake && ok
