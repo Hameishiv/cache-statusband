@@ -163,6 +163,7 @@ function Get-EditedConfig {
 # Validate the edit against the user's config first, so a rejection changes nothing.
 $null = Get-EditedConfig
 
+$backupRoot = $null
 if (Test-Path -LiteralPath $configPath) {
   $backupRoot = Join-Path $CodexHome ("backups\cache-statusband-codex-" + (Get-Date -Format "yyyyMMdd-HHmmss"))
   New-Item -ItemType Directory -Force -Path $backupRoot | Out-Null
@@ -182,7 +183,17 @@ try {
 }
 
 # The plugin commands write their own tables into config.toml, so edit it after them.
-$configText = Get-EditedConfig
+# The plugin is registered by now: a failure here must not leave config.toml half edited.
+try {
+  $configText = Get-EditedConfig
+} catch {
+  $editError = $_.Exception.Message
+  if ($backupRoot) {
+    Copy-Item -LiteralPath (Join-Path $backupRoot "config.toml") -Destination $configPath -Force
+    throw "The config.toml changes were rolled back to the backup at $backupRoot. $editError"
+  }
+  throw "The plugin is registered, but hooks were not enabled (there was no config.toml to restore). $editError"
+}
 
 $configCandidate = Join-Path $CodexHome (".config.toml.cache-statusband-" + [guid]::NewGuid().ToString("N") + ".tmp")
 try {
