@@ -18,7 +18,7 @@ function engine($: any, on: any, seat: { label: string; recording?: string } = {
     on('store.keys', () => ({ value: [...kept.keys()] }))
   } else mock.store(on)
   mock.env(on, { USERPROFILE: 'C:/Users/T' })
-  const seen = { compacts: 0, submits: [] as string[], asks: 0, toasts: [] as string[], failCompact: false, failSubmit: false, duringCompact: null as null | (() => Promise<unknown>) }
+  const seen = { compacts: 0, submits: [] as string[], asks: 0, toasts: [] as string[], failCompact: false, failSubmit: false, duringCompact: null as null | (() => Promise<unknown>), duringSubmit: null as null | (() => Promise<unknown>) }
   on('session.id', () => ({ value: 'sid-test' }))
   on('session.cwd', () => ({ value: '/repo' }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
@@ -50,7 +50,7 @@ function engine($: any, on: any, seat: { label: string; recording?: string } = {
   })
   on('prompt.submit', (_: unknown, e: any) => {
     if (e.text === 'DROPME') return { drop: 'another guard' }
-    if (seen.failSubmit && e.origin?.kind === 'plugin') throw new Error('refused') // this mod's own sends are refused, both ways
+    if (seen.failSubmit && e.origin?.kind === 'plugin') return Promise.resolve(seen.duringSubmit?.()).then(() => { throw new Error('refused') }) // this mod's own sends are refused, both ways, after whatever the test does while the submit is out
     if (e.text === 'SLOW') return clock.advance(40000).then(() => ({ text: e.text })) // a lower hook that takes 40 s to hand the message on
     if (e.origin?.kind === 'plugin') seen.submits.push(e.text)
     return { text: e.text }
@@ -2518,12 +2518,12 @@ async function resumeCompacting($: any, on: any, before?: () => void) {
   return e
 }
 
-test('the Resume re-armed after a cancel does not compact a second time: the chat is already short (2 compactions, not 3)', { options: { autoResume: true } }, async ($, on) => {
+test('the Resume re-armed after a cancel does not compact a second time, and neither does the "Compact first" that cancelled it: the chat is already short (1 compaction, not 3)', { options: { autoResume: true } }, async ($, on) => {
   const { clock, seen, fills } = await resumeCompactingThenCompactFirst($, on)
-  await clock.advance(91 * 60000 + 1000) // the Resume compacts and the person's "Compact first" on a slash message cancels it, and compacts too
+  await clock.advance(91 * 60000 + 1000) // the Resume compacts and the person's "Compact first" on a slash message cancels it: it finds the chat just compacted and does not compact again
   await clock.advance(60000)
   await clock.advance(100000) // the re-armed Resume falls due
-  expect({ compacts: seen.compacts, submits: seen.submits, fills }).toEqual({ compacts: 2, submits: ['Resume'], fills: ['/merge-pr 1'] })
+  expect({ compacts: seen.compacts, submits: seen.submits, fills }).toEqual({ compacts: 1, submits: ['Resume'], fills: ['/merge-pr 1'] })
 })
 
 test('a cold-send dialog open when the Resume\'s compaction ends holds it, and "Send anyway" cancels it: no Resume beside the message', { options: { autoResume: true } }, async ($, on) => {
@@ -2696,7 +2696,7 @@ test('a Resume neither submit way could send is tried again 2 minutes on, and sa
   expect(seen.submits).toEqual(['Resume'])
 })
 
-test('a Resume refused every time gives up after three more tries, and says so once', { options: { autoResume: true } }, async ($, on) => {
+test('a Resume refused every time gives up after four tries in all, and says so once', { options: { autoResume: true } }, async ($, on) => {
   const { clock, seen } = engine($, on)
   on('classic.StopFailure', () => ({}))
   await start($, 50000, clock)
@@ -2705,8 +2705,176 @@ test('a Resume refused every time gives up after three more tries, and says so o
   await clock.advance(60 * 60000 + 30000)
   for (let i = 0; i < 5; i++) await clock.advance(2 * 60000 + 30000)
   expect(seen.toasts.filter((t) => /Trying again at/.test(t)).length).toBe(3)
-  expect(seen.toasts.filter((t) => /after three tries/.test(t)).length).toBe(1)
+  expect(seen.toasts.filter((t) => /after four tries/.test(t)).length).toBe(1)
   seen.failSubmit = false
   await clock.advance(10 * 60000)
   expect(seen.submits).toEqual([])
+})
+
+test('a refusal count left by a settled arm does not cut the next arm short', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = engine($, on)
+  on('classic.StopFailure', () => ({}))
+  on('turn.step', async function* () { return { answer: '', toolUses: [], usage: null } })
+  await start($, 50000, clock)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  seen.failSubmit = true
+  await clock.advance(60 * 60000 + 30000)
+  await clock.advance(2 * 60000 + 30000)
+  await clock.advance(2 * 60000 + 30000)
+  expect(seen.toasts.filter((t) => /Trying again at/.test(t)).length).toBe(3)
+  await mainStep($) // the person's own message settles it
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  await clock.advance(60 * 60000 + 30000) // the new arm's first refusal
+  expect(seen.toasts.filter((t) => /after four tries/.test(t)).length).toBe(0)
+  expect(seen.toasts.filter((t) => /Trying again at/.test(t)).length).toBe(4)
+})
+
+test('a refused Resume is not armed again in a chat cleared while the submit was out', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = engine($, on)
+  on('classic.StopFailure', () => ({}))
+  on('classic.SessionStart', () => ({}))
+  await start($, 50000, clock)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  seen.failSubmit = true
+  let n = 0
+  seen.duringSubmit = async () => { if (++n === 1) await ($ as any).classic.SessionStart({ source: 'clear' }) }
+  await clock.advance(60 * 60000 + 30000)
+  seen.failSubmit = false
+  await clock.advance(10 * 60000)
+  expect(seen.submits).toEqual([])
+  expect(seen.toasts.filter((t) => /Trying again at/.test(t))).toEqual([])
+})
+
+test('a refused Resume is not armed again once a request of the main loop settled it while the submit was out', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = engine($, on)
+  on('classic.StopFailure', () => ({}))
+  on('turn.step', async function* () { return { answer: '', toolUses: [], usage: null } })
+  await start($, 50000, clock)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  seen.failSubmit = true
+  let n = 0
+  seen.duringSubmit = async () => { if (++n === 1) await mainStep($) }
+  await clock.advance(60 * 60000 + 30000)
+  seen.failSubmit = false
+  await clock.advance(10 * 60000)
+  expect(seen.submits).toEqual([])
+  expect(seen.toasts.filter((t) => /Trying again at/.test(t))).toEqual([])
+})
+
+test('a Resume sent after compacting and refused both ways is tried again 2 minutes on, not put in the prompt box', { options: { autoResume: true } }, async ($, on) => {
+  const fills: string[] = []
+  const { clock, seen } = await resumeCompacting($, on, () => on('prompt.fill', (_: unknown, e: any) => (fills.push(e.text), { isFilled: true })))
+  seen.failSubmit = true
+  await clock.advance(91 * 60000 + 1000) // the Resume falls due, compacts, and both ways of sending it are refused
+  expect(seen.toasts.filter((t) => /Could not send Resume\. Trying again at/.test(t)).length).toBe(1)
+  expect(await bandResume($)).toMatch(/Resumes/)
+  seen.failSubmit = false
+  await clock.advance(60000)
+  expect(seen.submits).toEqual([]) // still inside the 2 minutes
+  await clock.advance(100000)
+  expect({ submits: seen.submits, compacts: seen.compacts, fills }).toEqual({ submits: ['Resume'], compacts: 1, fills: [] }) // the chat is already short: no second compaction
+})
+
+test('a Resume sent after compacting and refused every time gives up after four tries in all, and says so once', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = await resumeCompacting($, on)
+  seen.failSubmit = true
+  await clock.advance(91 * 60000 + 1000)
+  for (let i = 0; i < 5; i++) await clock.advance(2 * 60000 + 30000)
+  expect(seen.toasts.filter((t) => /Trying again at/.test(t)).length).toBe(3)
+  expect(seen.toasts.filter((t) => /after four tries/.test(t)).length).toBe(1)
+})
+
+test('a send cancelled while it waits on a shared compaction that failed does not compact again', { options: { rotatorWakePattern: WAKE.options.rotatorWakePattern, autoResume: true } }, async ($, on) => {
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock, seen } = engine($, on, { label: 'A' }, undefined, undefined, disk)
+  on('classic.StopFailure', () => ({}))
+  on('classic.SessionStart', () => ({}))
+  on('turn.step', async function* () { return { answer: '', toolUses: [], usage: { input_tokens: 10, cache_read_input_tokens: 300000, cache_creation_input_tokens: 0 } } })
+  await start($, 300000, clock)
+  const t0 = await clock.now()
+  await mainStep($)
+  await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [{ kind: 'five_hour', percentUsed: 100, resetsAt: new Date(t0 + 90 * 60000).toISOString() }], changed: [] } as never)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  seen.failCompact = true
+  let n = 0
+  // while the Resume compacts: the account rotates, the wake-up waits on that compaction, and a /clear cancels the wake-up before the compaction fails
+  seen.duringCompact = async () => { if (++n === 1) { disk.files['.claude.json'] = account('b@x'); await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never); await clock.advance(1000); await ($ as any).classic.SessionStart({ source: 'clear' }) } }
+  await clock.advance(91 * 60000 + 1000)
+  await clock.advance(5000)
+  expect({ compacts: seen.compacts, submits: seen.submits }).toEqual({ compacts: 1, submits: [] })
+})
+
+test('a Resume whose compaction failed while a cold-send dialog was open, answered Cancel, waits and compacts again instead of going uncompacted', { options: { autoResume: true } }, async ($, on) => {
+  let release: (label: string) => void = () => {}
+  const gate = new Promise<string>((r) => { release = r })
+  const { clock, seen } = await resumeCompacting($, on, () => on('tool.call', async (_: unknown, e: any) => {
+    if (e.tool !== 'AskUserQuestion') return { result: {} }
+    const label = await gate
+    const q = e.questions?.[0]?.question ?? ''
+    return { result: { questions: e.questions, answers: { [q]: label } } }
+  }))
+  seen.failCompact = true
+  let sent: Promise<unknown> | null = null
+  let n = 0
+  seen.duringCompact = async () => { if (++n === 1) sent = $.prompt.submit({ text: 'hold on', origin: COMPOSER, wait: false } as never) }
+  await clock.advance(91 * 60000 + 1000)
+  await clock.advance(5000)
+  expect(seen.submits).toEqual([]) // not while the dialog is open
+  release('Cancel')
+  await sent
+  await clock.advance(1000)
+  expect({ submits: seen.submits, compacts: seen.compacts }).toEqual({ submits: [], compacts: 1 }) // not sent uncompacted
+  expect(seen.toasts.filter((t) => /Could not compact \(.*\), so the Resume waits until/.test(t)).length).toBe(1)
+  expect(seen.toasts.filter((t) => /so the message goes as typed/.test(t))).toEqual([])
+  expect(await bandResume($)).toMatch(/Resumes/)
+  seen.failCompact = false
+  await clock.advance(60000)
+  expect(seen.submits).toEqual([]) // still inside the 2 minutes
+  await clock.advance(100000)
+  expect({ submits: seen.submits, compacts: seen.compacts }).toEqual({ submits: ['Resume'], compacts: 2 }) // it compacted again first
+})
+
+test('a Resume whose compaction failed with no dialog open still goes as typed', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = await resumeCompacting($, on)
+  seen.failCompact = true
+  await clock.advance(91 * 60000 + 1000)
+  await clock.advance(5000)
+  expect({ submits: seen.submits, compacts: seen.compacts }).toEqual({ submits: ['Resume'], compacts: 1 })
+  expect(seen.toasts.filter((t) => /Could not compact \(.*\), so the message goes as typed/.test(t)).length).toBe(1)
+})
+
+test('a "Compact first" send waiting on a compaction that never finishes runs its own after 2 minutes and goes', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, 'Compact first, then send')
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+  await clock.advance(77 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  let n = 0
+  seen.duringCompact = () => (++n === 1 ? new Promise(() => {}) : Promise.resolve()) // the first /compact hangs
+  await $.prompt.submit({ text: 'one', origin: COMPOSER, wait: false } as never)
+  await clock.advance(100)
+  expect(seen.compacts).toBe(1)
+  await $.prompt.submit({ text: 'two', origin: COMPOSER, wait: false } as never)
+  await clock.advance(100)
+  await clock.advance(60000)
+  expect({ compacts: seen.compacts, submits: seen.submits }).toEqual({ compacts: 1, submits: [] }) // still waiting on the first
+  await clock.advance(61000)
+  expect({ compacts: seen.compacts, submits: seen.submits }).toEqual({ compacts: 2, submits: ['two'] })
+})
+
+test('the cold-send guard asks for /btw with a question, which goes to the model, but not for /usage or a bare /btw', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, 'Send anyway')
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+  await clock.advance(77 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ text: '/usage', command: { name: 'usage', args: '' }, origin: COMPOSER, wait: false } as never)
+  await $.prompt.submit({ text: '/btw', command: { name: 'btw', args: '  ' }, origin: COMPOSER, wait: false } as never)
+  expect(seen.asks).toBe(0)
+  await $.prompt.submit({ text: '/btw what is x', command: { name: 'btw', args: 'what is x' }, origin: COMPOSER, wait: false } as never)
+  expect(seen.asks).toBe(1)
 })
