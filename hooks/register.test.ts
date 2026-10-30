@@ -789,7 +789,7 @@ for (const [email, cold] of [['b@example.com', true], ['a@example.com', false]] 
   })
 }
 
-test('a startup seed that ran before the seat was read is judged again once it is', SETUP, async ($, on) => {
+test('a startup seed is deferred until the seat is read, then judged against the record', SETUP, async ($, on) => {
   const kept = new Map<string, unknown>()
   const disk: { files: Record<string, string> } = { files: {} }
   const { clock, seen } = engine($, on, { label: 'B' }, kept, undefined, disk)
@@ -910,3 +910,101 @@ test('a branch of a chat kept warm by pings stays warm: it shares its parent\'s 
   await $.prompt.submit({ text: 'carry on', origin: COMPOSER, wait: false } as never)
   expect(seen.asks).toBe(0)
 })
+
+test('a resume that arrives before the session starts is judged once the seat is read', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const disk: { files: Record<string, string> } = { files: {} }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  answer(on, seen, 'Send anyway')
+  on('classic.SessionStart', () => ({}))
+  await clock.advance(60000)
+  disk.files['sid-test.jsonl'] = reply(await clock.now(), 300000)
+  kept.set('last:sid-test', { ctx: 300004, at: await clock.now(), model: 'claude-opus-5-5', seat: 'B', desktop: false })
+  await clock.advance(5 * 60000)
+  await ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/sid-test.jsonl' })
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/account rotated/)
+  await $.prompt.submit({ text: 'carry on', origin: COMPOSER, wait: false } as never)
+  expect(seen.asks).toBe(1)
+})
+
+test('a wake-up with no seat file reads the account again: a resumed chat\'s record of the old account is cold', { options: { rotatorWakePattern: String.raw`account was rotated` } }, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  answer(on, seen, 'Send anyway')
+  on('classic.SessionStart', () => ({}))
+  const step = stepper($, on)
+  await clock.advance(60000)
+  const xAt = await clock.now()
+  await clock.advance(10 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await $.session.measure({ context: { tokens: 100000, window: 1000000, percent: 10 }, rateLimits: [], changed: [] } as never)
+  // the rotator moved the signed-in account, and woke the session
+  disk.files['.claude.json'] = account('b@x')
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  await step(usage({ cache_read_input_tokens: 100000 }))
+  await clock.advance(60000)
+  // chat X last answered on the old account before the rotation
+  kept.set('last:sid-test', { ctx: 300000, at: xAt, model: 'claude-opus-5-5', account: 'a@x', desktop: false })
+  await ($ as any).classic.SessionStart({ source: 'resume' })
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/account rotated/)
+  await $.prompt.submit({ text: 'carry on', origin: COMPOSER, wait: false } as never)
+  expect(seen.asks).toBe(1)
+})
+
+test('a wake-up whose account file could not be read leaves a record compared by account undecided, so the rotation dates it', { options: { rotatorWakePattern: String.raw`account was rotated` } }, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  answer(on, seen, 'Send anyway')
+  on('classic.SessionStart', () => ({}))
+  const step = stepper($, on)
+  await clock.advance(60000)
+  const xAt = await clock.now()
+  await clock.advance(10 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await $.session.measure({ context: { tokens: 100000, window: 1000000, percent: 10 }, rateLimits: [], changed: [] } as never)
+  await clock.advance(60000)
+  delete disk.files['.claude.json']
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  await step(usage({ cache_read_input_tokens: 100000 }))
+  await clock.advance(60000)
+  disk.files['x.jsonl'] = reply(xAt, 300000)
+  kept.set('last:sid-test', { ctx: 300000, at: xAt, model: 'claude-opus-5-5', account: 'a@x', desktop: false })
+  await ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/x.jsonl' })
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/account rotated.* 1m ago/)
+})
+
+// A rotation this process saw outlives a /clear and a resume of a chat whose record cannot say
+for (const source of ['clear', 'resume']) {
+  test(`a rotation this process saw still dates a chat resumed after a ${source}`, SETUP, async ($, on) => {
+    const kept = new Map<string, unknown>()
+    const seat = { label: 'A' }
+    const disk: { files: Record<string, string> } = { files: {} }
+    const { clock, seen } = engine($, on, seat, kept, undefined, disk)
+    answer(on, seen, 'Send anyway')
+    on('classic.SessionStart', () => ({}))
+    const step = stepper($, on)
+    await start($, 100000, clock)
+    const xAt = await clock.now()
+    disk.files['x.jsonl'] = reply(xAt, 300000)
+    await clock.advance(10 * 60000)
+    seat.label = 'B'
+    await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+    await step(usage({ cache_read_input_tokens: 100000 }))
+    await clock.advance(60000)
+    // neither chat has a record of its own
+    for (const k of [...kept.keys()]) if (k.startsWith('last:')) kept.delete(k)
+    await ($ as any).classic.SessionStart({ source })
+    for (const k of [...kept.keys()]) if (k.startsWith('last:')) kept.delete(k)
+    await ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/x.jsonl' })
+    const r: any = await $.command.run({ command: 'cache', args: '' })
+    expect(r.text).toMatch(/account rotated.* 1m ago/)
+    await $.prompt.submit({ text: 'carry on', origin: COMPOSER, wait: false } as never)
+    expect(seen.asks).toBe(1)
+  })
+}
