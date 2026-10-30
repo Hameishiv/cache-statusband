@@ -9,7 +9,8 @@ import { usagePresentation } from "../src/settings.mjs";
 import { captureUsageIdentity, getUsageSnapshot } from "../src/usage.mjs";
 
 // The hook times out at 15 seconds and writes once at the end, so the usage reads share a deadline.
-const USAGE_BUDGET_MS = 12_000;
+// It leaves room for the 3 second tree-kill of an aborted read, which runs outside the budget.
+const USAGE_BUDGET_MS = 11_000;
 const MIN_READ_MS = 500;
 
 export async function handleSessionStart(input, {
