@@ -1916,3 +1916,20 @@ test('a usage failure of a request that started before an account change arms a 
   await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
   expect(seen.toasts.some((t) => /Auto-resume gave up/.test(t))).toBe(true)
 })
+
+test('a session with no seat or account whose first sign-in check threw neither shows nor overwrites the bare plan reading', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock } = engine($, on, { label: 'A' }, kept)
+  let calls = 0
+  on('session.authorize', () => { calls++; if (calls === 1) throw new Error('transient'); return { value: { handle: 'h' } } })
+  on('http.fetch', () => ({ value: { ok: true, status: 200, headers: {}, text: JSON.stringify({ five_hour: { utilization: 7, resets_at: 9999999999 }, limits: [{ kind: 'weekly_scoped', scope: { model: { display_name: 'Fable' } }, percent: 20 }] }) } }))
+  await clock.advance(10 * 60000)
+  const stale = { at: 1, next: 2, fable: { percentUsed: 77, resetsAt: '2099-01-01T00:00:00Z' }, windows: [], why: 'ok' }
+  kept.set('plan', stale)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await clock.advance(31000)
+  expect(calls).toBeGreaterThanOrEqual(2) // the check was retried at the fetch
+  expect(kept.get('plan')).toEqual(stale)
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/77%/)
+})

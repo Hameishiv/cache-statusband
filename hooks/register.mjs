@@ -712,10 +712,10 @@ function planKey() {
   return S.account ? `${PLAN_KEY}:account:${S.account}` : PLAN_KEY
 }
 
-// A signed-in session that can name neither seat nor account has no key of its own: the bare one would be shared with sessions on other accounts.
-// It fetches for itself, shares nothing, lends no windows and borrows none.
+// A session that can name neither seat nor account has no key of its own: the bare one would be shared with sessions on other accounts.
+// If signed in (or not yet known to be, where the sign-in check failed) it fetches for itself, shares nothing, lends no windows and borrows none.
 function unidentified() {
-  return signedIn === true && !S.seat && !S.account
+  return signedIn !== false && !S.seat && !S.account // an unchecked sign-in counts: it cannot be told from one that will turn out signed in
 }
 
 async function refreshPlan($) {
@@ -736,10 +736,11 @@ async function refreshPlan($) {
   // a seat or account change, or a wake-up, during any await below: don't restore the old account's readings
   if (stale()) return
   if (signedIn === false) return noSignIn()
-  const alone = unidentified()
+  // decided again before each store access: the sign-in check may have only now succeeded
+  const alone = unidentified
   let cached = null
   try {
-    cached = alone ? null : await $.store.get(key)
+    cached = alone() ? null : await $.store.get(key)
   } catch {
     cached = null
   }
@@ -754,7 +755,7 @@ async function refreshPlan($) {
   planNext = now + PLAN_EVERY
   // claim the slot first, so a session that wakes meanwhile finds it taken
   try {
-    if (!alone) await $.store.set(key, { ...prior, next: now + PLAN_EVERY })
+    if (!alone()) await $.store.set(key, { ...prior, next: now + PLAN_EVERY })
   } catch {
     // lock held: this session's own planNext still holds it back
   }
@@ -772,6 +773,7 @@ async function refreshPlan($) {
       signedIn = false
       return noSignIn()
     }
+    signedIn = true
     const r = await $.http.fetch(USAGE_URL, { auth: auth.handle, headers: { 'anthropic-beta': 'oauth-2025-04-20' } })
     if (r.ok) {
       const body = JSON.parse(r.text)
@@ -794,7 +796,7 @@ async function refreshPlan($) {
   planWhy = why
   try {
     // a failed check must not put its older reading over one another session took meanwhile
-    if (alone) return
+    if (alone()) return
     const stored = fetched ? null : await $.store.get(key)
     if (stale()) return
     if (stored && typeof stored === 'object' && (stored.at || 0) > (prior.at || 0)) {
