@@ -231,15 +231,17 @@ describe("cli", () => {
     const dir = mkdtempSync(join(tmpdir(), "csb-cli-"));
     const logPath = join(dir, "unified.jsonl");
     const cachePath = join(dir, "usage.json");
+    // The script reads the real clock, so the log must be recent and the period still open
+    const t = Date.now();
     writeFileSync(
       logPath,
       `${JSON.stringify({
-        ts: "2026-10-29T11:37:35.772Z",
+        ts: new Date(t - 9 * 60_000).toISOString(),
         msg: "billing: fetched credits config",
         ctx: {
           config: {
             creditUsagePercent: 23,
-            currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", end: "2026-11-02T22:57:09.651+00:00" },
+            currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", end: new Date(t + 4 * 86_400_000).toISOString() },
           },
           subscriptionTier: "super-secret-tier",
           email: "user@example.com",
