@@ -972,6 +972,13 @@ async function refreshIdentity($) {
     if (seatFile && (await $.fs.exists(seatFile))) {
       const seat = String(await $.fs.read(seatFile)).trim()
       if (seat && seat !== wakeSeat) {
+        if (seat !== S.seat) {
+          // the old account's readings, as readSeat drops them: borrow or fetch the new one's
+          S.rateLimits = []
+          S.fable = null
+          S.planWindows = []
+          planNext = 0
+        }
         S.seat = seat
         identityStale = false
       }
