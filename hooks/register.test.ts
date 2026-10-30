@@ -18,7 +18,7 @@ function engine($: any, on: any, seat: { label: string; recording?: string } = {
     on('store.keys', () => ({ value: [...kept.keys()] }))
   } else mock.store(on)
   mock.env(on, { USERPROFILE: 'C:/Users/T' })
-  const seen = { compacts: 0, submits: [] as string[], asks: 0, toasts: [] as string[], failCompact: false, duringCompact: null as null | (() => Promise<unknown>) }
+  const seen = { compacts: 0, submits: [] as string[], asks: 0, toasts: [] as string[], failCompact: false, failSubmit: false, duringCompact: null as null | (() => Promise<unknown>) }
   on('session.id', () => ({ value: 'sid-test' }))
   on('session.cwd', () => ({ value: '/repo' }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
@@ -50,6 +50,7 @@ function engine($: any, on: any, seat: { label: string; recording?: string } = {
   })
   on('prompt.submit', (_: unknown, e: any) => {
     if (e.text === 'DROPME') return { drop: 'another guard' }
+    if (seen.failSubmit && e.origin?.kind === 'plugin') throw new Error('refused') // this mod's own sends are refused, both ways
     if (e.text === 'SLOW') return clock.advance(40000).then(() => ({ text: e.text })) // a lower hook that takes 40 s to hand the message on
     if (e.origin?.kind === 'plugin') seen.submits.push(e.text)
     return { text: e.text }
@@ -314,7 +315,7 @@ test('a throttle code beside "usage limit reached" is still spent usage', { opti
   expect(seen.submits).toEqual(['Resume'])
 })
 
-test('an automatic message cancelled by one sent meanwhile says so once, even when the compaction failed', { options: { autoResume: true } }, async ($, on) => {
+test('an automatic message cancelled by a real message sent meanwhile says so once, and that it waits for that message\'s request, even when the compaction failed', { options: { autoResume: true } }, async ($, on) => {
   const { clock, seen } = engine($, on)
   seen.failCompact = true
   on('classic.StopFailure', () => ({}))
@@ -329,8 +330,8 @@ test('an automatic message cancelled by one sent meanwhile says so once, even wh
   expect(seen.submits).toEqual([])
   expect(seen.toasts.filter((t) => /Could not compact/.test(t))).toEqual([])
   expect(seen.toasts.filter((t) => /Compacted/.test(t))).toEqual([])
-  expect(seen.toasts.filter((t) => /so the automatic one waits until/.test(t)).length).toBe(1) // no request had started when it was cancelled: the Resume is armed again
-  expect(seen.toasts.filter((t) => /was not sent/.test(t))).toEqual([])
+  expect(seen.toasts.filter((t) => /A message was sent meanwhile, so the automatic one waits until .* unless that message's request starts/.test(t)).length).toBe(1) // no request had started when it was cancelled: the Resume is armed again
+  expect(seen.toasts.filter((t) => /was not sent|Something else/.test(t))).toEqual([])
 })
 
 test('a /clear drops the resume armed in the last chat', { options: { autoResume: true } }, async ($, on) => {
@@ -2525,7 +2526,7 @@ test('the Resume re-armed after a cancel does not compact a second time: the cha
   expect({ compacts: seen.compacts, submits: seen.submits, fills }).toEqual({ compacts: 2, submits: ['Resume'], fills: ['/merge-pr 1'] })
 })
 
-test('a cold-send dialog opened while the Resume compacts cancels it, whatever is answered: no Resume beside the message', { options: { autoResume: true } }, async ($, on) => {
+test('a cold-send dialog open when the Resume\'s compaction ends holds it, and "Send anyway" cancels it: no Resume beside the message', { options: { autoResume: true } }, async ($, on) => {
   let release: (label: string) => void = () => {}
   const gate = new Promise<string>((r) => { release = r })
   let asks = 0
@@ -2542,17 +2543,18 @@ test('a cold-send dialog opened while the Resume compacts cancels it, whatever i
   await clock.advance(91 * 60000 + 1000) // the Resume falls due and compacts; the dialog is still open when the compaction ends
   await clock.advance(5000)
   expect({ asks, submits: seen.submits }).toEqual({ asks: 1, submits: [] })
-  expect(seen.toasts.filter((t) => /so the automatic one waits until/.test(t)).length).toBe(1)
+  expect(seen.toasts.filter((t) => /automatic one/.test(t))).toEqual([]) // nothing decided while the dialog is open
   release('Send anyway')
   await sent
   await clock.advance(5000)
+  expect(seen.toasts.filter((t) => /A message was sent meanwhile, so the automatic one waits until/.test(t)).length).toBe(1)
   expect(seen.submits).toEqual([]) // the person's message is handed on, and no Resume beside it
   await mainStep($) // its request starts
   await clock.advance(10 * 60000)
   expect(seen.submits).toEqual([])
 })
 
-test('a cold-send dialog opened while the Resume compacts and answered Cancel: the Resume is armed again 2 minutes on, without compacting again', { options: { autoResume: true } }, async ($, on) => {
+test('a cold-send dialog open when the Resume\'s compaction ends and answered Cancel: the Resume goes as soon as it is closed, without compacting again', { options: { autoResume: true } }, async ($, on) => {
   let release: (label: string) => void = () => {}
   const gate = new Promise<string>((r) => { release = r })
   const { clock, seen } = await resumeCompacting($, on, () => on('tool.call', async (_: unknown, e: any) => {
@@ -2569,8 +2571,9 @@ test('a cold-send dialog opened while the Resume compacts and answered Cancel: t
   expect(seen.submits).toEqual([]) // not while the dialog is open
   release('Cancel')
   await sent
-  await clock.advance(3 * 60000)
+  await clock.advance(1000)
   expect({ submits: seen.submits, compacts: seen.compacts }).toEqual({ submits: ['Resume'], compacts: 1 })
+  expect(seen.toasts.filter((t) => /automatic one/.test(t))).toEqual([]) // nothing cancelled it
 })
 
 test('a wake-up on a cold big chat arriving while the Resume compacts cancels the Resume: only the wake-up goes', { options: { rotatorWakePattern: WAKE.options.rotatorWakePattern, autoResume: true } }, async ($, on) => {
@@ -2584,21 +2587,22 @@ test('a wake-up on a cold big chat arriving while the Resume compacts cancels th
   await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [{ kind: 'five_hour', percentUsed: 100, resetsAt: new Date(t0 + 90 * 60000).toISOString() }], changed: [] } as never)
   await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
   let n = 0
-  seen.duringCompact = async () => { if (++n === 1) { disk.files['.claude.json'] = account('b@x'); await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never) } } // the wake-up arrives while the Resume compacts
+  seen.duringCompact = async () => { if (++n === 1) { disk.files['.claude.json'] = account('b@x'); await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never); await clock.advance(1000) } } // the wake-up arrives while the Resume compacts, and its own send starts (50 ms on) while that compaction is still running
   await clock.advance(91 * 60000 + 1000)
   await clock.advance(5000)
   expect(seen.submits.filter((t) => t === 'Resume')).toEqual([])
   expect(seen.submits).toEqual([ROTATE]) // the wake-up's own compaction ended and it went
+  expect(seen.compacts).toBe(1) // it used the Resume's compaction
 })
 
-test('the cancel toast and the band show the pending Resume: it waits until 2 minutes after the cancel, even when a message was handed on', { options: { autoResume: true } }, async ($, on) => {
+test('the cancel toast and the band show the pending Resume when a real message was handed on: it waits until 2 minutes after the cancel unless that message\'s request starts', { options: { autoResume: true } }, async ($, on) => {
   const { clock, seen } = await resumeCompacting($, on)
   let n = 0
   seen.duringCompact = async () => { if (++n === 1) await $.prompt.submit({ text: 'hold on', origin: COMPOSER, wait: false } as never) } // a real message handed on to the chat, its request not started
   await clock.advance(91 * 60000 + 1000)
   await clock.advance(5000)
-  expect(seen.toasts.filter((t) => /so the automatic one waits until/.test(t)).length).toBe(1)
-  expect(seen.toasts.filter((t) => /was not sent/.test(t))).toEqual([])
+  expect(seen.toasts.filter((t) => /A message was sent meanwhile, so the automatic one waits until .* unless that message's request starts/.test(t)).length).toBe(1)
+  expect(seen.toasts.filter((t) => /was not sent|Something else/.test(t))).toEqual([])
   expect(await bandResume($)).toMatch(/^⏸ Resumes \d{1,2}:\d\d/)
   await mainStep($) // the message's request starts: nothing is pending
   expect(await bandResume($)).toBe(null)
@@ -2612,4 +2616,82 @@ test('the band shows no pending Resume once /clear replaced the chat the Resume 
   expect(await bandResume($)).toBe(null)
   await clock.advance(10 * 60000)
   expect(seen.submits).toEqual([])
+})
+
+test('a local built-in typed on a cold big chat while the Resume compacts gets no cold-send dialog: the Resume goes right after the compaction', { options: { autoResume: true } }, async ($, on) => {
+  let asked = 0
+  const { clock, seen } = await resumeCompacting($, on, () => on('tool.call', (_: unknown, e: any) => {
+    if (e.tool !== 'AskUserQuestion') return { result: {} }
+    asked++
+    const q = e.questions?.[0]?.question ?? ''
+    return { result: { questions: e.questions, answers: { [q]: 'Send anyway' } } }
+  }))
+  let n = 0
+  seen.duringCompact = async () => { if (++n === 1) await $.prompt.submit({ text: '/usage', command: { name: 'usage', args: '' }, origin: COMPOSER, wait: false } as never) }
+  await clock.advance(91 * 60000 + 1000)
+  await clock.advance(5000)
+  expect({ asked, submits: seen.submits, compacts: seen.compacts }).toEqual({ asked: 0, submits: ['Resume'], compacts: 1 })
+  expect(seen.toasts.filter((t) => /automatic one/.test(t))).toEqual([])
+})
+
+test('a wake-up is not cancelled by a cold-send dialog the person answers Cancel: its text goes after its compaction', { options: { rotatorWakePattern: WAKE.options.rotatorWakePattern } }, async ($, on) => {
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock, seen } = engine($, on, { label: 'A' }, undefined, undefined, disk)
+  let release: (label: string) => void = () => {}
+  const gate = new Promise<string>((r) => { release = r })
+  on('tool.call', async (_: unknown, e: any) => {
+    if (e.tool !== 'AskUserQuestion') return { result: {} }
+    seen.asks++
+    const label = await gate
+    const q = e.questions?.[0]?.question ?? ''
+    return { result: { questions: e.questions, answers: { [q]: label } } }
+  })
+  on('turn.step', async function* () { return { answer: '', toolUses: [], usage: { input_tokens: 10, cache_read_input_tokens: 300000, cache_creation_input_tokens: 0 } } })
+  await start($, 300000, clock)
+  await mainStep($)
+  let sent: Promise<unknown> | null = null
+  let n = 0
+  seen.duringCompact = async () => { if (++n === 1) sent = $.prompt.submit({ text: 'hold on', origin: COMPOSER, wait: false } as never) } // the person sends into the cold chat while the wake-up compacts
+  disk.files['.claude.json'] = account('b@x')
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  await clock.advance(1000)
+  expect({ asks: seen.asks, submits: seen.submits }).toEqual({ asks: 1, submits: [] }) // the dialog is open: the wake-up waits
+  release('Cancel')
+  await sent
+  await clock.advance(1000)
+  expect({ submits: seen.submits, compacts: seen.compacts }).toEqual({ submits: [ROTATE], compacts: 1 })
+  expect(seen.toasts.filter((t) => /was not sent|automatic one/.test(t))).toEqual([])
+})
+
+test('a wake-up arriving while the Resume compacts uses that compaction: one compaction, only the wake-up\'s text goes', { options: { rotatorWakePattern: WAKE.options.rotatorWakePattern, autoResume: true } }, async ($, on) => {
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock, seen } = engine($, on, { label: 'A' }, undefined, undefined, disk)
+  on('classic.StopFailure', () => ({}))
+  on('turn.step', async function* () { return { answer: '', toolUses: [], usage: { input_tokens: 10, cache_read_input_tokens: 300000, cache_creation_input_tokens: 0 } } })
+  await start($, 300000, clock)
+  const t0 = await clock.now()
+  await mainStep($)
+  await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [{ kind: 'five_hour', percentUsed: 100, resetsAt: new Date(t0 + 90 * 60000).toISOString() }], changed: [] } as never)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  let n = 0
+  seen.duringCompact = async () => { if (++n === 1) { disk.files['.claude.json'] = account('b@x'); await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never); await clock.advance(1000) } } // the wake-up's own send starts while the Resume's compaction is still running
+  await clock.advance(91 * 60000 + 1000)
+  await clock.advance(5000)
+  expect({ compacts: seen.compacts, submits: seen.submits }).toEqual({ compacts: 1, submits: [ROTATE] })
+})
+
+test('a Resume neither submit way could send is tried again 2 minutes on, and says so', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = engine($, on)
+  on('classic.StopFailure', () => ({}))
+  await start($, 50000, clock)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  seen.failSubmit = true
+  await clock.advance(60 * 60000 + 30000) // no reset time is known: the Resume falls due an hour on, and both ways are refused
+  expect(seen.toasts.filter((t) => /Could not send Resume\. Trying again at/.test(t)).length).toBe(1)
+  expect(seen.submits).toEqual([])
+  seen.failSubmit = false
+  await clock.advance(30000)
+  expect(seen.submits).toEqual([]) // still inside the 2 minutes
+  await clock.advance(100000)
+  expect(seen.submits).toEqual(['Resume'])
 })

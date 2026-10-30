@@ -433,7 +433,10 @@ const RESUME_FALLBACK = 60 * MIN // no reset time known: try once an hour, three
 let resumeTries = 0
 let staleArmedGen = -1 // the identityGen at which a failure of an earlier request was already given its free minute
 let resumeFromReadings = false // the pending resume rests on plan windows, not on the error's wording (nor, after dropReadings, on a re-arm); cleared wherever resumeAt is
-let submitsSeen = 0 // messages handed on to the chat so far (not dropped, not ours, not a local command), each cold-send dialog opened for the person, each wake-up that starts compacting and each /clear or resume, so an unattended send (rule B) can tell something was sent or chosen meanwhile
+let submitsSeen = 0 // messages handed on to the chat so far (not dropped, not ours, not a local command), each "Compact first" answer, each wake-up that starts compacting and each /clear or resume, so an unattended send (rule B) can tell something was sent or chosen meanwhile
+let dialogsOpen = 0 // cold-send dialogs open for the person: an unattended send that has compacted waits for them to close before it judges whether it was cancelled (Cancel lets it go; Send anyway or Compact first cancels it)
+let dialogsClosed = [] // resolvers of the sends waiting for dialogsOpen to reach 0
+let compacting = null // this mod's compaction in flight (a promise): a second send needing one waits for it and uses its result
 let sendsHeld = 0 // a cold-send dialog is open, any send handed on that is not this mod's own is going down the chain, or a compact-then-send is in flight: a due resume waits
 let wakePendingId = 0 // the wakeCount of a rotator wake-up that has arrived and whose own request has not started (0: none): a due resume waits and a drop of the readings does not re-arm it, as the wake-up's turn settles it. A wake-up lowers it only if it is still its own id, so an earlier one giving up cannot release a later one's hold
 let sendPending = new Map() // id -> deadline: a send handed on that is not this mod's own (and the person's own message this mod sends again after Compact first) whose request has not started: a due resume waits. A main-loop request, /clear or resuming another chat lowers all; the deadline (SEND_SAFETY after hand-over) covers a send that never starts a request
@@ -539,6 +542,10 @@ async function resumeStep($) {
       // try the plugin's own voice next
     }
   }
+  // neither way went: try again in 2 minutes (tries kept), so the Resume is not lost
+  S.resumeAt = now + CANCEL_REARM
+  $.ui.toast(`Could not send Resume. Trying again at ${resumeText(S.resumeAt, now)}.`, { timeoutMs: 8000 })
+  $.ui.invalidate('ui.render')
 }
 
 // wake: the id of the rotator wake-up this send is (0 for any other send)
@@ -558,16 +565,34 @@ function lowerWake(id) {
 async function runCompactThenSend($, msg, unattended, before, wake) {
   const cancelled = () => unattended && submitsSeen !== before.seen
   let compacted = false
+  let waited = false
+  while (compacting) { // our own compaction is already running: wait for it, and do not compact again if it succeeded
+    waited = true
+    await compacting.catch(() => {})
+  }
   try {
-    await $.command.run({ command: 'compact', args: '' })
-    markCompacted($)
-    compacted = true
+    if (waited && justCompacted) compacted = true
+    else {
+      const run = (async () => {
+        await $.command.run({ command: 'compact', args: '' })
+        markCompacted($)
+      })()
+      compacting = run
+      try {
+        await run
+        compacted = true
+      } finally {
+        if (compacting === run) compacting = null
+      }
+    }
   } catch (err) {
     // an automatic message about to be cancelled is not going as typed: say only the cancel
     if (!cancelled()) $.ui.toast('Could not compact (' + clip(String((err && err.message) || err), 80) + '), so the message goes as typed.', { timeoutMs: 8000 })
   }
+  // a cold-send dialog is open: what the person answers decides whether this one goes
+  while (unattended && dialogsOpen > 0) await new Promise((resolve) => dialogsClosed.push(resolve))
   if (cancelled()) {
-    // a message that reached the chat while compacting (another plugin's too), a cold-send dialog opened for the person's own (whatever they answer), a wake-up that starts compacting, or /clear or a resume, cancels an automatic one (a local command or a dropped send does not), and with it the wake-up's turn. A cancelled Resume is armed again when no request starts (resumeAt)
+    // a message that reached the chat while compacting (another plugin's too), "Send anyway" or "Compact first" on a cold-send dialog, a wake-up that starts compacting, or /clear or a resume, cancels an automatic one (a local command, a dropped send or Cancel does not), and with it the wake-up's turn. A cancelled Resume is armed again when no request starts (resumeAt)
     lowerWake(wake)
     // the Resume's send goes again 2 minutes on (resumeAt, shown in the band) unless another request starts or the chat is replaced. The time is read before the check: nothing that clears the re-arm can run between the check and the assignment
     const t = await $.clock.now()
@@ -576,7 +601,10 @@ async function runCompactThenSend($, msg, unattended, before, wake) {
       S.resumeAt = t + CANCEL_REARM
       $.ui.invalidate('ui.render')
     }
-    const text = rearm ? `Something else was sent or chosen meanwhile, so the automatic one waits until ${resumeText(S.resumeAt, t)}.` : realSends !== before.real ? 'A message was sent meanwhile, so the automatic one was not sent.' : 'Something else was sent or chosen meanwhile, so the automatic one was not sent.'
+    const handed = realSends !== before.real // a real message reached the chat
+    const text = rearm
+      ? handed ? `A message was sent meanwhile, so the automatic one waits until ${resumeText(S.resumeAt, t)} unless that message's request starts.` : `Something else was sent or chosen meanwhile, so the automatic one waits until ${resumeText(S.resumeAt, t)}.`
+      : handed ? 'A message was sent meanwhile, so the automatic one was not sent.' : 'Something else was sent or chosen meanwhile, so the automatic one was not sent.'
     $.ui.toast((compacted ? 'Compacted. ' : '') + text, { timeoutMs: 8000 })
     return
   }
@@ -1398,7 +1426,7 @@ export function register(on, options = {}) {
         } else sendPending.delete(pendingId) // dropped or failed: no request follows
       }
     }
-    if (!settings.guard || !fromUser || !isCold || local || justCompacted || S.ctx < settings.bigTokens || e.turnId) return through()
+    if (!settings.guard || !fromUser || !isCold || local || isLocalBuiltin(e.command) || justCompacted || S.ctx < settings.bigTokens || e.turnId) return through()
     // an attachment's handle lives only while this submit is in flight: a resend after compacting would drop it
     const media = Array.isArray(e.attachments) && e.attachments.length > 0
     if (wake) {
@@ -1410,7 +1438,7 @@ export function register(on, options = {}) {
     const why = rotated ? `The account rotated to ${mask(S.seat || S.account) || 'another seat'}${rotatedAgo()}, so the cache is cold.` : `Cache went cold ${minutes(-left)} ago.`
     const floor = S.floor ? ` Compacting last left ${tokens(S.floor)}.` : ''
     sendsHeld++ // the dialog is open: a due resume waits, until the send is handed on or given up
-    submitsSeen++ // the person is sending something, whatever they answer: an unattended send still compacting (the Resume) must not go next to it
+    dialogsOpen++ // an unattended send that has compacted waits for the answer
     try {
       let answer = 'Send anyway'
       try {
@@ -1424,6 +1452,7 @@ export function register(on, options = {}) {
       }
       // $.session.compact() is refused on SDK hosts (the desktop app), so this queues /compact. It takes its own hold, until it has sent or given up
       if (answer === 'Compact first, then send') {
+        submitsSeen++ // the person's own message goes next: an unattended send still compacting (the Resume) must not go beside it
         return compactThenSend($, e, false)
       }
       if (answer === 'Send anyway') return await through()
@@ -1431,6 +1460,7 @@ export function register(on, options = {}) {
       return { drop: 'Cancelled by cache-keeper before a cold cache rewrite' }
     } finally {
       sendsHeld--
+      if (--dialogsOpen === 0) for (const resolve of dialogsClosed.splice(0)) resolve() // lowered after a Send anyway has been handed on (through counted it)
     }
   })
 
