@@ -1875,3 +1875,44 @@ test('a resume re-armed by a late seat waits while the account is still unknown:
   await clock.advance(3 * 60 * 60000)
   expect(seen.submits).toEqual(['Resume'])
 })
+
+test('a usage failure of a request that started before an account change arms a resume for a minute from now and spends no try', RESUME_WAKE, async ($, on) => {
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock, seen } = engine($, on, { label: 'A' }, undefined, undefined, disk)
+  on('classic.StopFailure', () => ({}))
+  let release: () => void = () => {}
+  let gate = new Promise<void>((r) => (release = r))
+  on('turn.step', async function* () {
+    await gate
+    return { answer: '', toolUses: [], usage: null }
+  })
+  await start($, 50000, clock)
+  const step = async () => {
+    const it = ($ as any).turn.step({ model: 'claude-opus-5-5', messages: [] })
+    if (it && typeof it[Symbol.asyncIterator] === 'function') for await (const _ of it) void _
+    else await it
+  }
+  const old = step()
+  await clock.advance(10) // the request is out on a@x
+  disk.files['.claude.json'] = account('b@x')
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never) // the account moves while it runs
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" }) // a@x's cap, from the old request
+  release()
+  await old
+  expect(seen.toasts.filter((t) => /resumes on its own/.test(t)).length).toBe(1)
+  await clock.advance(30000)
+  expect(seen.submits).toEqual([])
+  await clock.advance(70000) // a minute and a tick on: not hours
+  expect(seen.submits).toEqual(['Resume'])
+  // no try was spent: the full three fallback tries remain, and only the fourth gives up
+  gate = Promise.resolve()
+  for (let i = 0; i < 3; i++) {
+    await step() // a request that starts on b@x
+    await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+    await clock.advance(61 * 60000)
+    expect(seen.submits.length).toBe(2 + i)
+  }
+  await step()
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  expect(seen.toasts.some((t) => /Auto-resume gave up/.test(t))).toBe(true)
+})

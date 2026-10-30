@@ -430,6 +430,7 @@ const THROTTLE = /rate[ _-]?limit/i // "rate limit reached" is a short throttle,
 const USAGE_MARKER = /usage limit|hit your limit|out of (extra )?usage|5-hour|weekly/i // a throttle's wording beside one of these is still spent usage
 const RESUME_FALLBACK = 60 * MIN // no reset time known: try once an hour, three times at most
 let resumeTries = 0
+let staleArmedGen = -1 // the identityGen at which a failure of an earlier request was already given its free minute
 let resumeFromReadings = false // the armed resume rests on plan windows, not on the error's wording (nor, after dropReadings, on a re-arm)
 let submitsSeen = 0 // prompt.submit hooks so far, so an unattended send can tell the person sent something meanwhile
 
@@ -459,6 +460,16 @@ function armResume($, details) {
   const full = spentWindows(limits, unsure ? null : S.fable, S.model)
   const text = String(details || '')
   if (!full.length && !(USAGE_SPENT.test(text) && (!THROTTLE.test(text) || USAGE_MARKER.test(text)))) return // not usage exhaustion
+  // A request that started before an account change failed on the old account's usage: the new one is tried a minute from now, no try spent.
+  // Once per change, so a failure that reports no request start cannot loop.
+  if (requestGen !== identityGen && staleArmedGen !== identityGen) {
+    staleArmedGen = identityGen
+    S.resumeAt = now + MIN
+    resumeFromReadings = false // it rests on no reading
+    $.ui.toast(`Out of usage. This chat resumes on its own at ${resumeText(S.resumeAt, now)}.`, { timeoutMs: 15000 })
+    $.ui.invalidate('ui.render')
+    return
+  }
   const at = resumeTime(full, now)
   if (!at && resumeTries >= 3) {
     $.ui.toast('Auto-resume gave up: no reset time is known. Send a message once usage renews.', { timeoutMs: 15000 })
