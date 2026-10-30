@@ -411,7 +411,7 @@ function dropReadings() {
   S.fable = null
   S.planWindows = []
   planNext = 0
-  if (resumeFromReadings) {
+  if (resumeFromReadings && S.resumeAt) { // only a resume still pending: one settled, fired or cleared stays so
     S.resumeAt = now + MIN
     resumeFromReadings = false
   }
@@ -474,7 +474,14 @@ function armResume($, details) {
 // From the heartbeat tick: send "Resume" once its time has come, as the person's own word
 async function resumeStep($) {
   if (!S.resumeAt || now < S.resumeAt || S.working) return
+  // the account is not known yet: the send waits for it or for the window to close, without spending a try or compacting
+  if (keyUnsure()) {
+    S.resumeAt = wakeWindowEnd
+    $.ui.invalidate('ui.render')
+    return
+  }
   S.resumeAt = 0
+  resumeFromReadings = false
   $.ui.invalidate('ui.render')
   if (worthCompacting()) {
     compactThenSend($, { text: 'Resume' }, true)
@@ -1215,6 +1222,7 @@ export function register(on, options = {}) {
     S.coldRestarts = [] // a resumed chat's own come back with its seed
     // a resume armed in the last chat must not fire into this one
     S.resumeAt = 0
+    resumeFromReadings = false
     resumeTries = 0
     $.ui.invalidate('ui.render')
     try {
@@ -1249,6 +1257,7 @@ export function register(on, options = {}) {
     now = await $.clock.now()
     if (!(e.command && e.command.name === 'compact')) submitsSeen++ // our own compaction is not the person
     // anything sent to the chat (the person, a rotator's wake-up, our own "Resume") settles a pending resume
+    resumeFromReadings = false // settled: a later account change must not bring it back
     if (S.resumeAt) {
       S.resumeAt = 0
       $.ui.invalidate('ui.render')

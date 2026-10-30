@@ -1789,3 +1789,89 @@ test('a seat that appears at the wake-up, where the session had none, drops the 
   expect(b.fable ?? null).toBe(null)
   expect((kept.get('hb:sid-test') as any).rateLimits).toEqual([])
 })
+
+test('the wake-up is itself the resume: a resume armed before it is settled, and the account change it shows does not arm another', RESUME_WAKE, async ($, on) => {
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock, seen } = engine($, on, { label: 'A' }, undefined, undefined, disk)
+  on('classic.StopFailure', () => ({}))
+  await start($, 50000, clock)
+  const t0 = await clock.now()
+  await $.session.measure({ context: { tokens: 50000, window: 1000000, percent: 5 }, rateLimits: fiveFull(t0), changed: [] } as never)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  disk.files['.claude.json'] = account('b@x')
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never) // the wake-up is itself the resume
+  await clock.advance(5 * 60000)
+  expect(seen.submits).toEqual([])
+})
+
+test('a resume the person settled by sending is not revived by a later account change', RESUME_WAKE, async ($, on) => {
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock, seen } = engine($, on, { label: 'A' }, undefined, undefined, disk)
+  on('classic.StopFailure', () => ({}))
+  await start($, 50000, clock)
+  const t0 = await clock.now()
+  await $.session.measure({ context: { tokens: 50000, window: 1000000, percent: 5 }, rateLimits: fiveFull(t0), changed: [] } as never)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  await $.prompt.submit({ text: 'never mind', origin: COMPOSER, wait: false } as never) // settles it
+  await clock.advance(10 * 60000)
+  disk.files['.claude.json'] = account('b@x')
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  await clock.advance(5 * 60000)
+  expect(seen.submits).toEqual([])
+})
+
+test('a resume armed in the last chat does not come back into the cleared one on a later account change', RESUME_WAKE, async ($, on) => {
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock, seen } = engine($, on, { label: 'A' }, undefined, undefined, disk)
+  on('classic.StopFailure', () => ({}))
+  on('classic.SessionStart', () => ({}))
+  await start($, 50000, clock)
+  const t0 = await clock.now()
+  await $.session.measure({ context: { tokens: 50000, window: 1000000, percent: 5 }, rateLimits: fiveFull(t0), changed: [] } as never)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  await ($ as any).classic.SessionStart({ source: 'clear' })
+  await clock.advance(60000)
+  disk.files['.claude.json'] = account('b@x')
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  await clock.advance(5 * 60000)
+  expect(seen.submits).toEqual([])
+})
+
+test('a resume that already fired is not sent again by a later account change', RESUME_WAKE, async ($, on) => {
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock, seen } = engine($, on, { label: 'A' }, undefined, undefined, disk)
+  on('classic.StopFailure', () => ({}))
+  await start($, 50000, clock)
+  const t0 = await clock.now()
+  await $.session.measure({ context: { tokens: 50000, window: 1000000, percent: 5 }, rateLimits: fiveFull(t0), changed: [] } as never)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  await clock.advance(2 * 60 * 60000 + 2 * 60000)
+  expect(seen.submits).toEqual(['Resume'])
+  disk.files['.claude.json'] = account('b@x')
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  await clock.advance(5 * 60000)
+  expect(seen.submits).toEqual(['Resume'])
+})
+
+test('a resume re-armed by a late seat waits while the account is still unknown: nothing is sent until it is adopted or the window closes, then once', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x'), '.active': 'A' } }
+  const { clock, seen } = engine($, on, { label: 'A' }, undefined, undefined, disk)
+  on('classic.StopFailure', () => ({}))
+  await start($, 300000, clock)
+  const t0 = await clock.now()
+  await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: fiveFull(t0), changed: [] } as never)
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never) // nothing on disk changed: seat and account unknown
+  await clock.advance(100) // the wake-up's own compaction and send
+  await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: fiveFull(t0), changed: [] } as never)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" }) // armed from the old windows
+  seen.submits.length = 0
+  seen.compacts = 0
+  disk.files['.active'] = 'B'
+  await clock.advance(30000) // the seat is adopted: the resume moves to a minute from now, the account still unknown
+  await clock.advance(80000)
+  expect({ compacts: seen.compacts, submits: seen.submits }).toEqual({ compacts: 0, submits: [] })
+  await clock.advance(90000) // the window has closed
+  expect(seen.submits).toEqual(['Resume'])
+  await clock.advance(3 * 60 * 60000)
+  expect(seen.submits).toEqual(['Resume'])
+})
