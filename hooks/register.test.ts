@@ -223,12 +223,20 @@ test('a reopened chat borrows plan windows from the freshest session on the same
   ]
   expect(borrowedLimits(list, { seat: 'A', desktop: false }, at)[0].percentUsed).toBe(44)
   expect(borrowedLimits(list, { seat: '', desktop: true }, at)).toEqual([]) // an unseated session does not borrow a seated one's
-  expect(borrowedLimits([{ seat: 'A', updatedAt: at, rateLimits: five(80, '2026-10-29T09:00:00Z') }], { seat: 'A', desktop: false }, at)).toEqual([])
+  expect(borrowedLimits([{ seat: 'A', desktop: false, updatedAt: at, rateLimits: five(80, '2026-10-29T09:00:00Z') }], { seat: 'A', desktop: false }, at)).toEqual([])
   // a seated and an unseated session on one surface are not known to share an account
   const mixed = [{ seat: '', desktop: true, updatedAt: at, rateLimits: five(70, '2026-10-29T12:00:00Z') }, { seat: 'B', desktop: true, updatedAt: at, rateLimits: five(90, '2026-10-29T12:00:00Z') }]
   expect(borrowedLimits(mixed, { seat: 'A', desktop: true }, at)).toEqual([])
   expect(borrowedLimits(mixed.slice(1), { seat: '', desktop: true }, at)).toEqual([])
   expect(borrowedLimits(mixed, { seat: '', desktop: true }, at)[0].percentUsed).toBe(70)
+  // the terminal's and the app's rotators name seats alone: the same name on another surface is not the same account
+  const surfaces = [{ seat: 'A', desktop: true, updatedAt: at, rateLimits: five(60, '2026-10-29T12:00:00Z') }]
+  expect(borrowedLimits(surfaces, { seat: 'A', desktop: false }, at)).toEqual([])
+  expect(borrowedLimits(surfaces, { seat: 'A', desktop: true }, at)[0].percentUsed).toBe(60)
+  // an API-key session's windows are not an account's
+  const keyed = [{ seat: '', desktop: false, signedIn: false, updatedAt: at, rateLimits: five(30, '2026-10-29T12:00:00Z') }]
+  expect(borrowedLimits(keyed, { seat: '', desktop: false }, at)).toEqual([])
+  expect(borrowedLimits([{ ...keyed[0], signedIn: true }], { seat: '', desktop: false }, at)[0].percentUsed).toBe(30)
 })
 
 test('auto-resume waits for the last full window to reset, and only for usage', async () => {

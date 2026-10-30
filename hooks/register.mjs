@@ -497,6 +497,7 @@ function myHeartbeat() {
     lastTurnEnd: S.lastTurnEnd,
     seat: S.seat,
     desktop: !onTerminal,
+    signedIn, // an API-key session's windows are not an account's: others must not borrow them
     rateLimits: S.rateLimits, // the engine's own reading, which a reopened chat borrows
     updatedAt: now,
   }
@@ -509,10 +510,10 @@ export function stillOpen(limits, at) {
 }
 
 export function borrowedLimits(list, self, at) {
-  // a seat on either side must match: a seated and an unseated session are not known to share an account
-  const same = (hb) => (self.seat || hb.seat ? hb.seat === self.seat : hb.desktop === self.desktop)
+  // a seat on either side must match, on the same surface (each rotator names its seats alone): a seated and an unseated session are not known to share an account
+  const same = (hb) => (self.seat || hb.seat ? hb.seat === self.seat && hb.desktop === self.desktop : hb.desktop === self.desktop)
   const best = list
-    .filter((hb) => !hb.self && Array.isArray(hb.rateLimits) && hb.rateLimits.length && same(hb))
+    .filter((hb) => !hb.self && hb.signedIn !== false && Array.isArray(hb.rateLimits) && hb.rateLimits.length && same(hb))
     .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))[0]
   if (!best) return []
   return stillOpen(best.rateLimits, at)
