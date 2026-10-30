@@ -297,10 +297,16 @@ function markCompacted($, seq = 0) {
   }
   justCompacted = true
   compactDeclined = false
-  if (abandoned && !(seq && abandoned.seq > seq)) abandoned = null // a compaction that succeeded, ours or the person's, makes an earlier hung one moot, not one that started after it (seq: the succeeding run's number, 0 for an engine mark)
+  if (abandoned && !(seq ? abandoned.seq > seq : olderRunOut(abandoned.seq))) abandoned = null // a compaction that succeeded, ours or the person's, makes an earlier hung one moot, not one that started after it (seq: the succeeding run's number; 0 for an engine mark, which can't say whose end it is: while an older run of ours is still out it is probably that one's)
   rotatedPending = false // the rotation is now part of compactedCold
   S.lastActivity = 0
   rememberCompacted($)
+}
+
+// Whether one of this mod's /compact runs that started before run `seq` is still out: an engine compaction mark arriving now may be its end, which says nothing about the newer run
+function olderRunOut(seq) {
+  for (const r of liveRuns) if (r.seq < seq) return true
+  return false
 }
 
 // Where the request ran, kept with the chat's record: the seat (a seat name belongs to one
@@ -443,8 +449,9 @@ let dialogCancels = 0 // cold-send dialogs the person answered Cancel so far: an
 let compactDeclined = false // a Resume's failed compaction behind a Cancel was armed again: if the next one fails too it is not sent uncompacted. Cleared by a main-loop request, /clear, a resume or fork, a new arm and a successful compaction
 let compacting = null // { run, gen }: this mod's compaction in flight (run settles at COMPACT_LIMIT at worst), started in chat gen: a second send in that chat needing one waits for it, with no timer of its own, and uses its result (if it is abandoned instead, that send goes back in the prompt box: see abandoned). A send in a replaced chat's successor does not wait for it
 let compactSeq = 0 // numbers this mod's /compact runs in the order they start
-const liveRuns = new Set() // { gen, seq } of this mod's /compact runs not settled yet, abandoned ones too: one started in a chat since replaced makes the engine's compaction marks untrustworthy (see staleRunOut)
-let abandoned = null // { done, at, batch, seq }: the /compact call still out after COMPACT_LIMIT. No send starts another until it settles (its end clears this), a compaction that started before it succeeds (the person's own too), the chat is replaced, or a second COMPACT_LIMIT has passed. A Resume is tried again, the person's and a wake-up's message go back in the prompt box
+const RUN_END_GRACE = 5000
+const liveRuns = new Set() // { gen, seq, at } of this mod's /compact runs not settled yet (and for RUN_END_GRACE after), abandoned ones too: an engine compaction mark may be one's end, which says nothing about a replaced chat (see staleRunOut) nor about a newer abandoned run (see olderRunOut)
+let abandoned = null // { done, at, batch, seq }: the /compact call still out after COMPACT_LIMIT. No send starts another until it settles (its end clears this), a compaction that started before it succeeds (the person's own too, but an engine compaction mark does not count while an older run of ours is still out, as it may be that run's end), the chat is replaced, or a second COMPACT_LIMIT has passed. A Resume is tried again, the person's and a wake-up's message go back in the prompt box
 let putBackPending = null // { real, steps, text, at, slash }: a message was put back in the prompt box (text, as filled) and not sent yet. A due Resume waits while realSends and stepsSeen are as they were then, for COMPACT_LIMIT at most; a later put-back keeps text in front of its own while it holds; cleared by /clear, a resume or a fork. Not set for a local command (sent again it never reaches the chat) nor for a fill that failed
 let fillChain = Promise.resolve() // put-back fills run one after another: each reads what the last left in the box
 let tryCause = '' // why the most recent Resume try failed: 'refused' (neither submit way took it) or 'compaction' (still out, or not finished), named in the give-up toast
@@ -725,7 +732,7 @@ async function runCompactThenSend($, msg, unattended, before, wake) {
       const run = (async () => {
         liveRuns.add(live)
         const done = $.command.run({ command: 'compact', args: '' })
-        const ended = () => liveRuns.delete(live)
+        const ended = () => $.clock.after(RUN_END_GRACE, () => liveRuns.delete(live)) // kept a few seconds past its end: the engine's compaction marks for it may arrive just after
         done.then(ended, ended)
         const late = new Promise((resolve) => $.clock.after(COMPACT_LIMIT, () => resolve(true)))
         if (await Promise.race([done.then(() => false), late])) {
@@ -1784,7 +1791,8 @@ export function register(on, options = {}) {
 
   // A compaction arrives by several roads (typed /compact, auto-compact, a plugin,
   // the desktop host running it inside a turn); each one marks it
-  // While one of this mod's /compact runs from a replaced chat is still out, the marks are ignored: they may be its late end, not this chat's compaction (the person's own /compact then goes unmarked until it ends)
+  // While one of this mod's /compact runs from a replaced chat is still out, the marks are ignored: they may be its late end, not this chat's compaction (the person's own /compact then goes unmarked until it ends).
+  // While a run older than the abandoned one is out (or just ended), a mark does not forget the abandonment, as it may be that run's end; the chat is still marked compacted
   on('session.compact', async ($, e, next) => {
     now = await $.clock.now()
     const r = await next(e)

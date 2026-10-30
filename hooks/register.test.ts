@@ -3702,3 +3702,28 @@ async function bandText($: any, re: RegExp) {
   const seg: any = await ui.find({ type: 'Text', text: re })
   return seg ? String(seg.text).trim() : null
 }
+
+// ===== review round 27: engine marks, the box text, a replaced chat =====
+test('the engine\'s compaction marks for an older run\'s end do not forget a newer abandoned compaction: the next send starts none beside it', SETUP, async ($, on) => {
+  const log = askLog(on)
+  const { clock, seen } = await coldChat($, on, () => (on('classic.SessionStart', () => ({})), on('classic.PostCompact', () => ({}))))
+  let finishA: () => void = () => {}
+  let n = 0
+  seen.duringCompact = () => (++n === 1 ? new Promise<void>((r) => { finishA = r }) : n === 2 ? new Promise(() => {}) : Promise.resolve())
+  await send($, 'one')
+  await clock.advance(15 * 60000 + 1000) // A abandoned
+  await clock.advance(16 * 60000) // and forgotten, 15 minutes on
+  await send($, 'two') // compacts again: B
+  await clock.advance(15 * 60000 + 1000) // B abandoned
+  expect(seen.compacts).toBe(2)
+  finishA()
+  await ($ as any).classic.PostCompact({}) // the engine reports A's end
+  await ($ as any).classic.SessionStart({ source: 'compact' })
+  await clock.advance(1000)
+  await mainStep($) // a request: the chat is not just-compacted any more
+  await send($, WAKE_TEXT) // the rotation makes the chat cold again
+  await send($, 'three') // the dialog: B is still out
+  await clock.advance(1000)
+  expect(log.asked[log.asked.length - 1].labels).toEqual(['Send anyway', 'Cancel'])
+  expect(seen.compacts).toBe(2)
+})
