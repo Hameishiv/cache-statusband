@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { capFirst, formatAge, formatDuration, formatUsageLines } from "../src/format.mjs";
+import { capFirst, formatAge, formatDuration, formatUsageLines, plainSpaces } from "../src/format.mjs";
 import { displayIdentity, usagePresentation } from "../src/settings.mjs";
 import {
   fetchRateLimitsViaAppServer,
@@ -188,6 +188,10 @@ test("prints every supplied expiry as an absolute local date in detailed output"
   assert.equal(compact.length, 1);
   assert.match(detailed[1], /^  First reset — expires Oct 29, 2026, 8:22 PM UTC \(in 8h22m\)$/);
   assert.match(detailed[2], /^  Later reset — expires Oct 31, 2026, 12:00 PM UTC \(in 2d0h\)$/);
+});
+
+test("narrow and no-break spaces in a formatted time become plain spaces", () => {
+  assert.equal(plainSpaces("8:22\u202fPM\u00a0UTC"), "8:22 PM UTC");
 });
 
 test("formats usage windows and ages without reset prose", () => {

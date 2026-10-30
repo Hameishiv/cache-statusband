@@ -327,6 +327,7 @@ function worthCompacting() {
 // Auto-resume: a turn cut short by an exhausted plan window gets "Resume" once it renews.
 // Only usage exhaustion: a short throttle, an overload or any other error is left alone.
 const USAGE_SPENT = /usage limit|limit reached|hit your limit|out of (extra )?usage|limit will reset|resets? (at|in)\b/i
+const THROTTLE = /rate[ _-]?limit/i // "rate limit reached" is a short throttle, not spent usage
 const RESUME_FALLBACK = 60 * MIN // no reset time known: try once an hour, three times at most
 let resumeTries = 0
 
@@ -353,7 +354,8 @@ function armResume($, details) {
   if (!limits.length && signedIn !== false) limits = borrowedLimits(fleet, { seat: S.seat, desktop: !onTerminal }, now)
   if (!limits.length) limits = stillOpen(S.planWindows, now)
   const full = spentWindows(limits, S.fable, S.model)
-  if (!full.length && !USAGE_SPENT.test(String(details || ''))) return // not usage exhaustion
+  const text = String(details || '')
+  if (!full.length && !(USAGE_SPENT.test(text) && !THROTTLE.test(text))) return // not usage exhaustion
   const at = resumeTime(full, now)
   if (!at && resumeTries >= 3) {
     $.ui.toast('Auto-resume gave up: no reset time is known. Send a message once usage renews.', { timeoutMs: 15000 })

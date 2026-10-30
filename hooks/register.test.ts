@@ -253,6 +253,21 @@ test('a chat cut short by spent usage sends "Resume" once the window renews; a t
   expect(seen.submits).toEqual(['Resume'])
 })
 
+test('"rate limit reached" is a throttle and arms no resume; "5-hour limit reached" and "Weekly limit reached" do', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = engine($, on)
+  on('classic.StopFailure', () => ({}))
+  await start($, 50000, clock)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: 'Rate limit reached' })
+  await clock.advance(70 * 60000)
+  expect(seen.submits).toEqual([])
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: '5-hour limit reached' })
+  await clock.advance(70 * 60000)
+  expect(seen.submits).toEqual(['Resume'])
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: 'Weekly limit reached' })
+  await clock.advance(70 * 60000)
+  expect(seen.submits).toEqual(['Resume', 'Resume'])
+})
+
 test('a short throttle or an overload arms no resume', { options: { autoResume: true } }, async ($, on) => {
   const { clock, seen } = engine($, on)
   on('classic.StopFailure', () => ({}))

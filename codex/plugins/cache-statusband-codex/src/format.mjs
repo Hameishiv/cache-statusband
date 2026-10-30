@@ -79,6 +79,11 @@ export function capFirst(text) {
   return value.replace(/^([^\p{L}\p{N}]*)(\p{Ll})/u, (_, lead, letter) => lead + letter.toUpperCase());
 }
 
+// Node 20's ICU puts U+202F before AM/PM, later versions a plain space: use a plain one everywhere
+export function plainSpaces(text) {
+  return String(text).replace(/[\u202f\u00a0]/g, " ");
+}
+
 export function formatLocalDate(value, { locale, timeZone } = {}) {
   const options = {
     year: "numeric",
@@ -89,7 +94,7 @@ export function formatLocalDate(value, { locale, timeZone } = {}) {
     timeZoneName: "short",
   };
   if (timeZone) options.timeZone = timeZone;
-  return new Intl.DateTimeFormat(locale, options).format(new Date(value));
+  return plainSpaces(new Intl.DateTimeFormat(locale, options).format(new Date(value)));
 }
 
 export function formatDuration(milliseconds) {

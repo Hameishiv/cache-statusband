@@ -132,10 +132,8 @@ function Assert-CodexConfig {
     }
   } finally {
     $env:CODEX_HOME = $previousCodexHome
-    if (Test-Path -LiteralPath $validationHome) {
-      $resolved = (Resolve-Path -LiteralPath $validationHome).Path
-      if ($resolved -eq $validationHome) { [IO.Directory]::Delete($resolved, $true) }
-    }
+    # a GUID folder this function made: always delete it, it holds a copy of the user's config.
+    if (Test-Path -LiteralPath $validationHome) { Remove-Item -LiteralPath $validationHome -Recurse -Force }
   }
 }
 
