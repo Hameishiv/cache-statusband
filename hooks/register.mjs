@@ -435,9 +435,9 @@ let sendFailures = 0 // Resume submits refused both ways in a row; cleared by a 
 let staleArmedGen = -1 // the identityGen at which a failure of an earlier request was already given its free minute
 let resumeFromReadings = false // the pending resume rests on plan windows, not on the error's wording (nor, after dropReadings, on a re-arm); cleared wherever resumeAt is
 let submitsSeen = 0 // messages handed on to the chat so far (not dropped, not ours, not a local command), each "Compact first" answer, each wake-up that starts compacting and each /clear or resume, so an unattended send (rule B) can tell something was sent or chosen meanwhile
-let dialogsOpen = 0 // cold-send dialogs open for the person: an unattended send that has compacted waits for them to close before it judges whether it was cancelled (Cancel lets it go; Send anyway or Compact first cancels it)
+let dialogsOpen = 0 // cold-send dialogs open for the person: an unattended send that has compacted waits for them to close before it judges whether it was cancelled (Cancel lets it go, except a Resume whose own compaction failed, which is armed again; Send anyway or Compact first cancels it)
 let dialogsClosed = [] // resolvers of the sends waiting for dialogsOpen to reach 0
-let compacting = null // this mod's compaction in flight (a promise): a second send needing one waits for it and uses its result
+let compacting = null // this mod's compaction in flight (a promise): a second send needing one waits for it (at most SEND_SAFETY, so a hung one holds nothing for good) and uses its result
 let sendsHeld = 0 // a cold-send dialog is open, any send handed on that is not this mod's own is going down the chain, or a compact-then-send is in flight: a due resume waits
 let wakePendingId = 0 // the wakeCount of a rotator wake-up that has arrived and whose own request has not started (0: none): a due resume waits and a drop of the readings does not re-arm it, as the wake-up's turn settles it. A wake-up lowers it only if it is still its own id, so an earlier one giving up cannot release a later one's hold
 let sendPending = new Map() // id -> deadline: a send handed on that is not this mod's own (and the person's own message this mod sends again after Compact first) whose request has not started: a due resume waits. A main-loop request, /clear or resuming another chat lowers all; the deadline (SEND_SAFETY after hand-over) covers a send that never starts a request
@@ -445,7 +445,7 @@ let sendPendingId = 0
 let stepsSeen = 0 // main-loop requests started so far
 let realSends = 0 // messages handed on to the chat (submitsSeen without "Compact first" answers, wake-ups and /clear)
 let chatGen = 0 // bumped when the chat is replaced (/clear, resuming another chat)
-const CANCEL_REARM = 2 * MIN // a cancelled Resume with no request started since is armed again this long after the cancel (tries kept)
+const CANCEL_REARM = 2 * MIN // a cancelled Resume with no request started since, a Resume neither submit way could send, and one whose compaction failed behind a cancelled dialog are armed again this long after (tries kept)
 const SEND_SAFETY = 2 * MIN
 let resumeHeld = false // the due resume is waiting for the seat and account to be known: it goes once they are, or at the window's end
 // Built-in commands that run locally: they neither settle a pending resume nor cancel an unattended send.
@@ -537,7 +537,7 @@ async function resumeStep($) {
   resumeHeld = false
   resumeFromReadings = false
   $.ui.invalidate('ui.render')
-  if (worthCompacting() && !justCompacted) { // not again after a compaction cancelled this one's send: the chat is already short
+  if (worthCompacting() && !justCompacted) { // not again after a compaction that is already done (a cancelled send's, or the Resume's own): the chat is already short
     compactThenSend($, { text: 'Resume' }, true)
     return
   }
