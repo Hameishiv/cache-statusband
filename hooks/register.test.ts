@@ -463,6 +463,26 @@ test('a rotation does not leave the band cold once the chat is cleared', SETUP, 
   expect(r.text).not.toMatch(/account rotated/)
 })
 
+test('a chat resumed after a rotation, last answered on the old account, is cold and asks once', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const seat = { label: 'A' }
+  const { clock, seen } = engine($, on, seat, kept)
+  answer(on, seen, 'Send anyway')
+  on('classic.SessionStart', () => ({}))
+  await clock.advance(30 * 60000)
+  await start($, 100000, clock)
+  seat.label = 'B'
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never) // the rotation reaches this small chat
+  await clock.advance(60000)
+  // the resumed chat's last request: 20 minutes ago, before the rotation, so on account A
+  kept.set('last:sid-test', { ctx: 300000, at: (await clock.now()) - 20 * 60000, model: 'claude-opus-5-5' })
+  await ($ as any).classic.SessionStart({ source: 'resume' })
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/account rotated/)
+  await $.prompt.submit({ text: 'carry on', origin: COMPOSER, wait: false } as never)
+  expect(seen.asks).toBe(1)
+})
+
 test('a compaction is kept for a reopened chat as a record with an `at` of 0', async ($, on) => {
   const kept = new Map<string, unknown>()
   const { clock } = engine($, on, { label: 'A' }, kept)

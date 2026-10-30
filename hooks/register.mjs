@@ -1002,14 +1002,14 @@ export function register(on, options = {}) {
   // on under a new session id, and no session.start fires for it.
   on('classic.SessionStart', { source: ['clear', 'resume', 'fork'] }, async ($, e, next) => {
     S.lastActivity = 0
-    rotatedPending = false // the new chat starts from an unknown cache, not a rotated one
+    rotatedPending = false // a cleared chat starts afresh; a resumed or forked one is judged below, once seeded
     S.keepWarm = false
     H.armed = false
     // the last chat's compaction says nothing about this one, and would mute its cold-send guard
     justCompacted = false
     compactedCold = false
     S.floor = 0
-    S.ctx = 0 // the last chat's size; the new chat's own is seeded below
+    S.ctx = 0 // the last chat's size; a resumed or forked chat's own is seeded below (a cleared one starts at 0)
     S.coldRestarts = [] // the new chat's own, from its record below
     // a resume armed in the last chat must not fire into this one
     S.resumeAt = 0
@@ -1021,7 +1021,11 @@ export function register(on, options = {}) {
       // keep the old id
     }
     S.label = basename(S.cwd)
-    if (e.source === 'resume') await seedFromTranscript($, e.transcript_path)
+    if (e.source === 'resume' || e.source === 'fork') {
+      await seedFromTranscript($, e.transcript_path)
+      // a seeded last request older than the rotation ran on the other account: this seat's cache is cold
+      rotatedPending = S.seatChangedAt > 0 && S.lastActivity > 0 && S.seatChangedAt > S.lastActivity
+    }
     return next(e)
   })
 
