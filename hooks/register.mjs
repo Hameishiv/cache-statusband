@@ -911,7 +911,11 @@ async function tick($) {
       // a store lock held by another session: the settings stay as they were
     }
     await readRecording($)
-    await applyRemoteCommands($)
+    try {
+      await applyRemoteCommands($)
+    } catch {
+      // a bad command record must not skip the keep-warm, heartbeat and fleet reads
+    }
     await keepWarmStep($)
     await heartbeat($, true)
     await readFleet($)
@@ -941,7 +945,7 @@ function statusText() {
   lines.push(S.fable ? `Fable weekly: ${Math.round(S.fable.percentUsed)}% used.` : `Fable weekly: no reading yet${planWhy && planWhy !== 'ok' ? ` (last check: ${planWhy})` : ''}.`)
   lines.push(`Session cost so far: ${money(S.costUsd)}. Cold restarts this session: ${S.coldRestarts.length} (${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))}).`)
   lines.push(`Cold-send guard: ${settings.guard ? 'on' : 'off'} for contexts over ${tokens(settings.bigTokens)} tokens. Alerts: ${settings.alerts ? 'on' : 'off'}.`)
-  lines.push(`Auto keep warm: ${settings.autoWarmHours ? `on, until ${settings.autoWarmHours}h after the last turn, for contexts over ${tokens(settings.bigTokens)}${S.autoWarm ? '' : ' (off in this session)'}` : 'off'}.`)
+  lines.push(`Auto keep warm: ${settings.autoWarmHours ? `on, until ${settings.autoWarmHours}h after the last turn (sooner once its pings cost as much as the rewrite), for contexts over ${tokens(settings.bigTokens)}${S.autoWarm ? '' : ' (off in this session)'}` : 'off'}.`)
   lines.push(`Settings: /${names.cache} ttl 5|60|auto, /${names.cache} guard on|off, /${names.cache} big 150k, /${names.cache} alerts on|off, /${names.cache} autowarm 8|off. Board: /${names.board}.`)
   return lines.join('\n')
 }
@@ -965,7 +969,11 @@ export function register(on, options = {}) {
     S.cwd = await $.session.cwd()
     S.label = basename(S.cwd)
     S.model = await $.session.model()
-    await loadSettings($)
+    try {
+      await loadSettings($)
+    } catch {
+      // a store lock held by another session: the defaults stand until the next tick
+    }
     await readRecording($)
     let surface = null
     try {
@@ -1188,7 +1196,7 @@ export function register(on, options = {}) {
       // usage unavailable: keep the per-request figures
     }
     if (H.armed && e.turnId !== H.notTurn) await captureHandoff($, e)
-    // Auto keep warm: a big chat stays warm until autoWarmHours after its last turn
+    // Auto keep warm: a big chat stays warm until autoWarmHours after its last turn, or sooner once its pings cost as much as the rewrite
     if (settings.autoWarmHours > 0 && S.autoWarm && S.ctx >= settings.bigTokens) {
       if (!S.keepWarm) startKeepWarm($, settings.autoWarmHours, true)
       S.keepWarmUntil = Math.max(S.keepWarmUntil, now + settings.autoWarmHours * 60 * MIN)
