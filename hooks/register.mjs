@@ -658,22 +658,28 @@ const PLAN_EVERY = 5 * MIN
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
 let planWhy = ''
 let planNext = 0
-// One reading for every session: the endpoint rate-limits a second schedule within seconds.
+// One reading per account, shared by its sessions: the endpoint rate-limits a second schedule within seconds.
 // A session still on an older version writes it without `windows`; those stay as they were.
 const PLAN_KEY = 'plan'
 
 // Each account has its own limits: with a seat file configured, a reading per surface and seat
-// (the terminal's and the app's rotators name their seats independently)
+// (the terminal's and the app's rotators name their seats independently), else one per signed-in account
 function planKey() {
-  return S.seat ? `${PLAN_KEY}:${onTerminal ? 'cli' : 'app'}:${S.seat}` : PLAN_KEY
+  if (S.seat) return `${PLAN_KEY}:${onTerminal ? 'cli' : 'app'}:${S.seat}`
+  return S.account ? `${PLAN_KEY}:account:${S.account}` : PLAN_KEY
+}
+
+// Whether planKey may still name the old account after a wake-up
+function keyUnsure() {
+  return seatUnsure() || (!S.seat && accountUnsure())
 }
 
 async function refreshPlan($) {
-  if (seatUnsure()) return // the seat may be the old one: its key would take the new account's reading, and planNext waits for the real seat
+  if (keyUnsure()) return // the key may name the old account: it would take the new account's reading, and planNext waits for the real one
   const key = planKey() // one account's reading throughout, though the seat can change while the fetch is out
   const wake = wakeCount
   // a seat change or a wake-up during an await below: the reading is the old account's, or may be
-  const stale = () => planKey() !== key || wakeCount !== wake || seatUnsure()
+  const stale = () => planKey() !== key || wakeCount !== wake || keyUnsure()
   // An API-key session has no first-party sign-in: the shared reading is another account's
   if (signedIn === null || (signedIn === false && now >= signCheckAt)) {
     try {
@@ -1007,6 +1013,10 @@ async function refreshIdentity($) {
   let adopted = false
   try {
     if (accountUnknown && (await readAccount($, true)) && S.account !== wakeAccount) {
+      // the shared readings were the old account's, as at a wake-up that already shows the new one
+      S.fable = null
+      S.planWindows = []
+      planNext = 0
       accountUnknown = false
       adopted = true
     }
@@ -1079,7 +1089,8 @@ function statusText() {
   if (rotatedCold()) lines.push(`The account rotated${rotatedAgo()} (now ${mask(S.seat || S.account)}), so the cache is cold.`)
   if (S.keepWarm) lines.push(`Keep warm is on until ${clock(S.keepWarmUntil)}: ${S.pings} ping(s), ${money(S.pingUsd)} so far.`)
   if (S.rateLimits.length) lines.push(`Plan limits used: ${limitsText(S.rateLimits)}.`)
-  lines.push(S.fable ? `Fable weekly: ${Math.round(S.fable.percentUsed)}% used.` : `Fable weekly: no reading yet${planWhy && planWhy !== 'ok' ? ` (last check: ${planWhy})` : ''}.`)
+  if (seatUnsure()) lines.push('Fable weekly: waiting for the rotator to name the new seat.')
+  else lines.push(S.fable ? `Fable weekly: ${Math.round(S.fable.percentUsed)}% used.` : `Fable weekly: no reading yet${planWhy && planWhy !== 'ok' ? ` (last check: ${planWhy})` : ''}.`)
   lines.push(`Session cost so far: ${money(S.costUsd)}. Cold restarts this session: ${S.coldRestarts.length} (${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))}).`)
   lines.push(`Cold-send guard: ${settings.guard ? 'on' : 'off'} for contexts over ${tokens(settings.bigTokens)} tokens. Alerts: ${settings.alerts ? 'on' : 'off'}.`)
   lines.push(`Auto keep warm: ${settings.autoWarmHours ? `on, until ${settings.autoWarmHours}h after the last turn (sooner once its pings cost as much as the rewrite), for contexts over ${tokens(settings.bigTokens)}${S.autoWarm ? '' : ' (off in this session)'}` : 'off'}.`)

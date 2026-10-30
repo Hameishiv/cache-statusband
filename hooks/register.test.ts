@@ -1454,3 +1454,48 @@ test('a wake-up that already shows a new account drops the shared windows, which
   await clock.advance(60 * 60000)
   expect(seen.submits).toEqual([])
 })
+
+test('an account adopted after the wake-up drops the shared windows, which are the old account\'s', { options: { rotatorWakePattern: WAKE.options.rotatorWakePattern, autoResume: true } }, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  on('classic.StopFailure', () => ({}))
+  on('session.authorize', () => ({ value: { handle: 'h' } }))
+  await clock.advance(60000)
+  const t0 = await clock.now()
+  kept.set('plan:account:a@x', { at: t0, next: t0 + 60 * 60000, fable: null, windows: fullWeek(t0), why: 'ok' })
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await clock.advance(30000)
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  disk.files['.claude.json'] = account('b@x')
+  await clock.advance(30000)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: 'Too many requests, slow down' })
+  await clock.advance(60 * 60000)
+  expect(seen.submits).toEqual([])
+})
+
+test('with no seat file, no plan reading is fetched while the account is unknown after a wake-up', WAKE, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  kept.set('plan:account:a@x', { at: 1, next: 2, windows: [], why: 'ok' }) // a reading long past due
+  let fetches = 0
+  on('session.authorize', () => ({ value: { handle: 'h' } }))
+  on('http.fetch', async () => {
+    fetches++
+    return { value: { ok: true, status: 200, headers: {}, text: JSON.stringify({ five_hour: { utilization: 7, resets_at: 9999999999 } }) } }
+  })
+  await clock.advance(60000)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await clock.advance(31000) // the first tick reads the plan under the account's key
+  expect((kept.get('plan:account:a@x') as any).windows[0].percentUsed).toBe(7)
+  await clock.advance(3 * 60000)
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never) // .claude.json not rewritten yet
+  const before = fetches
+  await clock.advance(2 * 60000 + 50000) // the reading falls due inside the window: its key may name the old account
+  expect(fetches).toBe(before)
+  disk.files['.claude.json'] = account('b@x')
+  await clock.advance(30000) // the new account is adopted and read under its own key
+  expect(fetches).toBeGreaterThan(before)
+  expect(kept.get('plan:account:b@x')).toBeTruthy()
+})
