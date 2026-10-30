@@ -11,7 +11,7 @@
     "seatFileTerminal": {
       "type": "string",
       "title": "Seat file (terminal)",
-      "description": "For account rotators: a file holding the active seat's label (e.g. ~/.claude-cli-accounts/.active). Read when a session starts: the band shows that label in place of the account email. A running session keeps its account, so a change counts only once the rotator's wake-up prompt (below) reaches it. Leave empty to show the account email.",
+      "description": "For account rotators: a file holding the active seat's label (e.g. ~/.claude-cli-accounts/.active). Read when a session starts: the band shows that label in place of the account email. A running session keeps its account, so a change counts only once the rotator's wake-up prompt (below) reaches it, or within 3 minutes after it. Leave empty to show the account email.",
       "default": ""
     },
     "seatFileDesktop": {
@@ -23,7 +23,7 @@
     "rotatorWakePattern": {
       "type": "string",
       "title": "Rotator wake-up pattern",
-      "description": "A regular expression matching the prompt an unattended account rotator types after rotating. Such a prompt is compacted first without asking, since nobody is there to answer. Leave empty to turn off.",
+      "description": "A regular expression matching the prompt an unattended account rotator types after rotating. Such a prompt is compacted first without asking, since nobody is there to answer. For 3 minutes after it, a late rewrite of the seat file or the account is still taken as that rotation. Leave empty to turn off.",
       "default": ""
     },
     "prPattern": {

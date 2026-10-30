@@ -1155,3 +1155,98 @@ test('a second wake-up of an already rotated chat dates the rotation anew', WAKE
   const r: any = await $.command.run({ command: 'cache', args: '' })
   expect(r.text).toMatch(/account rotated 1m ago/)
 })
+
+// The rotator writes .claude.json and the seat file separately: each is taken on its own for a few minutes after the wake-up
+test('the account rewritten before the seat file: the seat is still adopted a minute later', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const seat = { label: 'A' }
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock } = engine($, on, seat, kept, undefined, disk)
+  const step = stepper($, on)
+  await start($, 100000, clock)
+  disk.files['.claude.json'] = account('b@x')
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  await clock.advance(60000)
+  seat.label = 'B'
+  await clock.advance(60000)
+  await step(usage({ cache_read_input_tokens: 100000 }))
+  const rec = kept.get('last:sid-test') as any
+  expect(rec.seat).toBe('B')
+  expect(rec.account).toBe('b@x')
+})
+
+test('the seat file rewritten before the account: the account is still adopted a minute later', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const seat = { label: 'A' }
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock } = engine($, on, seat, kept, undefined, disk)
+  const step = stepper($, on)
+  await start($, 100000, clock)
+  seat.label = 'B'
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  await clock.advance(60000)
+  disk.files['.claude.json'] = account('b@x')
+  await clock.advance(60000)
+  await step(usage({ cache_read_input_tokens: 100000 }))
+  const rec = kept.get('last:sid-test') as any
+  expect(rec.seat).toBe('B')
+  expect(rec.account).toBe('b@x')
+})
+
+test('a wake-up that showed no change leaves the identity unknown only for the window: later records carry seat and account', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('b@x') } }
+  const { clock } = engine($, on, { label: 'B' }, kept, undefined, disk)
+  const step = stepper($, on)
+  await start($, 100000, clock)
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  await step(usage({ cache_read_input_tokens: 100000 }))
+  let rec = kept.get('last:sid-test') as any
+  expect(rec.seat).toBeUndefined() // still unknown inside the window
+  expect(rec.account).toBeUndefined()
+  await clock.advance(6 * 60 * 60000)
+  await step(usage({ cache_read_input_tokens: 100000 }))
+  rec = kept.get('last:sid-test') as any
+  expect(rec.seat).toBe('B')
+  expect(rec.account).toBe('b@x')
+})
+
+test('a rotation meant for other sessions, hours after a no-change wake-up and with no new wake-up, is not adopted', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const seat = { label: 'B' }
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('b@x') } }
+  const { clock } = engine($, on, seat, kept, undefined, disk)
+  const step = stepper($, on)
+  await start($, 100000, clock)
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never) // nothing changed
+  await step(usage({ cache_read_input_tokens: 100000 }))
+  await clock.advance(3 * 60 * 60000)
+  seat.label = 'C'
+  disk.files['.claude.json'] = account('c@x')
+  await clock.advance(60000)
+  await step(usage({ cache_read_input_tokens: 100000 }))
+  const rec = kept.get('last:sid-test') as any
+  expect(rec.seat).toBe('B')
+  expect(rec.account).toBe('b@x')
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/now C/)
+})
+
+test('a seat adopted after a request landed since the wake-up marks the cache cold', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const seat = { label: 'A' }
+  const { clock, seen } = engine($, on, seat, kept)
+  answer(on, seen, 'Send anyway')
+  const step = stepper($, on)
+  await start($, 300000, clock)
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never) // the seat file is not written yet
+  await clock.advance(1000)
+  await step(usage({ cache_read_input_tokens: 300000 })) // the wake-up's request lands, perhaps on the old account
+  await clock.advance(60000)
+  seat.label = 'B'
+  await clock.advance(60000)
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/account rotated 1m ago \(now B\)/)
+  await $.prompt.submit({ text: 'carry on', origin: COMPOSER, wait: false } as never)
+  expect(seen.asks).toBe(1)
+})
