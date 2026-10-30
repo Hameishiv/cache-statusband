@@ -17,7 +17,7 @@ function engine($: any, on: any, seat: { label: string; recording?: string } = {
     on('store.keys', () => ({ value: [...kept.keys()] }))
   } else mock.store(on)
   mock.env(on, { USERPROFILE: 'C:/Users/T' })
-  const seen = { compacts: 0, submits: [] as string[], asks: 0, duringCompact: null as null | (() => Promise<unknown>) }
+  const seen = { compacts: 0, submits: [] as string[], asks: 0, toasts: [] as string[], failCompact: false, duringCompact: null as null | (() => Promise<unknown>) }
   on('session.id', () => ({ value: 'sid-test' }))
   on('session.cwd', () => ({ value: '/repo' }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
@@ -32,6 +32,7 @@ function engine($: any, on: any, seat: { label: string; recording?: string } = {
     if (e.command === 'compact') {
       seen.compacts++
       await seen.duringCompact?.()
+      if (seen.failCompact) throw new Error('no room')
     }
     return { text: '' }
   })
@@ -41,7 +42,7 @@ function engine($: any, on: any, seat: { label: string; recording?: string } = {
   })
   on('session.start', (_: unknown, e: any) => ({ cwd: e.cwd }))
   on('session.measure', () => ({ changed: [] }))
-  on('ui.toast', () => ({ value: undefined }))
+  on('ui.toast', (_: unknown, e: any) => (seen.toasts.push(JSON.stringify(e)), { value: undefined }))
   return { clock, seen }
 }
 
@@ -282,6 +283,31 @@ test('"rate limit reached" is a throttle and arms no resume; "5-hour limit reach
   await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: 'Weekly limit reached' })
   await clock.advance(70 * 60000)
   expect(seen.submits).toEqual(['Resume', 'Resume'])
+})
+
+test('a throttle code beside "usage limit reached" is still spent usage', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = engine($, on)
+  on('classic.StopFailure', () => ({}))
+  await start($, 50000, clock)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: 'rate_limit_error: usage limit reached' })
+  await clock.advance(70 * 60000)
+  expect(seen.submits).toEqual(['Resume'])
+})
+
+test('an automatic message cancelled by one sent meanwhile says so once, even when the compaction failed', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = engine($, on)
+  seen.failCompact = true
+  on('classic.StopFailure', () => ({}))
+  await start($, 300000, clock)
+  const resetsAt = new Date(60000 + 30 * 60000).toISOString()
+  await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [{ kind: 'five_hour', percentUsed: 100, resetsAt }], changed: [] } as never)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  seen.duringCompact = () => $.prompt.submit({ text: 'hold on', origin: COMPOSER, wait: false } as never)
+  await clock.advance(40 * 60000)
+  expect(seen.submits).toEqual([])
+  expect(seen.toasts.filter((t) => /Could not compact/.test(t))).toEqual([])
+  expect(seen.toasts.filter((t) => /Compacted/.test(t))).toEqual([])
+  expect(seen.toasts.filter((t) => /automatic one was not sent/.test(t)).length).toBe(1)
 })
 
 test('a /clear drops the resume armed in the last chat', { options: { autoResume: true } }, async ($, on) => {

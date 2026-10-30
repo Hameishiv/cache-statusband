@@ -328,6 +328,7 @@ function worthCompacting() {
 // Only usage exhaustion: a short throttle, an overload or any other error is left alone.
 const USAGE_SPENT = /usage limit|limit reached|hit your limit|out of (extra )?usage|limit will reset|resets? (at|in)\b/i
 const THROTTLE = /rate[ _-]?limit/i // "rate limit reached" is a short throttle, not spent usage
+const USAGE_MARKER = /usage limit|hit your limit|out of (extra )?usage|5-hour|weekly/i // a throttle's wording beside one of these is still spent usage
 const RESUME_FALLBACK = 60 * MIN // no reset time known: try once an hour, three times at most
 let resumeTries = 0
 let submitsSeen = 0 // prompt.submit hooks so far, so an unattended send can tell the person sent something meanwhile
@@ -356,7 +357,7 @@ function armResume($, details) {
   if (!limits.length) limits = stillOpen(S.planWindows, now)
   const full = spentWindows(limits, S.fable, S.model)
   const text = String(details || '')
-  if (!full.length && !(USAGE_SPENT.test(text) && !THROTTLE.test(text))) return // not usage exhaustion
+  if (!full.length && !(USAGE_SPENT.test(text) && (!THROTTLE.test(text) || USAGE_MARKER.test(text)))) return // not usage exhaustion
   const at = resumeTime(full, now)
   if (!at && resumeTries >= 3) {
     $.ui.toast('Auto-resume gave up: no reset time is known. Send a message once usage renews.', { timeoutMs: 15000 })
@@ -395,15 +396,19 @@ function compactThenSend($, e, unattended) {
 }
 
 async function runCompactThenSend($, msg, unattended, seenBefore) {
+  const cancelled = () => unattended && submitsSeen !== seenBefore
+  let compacted = false
   try {
     await $.command.run({ command: 'compact', args: '' })
     markCompacted($)
+    compacted = true
   } catch (err) {
-    $.ui.toast('Could not compact (' + clip(String((err && err.message) || err), 80) + '), so the message goes as typed.', { timeoutMs: 8000 })
+    // an automatic message about to be cancelled is not going as typed: say only the cancel
+    if (!cancelled()) $.ui.toast('Could not compact (' + clip(String((err && err.message) || err), 80) + '), so the message goes as typed.', { timeoutMs: 8000 })
   }
-  if (unattended && submitsSeen !== seenBefore) {
+  if (cancelled()) {
     // anything sent while compacting cancels an automatic message, as it would have before
-    $.ui.toast('Compacted. A message was sent meanwhile, so the automatic one was not sent.', { timeoutMs: 8000 })
+    $.ui.toast((compacted ? 'Compacted. A message' : 'A message') + ' was sent meanwhile, so the automatic one was not sent.', { timeoutMs: 8000 })
     return
   }
   const send = { text: msg.text, ...(msg.attachments ? { attachments: msg.attachments } : {}) }
@@ -584,6 +589,7 @@ function planKey() {
 }
 
 async function refreshPlan($) {
+  const key = planKey() // one account's reading throughout, though the seat can change while the fetch is out
   // An API-key session has no first-party sign-in: the shared reading is another account's
   if (signedIn === null || (signedIn === false && now >= signCheckAt)) {
     try {
@@ -596,7 +602,7 @@ async function refreshPlan($) {
   if (signedIn === false) return noSignIn()
   let cached = null
   try {
-    cached = await $.store.get(planKey())
+    cached = await $.store.get(key)
   } catch {
     cached = null
   }
@@ -610,7 +616,7 @@ async function refreshPlan($) {
   planNext = now + PLAN_EVERY
   // claim the slot first, so a session that wakes meanwhile finds it taken
   try {
-    await $.store.set(planKey(), { ...prior, next: now + PLAN_EVERY })
+    await $.store.set(key, { ...prior, next: now + PLAN_EVERY })
   } catch {
     // lock held: this session's own planNext still holds it back
   }
@@ -640,19 +646,21 @@ async function refreshPlan($) {
   } catch (err) {
     why = clip(String((err && err.message) || err), 120) // offline or refused: keep the last reading
   }
+  // the seat moved on meanwhile: this is the old account's reading, and the new one's slot is untouched
+  if (planKey() !== key) return
   planNext = next
   S.fable = fable
   S.planWindows = windows
   planWhy = why
   try {
     // a failed check must not put its older reading over one another session took meanwhile
-    const stored = fetched ? null : await $.store.get(planKey())
+    const stored = fetched ? null : await $.store.get(key)
     if (stored && typeof stored === 'object' && (stored.at || 0) > (prior.at || 0)) {
       if (Array.isArray(stored.windows) && stored.windows.length) S.planWindows = stored.windows
       if (stored.fable) S.fable = stored.fable
       return
     }
-    await $.store.set(planKey(), { at, next, fable, windows, why })
+    await $.store.set(key, { at, next, fable, windows, why })
   } catch {
     // lock held: another session is writing the same reading
   }
