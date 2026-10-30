@@ -255,6 +255,11 @@ function rotatedCold() {
   return rotatedPending
 }
 
+// A rotation seen in this process is dated; one found on a reopened chat's record only says it came after its last request
+function rotatedAgo() {
+  return S.seatChangedAt ? ` ${minutes(now - S.seatChangedAt)} ago` : ' since its last request'
+}
+
 // The next request writes the shorter context: no TTL evidence and nothing to warn about.
 // It also keeps the record a reopened chat reads: an `at` of 0 says it was compacted.
 function markCompacted($) {
@@ -270,11 +275,24 @@ function markCompacted($) {
   rememberCompacted($)
 }
 
+// Where the request ran, kept with the chat's record: the seat (a seat name belongs to one
+// surface's rotator), or the account where no seat file is set
+function whoRan() {
+  return { ...(S.seat ? { seat: S.seat } : S.account ? { account: S.account } : {}), desktop: !onTerminal }
+}
+
+// A record's request ran on another account than this process is on, so the cache it left is that account's.
+// Compared like with like (seat with seat, account with account); unknown on either side is no change.
+function ranElsewhere(r) {
+  if (r.seat && S.seat && !!r.desktop === !onTerminal) return r.seat !== S.seat
+  return !!r.account && !!S.account && r.account !== S.account
+}
+
 // The compacted size isn't known until the next request: keep the one before it, as rememberLast shapes it (keptAt dates an `at` of 0 for the prune)
 async function rememberCompacted($) {
   if (!S.id || !S.ctx) return
   try {
-    await $.store.set('last:' + S.id, { ctx: S.ctx, at: 0, keptAt: now, model: S.model, effort: S.effort, cold: S.coldRestarts.slice(-50) })
+    await $.store.set('last:' + S.id, { ctx: S.ctx, at: 0, keptAt: now, model: S.model, effort: S.effort, cold: S.coldRestarts.slice(-50), ...whoRan() })
   } catch {
     // another session holds the store's lock: the next request writes it
   }
@@ -599,6 +617,8 @@ async function refreshPlan($) {
     }
     signCheckAt = now + PLAN_EVERY
   }
+  // a seat change during any await below resets the readings and planNext: don't restore the old seat's
+  if (planKey() !== key) return
   if (signedIn === false) return noSignIn()
   let cached = null
   try {
@@ -606,6 +626,7 @@ async function refreshPlan($) {
   } catch {
     cached = null
   }
+  if (planKey() !== key) return
   const prior = cached && typeof cached === 'object' ? cached : {}
   if (Array.isArray(prior.windows) && prior.windows.length) S.planWindows = prior.windows
   // an older version writes null after a failed check: never let that wipe a good reading
@@ -620,6 +641,7 @@ async function refreshPlan($) {
   } catch {
     // lock held: this session's own planNext still holds it back
   }
+  if (planKey() !== key) return
   let fable = prior.fable || S.fable
   let windows = Array.isArray(prior.windows) && prior.windows.length ? prior.windows : S.planWindows
   let at = prior.at || 0 // when the reading was taken: a failure keeps the last good one
@@ -629,6 +651,7 @@ async function refreshPlan($) {
   try {
     const auth = await $.session.authorize()
     if (!auth) {
+      if (planKey() !== key) return
       signedIn = false
       return noSignIn()
     }
@@ -656,6 +679,7 @@ async function refreshPlan($) {
     // a failed check must not put its older reading over one another session took meanwhile
     const stored = fetched ? null : await $.store.get(key)
     if (stored && typeof stored === 'object' && (stored.at || 0) > (prior.at || 0)) {
+      if (planKey() !== key) return
       if (Array.isArray(stored.windows) && stored.windows.length) S.planWindows = stored.windows
       if (stored.fable) S.fable = stored.fable
       return
@@ -707,7 +731,7 @@ async function rememberLast($) {
   if (!S.id || !S.ctx) return
   try {
     // the chat's cold rewrites too, so their cost survives a reopen
-    await $.store.set('last:' + S.id, { ctx: S.ctx, at: S.lastActivity, model: S.model, effort: S.effort, cold: S.coldRestarts.slice(-50) })
+    await $.store.set('last:' + S.id, { ctx: S.ctx, at: S.lastActivity, model: S.model, effort: S.effort, cold: S.coldRestarts.slice(-50), ...whoRan() })
   } catch {
     // another session holds the store's lock: the next request writes it
   }
@@ -743,6 +767,8 @@ async function seedFromTranscript($, path) {
     }
   }
   if (!found) return
+  // a transcript newer than the record (past the minute their clocks may differ by) says nothing of where its request ran
+  if (last && Math.max(last.at || 0, last.keptAt || 0) >= (found.at || 0) - MIN && ranElsewhere(last)) rotatedPending = true
   S.ctx = found.ctx
   if (found.model && !S.model) S.model = found.model // the session's own model wins: it may have been switched
   if (found.effort) S.effort = found.effort
@@ -939,7 +965,7 @@ function statusText() {
   if (st.kind === 'unknown') lines.push('No request yet this session, so the cache state is unknown.')
   if (st.kind === 'warm' || st.kind === 'cooling') lines.push(`Cache is warm for about ${minutes(st.left)} more.`)
   if (st.kind === 'cold') lines.push(`Cache went cold ${minutes(-st.left)} ago. The next message rewrites it for about ${money(rewriteCost(S.ctx, S.model, ttl))}.`)
-  if (rotatedCold()) lines.push(`The account rotated ${minutes(now - S.seatChangedAt)} ago (now ${mask(S.seat)}), so the cache is cold.`)
+  if (rotatedCold()) lines.push(`The account rotated${rotatedAgo()} (now ${mask(S.seat || S.account)}), so the cache is cold.`)
   if (S.keepWarm) lines.push(`Keep warm is on until ${clock(S.keepWarmUntil)}: ${S.pings} ping(s), ${money(S.pingUsd)} so far.`)
   if (S.rateLimits.length) lines.push(`Plan limits used: ${limitsText(S.rateLimits)}.`)
   lines.push(S.fable ? `Fable weekly: ${Math.round(S.fable.percentUsed)}% used.` : `Fable weekly: no reading yet${planWhy && planWhy !== 'ok' ? ` (last check: ${planWhy})` : ''}.`)
@@ -1041,7 +1067,7 @@ export function register(on, options = {}) {
     if (e.source === 'resume' || e.source === 'fork') {
       await seedFromTranscript($, e.transcript_path)
       // a seeded last request older than the rotation ran on the other account: this seat's cache is cold
-      rotatedPending = S.seatChangedAt > 0 && S.lastActivity > 0 && S.seatChangedAt > S.lastActivity
+      rotatedPending = rotatedPending || (S.seatChangedAt > 0 && S.lastActivity > 0 && S.seatChangedAt > S.lastActivity)
     }
     return next(e)
   })
@@ -1097,7 +1123,7 @@ export function register(on, options = {}) {
     const media = Array.isArray(e.attachments) && e.attachments.length > 0
     if (wake) return worthCompacting() && !media ? compactThenSend($, e, true) : next(e)
     const cost = money(rewriteCost(S.ctx, S.model, ttl))
-    const why = rotated ? `The account rotated to ${mask(S.seat) || 'another seat'} ${minutes(now - S.seatChangedAt)} ago, so the cache is cold.` : `Cache went cold ${minutes(-left)} ago.`
+    const why = rotated ? `The account rotated to ${mask(S.seat || S.account) || 'another seat'}${rotatedAgo()}, so the cache is cold.` : `Cache went cold ${minutes(-left)} ago.`
     const floor = S.floor ? ` Compacting last left ${tokens(S.floor)}.` : ''
     let answer = 'Send anyway'
     try {

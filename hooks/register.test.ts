@@ -7,11 +7,11 @@ const SETUP = { options: { seatFileTerminal: '~/.claude-cli-accounts/.active', s
 
 
 // The engine beneath the mod: a terminal session on seat A, nothing on disk but the seat file
-function engine($: any, on: any, seat: { label: string; recording?: string } = { label: 'A' }, kept?: Map<string, unknown>) {
+function engine($: any, on: any, seat: { label: string; recording?: string } = { label: 'A' }, kept?: Map<string, unknown>, onGet?: (key: string) => Promise<void> | void) {
   const clock = mock.clock(on)
   if (kept) {
     // a store already holding what an earlier run of this mod wrote
-    on('store.get', (_: unknown, e: any) => ({ value: kept.get(e.key) }))
+    on('store.get', async (_: unknown, e: any) => (await onGet?.(e.key), { value: kept.get(e.key) }))
     on('store.set', (_: unknown, e: any) => (kept.set(e.key, e.value), { value: undefined }))
     on('store.delete', (_: unknown, e: any) => (kept.delete(e.key), { value: undefined }))
     on('store.keys', () => ({ value: [...kept.keys()] }))
@@ -517,6 +517,38 @@ test('a chat resumed after a rotation, last answered on the old account, is cold
   expect(seen.asks).toBe(1)
 })
 
+test('a chat last answered on another seat, reopened by a new process, is cold and asks once', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'B' }, kept)
+  answer(on, seen, 'Send anyway')
+  await clock.advance(60000)
+  // the chat's last request, 10 minutes ago: warm by the clock, but it ran on seat A and this process is on B
+  kept.set('last:sid-test', { ctx: 300000, at: (await clock.now()) - 10 * 60000, model: 'claude-opus-5-5', seat: 'A', desktop: false })
+  await clock.advance(10 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/account rotated since its last request \(now B\)/)
+  await $.prompt.submit({ text: 'carry on', origin: COMPOSER, wait: false } as never)
+  expect(seen.asks).toBe(1)
+})
+
+test('a chat last answered on this seat reopens warm, and its record names the seat', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'B' }, kept)
+  answer(on, seen, 'Send anyway')
+  const step = stepper($, on)
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: (await clock.now()) - 10 * 60000, model: 'claude-opus-5-5', seat: 'B', desktop: false })
+  await clock.advance(10 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/account rotated/)
+  await $.prompt.submit({ text: 'carry on', origin: COMPOSER, wait: false } as never)
+  expect(seen.asks).toBe(0)
+  await step(usage({ cache_read_input_tokens: 300000 }))
+  expect(kept.get('last:sid-test')).toMatchObject({ seat: 'B', desktop: false })
+})
+
 test('a compaction is kept for a reopened chat as a record with an `at` of 0', async ($, on) => {
   const kept = new Map<string, unknown>()
   const { clock } = engine($, on, { label: 'A' }, kept)
@@ -601,6 +633,31 @@ test('a failed plan check does not overwrite a newer reading another session too
   await start($, 50000, clock)
   await clock.advance(70000)
   expect(kept.get('plan')).toEqual(fresh)
+})
+
+test('a seat change while the plan reading is being fetched leaves the old seat\'s figures out of the new one', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const seat = { label: 'A' }
+  let release = () => {}
+  const gate = new Promise<void>((r) => (release = r))
+  let pending = false
+  const { clock } = engine($, on, seat, kept, async (key) => {
+    if (key === 'plan:cli:A') {
+      pending = true
+      await gate // the old seat's reading is still being read when the rotator's wake-up lands
+    }
+  })
+  kept.set('plan:cli:A', { at: 1, next: 2, fable: { percentUsed: 77 }, windows: [{ kind: 'five_hour', percentUsed: 66 }], why: 'ok' })
+  await start($, 50000, clock)
+  await clock.advance(10)
+  expect(pending).toBe(true)
+  seat.label = 'B'
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  release()
+  await clock.advance(70000)
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/77|66/)
+  expect(JSON.stringify(kept.get('plan:cli:B') ?? {})).not.toMatch(/77|66/)
 })
 
 test('a session without a first-party sign-in neither shows nor writes the shared plan reading', async ($, on) => {
