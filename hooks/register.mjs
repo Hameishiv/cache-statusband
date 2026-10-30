@@ -393,7 +393,7 @@ async function readSeat($, adopt = false) {
     S.seatChangedAt = now
     rotationSeenAt = now
     rotatedPending = true
-    dropReadings()
+    dropReadings(!adopt) // at a wake-up the wake-up is itself the resume: a pending one is not re-armed
     S.seat = seat // before the await: planKey must name the new account while it runs
     await readAccount($, true)
   }
@@ -432,7 +432,19 @@ const RESUME_FALLBACK = 60 * MIN // no reset time known: try once an hour, three
 let resumeTries = 0
 let staleArmedGen = -1 // the identityGen at which a failure of an earlier request was already given its free minute
 let resumeFromReadings = false // the pending resume rests on plan windows, not on the error's wording (nor, after dropReadings, on a re-arm); cleared wherever resumeAt is
-let submitsSeen = 0 // prompt.submit hooks so far, so an unattended send can tell the person sent something meanwhile
+let submitsSeen = 0 // sends committed so far (see committed), so an unattended send can tell the person sent something meanwhile
+let sendsHeld = 0 // a cold-send dialog is open or a compact-then-send is in flight: a due resume waits
+
+// A send is known to reach the chat: a pending resume is settled (a later account change must not bring it back) and the unattended sends see it.
+// Called where a prompt passes through, when the guard's answer sends it, and at a wake-up before it re-reads anything. Not for a local command, a cancelled send, nor our own Resume or /compact.
+function committed($) {
+  submitsSeen++
+  resumeFromReadings = false
+  if (S.resumeAt) {
+    S.resumeAt = 0
+    $.ui.invalidate('ui.render')
+  }
+}
 
 // The windows that are full, from the freshest reading this session has
 export function spentWindows(limits, fable, model) {
@@ -484,7 +496,7 @@ function armResume($, details) {
 
 // From the heartbeat tick: send "Resume" once its time has come, as the person's own word
 async function resumeStep($) {
-  if (!S.resumeAt || now < S.resumeAt || S.working) return
+  if (!S.resumeAt || now < S.resumeAt || S.working || sendsHeld) return // a send of the person's is held by the guard or compacting: it settles the resume once it is sent
   // the seat or the account is not known yet: the send waits for it or for the window to close, without spending a try or compacting
   if (keyUnsure()) {
     S.resumeAt = wakeWindowEnd
@@ -511,7 +523,8 @@ async function resumeStep($) {
 function compactThenSend($, e, unattended) {
   const msg = { text: e.text, attachments: e.attachments, slash: !!e.command }
   const seenBefore = submitsSeen
-  $.clock.after(50, () => runCompactThenSend($, msg, unattended, seenBefore).catch(() => {}))
+  sendsHeld++
+  $.clock.after(50, () => runCompactThenSend($, msg, unattended, seenBefore).catch(() => {}).finally(() => sendsHeld--))
   return { drop: 'cache-keeper: compacting first on a cold cache; the message is sent again once that finishes' }
 }
 
@@ -1267,7 +1280,6 @@ export function register(on, options = {}) {
   // The first prompt names the session on the board
   on('prompt.submit', async ($, e, next) => {
     now = await $.clock.now()
-    if (!(e.command && e.command.name === 'compact')) submitsSeen++ // our own compaction is not the person
     if (S.label === basename(S.cwd) && e.origin && e.origin.kind === 'composer' && e.text) {
       S.label = basename(S.cwd) + ' · ' + clip(e.text, 40)
     }
@@ -1282,6 +1294,7 @@ export function register(on, options = {}) {
     const wake = fromUser && !!cfg.rotatorWake && cfg.rotatorWake.test(String(e.text || ''))
     if (wake) {
       // The wake-up is the rotation reaching this session: take the new seat now; a late rewrite is taken within WAKE_WINDOW
+      committed($) // before anything is re-read: a re-read must not find a pending resume to re-arm
       wakeCount++
       wakeSeat = S.seat
       wakeAccount = S.account
@@ -1305,14 +1318,20 @@ export function register(on, options = {}) {
     const isCold = rotated || (left !== null && left <= 0)
     // These run locally or start afresh: a cold cache costs them nothing
     const local = e.command && ['compact', 'clear', names.cache, names.keepwarm, names.board, names.handoff].includes(e.command.name)
-    if (!settings.guard || !fromUser || !isCold || local || justCompacted || S.ctx < settings.bigTokens || e.turnId) return next(e)
+    // a prompt that passes straight through reaches the chat: not a local command, our own Resume (a plugin's) or the wake-up (committed above)
+    const through = () => {
+      if (!wake && !local && !(e.origin && e.origin.kind === 'plugin')) committed($)
+      return next(e)
+    }
+    if (!settings.guard || !fromUser || !isCold || local || justCompacted || S.ctx < settings.bigTokens || e.turnId) return through()
     // an attachment's handle lives only while this submit is in flight: a resend after compacting would drop it
     const media = Array.isArray(e.attachments) && e.attachments.length > 0
-    if (wake) return worthCompacting() && !media ? compactThenSend($, e, true) : next(e)
+    if (wake) return worthCompacting() && !media ? compactThenSend($, e, true) : through()
     const cost = money(rewriteCost(S.ctx, S.model, ttl))
     const why = rotated ? `The account rotated to ${mask(S.seat || S.account) || 'another seat'}${rotatedAgo()}, so the cache is cold.` : `Cache went cold ${minutes(-left)} ago.`
     const floor = S.floor ? ` Compacting last left ${tokens(S.floor)}.` : ''
     let answer = 'Send anyway'
+    sendsHeld++ // the dialog is open: a due resume waits
     try {
       answer = await $.ui.ask(
         `${why} Sending now rewrites ${tokens(S.ctx)} tokens of context (about ${cost}).${floor}${media ? ' (Compacting first would drop the attachment: run /compact yourself, then send again.)' : ''} What should happen?`,
@@ -1320,11 +1339,16 @@ export function register(on, options = {}) {
       )
     } catch {
       // nobody to ask (a -p run, or the dialog was dismissed): send as typed
-      return next(e)
+      return through()
+    } finally {
+      sendsHeld--
     }
     // $.session.compact() is refused on SDK hosts (the desktop app), so this queues /compact
-    if (answer === 'Compact first, then send') return compactThenSend($, e, false)
-    if (answer === 'Send anyway') return next(e)
+    if (answer === 'Compact first, then send') {
+      committed($) // the send is decided: it settles the resume before it compacts
+      return compactThenSend($, e, false)
+    }
+    if (answer === 'Send anyway') return through()
     $.ui.toast('Not sent. A fresh session with a short handoff avoids the rewrite entirely.', { timeoutMs: 8000 })
     return { drop: 'Cancelled by cache-keeper before a cold cache rewrite' }
   })

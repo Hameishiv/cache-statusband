@@ -2049,3 +2049,124 @@ test('a session with no seat or account whose first sign-in check threw neither 
   const r: any = await $.command.run({ command: 'cache', args: '' })
   expect(r.text).not.toMatch(/77%/)
 })
+
+
+test('a wake-up queued behind a running request, showing a new seat and account (seat file), leaves no Resume besides it', RESUME, async ($, on) => {
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const seat = { label: 'A' }
+  const { clock, seen } = engine($, on, seat, undefined, undefined, disk)
+  on('classic.StopFailure', () => ({}))
+  on('turn.step', async function* () { return { answer: '', toolUses: [], usage: null } })
+  await start($, 50000, clock)
+  const t0 = await clock.now()
+  await $.session.measure({ context: { tokens: 50000, window: 1000000, percent: 5 }, rateLimits: fiveFull(t0), changed: [] } as never)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  seat.label = 'B'
+  disk.files['.claude.json'] = account('b@x')
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, turnId: 't1', wait: false } as never)
+  await clock.advance(5 * 60000)
+  expect(seen.submits).toEqual([])
+})
+
+test('a local command typed while the Resume compacts does not cancel the Resume', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = engine($, on)
+  on('classic.StopFailure', () => ({}))
+  await start($, 300000, clock)
+  const t0 = await clock.now()
+  await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: fiveFull(t0), changed: [] } as never)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  seen.duringCompact = async () => {
+    await $.prompt.submit({ text: '/cache', command: { name: 'cache', args: '' }, origin: COMPOSER, wait: false } as never)
+  }
+  await clock.advance(3 * 60 * 60000)
+  expect(seen.compacts).toBe(1)
+  expect(seen.submits).toEqual(['Resume'])
+})
+
+test('a resume due while the person\'s "Compact first, then send" compaction runs is settled by that send: no Resume besides it', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = engine($, on)
+  answer(on, seen, 'Compact first, then send')
+  on('classic.StopFailure', () => ({}))
+  on('turn.step', async function* () { return { answer: '', toolUses: [], usage: { input_tokens: 10, cache_read_input_tokens: 300000, cache_creation_input_tokens: 0 } } })
+  await start($, 300000, clock)
+  const t0 = await clock.now()
+  await mainStep($)
+  await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [{ kind: 'five_hour', percentUsed: 100, resetsAt: new Date(t0 + 90 * 60000).toISOString() }], changed: [] } as never)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  await clock.advance(90 * 60000) // just before the resume (reset + 1 min)
+  let compacting = 0
+  seen.duringCompact = async () => {
+    compacting++
+    if (compacting === 1) await clock.advance(2 * 60000) // a big chat's compaction takes two minutes
+  }
+  await $.prompt.submit({ text: 'are we back?', origin: COMPOSER, wait: false } as never)
+  await clock.advance(5 * 60000)
+  expect(seen.asks).toBe(1)
+  expect({ submits: seen.submits, compacts: seen.compacts }).toEqual({ submits: ['are we back?'], compacts: 1 })
+})
+
+test('a wake-up on a big chat (seat file) compacts for two minutes: one compaction, and the pending resume is not sent besides', RESUME, async ($, on) => {
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const seat = { label: 'A' }
+  const { clock, seen } = engine($, on, seat, undefined, undefined, disk)
+  on('classic.StopFailure', () => ({}))
+  on('turn.step', async function* () { return { answer: '', toolUses: [], usage: null } })
+  await start($, 300000, clock)
+  const t0 = await clock.now()
+  await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: fiveFull(t0), changed: [] } as never)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  seat.label = 'B'
+  disk.files['.claude.json'] = account('b@x')
+  let compacting = 0
+  seen.duringCompact = async () => {
+    compacting++
+    if (compacting === 1) await clock.advance(2 * 60000)
+  }
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  await clock.advance(5 * 60000)
+  expect({ submits: seen.submits, compacts: seen.compacts }).toEqual({ submits: [ROTATE], compacts: 1 })
+})
+
+test('an account written late while the wake-up compacts (no seat file) does not re-arm the resume besides the wake-up', RESUME_WAKE, async ($, on) => {
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock, seen } = engine($, on, { label: 'A' }, undefined, undefined, disk)
+  on('classic.StopFailure', () => ({}))
+  on('turn.step', async function* () { return { answer: '', toolUses: [], usage: null } })
+  await start($, 300000, clock)
+  const t0 = await clock.now()
+  await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: fiveFull(t0), changed: [] } as never)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  let compacting = 0
+  seen.duringCompact = async () => {
+    compacting++
+    if (compacting === 1) {
+      disk.files['.claude.json'] = account('b@x')
+      await clock.advance(2 * 60000)
+    }
+  }
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  await clock.advance(5 * 60000)
+  expect({ submits: seen.submits, compacts: seen.compacts }).toEqual({ submits: [ROTATE], compacts: 1 })
+})
+
+test('a resume due while the cold-send dialog is open is not sent under it', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = engine($, on)
+  on('tool.call', async (_: unknown, e: any) => {
+    if (e.tool !== 'AskUserQuestion') return { result: {} }
+    seen.asks++
+    await clock.advance(2 * 60000) // the person reads the dialog for two minutes
+    const q = e.questions?.[0]?.question ?? ''
+    return { result: { questions: e.questions, answers: { [q]: 'Send anyway' } } }
+  })
+  on('classic.StopFailure', () => ({}))
+  on('turn.step', async function* () { return { answer: '', toolUses: [], usage: { input_tokens: 10, cache_read_input_tokens: 300000, cache_creation_input_tokens: 0 } } })
+  await start($, 300000, clock)
+  const t0 = await clock.now()
+  await mainStep($)
+  await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [{ kind: 'five_hour', percentUsed: 100, resetsAt: new Date(t0 + 90 * 60000).toISOString() }], changed: [] } as never)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  await clock.advance(90 * 60000)
+  await $.prompt.submit({ text: 'are we back?', origin: COMPOSER, wait: false } as never)
+  await clock.advance(5 * 60000)
+  expect({ submits: seen.submits.filter((t) => t === 'Resume'), compacts: seen.compacts }).toEqual({ submits: [], compacts: 0 })
+})
