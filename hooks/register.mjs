@@ -1084,6 +1084,7 @@ export function register(on, options = {}) {
       compactedCold = false
       S.floor = 0
       S.ctx = 0 // the last chat's size; a resumed chat's own is seeded below (a cleared one starts at 0)
+      pendingSeed = null // a transcript still waiting for session.start belongs to the chat this one replaces
     }
     S.keepWarm = false
     H.armed = false
