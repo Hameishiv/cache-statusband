@@ -2925,7 +2925,7 @@ test('a compaction that never finishes holds a due Resume for 15 minutes, not fo
   seen.duringCompact = () => (++n === 1 ? new Promise(() => {}) : Promise.resolve()) // the person's compaction hangs
   await $.prompt.submit({ text: 'one', origin: COMPOSER, wait: false } as never)
   await clock.advance(100)
-  for (let i = 0; i < 30; i++) await clock.advance(10 * 60000) // the Resume, due an hour on, is held only until the compaction is abandoned
+  for (let i = 0; i < 9; i++) await clock.advance(10 * 60000) // the Resume, due an hour on, is held only until the compaction is abandoned
   expect(seen.submits).toEqual(['Resume'])
   expect(seen.toasts.filter((t) => /Compaction has not finished after 15 minutes/.test(t)).length).toBe(1)
 })
@@ -2957,8 +2957,8 @@ test('a rotator wake-up whose compaction never finishes goes back in the prompt 
   expect({ submits: seen.submits, fills }).toEqual({ submits: [], fills: [ROTATE] })
 })
 
-// The Resume's compaction runs (and fails once the test says so) while the test answers a cold-send dialog for a message of the person's
-async function resumeDialogDuringCompaction($: any, on: any, text: string, command?: { name: string; args: string }) {
+// The Resume's compaction runs while a cold-send dialog opens for a message of the person's, and fails: once the test says so (endCompact), or at once, with the dialog still open (failsAtOnce)
+async function resumeDialogDuringCompaction($: any, on: any, text: string, command?: { name: string; args: string }, failsAtOnce = false) {
   const release = gatedAsk(on)
   const { clock, seen } = await resumeCompacting($, on)
   seen.failCompact = true
@@ -2966,7 +2966,7 @@ async function resumeDialogDuringCompaction($: any, on: any, text: string, comma
   const compactGate = new Promise<void>((r) => { endCompact = r })
   let sent: Promise<unknown> | null = null
   let n = 0
-  seen.duringCompact = () => { if (++n === 1) { sent = $.prompt.submit({ text, ...(command ? { command } : {}), origin: COMPOSER, wait: false } as never); return compactGate } return Promise.resolve() }
+  seen.duringCompact = () => { if (++n === 1) { sent = $.prompt.submit({ text, ...(command ? { command } : {}), origin: COMPOSER, wait: false } as never); return failsAtOnce ? Promise.resolve() : compactGate } return Promise.resolve() }
   await clock.advance(91 * 60000 + 1000) // the Resume falls due and starts compacting; the dialog opens
   await clock.advance(5000)
   return { clock, seen, release, sent: () => sent, endCompact }
@@ -2987,10 +2987,11 @@ test('Cancel answered before the Resume\'s compaction fails: the Resume is not s
 })
 
 test('"/btw question" answered Send anyway while the Resume\'s compaction fails: the Resume goes as typed, with no "waits until" toast', { options: { autoResume: true } }, async ($, on) => {
-  const { clock, seen, release, sent, endCompact } = await resumeDialogDuringCompaction($, on, '/btw what is x', { name: 'btw', args: 'what is x' })
+  const { clock, seen, release, sent } = await resumeDialogDuringCompaction($, on, '/btw what is x', { name: 'btw', args: 'what is x' }, true)
+  await clock.advance(1000)
+  expect(seen.submits).toEqual([]) // the compaction failed, the dialog is still open
   release('Send anyway')
   await sent()
-  endCompact()
   await clock.advance(5000)
   expect(seen.submits).toEqual(['Resume'])
   expect(seen.toasts.filter((t) => /so the Resume waits until/.test(t))).toEqual([])
@@ -3011,17 +3012,16 @@ test('a Resume armed again after a Cancel whose compaction fails again is not se
   expect({ submits: seen.submits, compacts: seen.compacts }).toEqual({ submits: [], compacts: 2 }) // and not armed a third time
 })
 
-test('a request of the main loop clears the mark of a Resume armed again after a Cancel: a later Resume whose compaction fails goes as typed', { options: { autoResume: true } }, async ($, on) => {
+test('a new arm clears the mark of a Resume armed again after a Cancel: its Resume whose compaction fails goes as typed', { options: { autoResume: true } }, async ($, on) => {
   const { clock, seen, release, sent, endCompact } = await resumeDialogDuringCompaction($, on, 'hold on')
   release('Cancel')
   await sent()
   endCompact()
-  await clock.advance(2000)
-  await mainStep($) // a request starts: the re-armed Resume is settled and the mark cleared
+  await clock.advance(2000) // armed again, marked
   const t = await clock.now()
   await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [{ kind: 'five_hour', percentUsed: 100, resetsAt: new Date(t + 5 * 60000).toISOString() }], changed: [] } as never)
-  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
-  await clock.advance(7 * 60000) // armed afresh: due, its compaction fails, no dialog open
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" }) // armed afresh, the mark cleared
+  await clock.advance(7 * 60000) // due, its compaction fails, no dialog open
   expect(seen.submits).toEqual(['Resume'])
   expect(seen.toasts.filter((t) => /Send Resume yourself when ready/.test(t))).toEqual([])
 })
