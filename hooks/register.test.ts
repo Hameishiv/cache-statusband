@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { ago, borrowedLimits, capFirst, fableLimit, HUES, paint, pattern, resumeTime, spentWindows, lastContext, modelName, planWindows, untilText } from './register.mjs'
+import { ago, borrowedLimits, capFirst, fableLimit, HUES, paint, pattern, resumeText, resumeTime, spentWindows, lastContext, modelName, planWindows, untilText } from './register.mjs'
 
 const COMPOSER = { kind: 'composer' } as never
 // An example setup: an account rotator and a merge-pr workflow, as the README describes
@@ -7,7 +7,7 @@ const SETUP = { options: { seatFileTerminal: '~/.claude-cli-accounts/.active', s
 
 
 // The engine beneath the mod: a terminal session on seat A, nothing on disk but the seat file
-function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unknown>) {
+function engine($: any, on: any, seat: { label: string; recording?: string } = { label: 'A' }, kept?: Map<string, unknown>) {
   const clock = mock.clock(on)
   if (kept) {
     // a store already holding what an earlier run of this mod wrote
@@ -25,8 +25,9 @@ function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unkno
   on('session.messages', () => ({ value: [] }))
   on('command.register', (_: unknown, e: any) => ({ value: { command: e.name } }))
   on('agent.list', () => ({ value: [] }))
-  on('fs.exists', (_: unknown, e: any) => ({ value: String(e.path ?? e).includes('.active') }))
-  on('fs.read', () => ({ value: seat.label }))
+  const isRecording = (e: any) => !!seat.recording && String(e.path ?? e).includes('recording')
+  on('fs.exists', (_: unknown, e: any) => ({ value: String(e.path ?? e).includes('.active') || isRecording(e) }))
+  on('fs.read', (_: unknown, e: any) => ({ value: isRecording(e) ? seat.recording : seat.label }))
   on('command.run', (_: unknown, e: any) => {
     if (e.command === 'compact') seen.compacts++
     return { text: '' }
@@ -331,4 +332,183 @@ test('a cold send that Claude Code auto-compacts still counts as a cold rewrite,
   await step(usage(oneHour(260000)))
   const rec = kept.get('last:sid-test') as { cold: unknown[] }
   expect(rec.cold.length).toBe(1)
+})
+
+// A main-loop request: drives turn.step with a given usage
+function stepper($: any, on: any) {
+  let next: unknown = null
+  on('turn.step', async function* () {
+    return { answer: '', toolUses: [], usage: next }
+  })
+  on('turn.complete', () => ({ text: '' }))
+  on('session.usage', () => ({ value: {} }))
+  return async (u: unknown) => {
+    next = u
+    const it = $.turn.step({ model: 'claude-opus-5-5', messages: [] })
+    if (it && typeof it[Symbol.asyncIterator] === 'function') for await (const _ of it) void _
+    else await it
+  }
+}
+
+const oneHourWrite = (n: number) => ({ cache_creation_input_tokens: n, cache_creation: { ephemeral_1h_input_tokens: n, ephemeral_5m_input_tokens: 0 } })
+const ROTATE = 'Usage reset: the CLI account was rotated to B. Go on.'
+
+test('a compaction after a rotation that a request already landed on is not a cold rewrite', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const seat = { label: 'A' }
+  const { clock } = engine($, on, seat, kept)
+  on('classic.PostCompact', () => ({}))
+  const step = stepper($, on)
+  await start($, 100000, clock)
+  await step(usage({ cache_read_input_tokens: 100000 }))
+  seat.label = 'B'
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never) // the rotation reaches the chat
+  await step(usage(oneHourWrite(100000))) // the rotation's own rewrite
+  expect((kept.get('last:sid-test') as { cold: unknown[] }).cold.length).toBe(1)
+  await clock.advance(60000)
+  // two of the hooks one compaction fires
+  await $.command.run({ command: 'compact', args: '' })
+  await ($ as any).classic.PostCompact({})
+  await step(usage(oneHourWrite(60000)))
+  expect((kept.get('last:sid-test') as { cold: unknown[] }).cold.length).toBe(1)
+})
+
+test('a compaction right after a rotation is one cold rewrite, however many hooks mark it', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const seat = { label: 'A' }
+  const { clock } = engine($, on, seat, kept)
+  on('classic.PostCompact', () => ({}))
+  const step = stepper($, on)
+  await start($, 100000, clock)
+  await step(usage({ cache_read_input_tokens: 100000 }))
+  seat.label = 'B'
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  await $.command.run({ command: 'compact', args: '' })
+  await ($ as any).classic.PostCompact({})
+  await step(usage(oneHourWrite(60000)))
+  expect((kept.get('last:sid-test') as { cold: unknown[] }).cold.length).toBe(1)
+})
+
+test('a rotation does not leave the band cold once the chat is cleared', SETUP, async ($, on) => {
+  const seat = { label: 'A' }
+  const { clock } = engine($, on, seat)
+  on('classic.SessionStart', () => ({}))
+  await start($, 100000, clock)
+  seat.label = 'B'
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  let r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/account rotated/)
+  await ($ as any).classic.SessionStart({ source: 'clear' })
+  r = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/account rotated/)
+})
+
+test('a compaction is kept for a reopened chat as a record with an `at` of 0', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock } = engine($, on, { label: 'A' }, kept)
+  const step = stepper($, on)
+  await start($, 300000, clock)
+  await step(usage(oneHourWrite(300000)))
+  await $.command.run({ command: 'compact', args: '' })
+  await clock.advance(10)
+  expect(kept.get('last:sid-test')).toMatchObject({ ctx: 300010, at: 0 })
+})
+
+test('a compact boundary without its size still ends the walk back through the transcript', async () => {
+  const reply = JSON.stringify({ type: 'assistant', isSidechain: false, timestamp: '2026-10-28T10:00:00Z', message: { model: 'claude-opus-5-5', usage: { input_tokens: 2, cache_read_input_tokens: 300000, output_tokens: 2 } } })
+  const boundary = JSON.stringify({ type: 'system', subtype: 'compact_boundary', timestamp: '2026-10-28T11:00:00Z' })
+  expect(lastContext([reply, boundary])).toEqual({ ctx: 0, at: Date.parse('2026-10-28T11:00:00Z'), compacted: true })
+})
+
+test('a dated model id keeps its major version and drops the date', async () => {
+  expect(modelName('claude-sonnet-4-20250514')).toBe('Sonnet 4')
+  expect(modelName('claude-opus-4-1-20250805')).toBe('Opus 4.1')
+  expect(modelName('claude-opus-5-5')).toBe('Opus 5.5')
+})
+
+test('a resume days away says how far off it is, one under a day is just the time', async () => {
+  const from = Date.parse('2026-10-29T08:00:00Z')
+  expect(resumeText(from + 5 * 3600000, from)).toBe(resumeText(from + 5 * 3600000, from + 1))
+  expect(resumeText(from + 5 * 3600000, from)).not.toMatch(/ in /)
+  expect(resumeText(from + 6 * 86400000 + 3 * 3600000, from)).toMatch(/ in 6d3h$/)
+})
+
+test('a stale full window alone does not arm a resume for a throttle', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = engine($, on)
+  on('classic.StopFailure', () => ({}))
+  await start($, 50000, clock)
+  const past = new Date(30000).toISOString() // reset since the reading
+  await $.session.measure({ context: { tokens: 50000, window: 1000000, percent: 5 }, rateLimits: [{ kind: 'five_hour', percentUsed: 100, resetsAt: past }], changed: [] } as never)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: 'Too many requests, slow down' })
+  await clock.advance(70 * 60000)
+  expect(seen.submits).toEqual([])
+})
+
+test('auto keep warm stops once its pings cost as much as the rewrite; one started by hand goes on', async ($, on) => {
+  const { clock } = engine($, on)
+  let pings = 0
+  on('model.fork', () => {
+    pings++
+    return { value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }
+  })
+  const step = stepper($, on)
+  await start($, 300000, clock)
+  await $.command.run({ command: 'cache', args: 'ttl 5' })
+  await step(usage({ cache_read_input_tokens: 300000 }))
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  let r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/Keep warm is on/)
+  await clock.advance(5 * 3600000)
+  r = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/Keep warm is on/)
+  const auto = pings
+  expect(auto).toBeGreaterThan(3)
+  expect(auto).toBeLessThan(30)
+  // by hand: no cap
+  await $.command.run({ command: 'keepwarm', args: '8' })
+  await step(usage({ cache_read_input_tokens: 300000 }))
+  await clock.advance(5 * 3600000)
+  expect(pings - auto).toBeGreaterThan(auto)
+  r = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/Keep warm is on/)
+})
+
+test('a failed plan check does not overwrite a newer reading another session took', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock } = engine($, on, { label: 'A' }, kept)
+  on('session.authorize', () => ({ value: { handle: 'h' } }))
+  const fresh = { at: 999999999, next: 999999999 + 300000, fable: { percentUsed: 7 }, windows: [{ kind: 'five_hour', percentUsed: 5 }], why: 'ok' }
+  on('http.fetch', () => {
+    // another session lands its reading while this one's check is in flight
+    kept.set('plan', fresh)
+    return { value: { ok: false, status: 429, text: '', headers: { 'retry-after': '600' } } }
+  })
+  kept.set('plan', { at: 1, next: 2, fable: { percentUsed: 1 }, windows: [], why: 'ok' })
+  await start($, 50000, clock)
+  await clock.advance(70000)
+  expect(kept.get('plan')).toEqual(fresh)
+})
+
+test('a session without a first-party sign-in neither shows nor writes the shared plan reading', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock } = engine($, on, { label: 'A' }, kept)
+  on('session.authorize', () => ({ value: null }))
+  const shared = { at: 5, next: 99999999999, fable: { percentUsed: 33 }, windows: [{ kind: 'five_hour', percentUsed: 44 }], why: 'ok' }
+  kept.set('plan', shared)
+  await start($, 50000, clock)
+  await clock.advance(70000)
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/Fable weekly: no reading yet \(last check: no first-party sign-in\)/)
+  expect(kept.get('plan')).toEqual(shared)
+})
+
+test('the seat label is masked in recording mode like the email', SETUP, async ($, on) => {
+  const seat = { label: 'A', recording: '{"on":true,"strict":true}' }
+  const { clock } = engine($, on, seat)
+  await start($, 100000, clock)
+  seat.label = 'jane.doe@example.com' // a rotator often labels seats by email
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/account rotated/)
+  expect(r.text).not.toMatch(/jane.doe/)
 })

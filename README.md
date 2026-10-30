@@ -72,6 +72,8 @@ If you also have Nate Herk's `cache-keeper` installed, turn one of them off: the
 | `/board` | Every local Claude Code chat: state, context, cache, cost |
 | `/handoff [continue]` | Session handoff, then clear this chat and continue with it |
 
+Auto keep warm (the default for big chats, `/cache autowarm 8|off`) stops on its own once its pings since your last message have cost as much as the rewrite they protect. On a 5-minute cache that happens much sooner than on a 1-hour one. `/keepwarm` started by hand is not capped this way.
+
 ## Optional settings
 
 Everything below is off by default. Set the values in Claude Code's config menu, or in `~/.claude/settings.json` under `pluginConfigs`:

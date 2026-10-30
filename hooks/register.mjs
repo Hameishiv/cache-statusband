@@ -39,6 +39,8 @@ const S = {
   keepWarmUntil: 0,
   pings: 0,
   pingUsd: 0,
+  autoPingUsd: 0, // what auto keep warm's pings cost since the last real request
+  keepWarmAuto: false, // the running keep warm began on its own, not by hand
   lastPingAt: 0,
   warnedFor: 0,
   agentsRunning: 0,
@@ -70,6 +72,9 @@ const alerted = new Map() // sessionId -> state or warning key already announced
 let paneOpen = false
 let justCompacted = false
 let compactedCold = false
+let rotatedPending = false // a seat change no request has landed on yet: the new account's cache is empty
+let signedIn = null // whether this session has a first-party sign-in (an API-key session has none); null until checked
+let signCheckAt = 0
 let handoffPending = false
 let seatFile = ''
 let onTerminal = false
@@ -245,18 +250,34 @@ function ttlMin() {
   return settings.ttlMin || S.ttlMin
 }
 
-// A rotation moves the session to another account, whose cache is empty
+// A rotation moves the session to another account, whose cache is empty, until a request lands on it
 function rotatedCold() {
-  return S.seatChangedAt > S.lastActivity
+  return rotatedPending
 }
 
-// The next request writes the shorter context: no TTL evidence and nothing to warn about
-function markCompacted() {
-  // a compaction of a cold cache (Claude Code auto-compacts a big chat as it is sent) still pays a rewrite
-  const left = msLeft(S.lastActivity, ttlMin())
-  compactedCold = compactedCold || (left !== null && left <= 0) || rotatedCold()
+// The next request writes the shorter context: no TTL evidence and nothing to warn about.
+// It also keeps the record a reopened chat reads: an `at` of 0 says it was compacted.
+function markCompacted($) {
+  // the several hooks of one compaction must not judge it again once lastActivity is zeroed
+  if (!justCompacted) {
+    // a compaction of a cold cache (Claude Code auto-compacts a big chat as it is sent) still pays a rewrite
+    const left = msLeft(S.lastActivity, ttlMin())
+    compactedCold = compactedCold || (left !== null && left <= 0) || rotatedCold()
+  }
   justCompacted = true
+  rotatedPending = false // the rotation is now part of compactedCold
   S.lastActivity = 0
+  rememberCompacted($)
+}
+
+// The compacted size isn't known until the next request: keep the one before it, as rememberLast shapes it (keptAt dates an `at` of 0 for the prune)
+async function rememberCompacted($) {
+  if (!S.id || !S.ctx) return
+  try {
+    await $.store.set('last:' + S.id, { ctx: S.ctx, at: 0, keptAt: now, model: S.model, effort: S.effort, cold: S.coldRestarts.slice(-50) })
+  } catch {
+    // another session holds the store's lock: the next request writes it
+  }
 }
 
 // Terminal sessions run on the CLI rotator's accounts, desktop ones on the app rotator's seats
@@ -286,6 +307,7 @@ async function readSeat($, adopt = false) {
   }
   if (S.seat && seat && seat !== S.seat) {
     S.seatChangedAt = now
+    rotatedPending = true
     // the old account's readings: borrow or fetch the new one's until a request measures them
     S.rateLimits = []
     S.fable = null
@@ -321,9 +343,15 @@ export function resumeTime(full, at) {
   return times.length ? Math.max(...times) + MIN : null
 }
 
+// The time of day, and how far off it is once that is more than a day away
+export function resumeText(at, from) {
+  return at - from > 24 * 60 * MIN ? `${clock(at)} in ${ago(at - from)}` : clock(at)
+}
+
 function armResume($, details) {
-  let limits = S.rateLimits.length ? S.rateLimits : borrowedLimits(fleet, { seat: S.seat, desktop: !onTerminal }, now)
-  if (!limits.length) limits = S.planWindows
+  let limits = stillOpen(S.rateLimits, now)
+  if (!limits.length && signedIn !== false) limits = borrowedLimits(fleet, { seat: S.seat, desktop: !onTerminal }, now)
+  if (!limits.length) limits = stillOpen(S.planWindows, now)
   const full = spentWindows(limits, S.fable, S.model)
   if (!full.length && !USAGE_SPENT.test(String(details || ''))) return // not usage exhaustion
   const at = resumeTime(full, now)
@@ -333,7 +361,7 @@ function armResume($, details) {
   }
   S.resumeAt = at || now + RESUME_FALLBACK
   if (!at) resumeTries++
-  $.ui.toast(`Out of usage. This chat resumes on its own at ${clock(S.resumeAt)}.`, { timeoutMs: 15000 })
+  $.ui.toast(`Out of usage. This chat resumes on its own at ${resumeText(S.resumeAt, now)}.`, { timeoutMs: 15000 })
   $.ui.invalidate('ui.render')
 }
 
@@ -365,7 +393,7 @@ function compactThenSend($, e, unattended) {
 async function runCompactThenSend($, msg, unattended) {
   try {
     await $.command.run({ command: 'compact', args: '' })
-    markCompacted()
+    markCompacted($)
   } catch (err) {
     $.ui.toast('Could not compact (' + clip(String((err && err.message) || err), 80) + '), so the message goes as typed.', { timeoutMs: 8000 })
   }
@@ -467,13 +495,17 @@ function myHeartbeat() {
 
 // A session that has sent nothing has no plan windows of its own: borrow the freshest
 // reading another session on the same account took, dropping a window that has since reset
+export function stillOpen(limits, at) {
+  return limits.filter((l) => !l.resetsAt || Date.parse(l.resetsAt) > at)
+}
+
 export function borrowedLimits(list, self, at) {
   const same = (hb) => (self.seat && hb.seat ? hb.seat === self.seat : hb.desktop === self.desktop)
   const best = list
     .filter((hb) => !hb.self && Array.isArray(hb.rateLimits) && hb.rateLimits.length && same(hb))
     .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))[0]
   if (!best) return []
-  return best.rateLimits.filter((l) => !l.resetsAt || Date.parse(l.resetsAt) > at)
+  return stillOpen(best.rateLimits, at)
 }
 
 async function registerCommand($, name, description, argumentHint, immediate) {
@@ -541,6 +573,16 @@ function planKey() {
 }
 
 async function refreshPlan($) {
+  // An API-key session has no first-party sign-in: the shared reading is another account's
+  if (signedIn === null || (signedIn === false && now >= signCheckAt)) {
+    try {
+      signedIn = !!(await $.session.authorize())
+    } catch {
+      signedIn = null // can't tell: carry on as before
+    }
+    signCheckAt = now + PLAN_EVERY
+  }
+  if (signedIn === false) return noSignIn()
   let cached = null
   try {
     cached = await $.store.get(planKey())
@@ -555,26 +597,35 @@ async function refreshPlan($) {
   // the store's backoff, or this session's own where a held lock kept it out of the store
   if (now < Math.max(prior.next || (prior.at || 0) + PLAN_EVERY, planNext)) return
   planNext = now + PLAN_EVERY
+  // claim the slot first, so a session that wakes meanwhile finds it taken
+  try {
+    await $.store.set(planKey(), { ...prior, next: now + PLAN_EVERY })
+  } catch {
+    // lock held: this session's own planNext still holds it back
+  }
   let fable = prior.fable || S.fable
   let windows = Array.isArray(prior.windows) && prior.windows.length ? prior.windows : S.planWindows
   let at = prior.at || 0 // when the reading was taken: a failure keeps the last good one
   let next = now + PLAN_EVERY
   let why = 'ok' // the last attempt's outcome, kept with the reading for /cache
+  let fetched = false
   try {
     const auth = await $.session.authorize()
-    if (!auth) why = 'no first-party sign-in'
-    else {
-      const r = await $.http.fetch(USAGE_URL, { auth: auth.handle, headers: { 'anthropic-beta': 'oauth-2025-04-20' } })
-      if (r.ok) {
-        const body = JSON.parse(r.text)
-        fable = fableLimit(body)
-        windows = planWindows(body)
-        at = now
-      } else why = 'HTTP ' + r.status
-      // a 429 names how long to stay away; every session waits it out, an hour at most
-      const wait = Number(r.headers && r.headers['retry-after'])
-      if (!r.ok && wait > 0) next = now + Math.min(60 * MIN, Math.max(PLAN_EVERY, wait * 1000))
+    if (!auth) {
+      signedIn = false
+      return noSignIn()
     }
+    const r = await $.http.fetch(USAGE_URL, { auth: auth.handle, headers: { 'anthropic-beta': 'oauth-2025-04-20' } })
+    if (r.ok) {
+      const body = JSON.parse(r.text)
+      fable = fableLimit(body)
+      windows = planWindows(body)
+      at = now
+      fetched = true
+    } else why = 'HTTP ' + r.status
+    // a 429 names how long to stay away; every session waits it out, an hour at most
+    const wait = Number(r.headers && r.headers['retry-after'])
+    if (!r.ok && wait > 0) next = now + Math.min(60 * MIN, Math.max(PLAN_EVERY, wait * 1000))
   } catch (err) {
     why = clip(String((err && err.message) || err), 120) // offline or refused: keep the last reading
   }
@@ -583,10 +634,24 @@ async function refreshPlan($) {
   S.planWindows = windows
   planWhy = why
   try {
+    // a failed check must not put its older reading over one another session took meanwhile
+    const stored = fetched ? null : await $.store.get(planKey())
+    if (stored && typeof stored === 'object' && (stored.at || 0) > (prior.at || 0)) {
+      if (Array.isArray(stored.windows) && stored.windows.length) S.planWindows = stored.windows
+      if (stored.fable) S.fable = stored.fable
+      return
+    }
     await $.store.set(planKey(), { at, next, fable, windows, why })
   } catch {
     // lock held: another session is writing the same reading
   }
+}
+
+// Nothing to read or write: the shared plan reading would be another account's
+function noSignIn() {
+  S.fable = null
+  S.planWindows = []
+  planWhy = 'no first-party sign-in'
 }
 
 // An opened or resumed session has sent nothing yet, so measure its first request from the
@@ -603,7 +668,8 @@ export function lastContext(lines) {
     if (!j || j.isSidechain) continue
     const at = Date.parse(j.timestamp || '') || 0
     const meta = j.compactMetadata
-    if (j.type === 'system' && j.subtype === 'compact_boundary' && meta && meta.postTokens) return { ctx: meta.postTokens, at, compacted: true }
+    // any compaction boundary ends the walk: what lies before it was compacted away
+    if (j.type === 'system' && j.subtype === 'compact_boundary') return { ctx: (meta && meta.postTokens) || 0, at, compacted: true }
     const u = j.type === 'assistant' && j.message && j.message.usage
     // the next request re-reads that reply too, so its output counts
     if (u && totalInput(u) > 0) return { ctx: totalInput(u) + (u.output_tokens || 0), at, model: j.message.model, effort: typeof j.effort === 'string' ? j.effort : '' }
@@ -664,7 +730,7 @@ async function seedFromTranscript($, path) {
   if (found.compacted) {
     // the next request writes the compacted context whatever happens: nothing to ask
     S.floor = found.ctx
-    markCompacted()
+    markCompacted($)
   } else {
     S.lastActivity = found.at // the cache's real age: the band and the cold-send guard read it
   }
@@ -699,7 +765,7 @@ async function readFleet($) {
     lastPrune = now
     for (const k of all.filter((k) => k.startsWith('last:'))) {
       const r = await $.store.get(k)
-      if (!r || now - (r.at || now) > LAST_KEEP) await $.store.delete(k)
+      if (!r || now - (r.at || r.keptAt || now) > LAST_KEEP) await $.store.delete(k)
     }
   }
   const keys = all.filter((k) => k.startsWith('hb:'))
@@ -734,8 +800,9 @@ async function applyRemoteCommands($) {
   }
 }
 
-function startKeepWarm($, hours) {
+function startKeepWarm($, hours, auto = false) {
   S.keepWarm = true
+  S.keepWarmAuto = auto
   S.keepWarmUntil = now + hours * 60 * MIN
   $.ui.toast(`Keeping this cache warm until ${clock(S.keepWarmUntil)}. A ping reads the cache before it expires.`)
 }
@@ -774,13 +841,19 @@ async function keepWarmStep($) {
   const u = reply.usage
   S.pings += 1
   S.lastPingAt = now
-  S.pingUsd += requestCost(u, S.model, ttl)
+  const pingCost = requestCost(u, S.model, ttl)
+  S.pingUsd += pingCost
+  if (S.keepWarmAuto) S.autoPingUsd += pingCost
   // A ping that writes instead of reading did not hit the cache: stop paying for it
   if ((u.cache_creation_input_tokens || 0) > 0.1 * Math.max(1, u.cache_read_input_tokens || 0)) {
     return stopKeepWarm($, `the ping wrote ${tokens(u.cache_creation_input_tokens)} tokens instead of reading the cache`)
   }
   S.lastActivity = now
   await rememberLast($)
+  // Auto keep warm only pays while it costs less than the rewrite it protects: on a 5-minute cache the pings catch up fast
+  if (S.keepWarmAuto && S.autoPingUsd >= rewriteCost(S.ctx, S.model, ttl)) {
+    return stopKeepWarm($, `its pings have cost as much as rewriting the cache (${money(S.autoPingUsd)})`)
+  }
 }
 
 function warnStep($) {
@@ -813,7 +886,11 @@ async function tick($) {
   try {
     await resumeStep($)
     await refreshPlan($)
-    await loadSettings($) // /cache set in another session applies here too
+    try {
+      await loadSettings($) // /cache set in another session applies here too
+    } catch {
+      // a store lock held by another session: the settings stay as they were
+    }
     await readRecording($)
     await applyRemoteCommands($)
     await keepWarmStep($)
@@ -839,7 +916,7 @@ function statusText() {
   if (st.kind === 'unknown') lines.push('No request yet this session, so the cache state is unknown.')
   if (st.kind === 'warm' || st.kind === 'cooling') lines.push(`Cache is warm for about ${minutes(st.left)} more.`)
   if (st.kind === 'cold') lines.push(`Cache went cold ${minutes(-st.left)} ago. The next message rewrites it for about ${money(rewriteCost(S.ctx, S.model, ttl))}.`)
-  if (rotatedCold()) lines.push(`The account rotated ${minutes(now - S.seatChangedAt)} ago (now ${S.seat}), so the cache is cold.`)
+  if (rotatedCold()) lines.push(`The account rotated ${minutes(now - S.seatChangedAt)} ago (now ${mask(S.seat)}), so the cache is cold.`)
   if (S.keepWarm) lines.push(`Keep warm is on until ${clock(S.keepWarmUntil)}: ${S.pings} ping(s), ${money(S.pingUsd)} so far.`)
   if (S.rateLimits.length) lines.push(`Plan limits used: ${limitsText(S.rateLimits)}.`)
   lines.push(S.fable ? `Fable weekly: ${Math.round(S.fable.percentUsed)}% used.` : `Fable weekly: no reading yet${planWhy && planWhy !== 'ok' ? ` (last check: ${planWhy})` : ''}.`)
@@ -915,6 +992,7 @@ export function register(on, options = {}) {
   // on under a new session id, and no session.start fires for it.
   on('classic.SessionStart', { source: ['clear', 'resume', 'fork'] }, async ($, e, next) => {
     S.lastActivity = 0
+    rotatedPending = false // the new chat starts from an unknown cache, not a rotated one
     S.keepWarm = false
     H.armed = false
     // the last chat's compaction says nothing about this one, and would mute its cold-send guard
@@ -966,7 +1044,10 @@ export function register(on, options = {}) {
     if (wake) {
       // The wake-up is the rotation reaching this session: take the new seat now
       await readSeat($, true)
-      if (!rotatedCold()) S.seatChangedAt = now
+      if (!rotatedCold()) {
+        S.seatChangedAt = now
+        rotatedPending = true
+      }
     }
     const ttl = ttlMin()
     const left = msLeft(S.lastActivity, ttl)
@@ -979,7 +1060,7 @@ export function register(on, options = {}) {
     const media = Array.isArray(e.attachments) && e.attachments.length > 0
     if (wake) return worthCompacting() && !media ? compactThenSend($, e, true) : next(e)
     const cost = money(rewriteCost(S.ctx, S.model, ttl))
-    const why = rotated ? `The account rotated to ${S.seat || 'another seat'} ${minutes(now - S.seatChangedAt)} ago, so the cache is cold.` : `Cache went cold ${minutes(-left)} ago.`
+    const why = rotated ? `The account rotated to ${mask(S.seat) || 'another seat'} ${minutes(now - S.seatChangedAt)} ago, so the cache is cold.` : `Cache went cold ${minutes(-left)} ago.`
     const floor = S.floor ? ` Compacting last left ${tokens(S.floor)}.` : ''
     let answer = 'Send anyway'
     try {
@@ -1053,6 +1134,8 @@ export function register(on, options = {}) {
     }
     S.ctx = total
     S.lastActivity = now
+    S.autoPingUsd = 0 // a real request ends the idle stretch the pings were protecting
+    rotatedPending = false
     await rememberLast($)
     return result
   })
@@ -1078,7 +1161,7 @@ export function register(on, options = {}) {
     if (H.armed && e.turnId !== H.notTurn) await captureHandoff($, e)
     // Auto keep warm: a big chat stays warm until autoWarmHours after its last turn
     if (settings.autoWarmHours > 0 && S.autoWarm && S.ctx >= settings.bigTokens) {
-      if (!S.keepWarm) startKeepWarm($, settings.autoWarmHours)
+      if (!S.keepWarm) startKeepWarm($, settings.autoWarmHours, true)
       S.keepWarmUntil = Math.max(S.keepWarmUntil, now + settings.autoWarmHours * 60 * MIN)
     }
     await heartbeat($, true)
@@ -1091,20 +1174,20 @@ export function register(on, options = {}) {
   on('session.compact', async ($, e, next) => {
     now = await $.clock.now()
     const r = await next(e)
-    if (!e.agentId) markCompacted()
+    if (!e.agentId) markCompacted($)
     return r
   })
   on('classic.PostCompact', async ($, e, next) => {
-    markCompacted()
+    markCompacted($)
     return next(e)
   })
   on('classic.SessionStart', { source: ['compact'] }, async ($, e, next) => {
-    markCompacted()
+    markCompacted($)
     return next(e)
   })
   on('command.run', { command: ['compact'] }, async ($, e, next) => {
     const r = await next(e)
-    markCompacted()
+    markCompacted($)
     return r
   })
 
@@ -1318,7 +1401,7 @@ export function paint(segs) {
 }
 
 export function modelName(id) {
-  const m = String(id || '').toLowerCase().match(/(opus|sonnet|haiku|fable)-(\d+)(?:-(\d+))?/)
+  const m = String(id || '').toLowerCase().match(/(opus|sonnet|haiku|fable)-(\d+)(?:-(\d{1,2})(?!\d))?/)
   if (!m) return String(id || '') || 'model ?'
   return m[1][0].toUpperCase() + m[1].slice(1) + ' ' + m[2] + (m[3] ? '.' + m[3] : '')
 }
@@ -1359,8 +1442,8 @@ function bandSegments() {
   // what this chat has already paid to rewrite cold caches, beside the next send's estimate
   if (S.coldRestarts.length) out.push([`Cold rewrites ${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))} (${S.coldRestarts.length})`, 'gray'])
   // the engine's own reading once a request has run; before that another session's on the same account, then the shared usage reading
-  let limits = S.rateLimits.filter((l) => !l.resetsAt || Date.parse(l.resetsAt) > now) // a window that reset since is stale
-  if (!limits.length) limits = borrowedLimits(fleet, { seat: S.seat, desktop: !onTerminal }, now)
+  let limits = stillOpen(S.rateLimits, now) // a window that reset since is stale
+  if (!limits.length && signedIn !== false) limits = borrowedLimits(fleet, { seat: S.seat, desktop: !onTerminal }, now)
   if (!limits.length) limits = S.planWindows
   const five = limits.find((l) => l.kind === 'five_hour')
   const week = limits.find((l) => l.kind === 'seven_day')
@@ -1370,9 +1453,9 @@ function bandSegments() {
   if (S.fable) out.push(limitSegment('Fable', S.fable, 'pink', false))
   for (const l of S.rateLimits) if (l.kind !== 'five_hour' && l.kind !== 'seven_day') out.push(limitSegment(LIMIT_LABEL[l.kind] || l.kind, l, 'gray'))
   out.push([`session ${money(S.costUsd)}`, 'salmon'])
-  if (S.resumeAt) out.push([`⏸ resumes ${clock(S.resumeAt)}`, WARN])
+  if (S.resumeAt) out.push([`⏸ resumes ${resumeText(S.resumeAt, now)}`, WARN])
   // who the terminal session runs as: a configured seat's label, else the signed-in account
-  const who = S.seat ? `seat ${S.seat}` : S.account ? mask(S.account) : ''
+  const who = S.seat ? `seat ${mask(S.seat)}` : S.account ? mask(S.account) : ''
   if (onTerminal && who) out.push([who, 'teal'])
   return paint(out)
 }
