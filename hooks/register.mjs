@@ -53,7 +53,7 @@ const S = {
   prCheckedAt: 0,
   effort: '', // the main loop's effort, as its last request named it
   account: '', // the signed-in account's email, shown when no seat file is configured
-  resumeAt: 0, // when an out-of-usage chat sends itself "Resume" (also a cancelled Resume's re-arm, 2 minutes after the cancel); 0 when none is pending
+  resumeAt: 0, // when an out-of-usage chat sends itself "Resume" (also the re-arm of a cancelled Resume or one that could not be sent, 2 minutes on); 0 when none is pending
   fable: null, // { percentUsed, resetsAt } from the plan's per-model weekly limits
   planWindows: [], // 5h and weekly from the same reading, for a session that has sent nothing yet
 }
@@ -442,7 +442,7 @@ let wakePendingId = 0 // the wakeCount of a rotator wake-up that has arrived and
 let sendPending = new Map() // id -> deadline: a send handed on that is not this mod's own (and the person's own message this mod sends again after Compact first) whose request has not started: a due resume waits. A main-loop request, /clear or resuming another chat lowers all; the deadline (SEND_SAFETY after hand-over) covers a send that never starts a request
 let sendPendingId = 0
 let stepsSeen = 0 // main-loop requests started so far
-let realSends = 0 // messages handed on to the chat (submitsSeen without the dialogs, wake-ups and /clear)
+let realSends = 0 // messages handed on to the chat (submitsSeen without "Compact first" answers, wake-ups and /clear)
 let chatGen = 0 // bumped when the chat is replaced (/clear, resuming another chat)
 const CANCEL_REARM = 2 * MIN // a cancelled Resume with no request started since is armed again this long after the cancel (tries kept)
 const SEND_SAFETY = 2 * MIN
