@@ -401,17 +401,17 @@ async function readSeat($, adopt = false) {
 }
 
 // The old account's readings, dropped once the account or seat moves: the new one's are borrowed or fetched until a request measures them.
-// A resume still pending that was armed from them is not cancelled: it moves to a minute from now, when the new account presumably has usage, keeping its tries. One already settled, sent or cleared is not revived.
+// A resume still pending that was armed from them is not cancelled: it moves to a minute from now, when the new account presumably has usage, keeping its tries. One already settled, sent or cleared is not revived. A wake-up is itself the resume, so its own drop (rearm false) leaves a pending one as it is: the wake-up's turn settles it.
 // A request that started before the drop reports the old account's windows: identityGen lets its readings be told apart.
 let identityGen = 0
-let requestGen = 0 // identityGen as the latest request started: session.measure names no request, so the latest start stands for the one that reports
-function dropReadings() {
+let requestGen = 0 // identityGen as the latest main-loop request started: session.measure names no request, so the latest start stands for the one that reports (a subagent's reading carries the same account)
+function dropReadings(rearm = true) {
   identityGen++
   S.rateLimits = []
   S.fable = null
   S.planWindows = []
   planNext = 0
-  if (resumeFromReadings && S.resumeAt) { // only a resume still pending: one settled, fired or cleared stays so
+  if (rearm && resumeFromReadings && S.resumeAt) { // only a resume still pending: one settled, fired or cleared stays so
     S.resumeAt = now + MIN
     resumeFromReadings = false
   }
@@ -485,7 +485,7 @@ function armResume($, details) {
 // From the heartbeat tick: send "Resume" once its time has come, as the person's own word
 async function resumeStep($) {
   if (!S.resumeAt || now < S.resumeAt || S.working) return
-  // the account is not known yet: the send waits for it or for the window to close, without spending a try or compacting
+  // the seat or the account is not known yet: the send waits for it or for the window to close, without spending a try or compacting
   if (keyUnsure()) {
     S.resumeAt = wakeWindowEnd
     $.ui.invalidate('ui.render')
@@ -736,11 +736,10 @@ async function refreshPlan($) {
   // a seat or account change, or a wake-up, during any await below: don't restore the old account's readings
   if (stale()) return
   if (signedIn === false) return noSignIn()
-  // decided again before each store access: the sign-in check may have only now succeeded
-  const alone = unidentified
+  const alone = unidentified() // once: a seat or account change during an await makes stale() return
   let cached = null
   try {
-    cached = alone() ? null : await $.store.get(key)
+    cached = alone ? null : await $.store.get(key)
   } catch {
     cached = null
   }
@@ -755,7 +754,7 @@ async function refreshPlan($) {
   planNext = now + PLAN_EVERY
   // claim the slot first, so a session that wakes meanwhile finds it taken
   try {
-    if (!alone()) await $.store.set(key, { ...prior, next: now + PLAN_EVERY })
+    if (!alone) await $.store.set(key, { ...prior, next: now + PLAN_EVERY })
   } catch {
     // lock held: this session's own planNext still holds it back
   }
@@ -796,7 +795,7 @@ async function refreshPlan($) {
   planWhy = why
   try {
     // a failed check must not put its older reading over one another session took meanwhile
-    if (alone()) return
+    if (alone) return
     const stored = fetched ? null : await $.store.get(key)
     if (stale()) return
     if (stored && typeof stored === 'object' && (stored.at || 0) > (prior.at || 0)) {
@@ -1269,12 +1268,6 @@ export function register(on, options = {}) {
   on('prompt.submit', async ($, e, next) => {
     now = await $.clock.now()
     if (!(e.command && e.command.name === 'compact')) submitsSeen++ // our own compaction is not the person
-    // anything sent to the chat (the person, a rotator's wake-up, our own "Resume") settles a pending resume
-    resumeFromReadings = false // settled: a later account change must not bring it back
-    if (S.resumeAt) {
-      S.resumeAt = 0
-      $.ui.invalidate('ui.render')
-    }
     if (S.label === basename(S.cwd) && e.origin && e.origin.kind === 'composer' && e.text) {
       S.label = basename(S.cwd) + ' · ' + clip(e.text, 40)
     }
@@ -1302,7 +1295,7 @@ export function register(on, options = {}) {
       accountUnknown = !S.account || S.account === wakeAccount
       seatMoved = !!seatFile && S.seat !== wakeSeat
       accountMoved = !accountUnknown
-      if (accountMoved) dropReadings() // the account is known to have moved: the readings are the old account's, as on a seat change
+      if (accountMoved) dropReadings(false) // the account is known to have moved: the readings are the old account's, as on a seat change; the wake-up is itself the resume, so a pending one is not re-armed
       S.seatChangedAt = now // a second wake-up of an already rotated chat dates it anew
       rotatedPending = true
     }
@@ -1346,7 +1339,15 @@ export function register(on, options = {}) {
 
   // Each main-loop request: did it read the cache, or rewrite it?
   on('turn.step', async function* ($, e, next) {
-    requestGen = identityGen
+    if (!e.agentId) {
+      requestGen = identityGen
+      // a main-loop request started: what was sent reached the chat, so a pending resume is settled (our own "Resume" zeroes it before it sends)
+      resumeFromReadings = false // settled: a later account change must not bring it back
+      if (S.resumeAt) {
+        S.resumeAt = 0
+        $.ui.invalidate('ui.render')
+      }
+    }
     const startedAt = await $.clock.now()
     if (!e.agentId) {
       S.model = e.model || S.model

@@ -463,6 +463,12 @@ function stepper($: any, on: any) {
 }
 
 const oneHourWrite = (n: number) => ({ cache_creation_input_tokens: n, cache_creation: { ephemeral_1h_input_tokens: n, ephemeral_5m_input_tokens: 0 } })
+// A main-loop request (or a subagent's, with an agentId) starts and ends
+async function mainStep($: any, agentId?: string) {
+  const it = ($ as any).turn.step({ model: 'claude-opus-5-5', messages: [], ...(agentId ? { agentId } : {}) })
+  if (it && typeof it[Symbol.asyncIterator] === 'function') for await (const _ of it) void _
+  else await it
+}
 const ROTATE = 'Usage reset: the CLI account was rotated to B. Go on.'
 
 test('a compaction after a rotation that a request already landed on is not a cold rewrite', SETUP, async ($, on) => {
@@ -1794,13 +1800,17 @@ test('the wake-up is itself the resume: a resume armed before it is settled, and
   const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
   const { clock, seen } = engine($, on, { label: 'A' }, undefined, undefined, disk)
   on('classic.StopFailure', () => ({}))
+  on('turn.step', async function* () { return { answer: '', toolUses: [], usage: null } })
   await start($, 50000, clock)
   const t0 = await clock.now()
   await $.session.measure({ context: { tokens: 50000, window: 1000000, percent: 5 }, rateLimits: fiveFull(t0), changed: [] } as never)
   await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
   disk.files['.claude.json'] = account('b@x')
-  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never) // the wake-up is itself the resume
-  await clock.advance(5 * 60000)
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, turnId: 't1', wait: false } as never) // the wake-up is itself the resume, queued behind a running turn
+  await clock.advance(5 * 60000) // not re-armed for a minute from now meanwhile
+  expect(seen.submits).toEqual([])
+  await mainStep($) // the wake-up's turn starts: it settles the resume
+  await clock.advance(3 * 60 * 60000)
   expect(seen.submits).toEqual([])
 })
 
@@ -1808,11 +1818,13 @@ test('a resume the person settled by sending is not revived by a later account c
   const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
   const { clock, seen } = engine($, on, { label: 'A' }, undefined, undefined, disk)
   on('classic.StopFailure', () => ({}))
+  on('turn.step', async function* () { return { answer: '', toolUses: [], usage: null } })
   await start($, 50000, clock)
   const t0 = await clock.now()
   await $.session.measure({ context: { tokens: 50000, window: 1000000, percent: 5 }, rateLimits: fiveFull(t0), changed: [] } as never)
   await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
-  await $.prompt.submit({ text: 'never mind', origin: COMPOSER, wait: false } as never) // settles it
+  await $.prompt.submit({ text: 'never mind', origin: COMPOSER, wait: false } as never)
+  await mainStep($) // its request starts: that settles the resume
   await clock.advance(10 * 60000)
   disk.files['.claude.json'] = account('b@x')
   await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
@@ -1895,7 +1907,7 @@ test('a usage failure of a request that started before an account change arms a 
   const old = step()
   await clock.advance(10) // the request is out on a@x
   disk.files['.claude.json'] = account('b@x')
-  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never) // the account moves while it runs
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, turnId: 't1', wait: false } as never) // the account moves while it runs; the wake-up queued over the turn is withdrawn, so no turn of its own follows
   await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" }) // a@x's cap, from the old request
   release()
   await old
@@ -1915,6 +1927,110 @@ test('a usage failure of a request that started before an account change arms a 
   await step()
   await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
   expect(seen.toasts.some((t) => /Auto-resume gave up/.test(t))).toBe(true)
+})
+
+test('typing a local command while a resume is pending does not cancel it', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = engine($, on)
+  on('classic.StopFailure', () => ({}))
+  await start($, 50000, clock)
+  const t0 = await clock.now()
+  await $.session.measure({ context: { tokens: 50000, window: 1000000, percent: 5 }, rateLimits: fiveFull(t0), changed: [] } as never)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  await clock.advance(60000)
+  await $.prompt.submit({ text: '/cache', command: { name: 'cache', args: '' }, origin: COMPOSER, wait: false } as never) // runs locally: never reaches the chat
+  await clock.advance(3 * 60 * 60000)
+  expect(seen.submits).toEqual(['Resume'])
+})
+
+test('a send the cold-send guard cancels does not cancel a pending resume', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = engine($, on)
+  answer(on, seen, 'Cancel')
+  on('classic.StopFailure', () => ({}))
+  on('turn.step', async function* () { return { answer: '', toolUses: [], usage: { input_tokens: 10, cache_read_input_tokens: 300000, cache_creation_input_tokens: 0 } } })
+  await start($, 300000, clock)
+  const t0 = await clock.now()
+  await mainStep($) // the last request, so the cache's age is known
+  await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [{ kind: 'five_hour', percentUsed: 100, resetsAt: new Date(t0 + 90 * 60000).toISOString() }], changed: [] } as never)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  await clock.advance(70 * 60000) // the cache has gone cold
+  await $.prompt.submit({ text: 'are we back?', origin: COMPOSER, wait: false } as never)
+  expect(seen.asks).toBe(1)
+  expect(seen.toasts.filter((t) => /Not sent/.test(t)).length).toBe(1)
+  await clock.advance(40 * 60000)
+  expect(seen.submits.filter((t) => t === 'Resume').length + seen.compacts).toBeGreaterThan(0) // the resume still fires (on a big chat it compacts first)
+})
+
+test('a subagent request starting does not settle a pending resume, a main-loop one does', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = engine($, on)
+  on('classic.StopFailure', () => ({}))
+  on('turn.step', async function* () { return { answer: '', toolUses: [], usage: null } })
+  await start($, 50000, clock)
+  const t0 = await clock.now()
+  await $.session.measure({ context: { tokens: 50000, window: 1000000, percent: 5 }, rateLimits: fiveFull(t0), changed: [] } as never)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  await mainStep($, 'agent-1')
+  await clock.advance(3 * 60 * 60000)
+  expect(seen.submits).toEqual(['Resume'])
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  await mainStep($)
+  await clock.advance(3 * 60 * 60000)
+  expect(seen.submits).toEqual(['Resume'])
+})
+
+test('a wake-up typed over a running request is delivered after it fails on the old account: its turn settles the resume, no Resume follows', RESUME_WAKE, async ($, on) => {
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock, seen } = engine($, on, { label: 'A' }, undefined, undefined, disk)
+  on('classic.StopFailure', () => ({}))
+  let release: () => void = () => {}
+  const gate = new Promise<void>((r) => (release = r))
+  on('turn.step', async function* () {
+    await gate
+    return { answer: '', toolUses: [], usage: null }
+  })
+  await start($, 50000, clock)
+  const old = ($ as any).turn.step({ model: 'claude-opus-5-5', messages: [] })
+  const draining = (async () => {
+    if (old && typeof old[Symbol.asyncIterator] === 'function') for await (const _ of old) void _
+    else await old
+  })()
+  await clock.advance(10)
+  disk.files['.claude.json'] = account('b@x')
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, turnId: 't1', wait: false } as never) // typed over the running turn: queued
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" }) // the old account's cap
+  release()
+  await draining
+  await mainStep($) // the queued wake-up's own turn, on b@x
+  await clock.advance(5 * 60000)
+  expect(seen.submits).toEqual([])
+})
+
+test('a subagent request starting after an account change does not hide a stale main request\'s failure: the resume is a minute off and spends no try', RESUME_WAKE, async ($, on) => {
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock, seen } = engine($, on, { label: 'A' }, undefined, undefined, disk)
+  on('classic.StopFailure', () => ({}))
+  let release: () => void = () => {}
+  const gate = new Promise<void>((r) => (release = r))
+  on('turn.step', async function* (_: unknown, e: any) {
+    if (!e.agentId) await gate
+    return { answer: '', toolUses: [], usage: null }
+  })
+  await start($, 50000, clock)
+  const drain = async (it: any) => {
+    if (it && typeof it[Symbol.asyncIterator] === 'function') for await (const _ of it) void _
+    else await it
+  }
+  const old = drain(($ as any).turn.step({ model: 'claude-opus-5-5', messages: [] }))
+  await clock.advance(10)
+  disk.files['.claude.json'] = account('b@x')
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, turnId: 't1', wait: false } as never) // the wake-up queued over the turn is withdrawn
+  await drain(($ as any).turn.step({ model: 'claude-opus-5-5', messages: [], agentId: 'agent-1' })) // a subagent starts on b@x
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" }) // the main request's failure, on a@x
+  release()
+  await old
+  await clock.advance(30000)
+  expect(seen.submits).toEqual([])
+  await clock.advance(70000) // a minute and a tick on: not an hour
+  expect(seen.submits).toEqual(['Resume'])
 })
 
 test('a session with no seat or account whose first sign-in check threw neither shows nor overwrites the bare plan reading', async ($, on) => {
