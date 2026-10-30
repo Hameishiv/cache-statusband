@@ -77,7 +77,7 @@ let pendingSeed = null // a startup or resume SessionStart's transcript that cam
 let rotationSeenAt = 0 // when this process last saw a rotation: a process fact, kept across /clear, resume and fork
 const WAKE_WINDOW = 3 * MIN // how long after a wake-up a late rewrite of the seat file or .claude.json is still taken as that rotation
 let seatUnknown = false // after a wake-up, until the seat file names a new seat: the rotator may not have written it yet, so S.seat may be the old one: its plan fetch, borrowing and lending of usage windows, and the shared windows and Fable reading it shows wait for it
-let accountUnknown = false // likewise for the account in .claude.json; a read with no account is not a change
+let accountUnknown = false // likewise for the account in .claude.json, which may not have switched though the seat label did: it holds back the same things (keyUnsure); a read with no account is not a change
 let wakeWindowEnd = 0 // when the wake-up's window closes; 0 = no window
 let accountMoved = false // the wake-up's re-read, or a late adoption since, has shown the account change: a seat label arriving after that is not a new rotation
 let seatMoved = false // the wake-up's re-read already showed the seat change. A seat adopted late does not count: its label may be written before the credential switches, so the account can still arrive after it
@@ -674,14 +674,14 @@ async function heartbeat($, force) {
 }
 
 // The plan's per-model weekly limits (Fable) aren't in session.measure, so read the
-// usage endpoint the app's usage card reads. One fetch per 5 minutes across every
-// session, shared through the store; a 429 backs every session off the same 5 minutes.
+// usage endpoint the app's usage card reads. One fetch per 5 minutes per account (per seat when a seat file
+// is set), shared through the store by that account's sessions; a 429 backs those sessions off the same 5 minutes.
 const PLAN_EVERY = 5 * MIN
 const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
 let planWhy = ''
 let planNext = 0
 // One reading per account, shared by its sessions: the endpoint rate-limits a second schedule within seconds.
-// A session still on an older version writes it without `windows`; those stay as they were.
+// An older version kept one reading under this bare key for every account: a session with an account or seat never reads it.
 const PLAN_KEY = 'plan'
 
 // Each account has its own limits: with a seat file configured, a reading per surface and seat

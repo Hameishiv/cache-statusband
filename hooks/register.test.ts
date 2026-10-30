@@ -1553,6 +1553,7 @@ test('with no seat file, the old account\'s full week arms no resume while the a
   expect((kept.get('hb:sid-test') as any).account).toBe('a@x')
   await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never) // .claude.json not rewritten yet
   await ($ as any).classic.StopFailure(throttle)
+  expect(seen.toasts.some((t) => /resumes on its own/.test(t))).toBe(false) // nothing is armed from the old account's week
   await clock.advance(30000)
   expect((kept.get('hb:sid-test') as any).account).toBeUndefined() // the account is unknown: it names no one's windows
   disk.files['.claude.json'] = account('b@x')

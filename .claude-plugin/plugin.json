@@ -1,6 +1,6 @@
 {
   "name": "cache-statusband",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Nate Herk's Cache Keeper plus a ccstatusline-style status band: model, effort, context, cache, 5-hour/weekly/Fable usage with resets, and reopened chats measured before you send",
   "author": {
     "name": "Hameishiv, built on Cache Keeper by Nate Herk"
