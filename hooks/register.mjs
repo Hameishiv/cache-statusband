@@ -447,10 +447,10 @@ let dialogsOpen = 0 // cold-send dialogs open for the person: an unattended send
 let dialogsClosed = [] // resolvers of the sends waiting for dialogsOpen to reach 0
 let dialogCancels = 0 // cold-send dialogs the person answered Cancel so far: an unattended send compares it with its start, so only a Cancel (not a Send anyway on a message that does not cancel it) re-arms a Resume whose compaction failed
 let compactDeclined = false // a Resume's failed compaction behind a Cancel was armed again: if the next one fails too it is not sent uncompacted. Cleared by a main-loop request, /clear, a resume or fork, a new arm and a successful compaction
-let compacting = null // { run, gen }: this mod's compaction in flight (run settles at COMPACT_LIMIT at worst), started in chat gen: a second send in that chat needing one waits for it, with no timer of its own, and uses its result (if it is abandoned instead, that send goes back in the prompt box: see abandoned). A send in a replaced chat's successor does not wait for it
+let compacting = null // { run, chat }: this mod's compaction in flight (run settles at COMPACT_LIMIT at worst), started in conversation `chat` (msgChat): a second send in that conversation needing one waits for it, with no timer of its own, and uses its result (if it is abandoned instead, that send goes back in the prompt box: see abandoned). A fork is the same conversation and waits too; a send after a /clear or a resume of another chat does not wait for it
 let compactSeq = 0 // numbers this mod's /compact runs in the order they start
 const RUN_END_GRACE = 5000
-const liveRuns = new Set() // { gen, seq, at } of this mod's /compact runs not settled yet (and for RUN_END_GRACE after), abandoned ones too: an engine compaction mark may be one's end, which says nothing about a replaced chat (see staleRunOut) nor about a newer abandoned run (see olderRunOut)
+const liveRuns = new Set() // { chat, seq, at } (the conversation's msgChat, the run's number, when it started) of this mod's /compact runs not settled yet (and for RUN_END_GRACE after), abandoned ones too: an engine compaction mark may be one's end, which says nothing about a conversation since replaced (see staleRunOut) nor about a newer abandoned run (see olderRunOut)
 let abandoned = null // { done, at, batch, seq }: the /compact call still out after COMPACT_LIMIT. No send starts another until it settles (its end clears this), a compaction that started before it succeeds (the person's own too, but an engine compaction mark does not count while an older run of ours is still out, as it may be that run's end), the chat is replaced, or a second COMPACT_LIMIT has passed. A Resume is tried again, the person's and a wake-up's message go back in the prompt box
 let putBackPending = null // { real, steps, at }: the Resume hold. A message was put back in the prompt box (a successful fill of a message that reaches the chat, not a /btw question, not a failed fill) and nothing has been sent since: a due Resume waits while realSends and stepsSeen are as they were then, for COMPACT_LIMIT at most. Cleared by /clear, a resume or a fork
 let boxText = null // { real, steps, text }: the text a put-back left in the prompt box, unsent (a /btw question too). Not bound by COMPACT_LIMIT: it stays until a message is handed on or a request starts (realSends, stepsSeen), or /clear, a resume or a fork. A later put-back goes in behind what the box holds (read from it when the engine can, else this text), so a fill does not remove it
@@ -463,8 +463,8 @@ let sendPending = new Map() // id -> deadline: a send handed on that is not this
 let sendPendingId = 0
 let stepsSeen = 0 // main-loop requests started so far
 let realSends = 0 // messages handed on to the chat (submitsSeen without "Compact first" answers, wake-ups and /clear)
-let chatGen = 0 // bumped when the chat is replaced (/clear, resuming another chat) and by a fork
-let msgChat = 0 // chatGen without the forks: a fork carries the conversation on, so a message of the chat before it is still the new one's; /clear and resuming another chat start another conversation, and a message from before is not sent into it
+let chatGen = 0 // bumped when the session id changes: /clear, resuming another chat, and a fork. What a Resume's re-arm and a send's settling check ("is this still the chat it was for?"); not what a compaction belongs to (msgChat)
+let msgChat = 0 // the conversation: chatGen without the forks, as a fork carries the conversation on. A message from before a fork is still the new chat's, and so is a compaction in flight (it is waited for, and its success or abandonment is recorded: compacting, liveRuns, abandoned); /clear and resuming another chat start another conversation, where neither is sent or recorded
 let msgChatCause = '' // why msgChat last moved, in words for the toast: 'cleared' or 'replaced by a resumed chat'
 const CANCEL_REARM = 2 * MIN // a cancelled Resume with no request started since, a Resume neither submit way could send, one whose compaction did not finish in COMPACT_LIMIT, and one whose compaction failed behind a cancelled dialog are armed again this long after (tries kept)
 const SEND_SAFETY = 2 * MIN
@@ -639,11 +639,11 @@ function compactOut() {
   return !!abandoned
 }
 
-// A /compact still out after COMPACT_LIMIT: no send starts another while it is. It clears this when it settles, however it ends, and one that succeeds late still shortened that chat (not a new one).
-// gen: the chat it was started in. In a chat replaced since, it is not recorded at all: it says nothing about the new one.
+// A /compact still out after COMPACT_LIMIT: no send starts another while it is. It clears this when it settles, however it ends, and one that succeeds late still shortened that conversation (not a new one: a fork is the same one).
+// chat: the msgChat it was started in. After a /clear or a resume of another chat it is not recorded at all: it says nothing about the new one.
 // Returns the batch the put-backs of this abandonment (its owner and the sends that waited on it) go in, or null
-function abandon($, done, gen, seq) {
-  if (chatGen !== gen) return null
+function abandon($, done, chat, seq) {
+  if (msgChat !== chat) return null
   const batch = { items: [], flush: null, closed: false, chat: msgChat }
   // the batch takes its turn in the fill order now, not when its first member arrives: a put-back that arrives in the 50 ms its members take to join goes after it
   batch.flush = placeBack($, () => {
@@ -654,16 +654,16 @@ function abandon($, done, gen, seq) {
   abandoned = { done, at: now, batch, seq }
   done.then(() => {
     if (abandoned && abandoned.done === done) abandoned = null
-    if (chatGen === gen) markCompacted($, seq)
+    if (msgChat === chat) markCompacted($, seq)
   }, () => {
     if (abandoned && abandoned.done === done) abandoned = null
   })
   return batch
 }
 
-// Whether one of this mod's /compact runs started in a chat since replaced is still out (an abandoned one too): the engine's compaction marks may be its late end, which says nothing about this chat. A run out longer than two COMPACT_LIMITs no longer counts, as for abandoned, so a hung one does not mute the marks for good
+// Whether one of this mod's /compact runs started in a conversation since replaced (/clear, a resume of another chat; not a fork) is still out (an abandoned one too): the engine's compaction marks may be its late end, which says nothing about this chat. A run out longer than two COMPACT_LIMITs no longer counts, as for abandoned, so a hung one does not mute the marks for good
 function staleRunOut() {
-  for (const r of liveRuns) if (r.gen !== chatGen && now - r.at < 2 * COMPACT_LIMIT) return true
+  for (const r of liveRuns) if (r.chat !== msgChat && now - r.at < 2 * COMPACT_LIMIT) return true
   return false
 }
 
@@ -750,8 +750,8 @@ async function runCompactThenSend($, msg, unattended, before, wake) {
     $.ui.toast(`Not sent, because the chat was ${msgChatCause}: ${msg.text}`, { timeoutMs: 15000 })
     lowerWake(wake)
   }
-  // our own compaction of this chat is already running: wait for it (it settles at COMPACT_LIMIT at worst) and do not compact again if it succeeded. One of a chat since replaced is not waited for; a send that waited on one when its chat was replaced stops at its end, and is dropped then, not held on a compaction of the new chat
-  while (compacting && compacting.gen === before.chat && chatGen === before.chat) {
+  // our own compaction of this conversation is already running: wait for it (it settles at COMPACT_LIMIT at worst) and do not compact again if it succeeded. One of a conversation since replaced (/clear, a resume of another chat) is not waited for; a send that waited on one when its chat was replaced stops at its end, and is dropped then, not held on a compaction of the new chat. A fork is the same conversation: its sends keep waiting
+  while (compacting && compacting.chat === before.msgChat && msgChat === before.msgChat) {
     waited = true
     await compacting.run.then(() => {}, () => {})
   }
@@ -763,8 +763,8 @@ async function runCompactThenSend($, msg, unattended, before, wake) {
       if (waited) batch = abandoned.batch // it was abandoned while this send waited on it
     }
     else if (!cancelled()) { // a send already cancelled does not compact for nothing
-      const gen = chatGen // a compaction of a chat since replaced says nothing about the new one
-      const live = { gen, seq: ++compactSeq, at: now }
+      const chat = msgChat // a compaction of a conversation since replaced says nothing about the new one (a fork's is the same one)
+      const live = { chat, seq: ++compactSeq, at: now }
       const run = (async () => {
         liveRuns.add(live)
         const done = $.command.run({ command: 'compact', args: '' })
@@ -773,12 +773,12 @@ async function runCompactThenSend($, msg, unattended, before, wake) {
         const late = new Promise((resolve) => $.clock.after(COMPACT_LIMIT, () => resolve(true)))
         if (await Promise.race([done.then(() => false), late])) {
           timedOut = true
-          batch = abandon($, done, gen, live.seq)
+          batch = abandon($, done, chat, live.seq)
           throw new Error('timed out')
         }
-        if (chatGen === gen) markCompacted($, live.seq)
+        if (msgChat === chat) markCompacted($, live.seq)
       })()
-      const mine = { run, gen }
+      const mine = { run, chat }
       compacting = mine
       try {
         await run

@@ -3918,3 +3918,49 @@ test('a wake-up cancelled by the person\'s message arms no Resume: with autoResu
   expect(seen.submits).toEqual([])
   expect(seen.compacts).toBe(1)
 })
+
+test('a branch while a message waits on a compaction that succeeds: the fork is the same conversation, so the waiter uses it and no second /compact starts', SETUP, async ($, on) => {
+  askLog(on)
+  let finish: () => void = () => {}
+  const { clock, seen, fills } = await coldChat($, on, () => on('classic.SessionStart', () => ({})))
+  let n = 0
+  seen.duringCompact = () => (++n === 1 ? new Promise<void>((r) => { finish = r }) : Promise.resolve())
+  await send($, 'first')
+  await clock.advance(1000)
+  await send($, 'second') // waits on the first compaction
+  await clock.advance(1000)
+  await ($ as any).classic.SessionStart({ source: 'fork', transcript_path: '/h/fork.jsonl' })
+  await clock.advance(60000)
+  finish()
+  await clock.advance(1000)
+  expect({ compacts: seen.compacts, submits: seen.submits, fills }).toEqual({ compacts: 1, submits: ['first', 'second'], fills: [] })
+})
+
+test('a branch while a message waits on a compaction that hangs: it is still abandoned for the fork, and both messages are put back together in order', SETUP, async ($, on) => {
+  askLog(on)
+  const { clock, seen, fills } = await coldChat($, on, () => on('classic.SessionStart', () => ({})))
+  hang(seen)
+  await send($, 'first')
+  await clock.advance(1000)
+  await send($, 'second')
+  await clock.advance(1000)
+  await ($ as any).classic.SessionStart({ source: 'fork', transcript_path: '/h/fork.jsonl' })
+  await clock.advance(15 * 60000 + 1000)
+  await clock.advance(1000)
+  expect({ compacts: seen.compacts, submits: seen.submits, fills }).toEqual({ compacts: 1, submits: [], fills: ['first\n\nsecond'] })
+})
+
+test('a compaction of ours still out when the chat is branched does not mute the engine\'s compaction marks in the fork: the person\'s own /compact there counts', SETUP, async ($, on) => {
+  const log = askLog(on)
+  const { clock, seen } = await coldChat($, on, () => (on('classic.SessionStart', () => ({})), on('classic.PostCompact', () => ({}))))
+  hang(seen)
+  await send($, 'one')
+  await clock.advance(15 * 60000 + 1000) // abandoned, still out
+  await ($ as any).classic.SessionStart({ source: 'fork', transcript_path: '/h/fork.jsonl' })
+  await ($ as any).classic.PostCompact({}) // the person's own /compact in the fork succeeds
+  await ($ as any).classic.SessionStart({ source: 'compact' })
+  await clock.advance(1000)
+  await send($, 'two')
+  await clock.advance(1000)
+  expect({ compacts: seen.compacts, asked: log.asked.length }).toEqual({ compacts: 1, asked: 1 }) // 'two' goes as typed: the chat is compacted, no cold-send dialog
+})
