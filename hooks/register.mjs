@@ -79,6 +79,14 @@ const WAKE_WINDOW = 3 * MIN // how long after a wake-up a late rewrite of the se
 let seatUnknown = false // after a wake-up, until the seat file names a new seat: the rotator may not have written it yet, so S.seat may be the old one
 let accountUnknown = false // likewise for the account in .claude.json
 let wakeWindowEnd = 0 // when the wake-up's window closes; 0 = no window
+
+// A field is unknown only while the window is open: a closed one stands even before the tick that clears the flags
+function seatUnsure() {
+  return seatUnknown && now < wakeWindowEnd
+}
+function accountUnsure() {
+  return accountUnknown && now < wakeWindowEnd
+}
 let wakeSeat = '' // the seat and account as they were when that wake-up came
 let wakeAccount = ''
 let rotatedPending = false // a seat change, or a reopened chat's last request on another seat or account, that no request has landed on yet: this account's cache is empty
@@ -290,8 +298,8 @@ function markCompacted($) {
 function whoRan() {
   // a field still unknown after a wake-up is left out, rather than recorded wrong
   return {
-    ...(S.seat && !seatUnknown ? { seat: S.seat } : {}),
-    ...(S.account && !accountUnknown ? { account: S.account } : {}),
+    ...(S.seat && !seatUnsure() ? { seat: S.seat } : {}),
+    ...(S.account && !accountUnsure() ? { account: S.account } : {}),
     desktop: !onTerminal
   }
 }
@@ -300,8 +308,8 @@ function whoRan() {
 // else accounts. A field unknown on either side, or still unknown here after a wake-up, can't decide.
 function comparableBy(r) {
   if (!r) return ''
-  if (r.seat && S.seat && !seatUnknown && !!r.desktop === !onTerminal) return 'seat'
-  return r.account && S.account && !accountUnknown ? 'account' : ''
+  if (r.seat && S.seat && !seatUnsure() && !!r.desktop === !onTerminal) return 'seat'
+  return r.account && S.account && !accountUnsure() ? 'account' : ''
 }
 
 // A record's request ran on another account than this process is on, so the cache it left is that account's.
