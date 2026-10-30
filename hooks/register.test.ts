@@ -2912,7 +2912,7 @@ test('a compaction that never finishes is abandoned after 15 minutes: that messa
   expect(seen.toasts.filter((t) => /The earlier compaction is still running; your message is back in the prompt box/.test(t)).length).toBe(1) // the waiter's
 })
 
-test('a compaction that never finishes holds a due Resume for 15 minutes; after that the Resume is tried again without compacting, and gives up after four tries', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+test('a compaction that never finishes holds a due Resume until the put-back message is sent: nothing is sent beside it and no second /compact, however long it takes', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)
   answer(on, seen, 'Compact first, then send')
@@ -2926,11 +2926,10 @@ test('a compaction that never finishes holds a due Resume for 15 minutes; after 
   seen.duringCompact = () => (++n === 1 ? new Promise(() => {}) : Promise.resolve()) // the person's compaction hangs
   await $.prompt.submit({ text: 'one', origin: COMPOSER, wait: false } as never)
   await clock.advance(100)
-  for (let i = 0; i < 9; i++) await clock.advance(10 * 60000) // the Resume, due an hour on, is held only until the compaction is abandoned: the compaction is still out, so it starts no other
+  for (let i = 0; i < 9; i++) await clock.advance(10 * 60000) // the Resume, due an hour on, finds 'one' still in the prompt box
   expect({ submits: seen.submits, compacts: seen.compacts }).toEqual({ submits: [], compacts: 1 })
   expect(seen.toasts.filter((t) => /Compaction has not finished after 15 minutes/.test(t)).length).toBe(1)
-  expect(seen.toasts.filter((t) => /The earlier compaction is still running; the Resume was not sent\. Trying again at/.test(t)).length).toBe(3)
-  expect(seen.toasts.filter((t) => /Compaction did not finish, so the Resume was not sent after four tries/.test(t)).length).toBe(1)
+  expect(seen.toasts.filter((t) => /Resume was not sent|Trying again|four tries/.test(t))).toEqual([]) // held, not tried and failed
 })
 
 test('a Resume whose own compaction never finishes is not sent uncompacted after 15 minutes: it is tried again 2 minutes on, without a second compaction while the first is out, and gives up after four tries saying compaction did not finish', { options: { autoResume: true } }, async ($, on) => {
@@ -2965,7 +2964,7 @@ test('a rotator wake-up whose compaction never finishes goes back in the prompt 
   expect({ submits: seen.submits, fills }).toEqual({ submits: [], fills: [ROTATE] })
 })
 
-test('a Resume due during the person\'s hung "Compact first": the message goes back in the prompt box first, and the Resume is sent no sooner than 2 minutes after it (the compaction ends late, so it needs none)', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+test('a Resume due during the person\'s hung "Compact first": the message goes back in the prompt box first, and no Resume goes while it sits there unsent; once it is sent the Resume waits for its request (and goes if none starts)', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)
   const fills: { at: number; text: string }[] = []
@@ -2983,18 +2982,19 @@ test('a Resume due during the person\'s hung "Compact first": the message goes b
   let n = 0
   seen.duringCompact = () => (++n === 1 ? new Promise<void>((r) => { finish = r }) : Promise.resolve()) // the person's compaction hangs; the Resume falls due 4 minutes in
   await $.prompt.submit({ text: 'stop, do X instead', origin: COMPOSER, wait: false } as never)
-  let resumeAt = 0
   let finished = false
   for (let i = 0; i < 25 * 6; i++) {
     await clock.advance(10000)
     if (!finished && fills.length) { finish(); finished = true } // it ends late, right after the message is back in the box
-    if (!resumeAt && seen.submits.includes('Resume')) resumeAt = await clock.now()
   }
   expect(fills.map((f) => f.text)).toEqual(['stop, do X instead'])
   expect(Math.round((fills[0].at - t0) / 60000)).toBe(15)
-  expect(seen.submits).toEqual(['Resume'])
-  expect(resumeAt - fills[0].at).toBeGreaterThanOrEqual(2 * 60000) // never ahead of the message the person still has to send
-  expect(seen.compacts).toBe(1)
+  expect({ submits: seen.submits, compacts: seen.compacts }).toEqual({ submits: [], compacts: 1 }) // 10 minutes after the box was filled, the Resume still waits for the message
+  await $.prompt.submit({ text: 'stop, do X instead', origin: COMPOSER, wait: false } as never) // the person presses Enter
+  await clock.advance(60000)
+  expect(seen.submits).toEqual([]) // its request has not started: the Resume still waits on it
+  await clock.advance(2 * 60000)
+  expect({ submits: seen.submits, compacts: seen.compacts }).toEqual({ submits: ['Resume'], compacts: 1 }) // none started: the Resume goes
 })
 
 test('a Resume due during the person\'s hung "Compact first" is not sent at all while the compaction stays out: nothing beside the filled-back message, no second /compact', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
@@ -3065,13 +3065,13 @@ test('a compaction abandoned after 15 minutes that fails late frees the next sen
   expect({ submits: seen.submits, compacts: seen.compacts }).toEqual({ submits: ['Resume'], compacts: 2 })
 })
 
-test('a message sent after the abandonment is put back with the earlier ones in one fill, in submission order, unless a message was sent in between', SETUP, async ($, on) => {
+test('a message sent after the abandonment is put back alone: the box holds nothing of the person\'s but what they just sent, and the earlier batch is closed', SETUP, async ($, on) => {
   const { clock, seen, fills } = await twoCompactFirst($, on, (n) => (n === 1 ? new Promise(() => {}) : Promise.resolve()))
   await clock.advance(15 * 60000 + 1000)
   expect(fills).toEqual(['one\n\ntwo'])
   await $.prompt.submit({ text: 'three', origin: COMPOSER, wait: false } as never) // no second compaction: it goes straight back
   await clock.advance(1000)
-  expect({ compacts: seen.compacts, submits: seen.submits, fills }).toEqual({ compacts: 1, submits: [], fills: ['one\n\ntwo', 'one\n\ntwo\n\nthree'] })
+  expect({ compacts: seen.compacts, submits: seen.submits, fills }).toEqual({ compacts: 1, submits: [], fills: ['one\n\ntwo', 'three'] })
 })
 
 test('a /clear after the abandonment starts afresh: the next chat\'s Resume compacts', { options: { autoResume: true } }, async ($, on) => {
@@ -3188,4 +3188,105 @@ test('the cold-send guard asks for /btw with a question, which goes to the model
   expect(seen.asks).toBe(0)
   await $.prompt.submit({ text: '/btw what is x', command: { name: 'btw', args: 'what is x' }, origin: COMPOSER, wait: false } as never)
   expect(seen.asks).toBe(1)
+})
+
+// ===== the abandoned compaction, round 2 =====
+// Answers each cold-send dialog with `prefer` when it is offered, else with its first option, and keeps what was asked
+function askLog(on: any) {
+  const asked: { question: string; labels: string[] }[] = []
+  let prefer = 'Compact first, then send'
+  on('tool.call', (_: unknown, e: any) => {
+    if (e.tool !== 'AskUserQuestion') return { result: {} }
+    const q = e.questions?.[0]
+    const labels = (q?.options ?? []).map((o: any) => (typeof o === 'string' ? o : o.label))
+    asked.push({ question: q?.question ?? '', labels })
+    return { result: { questions: e.questions, answers: { [q?.question ?? '']: labels.includes(prefer) ? prefer : labels[0] } } }
+  })
+  return { asked, prefer: (label: string) => { prefer = label } }
+}
+
+// A cold big chat where the person's "Compact first" hangs (n === 1), an optional second send waits on it. `hooks` go in beneath the plugins
+async function coldChat($: any, on: any, hooks: (kept: Map<string, unknown>) => void = () => {}) {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  const fills: string[] = []
+  on('prompt.fill', (_: unknown, e: any) => (fills.push(e.text), { isFilled: true }))
+  on('turn.step', async function* () { return { answer: '', toolUses: [], usage: { input_tokens: 10, cache_read_input_tokens: 300000, cache_creation_input_tokens: 0 } } })
+  hooks(kept)
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+  await clock.advance(77 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  return { clock, seen, fills, kept }
+}
+const send = ($: any, text: string, command?: { name: string; args: string }) => $.prompt.submit({ text, ...(command ? { command } : {}), origin: COMPOSER, wait: false } as never)
+
+test('after the put-back the person presses Enter and the cold-send dialog comes again: it offers no "Compact first" and says why, and nothing is put back a second time', SETUP, async ($, on) => {
+  const log = askLog(on)
+  const { clock, seen, fills } = await coldChat($, on)
+  let n = 0
+  seen.duringCompact = () => (++n === 1 ? new Promise(() => {}) : Promise.resolve())
+  await send($, 'one')
+  await clock.advance(100)
+  await send($, 'two')
+  await clock.advance(15 * 60000 + 1000)
+  expect(fills).toEqual(['one\n\ntwo'])
+  log.prefer('Compact first, then send') // if it were offered
+  await send($, 'one\n\ntwo') // Enter on the box
+  await clock.advance(1000)
+  expect(log.asked.length).toBe(3)
+  expect(log.asked[2].labels).toEqual(['Send anyway', 'Cancel'])
+  expect(log.asked[2].question).toContain('An earlier compaction is still running, so compacting first is not offered.')
+  expect(log.asked[0].labels).toContain('Compact first, then send') // before the abandonment it is offered
+  expect({ fills, compacts: seen.compacts }).toEqual({ fills: ['one\n\ntwo'], compacts: 1 })
+})
+
+test('a later abandonment does not bring back text that was delivered in between', SETUP, async ($, on) => {
+  const log = askLog(on)
+  const { clock, seen, fills } = await coldChat($, on)
+  let fail: (e: Error) => void = () => {}
+  let n = 0
+  seen.duringCompact = () => { n++; return n === 1 ? new Promise((_, rej) => { fail = rej }) : n === 2 ? Promise.resolve() : new Promise(() => {}) }
+  await send($, 'one')
+  await clock.advance(100)
+  await send($, 'two')
+  await clock.advance(15 * 60000 + 1000)
+  expect(fills).toEqual(['one\n\ntwo'])
+  fail(new Error('late')) // frees the next compaction
+  await clock.advance(1000)
+  await send($, 'one\n\ntwo') // Enter on the box: Compact first compacts again (n === 2) and sends it
+  await clock.advance(1000)
+  expect(seen.submits).toEqual(['one\n\ntwo'])
+  await mainStep($) // its request runs
+  await clock.advance(3 * 60 * 60000) // cold again
+  await send($, 'three') // this compaction (n === 3) hangs
+  await clock.advance(15 * 60000 + 1000)
+  expect(fills).toEqual(['one\n\ntwo', 'three'])
+  expect(log.asked.length).toBe(4)
+})
+
+test('a slash command is never joined with other text: the plain texts are filled, the command is quoted in a toast', SETUP, async ($, on) => {
+  askLog(on)
+  const { clock, seen, fills } = await coldChat($, on)
+  seen.duringCompact = () => new Promise(() => {})
+  await send($, '/merge-pr 1', { name: 'merge-pr', args: '1' })
+  await clock.advance(100)
+  await send($, 'hello')
+  await clock.advance(100)
+  await send($, 'world')
+  await clock.advance(15 * 60000 + 1000)
+  expect(fills).toEqual(['hello\n\nworld'])
+  expect(seen.toasts.filter((t) => /Also not sent: \/merge-pr 1 — send it again when ready\./.test(t)).length).toBe(1)
+  expect(seen.toasts.filter((t) => /Compaction has not finished after 15 minutes\./.test(t)).length).toBe(1) // the command's own toast does not claim it is in the box
+  expect(seen.toasts.filter((t) => /your message is back in the prompt box/.test(t)).length).toBe(2) // hello's and world's: the command owns the compaction, they waited on it
+})
+
+test('a batch that is only one slash command fills it alone', SETUP, async ($, on) => {
+  askLog(on)
+  const { clock, seen, fills } = await coldChat($, on)
+  seen.duringCompact = () => new Promise(() => {})
+  await send($, '/merge-pr 1', { name: 'merge-pr', args: '1' })
+  await clock.advance(15 * 60000 + 1000)
+  expect(fills).toEqual(['/merge-pr 1'])
+  expect(seen.toasts.filter((t) => /Also not sent/.test(t))).toEqual([])
 })
