@@ -401,15 +401,18 @@ async function readSeat($, adopt = false) {
 }
 
 // The old account's readings, dropped once the account or seat moves: the new one's are borrowed or fetched until a request measures them.
-// A resume armed from them goes too, and re-arms from fresh readings.
+// A resume armed from them is not cancelled: it moves to a minute from now, when the new account presumably has usage, keeping its tries.
+// A request that started before the drop reports the old account's windows: identityGen lets its readings be told apart.
+let identityGen = 0
+let requestGen = 0 // identityGen as the latest request started: session.measure names no request, so the latest start stands for the one that reports
 function dropReadings() {
+  identityGen++
   S.rateLimits = []
   S.fable = null
   S.planWindows = []
   planNext = 0
   if (resumeFromReadings) {
-    S.resumeAt = 0
-    resumeTries = 0
+    S.resumeAt = now + MIN
     resumeFromReadings = false
   }
 }
@@ -1154,7 +1157,8 @@ export function register(on, options = {}) {
     try {
       // the plan windows the status line already holds: free, and there before the first send
       const usage = await $.session.usage()
-      if (Array.isArray(usage.rateLimits) && usage.rateLimits.length) S.rateLimits = usage.rateLimits
+      // not a request that started before an account change: its windows are the old account's
+      if (Array.isArray(usage.rateLimits) && usage.rateLimits.length && requestGen === identityGen) S.rateLimits = usage.rateLimits
     } catch {
       // none yet: the first measure fills them
     }
@@ -1312,6 +1316,7 @@ export function register(on, options = {}) {
 
   // Each main-loop request: did it read the cache, or rewrite it?
   on('turn.step', async function* ($, e, next) {
+    requestGen = identityGen
     const startedAt = await $.clock.now()
     if (!e.agentId) {
       S.model = e.model || S.model
@@ -1377,7 +1382,8 @@ export function register(on, options = {}) {
       if (usage.context && usage.context.tokens) S.ctx = usage.context.tokens
       if (usage.context && usage.context.window) S.window = usage.context.window
       if (usage.cost) S.costUsd = usage.cost.usd
-      if (Array.isArray(usage.rateLimits) && usage.rateLimits.length) S.rateLimits = usage.rateLimits
+      // not a request that started before an account change: its windows are the old account's
+      if (Array.isArray(usage.rateLimits) && usage.rateLimits.length && requestGen === identityGen) S.rateLimits = usage.rateLimits
     } catch {
       // usage unavailable: keep the per-request figures
     }
@@ -1428,7 +1434,7 @@ export function register(on, options = {}) {
     if (e.context && e.context.tokens) S.ctx = e.context.tokens
     if (e.context && e.context.window) S.window = e.context.window
     if (e.cost) S.costUsd = e.cost.usd
-    if (Array.isArray(e.rateLimits) && e.rateLimits.length) S.rateLimits = e.rateLimits
+    if (Array.isArray(e.rateLimits) && e.rateLimits.length && requestGen === identityGen) S.rateLimits = e.rateLimits // as in turn.complete
     return next(e)
   })
 

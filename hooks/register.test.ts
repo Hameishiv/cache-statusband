@@ -1563,7 +1563,7 @@ test('with no seat file, the old account\'s full week arms no resume while the a
   expect(seen.submits).toEqual([])
 })
 
-test('a resume armed from the old account\'s own windows while the account is unknown is dropped once the new account is adopted', RESUME_WAKE, async ($, on) => {
+test('a resume armed from the old account\'s own windows while the account is unknown is re-armed for a minute after the new account is adopted', RESUME_WAKE, async ($, on) => {
   const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
   const { clock, seen } = engine($, on, { label: 'A' }, undefined, undefined, disk)
   on('classic.StopFailure', () => ({}))
@@ -1574,9 +1574,13 @@ test('a resume armed from the old account\'s own windows while the account is un
   await $.session.measure({ context: { tokens: 50000, window: 1000000, percent: 5 }, rateLimits: fiveFull(t0), changed: [] } as never)
   await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" }) // armed from the old account's window
   disk.files['.claude.json'] = account('b@x')
+  await clock.advance(30000) // adopted: the resume moves to a minute from now
   await clock.advance(30000)
+  expect(seen.submits).toEqual([]) // not at the old window's reset, hours off, and not yet the minute
+  await clock.advance(40000)
+  expect(seen.submits).toEqual(['Resume'])
   await clock.advance(3 * 60 * 60000)
-  expect(seen.submits).toEqual([])
+  expect(seen.submits).toEqual(['Resume']) // once
 })
 
 test('a wake-up that already shows a new account drops the old account\'s own 5h window: no resume, and /cache does not show it', RESUME_WAKE, async ($, on) => {
@@ -1610,6 +1614,44 @@ test('an account adopted after the wake-up drops the old account\'s own 5h windo
   await ($ as any).classic.StopFailure(throttle)
   await clock.advance(3 * 60 * 60000)
   expect(seen.submits).toEqual([])
+})
+
+test('a request that started before an account change reports the old account\'s windows: neither session.measure nor turn.complete takes them', RESUME_WAKE, async ($, on) => {
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock } = engine($, on, { label: 'A' }, undefined, undefined, disk)
+  let t0 = 0
+  let release: () => void = () => {}
+  const gate = new Promise<void>((r) => (release = r))
+  on('turn.step', async function* () {
+    await gate
+    return { answer: '', toolUses: [], usage: null }
+  })
+  on('turn.complete', () => ({ text: '' }))
+  on('session.usage', () => ({ value: { rateLimits: fiveFull(t0) } }))
+  await start($, 50000, clock)
+  t0 = await clock.now()
+  const step = async () => {
+    const it = ($ as any).turn.step({ model: 'claude-opus-5-5', messages: [] })
+    if (it && typeof it[Symbol.asyncIterator] === 'function') for await (const _ of it) void _
+    else await it
+  }
+  const request = step()
+  await clock.advance(10) // the request is out
+  disk.files['.claude.json'] = account('b@x')
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never) // the account moves while it runs
+  await $.session.measure({ context: { tokens: 50000, window: 1000000, percent: 5 }, rateLimits: fiveFull(t0), changed: [] } as never)
+  release()
+  await request
+  let r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/5h 100%/)
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  r = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/5h 100%/)
+  // a request that starts after the change reports the new account's
+  await step()
+  await $.session.measure({ context: { tokens: 50000, window: 1000000, percent: 5 }, rateLimits: fiveFull(t0), changed: [] } as never)
+  r = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/5h 100%/)
 })
 
 // Two unseated sessions on one surface: another session's heartbeat in the store
