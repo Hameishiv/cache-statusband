@@ -72,7 +72,7 @@ const alerted = new Map() // sessionId -> state or warning key already announced
 let paneOpen = false
 let justCompacted = false
 let compactedCold = false
-let rotatedPending = false // a seat change no request has landed on yet: the new account's cache is empty
+let rotatedPending = false // a seat change, or a reopened chat's last request on another seat or account, that no request has landed on yet: this account's cache is empty
 let signedIn = null // whether this session has a first-party sign-in (an API-key session has none); null until checked
 let signCheckAt = 0
 let handoffPending = false
@@ -250,7 +250,8 @@ function ttlMin() {
   return settings.ttlMin || S.ttlMin
 }
 
-// A rotation moves the session to another account, whose cache is empty, until a request lands on it
+// A rotation moves the session to another account, whose cache is empty, until a request lands on it;
+// so does reopening a chat whose last request ran on another seat or account
 function rotatedCold() {
   return rotatedPending
 }
@@ -276,16 +277,22 @@ function markCompacted($) {
 }
 
 // Where the request ran, kept with the chat's record: the seat (a seat name belongs to one
-// surface's rotator), or the account where no seat file is set
+// surface's rotator, so the surface goes with it) and the signed-in account
 function whoRan() {
-  return { ...(S.seat ? { seat: S.seat } : S.account ? { account: S.account } : {}), desktop: !onTerminal }
+  return { ...(S.seat ? { seat: S.seat } : {}), ...(S.account ? { account: S.account } : {}), desktop: !onTerminal }
 }
 
 // A record's request ran on another account than this process is on, so the cache it left is that account's.
-// Compared like with like (seat with seat, account with account); unknown on either side is no change.
+// Seats are compared when both sides have one on the same surface, else accounts; unknown on either side is no change.
 function ranElsewhere(r) {
   if (r.seat && S.seat && !!r.desktop === !onTerminal) return r.seat !== S.seat
   return !!r.account && !!S.account && r.account !== S.account
+}
+
+// A chat's record says its last request ran on another account, and was not overtaken by a later one
+// (the transcript's `at`, past the minute the two clocks may differ by, says nothing of where it ran)
+function ranBefore(last, at) {
+  return !!last && Math.max(last.at || 0, last.keptAt || 0) >= (at || 0) - MIN && ranElsewhere(last)
 }
 
 // The compacted size isn't known until the next request: keep the one before it, as rememberLast shapes it (keptAt dates an `at` of 0 for the prune)
@@ -331,6 +338,7 @@ async function readSeat($, adopt = false) {
     S.fable = null
     S.planWindows = []
     planNext = 0
+    S.seat = seat // before the await: planKey must name the new account while it runs
     await readAccount($)
   }
   if (seat) S.seat = seat
@@ -480,8 +488,9 @@ function msLeft(lastActivity, ttl) {
   return ttl * MIN - (now - lastActivity)
 }
 
+// `left` is null for a cold cache of no known age (a reopened chat's last request ran on another account)
 function cacheState(hb) {
-  if (hb.rotated) return { kind: 'cold', left: (hb.seatChangedAt || now) - now }
+  if (hb.rotated) return { kind: 'cold', left: hb.seatChangedAt ? hb.seatChangedAt - now : null }
   const left = msLeft(hb.lastActivity, hb.ttlMin)
   if (left === null) return { kind: 'unknown', left: 0 }
   if (hb.keepWarm) return { kind: 'kept', left }
@@ -768,7 +777,7 @@ async function seedFromTranscript($, path) {
   }
   if (!found) return
   // a transcript newer than the record (past the minute their clocks may differ by) says nothing of where its request ran
-  if (last && Math.max(last.at || 0, last.keptAt || 0) >= (found.at || 0) - MIN && ranElsewhere(last)) rotatedPending = true
+  if (ranBefore(last, found.at)) rotatedPending = true
   S.ctx = found.ctx
   if (found.model && !S.model) S.model = found.model // the session's own model wins: it may have been switched
   if (found.effort) S.effort = found.effort
@@ -778,6 +787,8 @@ async function seedFromTranscript($, path) {
     markCompacted($)
   } else {
     S.lastActivity = found.at // the cache's real age: the band and the cold-send guard read it
+    // keep-warm pings reach the cache but not the transcript: a record of the same chat size dates them
+    if (last && last.at > 0 && !ranElsewhere(last) && Math.abs(last.ctx - found.ctx) <= found.ctx * 0.05) S.lastActivity = Math.max(found.at || 0, last.at)
   }
   $.ui.invalidate('ui.render')
 }
@@ -964,7 +975,7 @@ function statusText() {
   lines.push(`Cache Keeper: ${tokens(S.ctx)} tokens in context on ${priceFor(S.model).id}, cache window ${ttl} min (${settings.ttlMin ? 'set by you' : S.ttlSource}).`)
   if (st.kind === 'unknown') lines.push('No request yet this session, so the cache state is unknown.')
   if (st.kind === 'warm' || st.kind === 'cooling') lines.push(`Cache is warm for about ${minutes(st.left)} more.`)
-  if (st.kind === 'cold') lines.push(`Cache went cold ${minutes(-st.left)} ago. The next message rewrites it for about ${money(rewriteCost(S.ctx, S.model, ttl))}.`)
+  if (st.kind === 'cold') lines.push(`Cache ${st.left === null ? 'is cold' : `went cold ${minutes(-st.left)} ago`}. The next message rewrites it for about ${money(rewriteCost(S.ctx, S.model, ttl))}.`)
   if (rotatedCold()) lines.push(`The account rotated${rotatedAgo()} (now ${mask(S.seat || S.account)}), so the cache is cold.`)
   if (S.keepWarm) lines.push(`Keep warm is on until ${clock(S.keepWarmUntil)}: ${S.pings} ping(s), ${money(S.pingUsd)} so far.`)
   if (S.rateLimits.length) lines.push(`Plan limits used: ${limitsText(S.rateLimits)}.`)
@@ -1038,6 +1049,14 @@ export function register(on, options = {}) {
       const config = ((await $.env.get('CLAUDE_CONFIG_DIR')) || `${home}/.claude`).replace(/\\/g, '/')
       await seedFromTranscript($, `${config}/projects/${S.cwd.replace(/[^a-zA-Z0-9]/g, '-')}/${S.id}.jsonl`)
     }
+    // a startup seed may have run before the seat and account were read above: judge its record again
+    if (S.id && S.lastActivity && !rotatedPending) {
+      try {
+        if (ranBefore(await $.store.get('last:' + S.id), S.lastActivity)) rotatedPending = true
+      } catch {
+        // store unavailable: the first request measures it
+      }
+    }
     return next(e)
   })
 
@@ -1045,7 +1064,8 @@ export function register(on, options = {}) {
   // The process goes on under a new session id, and no session.start fires for it.
   on('classic.SessionStart', { source: ['clear', 'resume', 'fork'] }, async ($, e, next) => {
     S.lastActivity = 0
-    rotatedPending = false // a cleared chat starts afresh; a resumed or forked one is judged below, once seeded
+    // a cleared chat starts afresh; a resumed one is judged below, once seeded; a fork shares its parent's cache
+    if (e.source !== 'fork') rotatedPending = false
     S.keepWarm = false
     H.armed = false
     // the last chat's compaction says nothing about this one, and would mute its cold-send guard
@@ -1381,7 +1401,7 @@ export function register(on, options = {}) {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const below = await next(e)
     // Drawn whenever there's no survey: an unknown cache (a new chat, or just after
-    // /clear, /resume or a compaction) still has a model, an effort and plan limits
+    // /clear or a compaction) still has a model, an effort and plan limits
     if (e.props && e.props.hasSurvey) return below
     const { Box, Text, Button } = $.ui.resolve(e)
     // Powerline look: each segment ends in an arrow in its own colour, on the next one's.
@@ -1500,7 +1520,7 @@ function bandSegments() {
   if (st.kind === 'kept') out.push([`◆ K.W. until ${clock(S.keepWarmUntil)} · ${S.pings} ping${S.pings === 1 ? '' : 's'} ${money(S.pingUsd)}`, 'cyan'])
   else if (st.kind === 'warm') out.push([`● cache warm ${minutes(st.left)}`, 'green'])
   else if (st.kind === 'cooling') out.push([`◐ cache cools in ${minutes(st.left)}`, WARN])
-  else if (st.kind === 'cold') out.push([`○ cache cold ${ago(-st.left)}`, big ? HOT : 'gray'])
+  else if (st.kind === 'cold') out.push([`○ cache cold${st.left === null ? '' : ' ' + ago(-st.left)}`, big ? HOT : 'gray'])
   else out.push(['cache –', 'gray'])
   // what this chat has already paid to rewrite cold caches, beside the next send's estimate
   if (S.coldRestarts.length) out.push([`Cold rewrites ${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))} (${S.coldRestarts.length})`, 'gray'])
@@ -1552,7 +1572,7 @@ function cacheCell(hb) {
   if (st.kind === 'kept') return ['kept warm', 'cyan']
   if (st.kind === 'warm') return ['warm ' + minutes(st.left), 'green']
   if (st.kind === 'cooling') return ['cools in ' + minutes(st.left), 'yellow']
-  if (st.kind === 'cold') return ['cold ' + minutes(-st.left), (hb.ctx || 0) >= settings.bigTokens ? 'red' : 'gray']
+  if (st.kind === 'cold') return [st.left === null ? 'cold' : 'cold ' + minutes(-st.left), (hb.ctx || 0) >= settings.bigTokens ? 'red' : 'gray']
   return ['–', 'gray']
 }
 

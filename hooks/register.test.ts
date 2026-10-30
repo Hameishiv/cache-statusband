@@ -7,7 +7,8 @@ const SETUP = { options: { seatFileTerminal: '~/.claude-cli-accounts/.active', s
 
 
 // The engine beneath the mod: a terminal session on seat A, nothing on disk but the seat file
-function engine($: any, on: any, seat: { label: string; recording?: string } = { label: 'A' }, kept?: Map<string, unknown>, onGet?: (key: string) => Promise<void> | void) {
+// `disk` adds files by name (a transcript, the account file); `holdAccount` makes reading the account file wait
+function engine($: any, on: any, seat: { label: string; recording?: string } = { label: 'A' }, kept?: Map<string, unknown>, onGet?: (key: string) => Promise<void> | void, disk: { files?: Record<string, string>; holdAccount?: Promise<void> } = {}) {
   const clock = mock.clock(on)
   if (kept) {
     // a store already holding what an earlier run of this mod wrote
@@ -27,7 +28,18 @@ function engine($: any, on: any, seat: { label: string; recording?: string } = {
   on('agent.list', () => ({ value: [] }))
   const isRecording = (e: any) => !!seat.recording && String(e.path ?? e).includes('recording')
   on('fs.exists', (_: unknown, e: any) => ({ value: String(e.path ?? e).includes('.active') || isRecording(e) }))
-  on('fs.read', (_: unknown, e: any) => ({ value: isRecording(e) ? seat.recording : seat.label }))
+  const named = (e: any) => String(e.path ?? e).split('/').pop()!
+  on('fs.read', async (_: unknown, e: any) => {
+    if (named(e) === '.claude.json') await disk.holdAccount
+    const file = disk.files?.[named(e)]
+    return { value: file ?? (isRecording(e) ? seat.recording : seat.label) }
+  })
+  if (disk.files)
+    on('fs.stat', (_: unknown, e: any) => {
+      const file = disk.files?.[named(e)]
+      if (file === undefined || named(e) === '.claude.json') throw new Error('no such file')
+      return { value: { kind: 'file', size: file.length } }
+    })
   on('command.run', async (_: unknown, e: any) => {
     if (e.command === 'compact') {
       seen.compacts++
@@ -682,4 +694,135 @@ test('the seat label is masked in recording mode like the email', SETUP, async (
   const r: any = await $.command.run({ command: 'cache', args: '' })
   expect(r.text).toMatch(/account rotated/)
   expect(r.text).not.toMatch(/jane.doe/)
+})
+
+// A reply record as the transcript holds it
+const reply = (at: number, tokens: number) => JSON.stringify({ type: 'assistant', isSidechain: false, timestamp: new Date(at).toISOString(), message: { model: 'claude-opus-5-5', usage: { input_tokens: 2, cache_read_input_tokens: tokens, output_tokens: 2 } } }) + '\n'
+const account = (email: string) => JSON.stringify({ oauthAccount: { emailAddress: email } })
+
+test('a reopened chat whose coldness has no date says it is cold, not that it went cold 0m ago', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock } = engine($, on, { label: 'B' }, kept)
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: (await clock.now()) - 10 * 60000, model: 'claude-opus-5-5', seat: 'A', desktop: false })
+  await clock.advance(10 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await clock.advance(30 * 60000)
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/Cache is cold\. The next message/)
+  expect(r.text).not.toMatch(/went cold/)
+  expect(r.text).toMatch(/account rotated since its last request/)
+})
+
+test('a plan reading fetched for the old seat is dropped even while the new seat\'s account is still being read', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const seat = { label: 'A' }
+  const disk: { holdAccount?: Promise<void> } = {}
+  const { clock } = engine($, on, seat, kept, undefined, disk)
+  on('session.authorize', () => ({ value: { handle: 'h' } }))
+  let releaseFetch = () => {}
+  const fetchGate = new Promise<void>((r) => (releaseFetch = r))
+  let fetching = false
+  on('http.fetch', async () => {
+    fetching = true
+    await fetchGate
+    return { value: { ok: true, status: 200, headers: {}, text: JSON.stringify({ five_hour: { utilization: 66, resets_at: 9999999999 }, limits: [{ kind: 'weekly_scoped', scope: { model: { display_name: 'Fable' } }, percent: 77 }] }) } }
+  })
+  kept.set('plan:cli:A', { at: 1, next: 2, windows: [], why: 'ok' })
+  await start($, 50000, clock)
+  await clock.advance(10)
+  expect(fetching).toBe(true)
+  let releaseRead = () => {}
+  disk.holdAccount = new Promise<void>((r) => (releaseRead = r)) // the rotation's account read waits
+  seat.label = 'B'
+  const sub = $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  await clock.advance(10)
+  releaseFetch() // the old seat's fetch lands while the new seat's account is being read
+  await clock.advance(10)
+  disk.holdAccount = undefined
+  releaseRead()
+  await sub
+  await clock.advance(70000)
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/77|66/)
+  expect(JSON.stringify(kept.get('plan:cli:B') ?? {})).not.toMatch(/77|66/)
+})
+
+test('a keep-warm ping, which never reaches the transcript, still dates the cache of a reopened chat', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const disk: { files: Record<string, string> } = { files: {} }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  answer(on, seen, 'Send anyway')
+  await clock.advance(60000)
+  const replied = await clock.now()
+  await clock.advance(3 * 60 * 60000) // the transcript's last reply is 3 hours old
+  disk.files['sid-test.jsonl'] = reply(replied, 300000)
+  // the last keep-warm ping, 10 minutes ago, on the same seat and at the same chat size
+  kept.set('last:sid-test', { ctx: 300004, at: (await clock.now()) - 10 * 60000, model: 'claude-opus-5-5', seat: 'A', desktop: false })
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/Cache is warm/)
+  await $.prompt.submit({ text: 'carry on', origin: COMPOSER, wait: false } as never)
+  expect(seen.asks).toBe(0)
+})
+
+// Reopened in a terminal on CLI seat B, signed in as `email`; the record is from app seat X of a@
+for (const [email, cold] of [['b@example.com', true], ['a@example.com', false]] as const) {
+  test(`a chat last answered on an app seat, reopened on a CLI seat of ${cold ? 'another' : 'the same'} account, is ${cold ? 'cold' : 'warm'}`, SETUP, async ($, on) => {
+    const kept = new Map<string, unknown>()
+    const disk = { files: { '.claude.json': account(email) } }
+    const { clock, seen } = engine($, on, { label: 'B' }, kept, undefined, disk)
+    answer(on, seen, 'Send anyway')
+    const step = stepper($, on)
+    await clock.advance(60000)
+    // seats of different surfaces are no comparison: the record's account decides
+    kept.set('last:sid-test', { ctx: 300000, at: (await clock.now()) - 10 * 60000, model: 'claude-opus-5-5', seat: 'X', account: 'a@example.com', desktop: true })
+    await clock.advance(10 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+    const r: any = await $.command.run({ command: 'cache', args: '' })
+    expect(/account rotated/.test(r.text)).toBe(cold)
+    await $.prompt.submit({ text: 'carry on', origin: COMPOSER, wait: false } as never)
+    expect(seen.asks).toBe(cold ? 1 : 0)
+    // the record of the request that lands now keeps the account beside the seat
+    await step(usage({ cache_read_input_tokens: 300000 }))
+    expect(kept.get('last:sid-test')).toMatchObject({ seat: 'B', account: email, desktop: false })
+  })
+}
+
+test('a startup seed that ran before the seat was read is judged again once it is', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const disk: { files: Record<string, string> } = { files: {} }
+  const { clock, seen } = engine($, on, { label: 'B' }, kept, undefined, disk)
+  answer(on, seen, 'Send anyway')
+  on('classic.SessionStart', () => ({}))
+  await clock.advance(60000)
+  const at = (await clock.now()) - 5 * 60000
+  disk.files['sid-test.jsonl'] = reply(at, 300000)
+  kept.set('last:sid-test', { ctx: 300004, at, model: 'claude-opus-5-5', seat: 'A', desktop: false })
+  // the startup handler seeds before session.start has read the seat
+  await ($ as any).classic.SessionStart({ source: 'startup', transcript_path: '/h/sid-test.jsonl' })
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/account rotated/)
+  await $.prompt.submit({ text: 'carry on', origin: COMPOSER, wait: false } as never)
+  expect(seen.asks).toBe(1)
+})
+
+test('a branch keeps its parent\'s pending "ran elsewhere" cold; a clear drops it', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock } = engine($, on, { label: 'B' }, kept)
+  on('classic.SessionStart', () => ({}))
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: (await clock.now()) - 10 * 60000, model: 'claude-opus-5-5', seat: 'A', desktop: false })
+  await clock.advance(10 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  let r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/account rotated/)
+  kept.delete('last:sid-test') // the fork has a new id, so no record of its own
+  await ($ as any).classic.SessionStart({ source: 'fork', transcript_path: '/h/other.jsonl' })
+  r = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/account rotated/)
+  await ($ as any).classic.SessionStart({ source: 'clear' })
+  r = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/account rotated/)
 })
