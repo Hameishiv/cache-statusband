@@ -3964,3 +3964,23 @@ test('a compaction of ours still out when the chat is branched does not mute the
   await clock.advance(1000)
   expect({ compacts: seen.compacts, asked: log.asked.length }).toEqual({ compacts: 1, asked: 1 }) // 'two' goes as typed: the chat is compacted, no cold-send dialog
 })
+
+test('an older run of ours that never settles stops muting the engine\'s compaction marks after two COMPACT_LIMITs: the person\'s own /compact then clears a newer abandonment', SETUP, async ($, on) => {
+  const log = askLog(on)
+  const { clock, seen } = await coldChat($, on, () => (on('classic.SessionStart', () => ({})), on('classic.PostCompact', () => ({}))))
+  let n = 0
+  seen.duringCompact = () => (++n <= 2 ? new Promise(() => {}) : Promise.resolve())
+  await send($, 'one')
+  await clock.advance(15 * 60000 + 1000) // A abandoned
+  await clock.advance(16 * 60000) // forgotten
+  await send($, 'two') // B
+  await clock.advance(15 * 60000 + 1000) // B abandoned, A still out, 46 minutes on
+  await ($ as any).classic.PostCompact({}) // the person's own /compact succeeds
+  await ($ as any).classic.SessionStart({ source: 'compact' })
+  await clock.advance(1000)
+  await mainStep($)
+  await send($, WAKE_TEXT)
+  await send($, 'three')
+  await clock.advance(1000)
+  expect(log.asked[log.asked.length - 1].labels).toContain('Compact first, then send')
+})

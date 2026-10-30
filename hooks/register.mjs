@@ -297,15 +297,15 @@ function markCompacted($, seq = 0) {
   }
   justCompacted = true
   compactDeclined = false
-  if (abandoned && !(seq ? abandoned.seq > seq : olderRunOut(abandoned.seq))) abandoned = null // a compaction that succeeded, ours or the person's, makes an earlier hung one moot, not one that started after it (seq: the succeeding run's number; 0 for an engine mark, which can't say whose end it is: while an older run of ours is still out it is probably that one's)
+  if (abandoned && !(seq ? abandoned.seq > seq : olderRunOut(abandoned.seq))) abandoned = null // a compaction that succeeded, ours or the person's, makes an earlier hung one moot, not one that started after it (seq: the succeeding run's number; 0 for an engine mark, which can't say whose end it is: while an older run of ours is still out, and started less than two COMPACT_LIMITs ago, it is probably that one's)
   rotatedPending = false // the rotation is now part of compactedCold
   S.lastActivity = 0
   rememberCompacted($)
 }
 
-// Whether one of this mod's /compact runs that started before run `seq` is still out: an engine compaction mark arriving now may be its end, which says nothing about the newer run
+// Whether one of this mod's /compact runs that started before run `seq` is still out: an engine compaction mark arriving now may be its end, which says nothing about the newer run. A run out longer than two COMPACT_LIMITs no longer counts, as for staleRunOut, so one that never settles does not keep a newer abandonment for good
 function olderRunOut(seq) {
-  for (const r of liveRuns) if (r.seq < seq) return true
+  for (const r of liveRuns) if (r.seq < seq && now - r.at < 2 * COMPACT_LIMIT) return true
   return false
 }
 
@@ -451,7 +451,7 @@ let compacting = null // { run, chat }: this mod's compaction in flight (run set
 let compactSeq = 0 // numbers this mod's /compact runs in the order they start
 const RUN_END_GRACE = 5000
 const liveRuns = new Set() // { chat, seq, at } (the conversation's msgChat, the run's number, when it started) of this mod's /compact runs not settled yet (and for RUN_END_GRACE after), abandoned ones too: an engine compaction mark may be one's end, which says nothing about a conversation since replaced (see staleRunOut) nor about a newer abandoned run (see olderRunOut)
-let abandoned = null // { done, at, batch, seq }: the /compact call still out after COMPACT_LIMIT. No send starts another until it settles (its end clears this), a compaction that started before it succeeds (the person's own too, but an engine compaction mark does not count while an older run of ours is still out, as it may be that run's end), the chat is replaced, or a second COMPACT_LIMIT has passed. A Resume is tried again, the person's and a wake-up's message go back in the prompt box
+let abandoned = null // { done, at, batch, seq }: the /compact call still out after COMPACT_LIMIT. No send starts another until it settles (its end clears this), a compaction that started before it succeeds (the person's own too, but an engine compaction mark does not count while an older run of ours is still out, and not out for more than two COMPACT_LIMITs, as it may be that run's end), the chat is replaced, or a second COMPACT_LIMIT has passed. A Resume is tried again, the person's and a wake-up's message go back in the prompt box
 let putBackPending = null // { real, steps, at }: the Resume hold. A message was put back in the prompt box (a successful fill of a message that reaches the chat, not a /btw question, not a failed fill) and nothing has been sent since: a due Resume waits while realSends and stepsSeen are as they were then, for COMPACT_LIMIT at most. Cleared by /clear, a resume or a fork
 let boxText = null // { real, steps, text }: the text a put-back left in the prompt box, unsent (a /btw question too). Not bound by COMPACT_LIMIT: it stays until a message is handed on or a request starts (realSends, stepsSeen), or /clear, a resume or a fork. A later put-back goes in behind what the box holds (read from it when the engine can, else this text), so a fill does not remove it
 let fillChain = Promise.resolve() // put-back fills run one after another: each reads what the last left in the box
