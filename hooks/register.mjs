@@ -431,6 +431,7 @@ const THROTTLE = /rate[ _-]?limit/i // "rate limit reached" is a short throttle,
 const USAGE_MARKER = /usage limit|hit your limit|out of (extra )?usage|5-hour|weekly/i // a throttle's wording beside one of these is still spent usage
 const RESUME_FALLBACK = 60 * MIN // no reset time known: try once an hour, three times at most
 let resumeTries = 0
+let sendFailures = 0 // Resume submits refused both ways in a row
 let staleArmedGen = -1 // the identityGen at which a failure of an earlier request was already given its free minute
 let resumeFromReadings = false // the pending resume rests on plan windows, not on the error's wording (nor, after dropReadings, on a re-arm); cleared wherever resumeAt is
 let submitsSeen = 0 // messages handed on to the chat so far (not dropped, not ours, not a local command), each "Compact first" answer, each wake-up that starts compacting and each /clear or resume, so an unattended send (rule B) can tell something was sent or chosen meanwhile
@@ -537,12 +538,19 @@ async function resumeStep($) {
   for (const asUser of [true, false]) {
     try {
       await $.prompt.submit({ text: 'Resume', ...(asUser ? { asUser } : {}) })
+      sendFailures = 0
       return
     } catch {
       // try the plugin's own voice next
     }
   }
-  // neither way went: try again in 2 minutes (tries kept), so the Resume is not lost
+  // neither way went: try again in 2 minutes, at most three times, so the Resume is not lost to one refusal
+  if (++sendFailures > 3) {
+    sendFailures = 0
+    $.ui.toast('Could not send Resume after three tries. Send it yourself when ready.', { timeoutMs: 8000 })
+    $.ui.invalidate('ui.render')
+    return
+  }
   S.resumeAt = now + CANCEL_REARM
   $.ui.toast(`Could not send Resume. Trying again at ${resumeText(S.resumeAt, now)}.`, { timeoutMs: 8000 })
   $.ui.invalidate('ui.render')

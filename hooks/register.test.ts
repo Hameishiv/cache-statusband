@@ -2695,3 +2695,18 @@ test('a Resume neither submit way could send is tried again 2 minutes on, and sa
   await clock.advance(100000)
   expect(seen.submits).toEqual(['Resume'])
 })
+
+test('a Resume refused every time gives up after three more tries, and says so once', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = engine($, on)
+  on('classic.StopFailure', () => ({}))
+  await start($, 50000, clock)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  seen.failSubmit = true
+  await clock.advance(60 * 60000 + 30000)
+  for (let i = 0; i < 5; i++) await clock.advance(2 * 60000 + 30000)
+  expect(seen.toasts.filter((t) => /Trying again at/.test(t)).length).toBe(3)
+  expect(seen.toasts.filter((t) => /after three tries/.test(t)).length).toBe(1)
+  seen.failSubmit = false
+  await clock.advance(10 * 60000)
+  expect(seen.submits).toEqual([])
+})
