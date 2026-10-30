@@ -437,9 +437,18 @@ let submitsSeen = 0 // messages handed on to the chat so far (not dropped, not o
 let sendsHeld = 0 // a cold-send dialog is open, any send of the person's is being handed on down the chain, or a compact-then-send is in flight: a due resume waits
 let wakePendingId = 0 // the wakeCount of a rotator wake-up that has arrived and whose own request has not started (0: none): a due resume waits and a drop of the readings does not re-arm it, as the wake-up's turn settles it. A wake-up lowers it only if it is still its own id, so an earlier one giving up cannot release a later one's hold
 let resumeHeld = false // the due resume is waiting for the seat and account to be known: it goes once they are, or at the window's end
-// Built-in commands that run locally and never reach the chat: they neither settle a pending resume nor cancel an unattended send.
-// Checked against engine 2.1.314: each is a local or local-jsx command there. A prompt-type built-in (statusline, init, review, doctor) goes to the model and must not be listed.
-export const LOCAL_BUILTINS = new Set(['usage', 'status', 'model', 'help', 'context', 'login', 'logout', 'config', 'memory', 'permissions', 'hooks', 'mcp', 'agents', 'ide', 'resume', 'export', 'theme', 'terminal-setup', 'add-dir', 'bug', 'release-notes', 'upgrade', 'privacy-settings', 'exit', 'fast', 'effort', 'plugin', 'output-style', 'tasks', 'copy', 'feedback', 'extra-usage', 'install-github-app', 'skills', 'plan', 'btw', 'rename', 'color', 'powerup'])
+// Built-in commands that run locally: they neither settle a pending resume nor cancel an unattended send.
+// Checked against engine 2.1.314: each is a local or local-jsx command there (hooks/local-builtins.test.mjs checks only that top-level type). A prompt-type built-in (statusline, init, doctor) goes to the model and must not be listed.
+// A local command that can also query the model is handled in code: `/plan <text>` (see isLocalBuiltin).
+export const LOCAL_BUILTINS = new Set(['usage', 'status', 'model', 'help', 'context', 'logout', 'config', 'memory', 'permissions', 'hooks', 'mcp', 'agents', 'ide', 'resume', 'export', 'theme', 'terminal-setup', 'add-dir', 'bug', 'release-notes', 'upgrade', 'privacy-settings', 'exit', 'fast', 'effort', 'plugin', 'output-style', 'tasks', 'copy', 'feedback', 'extra-usage', 'install-github-app', 'skills', 'plan', 'btw', 'rename', 'color', 'powerup'])
+
+// Whether a command typed by the person runs locally: a LOCAL_BUILTINS name, except `/plan <description>`, which sends the description to the model (`/plan` alone, `open` and `share` stay local)
+function isLocalBuiltin(command) {
+  if (!command || !LOCAL_BUILTINS.has(command.name)) return false
+  if (command.name !== 'plan') return true
+  const arg = String(command.args || '').trim()
+  return !arg || arg === 'open' || arg === 'share'
+}
 
 // The windows that are full, from the freshest reading this session has
 export function spentWindows(limits, fable, model) {
@@ -1339,7 +1348,7 @@ export function register(on, options = {}) {
     // These run locally or start afresh: a cold cache costs them nothing
     const local = e.command && ['compact', 'clear', names.cache, names.keepwarm, names.board, names.handoff].includes(e.command.name)
     // a message handed on and not dropped by a later hook reaches the chat: the unattended sends see it. Not a local command (LOCAL_BUILTINS), nor this mod's own Resume or send. Whether it settles a pending resume is up to its request (turn.step)
-    const counts = !local && !(e.command && LOCAL_BUILTINS.has(e.command.name)) && !(e.origin && e.origin.kind === 'plugin' && e.origin.name === $.plugin.name)
+    const counts = !local && !isLocalBuiltin(e.command) && !(e.origin && e.origin.kind === 'plugin' && e.origin.name === $.plugin.name)
     const mine = counts || fromUser // a send of the person's: a due resume waits while it is handed on, whether or not the guard asked
     const through = async () => {
       if (mine) sendsHeld++

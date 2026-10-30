@@ -2365,3 +2365,19 @@ test('a wake-up giving up does not release the hold of a later wake-up: the Resu
   await clock.advance(60 * 60000)
   expect(seen.submits).toEqual([ROTATE2])
 })
+
+// A `/plan` typed while the Resume compacts: with a description it reaches the model, alone it is local
+for (const [args, goes] of [['fix x', false], ['', true], ['open', true]] as const) {
+  test(`"/plan ${args}" typed while the Resume compacts ${goes ? 'leaves it going' : 'cancels it, as it reaches the model'}`, { options: { autoResume: true } }, async ($, on) => {
+    const { clock, seen } = engine($, on)
+    on('classic.StopFailure', () => ({}))
+    await start($, 300000, clock)
+    const t0 = await clock.now()
+    await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: fiveFull(t0), changed: [] } as never)
+    await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+    let n = 0
+    seen.duringCompact = async () => { if (++n === 1) await $.prompt.submit({ text: `/plan ${args}`.trim(), command: { name: 'plan', args }, origin: COMPOSER, wait: false } as never) }
+    await clock.advance(3 * 60 * 60000)
+    expect(seen.submits).toEqual(goes ? ['Resume'] : [])
+  })
+}
