@@ -1,0 +1,20 @@
+{
+  "name": "cache-statusband-codex-local",
+  "interface": {
+    "displayName": "Cache Statusband Codex (local)"
+  },
+  "plugins": [
+    {
+      "name": "cache-statusband-codex",
+      "source": {
+        "source": "local",
+        "path": "./plugins/cache-statusband-codex"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
