@@ -2912,10 +2912,11 @@ test('a compaction that never finishes is abandoned after 15 minutes: that messa
   expect(seen.toasts.filter((t) => /The earlier compaction is still running; your message is back in the prompt box/.test(t)).length).toBe(1) // the waiter's
 })
 
-test('a compaction that never finishes holds a due Resume until the put-back message is sent: nothing is sent beside it and no second /compact, however long it takes', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+test('a compaction that never finishes holds a due Resume while the put-back message is unsent, for 15 minutes at most: nothing is sent beside it and no second /compact until then', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)
   answer(on, seen, 'Compact first, then send')
+  on('prompt.fill', () => ({ isFilled: true }))
   on('classic.StopFailure', () => ({}))
   await clock.advance(60000)
   kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
@@ -2924,12 +2925,16 @@ test('a compaction that never finishes holds a due Resume until the put-back mes
   await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
   let n = 0
   seen.duringCompact = () => (++n === 1 ? new Promise(() => {}) : Promise.resolve()) // the person's compaction hangs
+  await clock.advance(50 * 60000) // the Resume is due 10 minutes after this
   await $.prompt.submit({ text: 'one', origin: COMPOSER, wait: false } as never)
   await clock.advance(100)
-  for (let i = 0; i < 9; i++) await clock.advance(10 * 60000) // the Resume, due an hour on, finds 'one' still in the prompt box
+  await clock.advance(14 * 60000) // abandoned at 15 minutes: 'one' is in the prompt box and the Resume, due since, waits for it
+  await clock.advance(14 * 60000)
   expect({ submits: seen.submits, compacts: seen.compacts }).toEqual({ submits: [], compacts: 1 })
   expect(seen.toasts.filter((t) => /Compaction has not finished after 15 minutes/.test(t)).length).toBe(1)
   expect(seen.toasts.filter((t) => /Resume was not sent|Trying again|four tries/.test(t))).toEqual([]) // held, not tried and failed
+  await clock.advance(5 * 60000) // 15 minutes after the put-back the hold lapses, as does the abandoned mark: the Resume goes
+  expect({ submits: seen.submits, compacts: seen.compacts }).toEqual({ submits: ['Resume'], compacts: 2 })
 })
 
 test('a Resume whose own compaction never finishes is not sent uncompacted after 15 minutes: it is tried again 2 minutes on, without a second compaction while the first is out, and gives up after four tries saying compaction did not finish', { options: { autoResume: true } }, async ($, on) => {
@@ -3035,7 +3040,7 @@ test('a person\'s "Compact first" that waits on a hung Resume compaction goes ba
   expect(seen.toasts.filter((t) => /The earlier compaction is still running; your message is back in the prompt box/.test(t)).length).toBe(1)
   expect(seen.toasts.filter((t) => /Something else was sent or chosen meanwhile, so the automatic one waits until/.test(t)).length).toBe(1) // the Compact first answer cancelled the Resume (rule B), which is armed again
   await clock.advance(20 * 60000)
-  expect({ submits: seen.submits, compacts: seen.compacts }).toEqual({ submits: [], compacts: 1 }) // the Resume's tries find it still out
+  expect({ submits: seen.submits, compacts: seen.compacts }).toEqual({ submits: ['Resume'], compacts: 2 }) // the put-back hold and the abandoned mark both end 15 minutes on: the Resume compacts afresh and goes
 })
 
 test('a compaction abandoned after 15 minutes that finishes late marks the chat compacted: the Resume tried again goes without compacting', { options: { autoResume: true } }, async ($, on) => {
@@ -3065,13 +3070,13 @@ test('a compaction abandoned after 15 minutes that fails late frees the next sen
   expect({ submits: seen.submits, compacts: seen.compacts }).toEqual({ submits: ['Resume'], compacts: 2 })
 })
 
-test('a message sent after the abandonment is put back alone: the box holds nothing of the person\'s but what they just sent, and the earlier batch is closed', SETUP, async ($, on) => {
+test('a message sent after the abandonment is put back behind the earlier batch, still unsent in the box: a fill never removes it', SETUP, async ($, on) => {
   const { clock, seen, fills } = await twoCompactFirst($, on, (n) => (n === 1 ? new Promise(() => {}) : Promise.resolve()))
   await clock.advance(15 * 60000 + 1000)
   expect(fills).toEqual(['one\n\ntwo'])
   await $.prompt.submit({ text: 'three', origin: COMPOSER, wait: false } as never) // no second compaction: it goes straight back
   await clock.advance(1000)
-  expect({ compacts: seen.compacts, submits: seen.submits, fills }).toEqual({ compacts: 1, submits: [], fills: ['one\n\ntwo', 'three'] })
+  expect({ compacts: seen.compacts, submits: seen.submits, fills }).toEqual({ compacts: 1, submits: [], fills: ['one\n\ntwo', 'one\n\ntwo\n\nthree'] })
 })
 
 test('a /clear after the abandonment starts afresh: the next chat\'s Resume compacts', { options: { autoResume: true } }, async ($, on) => {
