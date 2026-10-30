@@ -15,14 +15,41 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-const COLORS = {
-  model: { fg: 255, bg: 24 },
-  effort: { fg: 255, bg: 90 },
-  context: { fg: 235, bg: 123 },
-  cache: { fg: 235, bg: 114 },
-  week: { fg: 255, bg: 63 },
-  cost: { fg: 235, bg: 220 },
+/** Each family is [dark, light], the same pairs the Claude Code band already checked. */
+export const HUES = {
+  model: ["#1a4f99", "#99c1f1"],
+  effort: ["#5a3d8a", "#c9a8f0"],
+  context: ["#6b4b00", "#f6d32d"],
+  cache: ["#1d5c3d", "#8ff0a4"],
+  week: ["#0a5960", "#7fe0e0"],
+  cost: ["#7f302a", "#f5a99f"],
 };
+
+const TEXT_ON_DARK = "#ffffff";
+const TEXT_ON_LIGHT = "#1e1e1e";
+
+function hexRgb(hex) {
+  return [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
+}
+
+/** WCAG contrast ratio of two #rrggbb colours. */
+export function contrast(a, b) {
+  const lum = (hex) => {
+    const [r, g, bl] = hexRgb(hex)
+      .map((n) => n / 255)
+      .map((c) => (c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4));
+    return 0.2126 * r + 0.7152 * g + 0.0722 * bl;
+  };
+  const [x, y] = [lum(a), lum(b)].sort((p, q) => q - p);
+  return (x + 0.05) / (y + 0.05);
+}
+
+/** Dark shade on even positions, light shade on odd ones. */
+export function shade(kind, index) {
+  const pair = HUES[kind] || HUES.cost;
+  const dark = index % 2 === 0;
+  return { bg: pair[dark ? 0 : 1], fg: dark ? TEXT_ON_DARK : TEXT_ON_LIGHT };
+}
 
 const BILLING_MARKER = "billing: fetched credits config";
 const RESCAN_MS = 5 * 60 * 1000;
@@ -107,18 +134,19 @@ export function percentText(value) {
   return Number.isInteger(tenths) ? String(tenths) : tenths.toFixed(1);
 }
 
-/** Remaining time until a reset, from a millisecond duration. */
-export function countdown(ms) {
+/**
+ * Time left, matching the Claude Code band.
+ * Under an hour: "40m". Under a day: "23h05m". Past a day: "7d9h".
+ * A non-positive duration returns null.
+ */
+export function remaining(ms) {
   const v = finite(ms);
   if (v === null || v <= 0) return null;
-  const totalMin = Math.floor(v / 60000);
-  if (totalMin < 1) return "<1m";
-  const days = Math.floor(totalMin / 1440);
-  const hours = Math.floor((totalMin % 1440) / 60);
-  const mins = totalMin % 60;
-  if (days > 0) return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
-  if (hours > 0) return mins > 0 ? `${hours}h ${mins}m` : `${hours}h`;
-  return `${mins}m`;
+  const hours = Math.floor(v / 3600000);
+  if (hours >= 24) return `${Math.floor(hours / 24)}d${hours % 24}h`;
+  const mins = Math.round(v / 60000);
+  if (mins <= 60) return `${mins}m`;
+  return `${Math.floor(mins / 60)}h${String(mins % 60).padStart(2, "0")}m`;
 }
 
 /**
@@ -135,14 +163,18 @@ export function weeklyLabel(record, nowMs) {
   const end = Date.parse(record.periodEnd);
   const now = finite(nowMs);
   if (!Number.isFinite(end) || now === null || end <= now) return null;
-  const left = countdown(end - now);
+  const left = remaining(end - now);
   if (!left) return null;
   return `week ${percentText(pct)}% · ${left}`;
 }
 
-/** Uppercase the first letter of the first word. The rest of the label stays as written. */
-export function capitalizeFirstWord(label) {
-  return label.charAt(0).toUpperCase() + label.slice(1);
+/**
+ * Capitalise the first word. A leading symbol is skipped, a digit stays
+ * ("5h"), and an email stays as written.
+ */
+export function capFirst(label) {
+  if (/^\S+@\S+$/.test(label)) return label;
+  return String(label).replace(/^([^\p{L}\p{N}]*)(\p{Ll})/u, (_, lead, letter) => lead + letter.toUpperCase());
 }
 
 /** Plain segments, in band order. Missing inputs are skipped, not zeroed. */
@@ -160,17 +192,23 @@ export function segments(payload, extras = {}) {
   ];
   return parts
     .filter(([, label]) => label)
-    .map(([kind, label]) => ({ kind, label: capitalizeFirstWord(label) }));
+    .map(([kind, label]) => ({ kind, label: capFirst(label) }));
 }
 
-function paint(label, kind, nextKind) {
-  const color = COLORS[kind];
-  let out = `\x1b[38;5;${color.fg};48;5;${color.bg}m ${label} `;
+function ansi(fg, bg) {
+  const [fr, fgG, fb] = hexRgb(fg);
+  const [br, bgG, bb] = hexRgb(bg);
+  return `\x1b[38;2;${fr};${fgG};${fb};48;2;${br};${bgG};${bb}m`;
+}
+
+function paint(label, kind, index, nextKind) {
+  const color = shade(kind, index);
+  let out = `${ansi(color.fg, color.bg)} ${label} `;
   if (nextKind) {
-    const next = COLORS[nextKind];
-    out += `\x1b[38;5;${color.bg};48;5;${next.bg}m▶`;
+    const next = shade(nextKind, index + 1);
+    out += `${ansi(color.bg, next.bg)}▶`;
   } else {
-    out += `\x1b[38;5;${color.bg}m▶\x1b[0m`;
+    out += "\x1b[0m";
   }
   return out;
 }
@@ -179,7 +217,7 @@ function paint(label, kind, nextKind) {
 export function render(payload, extras) {
   const parts = segments(payload, extras);
   if (parts.length === 0) return "";
-  return parts.map((part, i) => paint(part.label, part.kind, parts[i + 1]?.kind)).join("");
+  return parts.map((part, i) => paint(part.label, part.kind, i, parts[i + 1]?.kind)).join("");
 }
 
 /** Grok's billing log, or null when CSB_BILLING_LOG is set to an empty string. */
@@ -273,56 +311,71 @@ function storedRecord(cached) {
   return { percent, periodType, periodEnd, fetchedAt: text(record.fetchedAt) };
 }
 
-/**
- * Last weekly reading. Re-reads the log at most once per five minutes.
- * The cache stores the percent, period type, period end, and fetch time.
- */
-export function loadWeekly(logPath, cachePath, nowMs = Date.now()) {
-  if (!logPath) return null;
-  let st;
+function readCache(cachePath) {
+  if (!cachePath) return null;
   try {
-    st = statSync(logPath);
+    return JSON.parse(readFileSync(cachePath, "utf8"));
   } catch {
     return null;
   }
-  let cached = null;
-  if (cachePath) {
+}
+
+function writeCache(cachePath, body) {
+  if (!cachePath) return;
+  try {
+    mkdirSync(dirname(cachePath), { recursive: true });
+    writeFileSync(cachePath, JSON.stringify(body));
+  } catch {
+    // This run can still show the reading it already has.
+  }
+}
+
+/**
+ * Last weekly reading. Re-reads the log at most once per five minutes.
+ * A failed re-read keeps the last good record and only moves the next check.
+ * The cache stores the percent, period type, period end, and fetch time.
+ */
+export function loadWeekly(logPath, cachePath, nowMs = Date.now()) {
+  const cached = readCache(cachePath);
+  const prior = storedRecord(cached);
+  const freshScan = cached && finite(cached.scannedAt) !== null && nowMs - cached.scannedAt < RESCAN_MS;
+  if (freshScan && prior) return prior;
+
+  let st = null;
+  if (logPath) {
     try {
-      cached = JSON.parse(readFileSync(cachePath, "utf8"));
+      st = statSync(logPath);
     } catch {
-      cached = null;
+      st = null;
     }
   }
-  const sameFile = cached && cached.sourceMtimeMs === st.mtimeMs && cached.sourceSize === st.size;
-  const freshScan = cached && finite(cached.scannedAt) !== null && nowMs - cached.scannedAt < RESCAN_MS;
-  if (sameFile || freshScan) {
-    const record = storedRecord(cached);
-    if (record) return record;
+  const sameFile = st && cached && cached.sourceMtimeMs === st.mtimeMs && cached.sourceSize === st.size;
+  if (sameFile && prior) return prior;
+
+  const found = st ? readLastBilling(logPath) : null;
+  if (!found) {
+    if (prior) {
+      writeCache(cachePath, {
+        sourceMtimeMs: cached.sourceMtimeMs,
+        sourceSize: cached.sourceSize,
+        scannedAt: nowMs,
+        record: prior,
+      });
+    }
+    return prior;
   }
-  const found = readLastBilling(logPath);
-  if (!found) return null;
   const record = {
     percent: found.percent,
     periodType: found.periodType,
     periodEnd: found.periodEnd,
     fetchedAt: found.fetchedAt,
   };
-  if (cachePath) {
-    try {
-      mkdirSync(dirname(cachePath), { recursive: true });
-      writeFileSync(
-        cachePath,
-        JSON.stringify({
-          sourceMtimeMs: found.sourceMtimeMs,
-          sourceSize: found.sourceSize,
-          scannedAt: nowMs,
-          record,
-        }),
-      );
-    } catch {
-      // This run can still show the reading it just parsed.
-    }
-  }
+  writeCache(cachePath, {
+    sourceMtimeMs: found.sourceMtimeMs,
+    sourceSize: found.sourceSize,
+    scannedAt: nowMs,
+    record,
+  });
   return record;
 }
 

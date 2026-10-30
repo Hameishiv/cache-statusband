@@ -6,12 +6,17 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import {
   cacheLabel,
+  capFirst,
   contextLabel,
+  contrast,
   costLabel,
   formatTokens,
+  HUES,
   loadWeekly,
+  remaining,
   render,
   segments,
+  shade,
   weeklyLabel,
 } from "./statusline.mjs";
 
@@ -82,9 +87,9 @@ describe("weekly usage", () => {
   };
 
   it("shows the weekly percent and the time until reset", () => {
-    assert.equal(weeklyLabel(weekly, now), "week 23% · 4d 11h");
-    assert.equal(weeklyLabel({ ...weekly, percent: 0 }, now), "week 0% · 4d 11h");
-    assert.equal(weeklyLabel({ ...weekly, percent: 23.4 }, now), "week 23.4% · 4d 11h");
+    assert.equal(weeklyLabel(weekly, now), "week 23% · 4d11h");
+    assert.equal(weeklyLabel({ ...weekly, percent: 0 }, now), "week 0% · 4d11h");
+    assert.equal(weeklyLabel({ ...weekly, percent: 23.4 }, now), "week 23.4% · 4d11h");
   });
 
   it("omits a monthly period, a finished week, and a missing reading", () => {
@@ -116,7 +121,7 @@ describe("weekly usage", () => {
     });
     writeFileSync(logPath, `noise\n${line}\nmore noise\n`);
     const first = loadWeekly(logPath, cachePath, now);
-    assert.equal(weeklyLabel(first, now), "week 23% · 4d 11h");
+    assert.equal(weeklyLabel(first, now), "week 23% · 4d11h");
     const cached = JSON.parse(readFileSync(cachePath, "utf8"));
     assert.deepEqual(Object.keys(cached).sort(), ["record", "scannedAt", "sourceMtimeMs", "sourceSize"]);
     assert.deepEqual(Object.keys(cached.record).sort(), ["fetchedAt", "percent", "periodEnd", "periodType"]);
@@ -140,6 +145,47 @@ describe("weekly usage", () => {
     cached.scannedAt = now - 6 * 60 * 1000;
     writeFileSync(cachePath, JSON.stringify(cached));
     assert.equal(loadWeekly(logPath, cachePath, now + 1000).percent, 40);
+    writeFileSync(logPath, "no credits line\n");
+    const aged = JSON.parse(readFileSync(cachePath, "utf8"));
+    aged.scannedAt = now - 6 * 60 * 1000;
+    writeFileSync(cachePath, JSON.stringify(aged));
+    assert.equal(loadWeekly(logPath, cachePath, now + 2000).percent, 40);
+  });
+});
+
+describe("display", () => {
+  it("capitalises the first word and leaves a number or an email alone", () => {
+    assert.equal(capFirst("● cache warm 42m"), "● Cache warm 42m");
+    assert.equal(capFirst("high"), "High");
+    assert.equal(capFirst("5h 43% · 2h17m"), "5h 43% · 2h17m");
+    assert.equal(capFirst("you@example.com"), "you@example.com");
+  });
+
+  it("formats a reset under a day as hours and minutes, and past a day as days and hours", () => {
+    const at = Date.parse("2026-10-29T08:00:00Z");
+    assert.equal(remaining(Date.parse("2026-10-29T11:30:00Z") - at), "3h30m");
+    assert.equal(remaining(Date.parse("2026-11-04T22:00:00Z") - at), "6d14h");
+    assert.equal(remaining(Date.parse("2026-10-30T07:05:00Z") - at), "23h05m");
+    assert.equal(remaining(Date.parse("2026-10-29T08:40:00Z") - at), "40m");
+    assert.equal(remaining(177 * 3600000 + 48 * 60000), "7d9h");
+    assert.equal(remaining(-1), null);
+  });
+
+  it("alternates dark and light shades that meet the contrast floors", () => {
+    assert.equal(shade("model", 0).bg, HUES.model[0]);
+    assert.equal(shade("effort", 1).bg, HUES.effort[1]);
+    for (const [dark, light] of Object.values(HUES)) {
+      assert.ok(contrast(dark, "#ffffff") >= 4.5);
+      assert.ok(contrast(light, "#1e1e1e") >= 4.5);
+      for (const [, otherLight] of Object.values(HUES)) assert.ok(contrast(dark, otherLight) >= 3);
+    }
+  });
+
+  it("puts an arrow only between segments", () => {
+    const plain = render(full).replace(/\x1b\[[0-9;]*m/g, "");
+    assert.equal(plain.endsWith("▶"), false);
+    assert.equal(plain.split("▶").length - 1, segments(full).length - 1);
+    assert.match(plain, /Session \$0\.04 $/);
   });
 });
 

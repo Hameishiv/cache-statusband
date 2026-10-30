@@ -3,7 +3,7 @@
 A status line for [Grok Build](https://x.ai). It paints the session figures Grok already sends to a status-line command: model, reasoning effort, context window, prompt-cache token counts, and session cost. It also paints the weekly usage percentage and reset countdown from the credits reading `/usage` already fetched.
 
 ```
- Grok 4.7 ▶ High ▶ Ctx 29% · 287k/1M ▶ Cache read 80k · write 1.5k ▶ Week 40% · 3d 2h ▶ Session $0.04 ▶
+ Grok 4.7 ▶ High ▶ Ctx 29% · 287k/1M ▶ Cache read 80k · write 1.5k ▶ Week 40% · 3d2h ▶ Session $0.04
 ```
 
 Each segment is a colour block. The arrow is `▶` (U+25B6), which does not need a special font. A figure that is neither in the status-line payload nor in a current weekly credits reading is left off the line. A zero Grok did send is shown as zero. The `40%` above is a sample.
