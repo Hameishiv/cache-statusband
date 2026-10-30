@@ -2965,6 +2965,129 @@ test('a rotator wake-up whose compaction never finishes goes back in the prompt 
   expect({ submits: seen.submits, fills }).toEqual({ submits: [], fills: [ROTATE] })
 })
 
+test('a Resume due during the person\'s hung "Compact first": the message goes back in the prompt box first, and the Resume is sent no sooner than 2 minutes after it (the compaction ends late, so it needs none)', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  const fills: { at: number; text: string }[] = []
+  on('prompt.fill', async (_: unknown, e: any) => (fills.push({ at: await clock.now(), text: e.text }), { isFilled: true }))
+  answer(on, seen, 'Compact first, then send')
+  on('classic.StopFailure', () => ({}))
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+  await clock.advance(77 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  const t0 = await clock.now()
+  await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [{ kind: 'five_hour', percentUsed: 100, resetsAt: new Date(t0 + 4 * 60000).toISOString() }], changed: [] } as never)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  let finish: () => void = () => {}
+  let n = 0
+  seen.duringCompact = () => (++n === 1 ? new Promise<void>((r) => { finish = r }) : Promise.resolve()) // the person's compaction hangs; the Resume falls due 4 minutes in
+  await $.prompt.submit({ text: 'stop, do X instead', origin: COMPOSER, wait: false } as never)
+  let resumeAt = 0
+  let finished = false
+  for (let i = 0; i < 25 * 6; i++) {
+    await clock.advance(10000)
+    if (!finished && fills.length) { finish(); finished = true } // it ends late, right after the message is back in the box
+    if (!resumeAt && seen.submits.includes('Resume')) resumeAt = await clock.now()
+  }
+  expect(fills.map((f) => f.text)).toEqual(['stop, do X instead'])
+  expect(Math.round((fills[0].at - t0) / 60000)).toBe(15)
+  expect(seen.submits).toEqual(['Resume'])
+  expect(resumeAt - fills[0].at).toBeGreaterThanOrEqual(2 * 60000) // never ahead of the message the person still has to send
+  expect(seen.compacts).toBe(1)
+})
+
+test('a Resume due during the person\'s hung "Compact first" is not sent at all while the compaction stays out: nothing beside the filled-back message, no second /compact', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  const fills: string[] = []
+  on('prompt.fill', (_: unknown, e: any) => (fills.push(e.text), { isFilled: true }))
+  answer(on, seen, 'Compact first, then send')
+  on('classic.StopFailure', () => ({}))
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+  await clock.advance(77 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  const t0 = await clock.now()
+  await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [{ kind: 'five_hour', percentUsed: 100, resetsAt: new Date(t0 + 4 * 60000).toISOString() }], changed: [] } as never)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  let n = 0
+  seen.duringCompact = () => (++n === 1 ? new Promise(() => {}) : Promise.resolve())
+  await $.prompt.submit({ text: 'stop, do X instead', origin: COMPOSER, wait: false } as never)
+  for (let i = 0; i < 20; i++) await clock.advance(60000) // minute 16 is the one the Resume used to go at
+  expect({ submits: seen.submits, compacts: seen.compacts, fills }).toEqual({ submits: [], compacts: 1, fills: ['stop, do X instead'] })
+})
+
+test('a person\'s "Compact first" that waits on a hung Resume compaction goes back in the prompt box when it is abandoned, with no second /compact, and the Resume is tried again', { options: { autoResume: true } }, async ($, on) => {
+  const box = { asks: 0 }
+  const fills: string[] = []
+  const { clock, seen } = await resumeCompacting($, on, () => {
+    answer(on, box, 'Compact first, then send')
+    on('prompt.fill', (_: unknown, e: any) => (fills.push(e.text), { isFilled: true }))
+  })
+  let n = 0
+  seen.duringCompact = () => (++n === 1 ? new Promise(() => {}) : Promise.resolve())
+  await clock.advance(91 * 60000 + 1000) // the Resume compacts, and the compaction hangs
+  await clock.advance(5 * 60000)
+  await $.prompt.submit({ text: 'hello', origin: COMPOSER, wait: false } as never) // waits on it
+  await clock.advance(10 * 60000 + 2000)
+  expect({ submits: seen.submits, compacts: seen.compacts, fills, asks: box.asks }).toEqual({ submits: [], compacts: 1, fills: ['hello'], asks: 1 })
+  expect(seen.toasts.filter((t) => /The earlier compaction is still running; your message is back in the prompt box/.test(t)).length).toBe(1)
+  expect(seen.toasts.filter((t) => /Something else was sent or chosen meanwhile, so the automatic one waits until/.test(t)).length).toBe(1) // the Compact first answer cancelled the Resume (rule B), which is armed again
+  await clock.advance(20 * 60000)
+  expect({ submits: seen.submits, compacts: seen.compacts }).toEqual({ submits: [], compacts: 1 }) // the Resume's tries find it still out
+})
+
+test('a compaction abandoned after 15 minutes that finishes late marks the chat compacted: the Resume tried again goes without compacting', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = await resumeCompacting($, on)
+  let finish: () => void = () => {}
+  let n = 0
+  seen.duringCompact = () => (++n === 1 ? new Promise<void>((r) => { finish = r }) : Promise.resolve())
+  await clock.advance(91 * 60000 + 1000)
+  await clock.advance(15 * 60000 + 1000) // abandoned; the Resume is armed again
+  expect({ submits: seen.submits, compacts: seen.compacts }).toEqual({ submits: [], compacts: 1 })
+  finish()
+  await clock.advance(1000)
+  await clock.advance(200000)
+  expect({ submits: seen.submits, compacts: seen.compacts }).toEqual({ submits: ['Resume'], compacts: 1 })
+})
+
+test('a compaction abandoned after 15 minutes that fails late frees the next send to compact', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = await resumeCompacting($, on)
+  let fail: (e: Error) => void = () => {}
+  let n = 0
+  seen.duringCompact = () => (++n === 1 ? new Promise<void>((_, rej) => { fail = rej }) : Promise.resolve())
+  await clock.advance(91 * 60000 + 1000)
+  await clock.advance(15 * 60000 + 1000)
+  fail(new Error('late boom'))
+  await clock.advance(1000)
+  await clock.advance(200000)
+  expect({ submits: seen.submits, compacts: seen.compacts }).toEqual({ submits: ['Resume'], compacts: 2 })
+})
+
+test('a message sent after the abandonment is put back with the earlier ones in one fill, in submission order, unless a message was sent in between', SETUP, async ($, on) => {
+  const { clock, seen, fills } = await twoCompactFirst($, on, (n) => (n === 1 ? new Promise(() => {}) : Promise.resolve()))
+  await clock.advance(15 * 60000 + 1000)
+  expect(fills).toEqual(['one\n\ntwo'])
+  await $.prompt.submit({ text: 'three', origin: COMPOSER, wait: false } as never) // no second compaction: it goes straight back
+  await clock.advance(1000)
+  expect({ compacts: seen.compacts, submits: seen.submits, fills }).toEqual({ compacts: 1, submits: [], fills: ['one\n\ntwo', 'one\n\ntwo\n\nthree'] })
+})
+
+test('a /clear after the abandonment starts afresh: the next chat\'s Resume compacts', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = await resumeCompacting($, on, () => on('classic.SessionStart', () => ({})))
+  let n = 0
+  seen.duringCompact = () => (++n === 1 ? new Promise(() => {}) : Promise.resolve())
+  await clock.advance(91 * 60000 + 1000)
+  await clock.advance(15 * 60000 + 1000) // abandoned
+  await ($ as any).classic.SessionStart({ source: 'clear' })
+  const t = await clock.now()
+  await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [{ kind: 'five_hour', percentUsed: 100, resetsAt: new Date(t + 5 * 60000).toISOString() }], changed: [] } as never)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  await clock.advance(7 * 60000)
+  expect({ submits: seen.submits, compacts: seen.compacts }).toEqual({ submits: ['Resume'], compacts: 2 })
+})
+
 // The Resume's compaction runs while a cold-send dialog opens for a message of the person's, and fails: once the test says so (endCompact), or at once, with the dialog still open (failsAtOnce)
 async function resumeDialogDuringCompaction($: any, on: any, text: string, command?: { name: string; args: string }, failsAtOnce = false) {
   const release = gatedAsk(on)
