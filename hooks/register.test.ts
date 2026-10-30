@@ -3681,19 +3681,22 @@ test('a /clear between the abandonment and the put-back fill leaves the new chat
   expect(seen.toasts.filter((t) => t.includes('Not sent, because the chat was cleared: one')).length).toBe(1)
 })
 
-test('a message put back while an unsent slash command is in the box is quoted in a toast, not joined to it', SETUP, async ($, on) => {
+test('a message put back while an unsent slash command is in the box is filled, and the command is quoted in full in a toast: nothing is lost, nothing is joined', SETUP, async ($, on) => {
   const dialogs = heldAsk(on)
   const { clock, seen, fills } = await coldChat($, on)
   hang(seen)
-  await send($, '/merge-pr 1', { name: 'merge-pr', args: '1' }) // its compaction hangs, then it is put back alone
+  const slash = '/merge-pr 1 --with-a-long-flag-list ' + 'x'.repeat(90)
+  await send($, slash, { name: 'merge-pr', args: '1' }) // its compaction hangs, then it is put back alone
   await clock.advance(1000)
-  void send($, 'three') // its dialog stays open
+  const long = 'Please refactor the parser so it handles nested quotes, then add tests for the three edge cases we discussed yesterday.'
+  void send($, long) // its dialog stays open
   await clock.advance(15 * 60000)
-  expect(fills).toEqual(['/merge-pr 1'])
+  expect(fills).toEqual([slash])
   dialogs.release('Compact first, then send')
   await clock.advance(1000)
-  expect(fills).toEqual(['/merge-pr 1'])
-  expect(seen.toasts.filter((t) => /Also not sent: three/.test(t)).length).toBe(1)
+  expect(fills).toEqual([slash, long])
+  expect(seen.toasts.filter((t) => t.includes(`Also not sent: ${slash} — send it again when ready.`)).length).toBe(1)
+  expect(seen.toasts.filter((t) => /Also not sent: Please/.test(t))).toEqual([])
 })
 
 // The band's segment matching re as drawn, or null when it shows none
@@ -3747,4 +3750,103 @@ test('a message waiting on a compaction when the chat is cleared is dropped as s
   expect(seen.compacts).toBe(2)
   expect(seen.toasts.filter((t) => t.includes('cleared: second')).length).toBe(1) // not 15 minutes on
   expect(seen.submits).toEqual([])
+})
+
+test('a slash command filled after a compaction that finished late does not overwrite unsent put-back text: the command is quoted in a toast', SETUP, async ($, on) => {
+  const dialogs = heldAsk(on)
+  const { clock, seen, fills } = await coldChat($, on)
+  let finishA: () => void = () => {}
+  let n = 0
+  seen.duringCompact = () => (++n === 1 ? new Promise<void>((r) => { finishA = r }) : Promise.resolve())
+  await send($, 'one')
+  await clock.advance(1000)
+  void send($, '/merge-pr 1', { name: 'merge-pr', args: '1' }) // its dialog stays open
+  await clock.advance(15 * 60000) // A abandoned: 'one' is back in the box
+  expect(fills).toEqual(['one'])
+  finishA() // A succeeds late: the chat counts as compacted
+  await clock.advance(1000)
+  dialogs.release('Compact first, then send')
+  await clock.advance(1000)
+  expect(fills).toEqual(['one'])
+  expect(seen.compacts).toBe(1)
+  expect(seen.toasts.filter((t) => t.includes('Also not sent: /merge-pr 1 — send it again when ready.')).length).toBe(1)
+})
+
+test('a /btw question put back is tracked in the box: a wake-up put back after it is filled, and the question is quoted in full in a toast', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+  askLog(on)
+  const fills: string[] = []
+  const { clock, seen } = await resumeCompacting($, on, () => on('prompt.fill', (_: unknown, e: any) => (fills.push(e.text), { isFilled: true })))
+  let n = 0
+  seen.duringCompact = async () => { if (++n === 1) { await send($, '/btw what is X?', { name: 'btw', args: 'what is X?' }); await new Promise(() => {}) } }
+  await clock.advance(91 * 60000 + 1000)
+  await clock.advance(15 * 60000 + 1000) // abandoned: the question is back in the box
+  expect(fills).toEqual(['/btw what is X?'])
+  await send($, WAKE_TEXT)
+  await clock.advance(1000)
+  expect(fills).toEqual(['/btw what is X?', WAKE_TEXT])
+  expect(seen.toasts.filter((t) => t.includes('Also not sent: /btw what is X? — send it again when ready.')).length).toBe(1)
+})
+
+test('a message put back after the Resume hold has lapsed still goes behind the unsent text in the box', SETUP, async ($, on) => {
+  askLog(on)
+  const { clock, seen, fills } = await coldChat($, on)
+  let n = 0
+  seen.duringCompact = () => (++n <= 2 ? new Promise(() => {}) : Promise.resolve())
+  await send($, 'one')
+  await clock.advance(15 * 60000 + 1000) // abandoned: 'one' is back in the box
+  expect(fills).toEqual(['one'])
+  await clock.advance(16 * 60000) // the abandonment and the Resume hold have both run out
+  await send($, 'two') // compacts again (hangs)
+  await clock.advance(15 * 60000 + 1000)
+  expect(seen.compacts).toBe(2)
+  expect(fills).toEqual(['one', 'one\n\ntwo'])
+})
+
+test('what the box holds is read from it: the person\'s edit of the put-back text is kept in front of a later fill', SETUP, async ($, on) => {
+  const dialogs = heldAsk(on)
+  const box: { edit: string | null; filled: string[] } = { edit: null, filled: [] } // what the person typed over the last fill, if anything
+  const { clock, seen, fills } = await coldChat($, on, () => on('prompt.read', () => { const text = box.edit ?? box.filled[box.filled.length - 1] ?? ''; return { value: { text, cursor: text.length } } }))
+  box.filled = fills
+  hang(seen)
+  await send($, 'one')
+  await clock.advance(1000)
+  void send($, 'three') // its dialog stays open
+  await clock.advance(15 * 60000)
+  expect(fills).toEqual(['one'])
+  box.edit = 'one, but edited' // the person edits the box
+  dialogs.release('Compact first, then send')
+  await clock.advance(1000)
+  expect(fills).toEqual(['one', 'one, but edited\n\nthree'])
+})
+
+test('what the box holds is read from it: text the person deleted does not come back with a later fill', SETUP, async ($, on) => {
+  const dialogs = heldAsk(on)
+  const box: { edit: string | null; filled: string[] } = { edit: null, filled: [] } // what the person typed over the last fill, if anything
+  const { clock, seen, fills } = await coldChat($, on, () => on('prompt.read', () => { const text = box.edit ?? box.filled[box.filled.length - 1] ?? ''; return { value: { text, cursor: text.length } } }))
+  box.filled = fills
+  hang(seen)
+  await send($, 'one')
+  await clock.advance(1000)
+  void send($, 'three')
+  await clock.advance(15 * 60000)
+  expect(fills).toEqual(['one'])
+  box.edit = '' // the person deletes it
+  dialogs.release('Compact first, then send')
+  await clock.advance(1000)
+  expect(fills).toEqual(['one', 'three'])
+})
+
+test('put-back text is no longer in the box once a request has started: a later put-back is filled alone', SETUP, async ($, on) => {
+  const dialogs = heldAsk(on)
+  const { clock, seen, fills } = await coldChat($, on)
+  hang(seen)
+  await send($, 'one')
+  await clock.advance(1000)
+  void send($, 'three') // its dialog stays open
+  await clock.advance(15 * 60000)
+  expect(fills).toEqual(['one'])
+  await mainStep($) // the person sent it and its request started
+  dialogs.release('Compact first, then send')
+  await clock.advance(1000)
+  expect(fills).toEqual(['one', 'three'])
 })
