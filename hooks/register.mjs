@@ -714,8 +714,8 @@ async function runCompactThenSend($, msg, unattended, before, wake) {
     $.ui.toast(`Not sent, because the chat was cleared: ${clip(msg.text, 80)}`, { timeoutMs: 15000 })
     lowerWake(wake)
   }
-  // our own compaction of this chat is already running: wait for it (it settles at COMPACT_LIMIT at worst) and do not compact again if it succeeded. One of a chat since replaced is not waited for
-  while (compacting && compacting.gen === chatGen) {
+  // our own compaction of this chat is already running: wait for it (it settles at COMPACT_LIMIT at worst) and do not compact again if it succeeded. One of a chat since replaced is not waited for; a send that waited on one when its chat was replaced stops at its end, and is dropped then, not held on a compaction of the new chat
+  while (compacting && compacting.gen === before.chat && chatGen === before.chat) {
     waited = true
     await compacting.run.then(() => {}, () => {})
   }

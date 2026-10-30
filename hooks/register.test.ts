@@ -3727,3 +3727,24 @@ test('the engine\'s compaction marks for an older run\'s end do not forget a new
   expect(log.asked[log.asked.length - 1].labels).toEqual(['Send anyway', 'Cancel'])
   expect(seen.compacts).toBe(2)
 })
+
+test('a message waiting on a compaction when the chat is cleared is dropped as soon as that compaction ends, not when the new chat\'s own compaction does', SETUP, async ($, on) => {
+  askLog(on)
+  const { clock, seen } = await coldChat($, on, () => on('classic.SessionStart', () => ({})))
+  let finishA: () => void = () => {}
+  let n = 0
+  seen.duringCompact = () => (++n === 1 ? new Promise<void>((r) => { finishA = r }) : new Promise(() => {}))
+  await send($, 'first')
+  await clock.advance(1000)
+  await send($, 'second') // waits on the first compaction
+  await clock.advance(1000)
+  await ($ as any).classic.SessionStart({ source: 'clear' })
+  await mainStep($)
+  await send($, WAKE_TEXT) // the new chat's own compaction: it hangs
+  await clock.advance(60000)
+  finishA()
+  await clock.advance(1000)
+  expect(seen.compacts).toBe(2)
+  expect(seen.toasts.filter((t) => t.includes('cleared: second')).length).toBe(1) // not 15 minutes on
+  expect(seen.submits).toEqual([])
+})
