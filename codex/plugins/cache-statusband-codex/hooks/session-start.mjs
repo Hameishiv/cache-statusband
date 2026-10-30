@@ -1,11 +1,16 @@
 #!/usr/bin/env node
-import { pathToFileURL } from "node:url";
+import { realpathSync } from "node:fs";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { formatUsageLines } from "../src/format.mjs";
 import { defaultCodexHome, parseRollout } from "../src/rollouts.mjs";
 import { resumeMessage } from "../src/resume.mjs";
 import { loadSessionState, mergeSavedContext } from "../src/session-state.mjs";
 import { usagePresentation } from "../src/settings.mjs";
 import { captureUsageIdentity, getUsageSnapshot } from "../src/usage.mjs";
+
+// The hook times out at 15 seconds and writes once at the end, so the usage reads share a deadline.
+const USAGE_BUDGET_MS = 12_000;
+const MIN_READ_MS = 500;
 
 export async function handleSessionStart(input, {
   usageGetter = getUsageSnapshot,
@@ -14,7 +19,9 @@ export async function handleSessionStart(input, {
   stateLoader = loadSessionState,
   codexHome = null,
   now = Date.now(),
+  usageBudgetMs = USAGE_BUDGET_MS,
 } = {}) {
+  const startedAt = Date.now();
   const source = input?.source;
   if (!input?.transcript_path || !["startup", "resume", "fork"].includes(source)) return {};
   const messages = [];
@@ -33,8 +40,11 @@ export async function handleSessionStart(input, {
   } catch {}
   try {
     if (!home) throw new Error("CODEX_HOME is unavailable");
-    const identity = await identityGetter(home);
-    const usage = await usageGetter({ codexHome: home, now, identity });
+    const remaining = () => usageBudgetMs - (Date.now() - startedAt);
+    if (remaining() < MIN_READ_MS) throw new Error("No time left for the usage read");
+    const identity = await identityGetter(home, { timeoutMs: remaining() });
+    if (remaining() < MIN_READ_MS) throw new Error("No time left for the usage read");
+    const usage = await usageGetter({ codexHome: home, now, identity, timeoutMs: remaining() });
     const presented = await usagePresentation(usage, { codexHome: home, identity });
     if (Number.isFinite(presented.snapshot.availableCount)) messages.push(formatUsageLines(presented.snapshot, now)[0]);
     if (presented.identity) messages.push(presented.identity.startsWith("Seat ") ? `${presented.identity}.` : `Account: ${presented.identity}.`);
@@ -61,4 +71,14 @@ async function readStdin(limit) {
   return result;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await main();
+// Compare real paths so a symlinked entry still counts as a direct run.
+function isDirectRun() {
+  if (!process.argv[1]) return false;
+  try {
+    return fileURLToPath(import.meta.url) === realpathSync(process.argv[1]);
+  } catch {
+    return import.meta.url === pathToFileURL(process.argv[1]).href;
+  }
+}
+
+if (isDirectRun()) await main();

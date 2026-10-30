@@ -10,10 +10,10 @@
  * weekly and still open. It does not use the network and does not read a token.
  */
 
-import { closeSync, mkdirSync, openSync, readFileSync, readSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 /** Each family is [dark, light], the same pairs the Claude Code band already checked. */
 export const HUES = {
@@ -53,6 +53,7 @@ export function shade(kind, index) {
 
 const BILLING_MARKER = "billing: fetched credits config";
 const RESCAN_MS = 5 * 60 * 1000;
+const WEEKLY_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 function finite(value) {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
@@ -152,7 +153,8 @@ export function remaining(ms) {
 /**
  * Weekly percent and reset, or null.
  * `record` is `{ percent, periodType, periodEnd }`. A monthly period, a
- * missing percent, or a reset that has already passed is left out.
+ * missing percent, a reset that has already passed, or a reading fetched
+ * more than a day ago is left out.
  */
 export function weeklyLabel(record, nowMs) {
   if (!record || typeof record !== "object") return null;
@@ -163,6 +165,8 @@ export function weeklyLabel(record, nowMs) {
   const end = Date.parse(record.periodEnd);
   const now = finite(nowMs);
   if (!Number.isFinite(end) || now === null || end <= now) return null;
+  const fetched = Date.parse(record.fetchedAt);
+  if (Number.isFinite(fetched) && now - fetched > WEEKLY_MAX_AGE_MS) return null;
   const left = remaining(end - now);
   if (!left) return null;
   return `week ${percentText(pct)}% · ${left}`;
@@ -231,7 +235,9 @@ export function billingLogPath() {
 /** Shared cache of the last weekly reading. Never holds a token or the raw line. */
 export function usageCachePath() {
   if (process.env.CSB_USAGE_CACHE) return process.env.CSB_USAGE_CACHE;
-  const base = process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local");
+  const base = process.platform === "win32"
+    ? process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local")
+    : process.env.XDG_CACHE_HOME || join(homedir(), ".cache");
   return join(base, "cache-statusband-grok", "usage.json");
 }
 
@@ -339,7 +345,7 @@ export function loadWeekly(logPath, cachePath, nowMs = Date.now()) {
   const cached = readCache(cachePath);
   const prior = storedRecord(cached);
   const freshScan = cached && finite(cached.scannedAt) !== null && nowMs - cached.scannedAt < RESCAN_MS;
-  if (freshScan && prior) return prior;
+  if (freshScan) return prior;
 
   let st = null;
   if (logPath) {
@@ -350,18 +356,17 @@ export function loadWeekly(logPath, cachePath, nowMs = Date.now()) {
     }
   }
   const sameFile = st && cached && cached.sourceMtimeMs === st.mtimeMs && cached.sourceSize === st.size;
-  if (sameFile && prior) return prior;
+  if (sameFile) return prior;
 
   const found = st ? readLastBilling(logPath) : null;
   if (!found) {
-    if (prior) {
-      writeCache(cachePath, {
-        sourceMtimeMs: cached.sourceMtimeMs,
-        sourceSize: cached.sourceSize,
-        scannedAt: nowMs,
-        record: prior,
-      });
-    }
+    // A miss is cached too, so a log with no billing line is not rescanned on every run.
+    writeCache(cachePath, {
+      sourceMtimeMs: prior ? cached.sourceMtimeMs : st ? st.mtimeMs : null,
+      sourceSize: prior ? cached.sourceSize : st ? st.size : null,
+      scannedAt: nowMs,
+      record: prior,
+    });
     return prior;
   }
   const record = {
@@ -382,7 +387,12 @@ export function loadWeekly(logPath, cachePath, nowMs = Date.now()) {
 function isDirectRun() {
   const entry = process.argv[1];
   if (!entry) return false;
-  return import.meta.url === pathToFileURL(entry).href;
+  // Compare real paths so a symlinked entry still counts as a direct run.
+  try {
+    return fileURLToPath(import.meta.url) === realpathSync(entry);
+  } catch {
+    return import.meta.url === pathToFileURL(entry).href;
+  }
 }
 
 if (isDirectRun()) {

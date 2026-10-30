@@ -16,6 +16,7 @@ export async function getUsageSnapshot({
   fetcher = fetchRateLimitsViaAppServer,
   env = process.env,
   identity: suppliedIdentity,
+  timeoutMs,
 } = {}) {
   if (!codexHome) throw new Error("codexHome is required");
   const dataDir = join(codexHome, "cache-statusband-codex");
@@ -49,7 +50,7 @@ export async function getUsageSnapshot({
     await writeCache(cachePath, attempted);
 
     try {
-      const raw = await fetcher({ codexHome, env });
+      const raw = await fetcher({ codexHome, env, ...(timeoutMs ? { timeoutMs } : {}) });
       const safe = sanitizeRateLimits(raw);
       if (identity?.key?.startsWith("account:") && safe.accountEmail && safe.accountEmail !== identity.label) {
         throw new Error("Codex account changed during the usage read");
@@ -83,11 +84,12 @@ export async function getUsageSnapshot({
 export async function captureUsageIdentity(codexHome, {
   env = process.env,
   accountReader = readAccountViaAppServer,
+  timeoutMs,
 } = {}) {
   const seat = await configuredSeatIdentity(codexHome, env);
   if (seat) return seat;
   try {
-    const account = await accountReader({ codexHome, env });
+    const account = await accountReader({ codexHome, env, ...(timeoutMs ? { timeoutMs } : {}) });
     const email = safeEmail(account?.email);
     return email ? { key: `account:${email}`, label: email, unavailable: false } : null;
   } catch {

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { pathToFileURL } from "node:url";
+import { realpathSync } from "node:fs";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { defaultCodexHome, parseRollout } from "../src/rollouts.mjs";
 import { saveSessionState } from "../src/session-state.mjs";
 
@@ -39,4 +40,14 @@ async function readStdin(limit) {
   return result;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) await main();
+// Compare real paths so a symlinked entry still counts as a direct run.
+function isDirectRun() {
+  if (!process.argv[1]) return false;
+  try {
+    return fileURLToPath(import.meta.url) === realpathSync(process.argv[1]);
+  } catch {
+    return import.meta.url === pathToFileURL(process.argv[1]).href;
+  }
+}
+
+if (isDirectRun()) await main();

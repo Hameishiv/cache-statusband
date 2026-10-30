@@ -100,6 +100,30 @@ describe("weekly usage", () => {
     assert.equal(labels.some((label) => /^week /i.test(label)), false);
   });
 
+  it("omits a reading fetched more than a day ago", () => {
+    assert.equal(weeklyLabel({ ...weekly, fetchedAt: "2026-10-29T11:00:00Z" }, now), "week 23% · 4d11h");
+    assert.equal(weeklyLabel({ ...weekly, fetchedAt: "2026-10-28T11:00:00Z" }, now), null);
+  });
+
+  it("caches a log with no credits line so it is not rescanned", () => {
+    const dir = mkdtempSync(join(tmpdir(), "csb-miss-"));
+    const logPath = join(dir, "unified.jsonl");
+    const cachePath = join(dir, "usage.json");
+    writeFileSync(logPath, "no credits line\n");
+    assert.equal(loadWeekly(logPath, cachePath, now), null);
+    const cached = JSON.parse(readFileSync(cachePath, "utf8"));
+    assert.equal(cached.record, null);
+    assert.equal(cached.scannedAt, now);
+    // A credits line appended within five minutes is not seen until the next rescan.
+    writeFileSync(logPath, `no credits line\n${JSON.stringify({
+      ts: "2026-10-29T11:40:00Z",
+      msg: "billing: fetched credits config",
+      ctx: { config: { creditUsagePercent: 5, currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", end: "2026-11-02T22:57:09.651+00:00" } } },
+    })}\n`);
+    assert.equal(loadWeekly(logPath, cachePath, now + 1000), null);
+    assert.equal(loadWeekly(logPath, cachePath, now + 6 * 60 * 1000).percent, 5);
+  });
+
   it("reads the last credits line and keeps every other field out of the cache", () => {
     const dir = mkdtempSync(join(tmpdir(), "csb-week-"));
     const logPath = join(dir, "unified.jsonl");
@@ -236,7 +260,7 @@ describe("cli", () => {
     assert.equal(run.stdout.includes("secret-token"), false);
   });
 
-  it("starts through the windows cmd wrapper", () => {
+  it("starts through the windows cmd wrapper", { skip: process.platform !== "win32" }, () => {
     const run = spawnSync(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", "statusline.cmd"], {
       cwd: import.meta.dirname,
       env: { ...process.env, CSB_BILLING_LOG: "" },
