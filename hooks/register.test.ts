@@ -3423,3 +3423,222 @@ test('the give-up toast names the cause of the latest failed try: two tries stop
   expect(seen.toasts.filter((t) => /Could not send Resume after four tries/.test(t)).length).toBe(1)
   expect(seen.toasts.filter((t) => /Compaction did not finish, so the Resume was not sent after four tries/.test(t))).toEqual([])
 })
+
+// ===== review round 26: the put-back, a replaced chat and the compaction marks =====
+const WAKE_TEXT = 'Usage reset: the 5h limit capped, so the CLI account was rotated to C. Go on.'
+// Cold-send dialogs the test answers by hand: the first `auto` answer "Compact first" at once, the later ones wait for release(label)
+function heldAsk(on: any, auto = 1) {
+  const waiting: ((label: string) => void)[] = []
+  let n = 0
+  on('tool.call', (_: unknown, e: any) => {
+    if (e.tool !== 'AskUserQuestion') return { result: {} }
+    const q = e.questions?.[0]
+    const reply = (label: string) => ({ result: { questions: e.questions, answers: { [q?.question ?? '']: label } } })
+    if (++n <= auto) return reply('Compact first, then send')
+    return new Promise((resolve) => waiting.push((label) => resolve(reply(label))))
+  })
+  return { release: (label: string) => waiting.shift()!(label) }
+}
+const hang = (seen: any) => { let n = 0; seen.duringCompact = () => (++n === 1 ? new Promise(() => {}) : Promise.resolve()) }
+
+test('a wake-up arriving after the put-back keeps the text still in the box: the fill is the unsent text and then the wake-up\'s', SETUP, async ($, on) => {
+  askLog(on)
+  const { clock, seen, fills } = await coldChat($, on)
+  hang(seen)
+  await send($, 'one')
+  await clock.advance(100)
+  await send($, 'two')
+  await clock.advance(15 * 60000 + 1000)
+  expect(fills).toEqual(['one\n\ntwo'])
+  await clock.advance(60000)
+  await send($, WAKE_TEXT)
+  await clock.advance(1000)
+  expect(fills).toEqual(['one\n\ntwo', 'one\n\ntwo\n\n' + WAKE_TEXT])
+  expect(seen.compacts).toBe(1)
+})
+
+test('a wake-up released by a cold-send dialog after the batch was filled is put back behind the batch, not over it', SETUP, async ($, on) => {
+  const dialogs = heldAsk(on)
+  const { clock, seen, fills } = await coldChat($, on)
+  hang(seen)
+  await send($, 'one')
+  await clock.advance(1000)
+  await send($, WAKE_TEXT) // waits on the compaction
+  await clock.advance(1000)
+  void send($, 'x') // a dialog opens and stays open
+  await clock.advance(15 * 60000) // abandoned: 'one' goes back; the wake-up waits for the dialog
+  expect(fills).toEqual(['one'])
+  dialogs.release('Cancel')
+  await clock.advance(1000)
+  expect(fills).toEqual(['one', 'one\n\n' + WAKE_TEXT])
+})
+
+test('a "Compact first" answered after the abandonment is put back behind the text still in the box', SETUP, async ($, on) => {
+  const dialogs = heldAsk(on)
+  const { clock, seen, fills } = await coldChat($, on)
+  hang(seen)
+  await send($, 'one')
+  await clock.advance(1000)
+  void send($, 'three') // its dialog stays open
+  await clock.advance(15 * 60000)
+  expect(fills).toEqual(['one'])
+  dialogs.release('Compact first, then send')
+  await clock.advance(1000)
+  expect({ fills, compacts: seen.compacts, submits: seen.submits }).toEqual({ fills: ['one', 'one\n\nthree'], compacts: 1, submits: [] })
+})
+
+test('a slash command put back while text is still in the box is quoted in a toast, and the box keeps its text', SETUP, async ($, on) => {
+  const dialogs = heldAsk(on)
+  const { clock, seen, fills } = await coldChat($, on)
+  hang(seen)
+  await send($, 'one')
+  await clock.advance(1000)
+  void send($, '/merge-pr 1', { name: 'merge-pr', args: '1' }) // its dialog stays open
+  await clock.advance(15 * 60000)
+  dialogs.release('Compact first, then send')
+  await clock.advance(1000)
+  expect(fills).toEqual(['one'])
+  expect(seen.toasts.filter((t) => /Also not sent: \/merge-pr 1/.test(t)).length).toBe(1)
+})
+
+test('a "Compact first" message from before a /clear is not sent into the new chat: a toast quotes it', SETUP, async ($, on) => {
+  askLog(on)
+  let finish: () => void = () => {}
+  const { clock, seen, fills } = await coldChat($, on, () => on('classic.SessionStart', () => ({})))
+  let n = 0
+  seen.duringCompact = () => (++n === 1 ? new Promise<void>((r) => { finish = r }) : Promise.resolve())
+  await send($, 'old chat message')
+  await clock.advance(60000)
+  await ($ as any).classic.SessionStart({ source: 'clear' })
+  await clock.advance(60000)
+  finish()
+  await clock.advance(1000)
+  expect({ submits: seen.submits, fills }).toEqual({ submits: [], fills: [] })
+  expect(seen.toasts.filter((t) => t.includes('Not sent, because the chat was cleared: old chat message')).length).toBe(1)
+})
+
+test('a message from before a /clear whose compaction runs out after it is not put back in the new chat\'s box either', SETUP, async ($, on) => {
+  askLog(on)
+  const { clock, seen, fills } = await coldChat($, on, () => on('classic.SessionStart', () => ({})))
+  hang(seen)
+  await send($, 'x'.repeat(100))
+  await clock.advance(60000)
+  await ($ as any).classic.SessionStart({ source: 'clear' })
+  await clock.advance(15 * 60000 + 1000)
+  expect({ submits: seen.submits, fills }).toEqual({ submits: [], fills: [] })
+  const stale = seen.toasts.filter((t) => t.includes('Not sent, because the chat was cleared: '))
+  expect(stale.length).toBe(1)
+  expect(stale[0]).toContain('x'.repeat(70))
+  expect(stale[0]).not.toContain('x'.repeat(81)) // clipped
+})
+
+test('a wake-up in the new chat does not wait on the old chat\'s hung compaction', SETUP, async ($, on) => {
+  askLog(on)
+  const { clock, seen } = await coldChat($, on, () => on('classic.SessionStart', () => ({})))
+  hang(seen)
+  await send($, 'old chat message')
+  await clock.advance(60000)
+  await ($ as any).classic.SessionStart({ source: 'clear' })
+  await mainStep($) // the new chat's first request
+  const t0 = await clock.now()
+  await send($, WAKE_TEXT)
+  let at = -1
+  for (let i = 0; i < 20 && at < 0; i++) { await clock.advance(60000); if (seen.submits.length) at = (await clock.now()) - t0 }
+  expect(seen.submits).toEqual([WAKE_TEXT])
+  expect(at).toBeLessThan(5 * 60000)
+  expect(seen.compacts).toBe(2) // its own compaction in the new chat
+})
+
+test('a /btw question put back is no hold: the Resume is not kept waiting for a message that never reaches the chat', { options: { autoResume: true } }, async ($, on) => {
+  askLog(on)
+  const fills: string[] = []
+  const { clock, seen } = await resumeCompacting($, on, () => on('prompt.fill', (_: unknown, e: any) => (fills.push(e.text), { isFilled: true })))
+  let n = 0
+  seen.duringCompact = async () => { if (++n === 1) { await send($, '/btw what is X?', { name: 'btw', args: 'what is X?' }); await new Promise(() => {}) } }
+  await clock.advance(91 * 60000 + 1000) // the Resume compacts; the /btw "Compact first" waits on it
+  await clock.advance(15 * 60000 + 1000) // abandoned
+  expect(fills).toEqual(['/btw what is X?'])
+  await send($, '/btw what is X?', { name: 'btw', args: 'what is X?' }) // Enter on the box: it runs locally and never reaches the chat
+  await clock.advance(1000)
+  expect(await bandText($, /⏸ Resume waits/)).toBeNull()
+  await clock.advance(5 * 60000)
+  expect(seen.toasts.filter((t) => /Resume was not sent/.test(t)).length).toBeGreaterThan(1) // tried again, not held
+})
+
+test('a put-back whose fill failed holds nothing: the Resume is tried and the band shows no wait', { options: { autoResume: true } }, async ($, on) => {
+  askLog(on)
+  const { clock, seen } = await resumeCompacting($, on, () => on('prompt.fill', () => ({ isFilled: false })))
+  let n = 0
+  seen.duringCompact = async () => { if (++n === 1) { await send($, 'hold on'); await new Promise(() => {}) } }
+  await clock.advance(91 * 60000 + 1000)
+  await clock.advance(15 * 60000 + 1000) // abandoned; the message could not be put back
+  expect(seen.toasts.filter((t) => /could not be put back: hold on/.test(t)).length).toBe(1)
+  await clock.advance(5 * 60000)
+  expect(await bandText($, /⏸ Resume waits/)).toBeNull()
+  expect(seen.toasts.filter((t) => /Resume was not sent/.test(t)).length).toBeGreaterThan(1) // tried again, not held
+})
+
+test('while a put-back message is unsent and the Resume is due the band says it waits for the message, not a time that has passed; once the hold lapses the band is clear', { options: { autoResume: true } }, async ($, on) => {
+  const box = { asks: 0 }
+  const { clock, seen } = await resumeCompacting($, on, () => {
+    answer(on, box, 'Compact first, then send')
+    on('prompt.fill', () => ({ isFilled: true }))
+  })
+  let n = 0
+  seen.duringCompact = () => (++n === 1 ? new Promise(() => {}) : Promise.resolve())
+  await clock.advance(91 * 60000 + 1000)
+  await clock.advance(5 * 60000)
+  await $.prompt.submit({ text: 'hello', origin: COMPOSER, wait: false } as never)
+  await clock.advance(10 * 60000 + 2000) // abandoned: 'hello' is back in the box and the cancelled Resume is armed 2 minutes on
+  expect(await bandText($, /⏸ Resumes? /)).toMatch(/Resumes /) // not due yet: a time
+  await clock.advance(3 * 60000)
+  expect(await bandText($, /⏸ Resumes? /)).toBe('⏸ Resume waits for your message')
+  await clock.advance(13 * 60000) // 15 minutes after the put-back
+  expect(seen.submits).toEqual(['Resume'])
+  expect(await bandText($, /⏸ Resumes? /)).toBeNull()
+})
+
+test('while a compaction of an earlier chat is still out, the engine\'s compaction marks do not mark the new chat compacted', SETUP, async ($, on) => {
+  const log = askLog(on)
+  const { clock, seen } = await coldChat($, on, () => (on('classic.SessionStart', () => ({})), on('classic.PostCompact', () => ({}))))
+  hang(seen)
+  await send($, 'old chat message') // Compact first: hangs
+  await clock.advance(60000)
+  await ($ as any).classic.SessionStart({ source: 'clear' })
+  await mainStep($) // the new chat's first request
+  await clock.advance(80 * 60000) // the new chat goes cold
+  await ($ as any).classic.PostCompact({}) // the old compaction's late end, as the engine reports it
+  await ($ as any).classic.SessionStart({ source: 'compact' })
+  await send($, 'new chat message')
+  await clock.advance(1000)
+  expect(log.asked.length).toBe(2) // the guard still asks
+})
+
+test('an older compaction that succeeds late does not forget a newer abandoned one: the next send that needs a compaction starts none beside it', SETUP, async ($, on) => {
+  const log = askLog(on)
+  const { clock, seen } = await coldChat($, on)
+  let finishA: () => void = () => {}
+  let n = 0
+  seen.duringCompact = () => (++n === 1 ? new Promise<void>((r) => { finishA = r }) : n === 2 ? new Promise(() => {}) : Promise.resolve())
+  await send($, 'one')
+  await clock.advance(15 * 60000 + 1000) // A abandoned
+  await clock.advance(16 * 60000) // and forgotten, 15 minutes on
+  await send($, 'two') // compacts again: B
+  await clock.advance(15 * 60000 + 1000) // B abandoned
+  expect(seen.compacts).toBe(2)
+  finishA() // A succeeds, late
+  await clock.advance(1000)
+  await mainStep($) // a request: the chat is not just-compacted any more
+  await send($, WAKE_TEXT) // the rotation makes the chat cold again
+  await send($, 'three') // the dialog: B is still out
+  await clock.advance(1000)
+  expect(log.asked[log.asked.length - 1].labels).toEqual(['Send anyway', 'Cancel'])
+  expect(seen.compacts).toBe(2)
+})
+
+// The band's segment matching re as drawn, or null when it shows none
+async function bandText($: any, re: RegExp) {
+  const ui = await $.ui.mount({ plugin: 'test', component: 'AbovePrompt', surface: 'terminal', viewport: { columns: 200, rows: 30 }, props: {} } as never)
+  const seg: any = await ui.find({ type: 'Text', text: re })
+  return seg ? String(seg.text).trim() : null
+}
