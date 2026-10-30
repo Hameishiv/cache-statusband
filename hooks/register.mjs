@@ -75,7 +75,9 @@ let compactedCold = false
 let identityRead = false // session.start has read the seat and account: a chat's record can be compared with them
 let pendingSeed = null // a startup or resume SessionStart's transcript that came before that, seeded once it has
 let rotationSeenAt = 0 // when this process last saw a rotation: a process fact, kept across /clear, resume and fork
-let accountReadAt = 0 // when S.account was last read
+let identityStale = false // after a rotator wake-up, until a read shows the seat or account changed: the rotator may not have written them yet, so S.seat and S.account may still be the old ones
+let wakeSeat = '' // the seat and account as they were when that wake-up came
+let wakeAccount = ''
 let rotatedPending = false // a seat change, or a reopened chat's last request on another seat or account, that no request has landed on yet: this account's cache is empty
 let signedIn = null // whether this session has a first-party sign-in (an API-key session has none); null until checked
 let signCheckAt = 0
@@ -283,27 +285,34 @@ function markCompacted($) {
 // Where the request ran, kept with the chat's record: the seat (a seat name belongs to one
 // surface's rotator, so the surface goes with it) and the signed-in account
 function whoRan() {
+  // while the identity is unknown a record says nothing of it, rather than the wrong thing
+  if (identityStale) return { desktop: !onTerminal }
   return { ...(S.seat ? { seat: S.seat } : {}), ...(S.account ? { account: S.account } : {}), desktop: !onTerminal }
 }
 
 // A record's request ran on another account than this process is on, so the cache it left is that account's.
-// Seats are compared when both sides have one on the same surface, else accounts; unknown on either side is no change.
+// Seats are compared when both sides have one on the same surface, else accounts; unknown on either side is no change,
+// and so is this process's identity while it is stale.
 function ranElsewhere(r) {
+  if (identityStale) return false
   if (r.seat && S.seat && !!r.desktop === !onTerminal) return r.seat !== S.seat
   return !!r.account && !!S.account && r.account !== S.account
 }
 
-// The one judge of a reopened, resumed or startup-seeded chat's cache, which seeding defers until this process
-// knows its own identity. `found` is what the transcript says, `last` the chat's record.
+// The one judge of a reopened, resumed or startup-seeded chat's cache, which seeding defers until session.start
+// has read this process's seat and account. `found` is what the transcript says, `last` the chat's record.
 // The record decides where the last request ran when it can: it is not overtaken by a later request (the
 // transcript's `at`, past the minute the two clocks may differ by, says nothing of where it ran) and it names
-// a seat or account comparable with this process's (an account read before a rotation this process saw is not).
-// Only without one does this process's own rotation (rotationSeenAt) date it.
+// a seat or account comparable with this process's (neither is while identityStale: they may be the old ones).
+// Only without one does this process's own rotation (rotationSeenAt) date it, when it came after the chat's last
+// touch: the transcript's reply, or the record's request or keep-warm ping (not one that ran elsewhere).
 // Sets rotatedPending and lastActivity, and seatChangedAt when the rotation is dated (seen here, not found on the record).
 function judgeChat(found, last) {
-  const byAccount = !!last && !!last.account && !!S.account && !(rotationSeenAt > accountReadAt)
-  const decides = !!last && Math.max(last.at || 0, last.keptAt || 0) >= (found.at || 0) - MIN && ((!!last.seat && !!S.seat && !!last.desktop === !onTerminal) || byAccount)
-  const dated = !decides && rotationSeenAt > 0 && found.at > 0 && rotationSeenAt > found.at
+  const lastTouch = last ? Math.max(last.at || 0, last.keptAt || 0) : 0
+  const byAccount = !!last && !!last.account && !!S.account
+  const decides = !identityStale && !!last && lastTouch >= (found.at || 0) - MIN && ((!!last.seat && !!S.seat && !!last.desktop === !onTerminal) || byAccount)
+  const lastSeen = Math.max(found.at || 0, last && !ranElsewhere(last) ? lastTouch : 0)
+  const dated = !decides && rotationSeenAt > 0 && lastSeen > 0 && rotationSeenAt > lastSeen
   rotatedPending = decides ? ranElsewhere(last) : dated
   if (dated) S.seatChangedAt = rotationSeenAt
   if (!found.compacted) {
@@ -325,21 +334,23 @@ async function rememberCompacted($) {
 
 // Terminal sessions run on the CLI rotator's accounts, desktop ones on the app rotator's seats
 // The signed-in account, as Claude Code keeps it in .claude.json: what the band shows
-// in place of a seat when no seat file is configured
+// in place of a seat when no seat file is configured; false when it could not be read
 async function readAccount($) {
   try {
     const dir = await $.env.get('CLAUDE_CONFIG_DIR')
     const o = JSON.parse(String(await $.fs.read(`${(dir || home).replace(/\\/g, '/')}/.claude.json`))).oauthAccount || {}
     S.account = String(o.emailAddress || o.displayName || '')
-    accountReadAt = now
+    return true
   } catch {
     // an API-key session, or no file: no account to show
+    return false
   }
 }
 
 // A running session keeps the account it signed in with: the seat file names the account the
 // rotator moved to, which reaches only a session it then wakes. So the seat is read at start,
-// and a change is taken only from the wake-up prompt (`adopt`)
+// and a change is taken only from the wake-up prompt (`adopt`), or from the ticks after a wake-up that showed none
+// (refreshIdentity)
 async function readSeat($, adopt = false) {
   if (!seatFile || (S.seat && !adopt)) return
   let seat = ''
@@ -952,9 +963,28 @@ function warnStep($) {
   }
 }
 
+// After a wake-up that showed no change, the rotator may write the account file or the seat file late: look again until
+// one differs from what it was at the wake-up. A new seat is only adopted: the wake-up already marked the rotation.
+async function refreshIdentity($) {
+  if (!identityStale) return
+  try {
+    if ((await readAccount($)) && S.account !== wakeAccount) identityStale = false
+    if (seatFile && (await $.fs.exists(seatFile))) {
+      const seat = String(await $.fs.read(seatFile)).trim()
+      if (seat && seat !== wakeSeat) {
+        S.seat = seat
+        identityStale = false
+      }
+    }
+  } catch {
+    // unreadable now: the next tick looks again
+  }
+}
+
 async function tick($) {
   now = await $.clock.now()
   try {
+    await refreshIdentity($)
     await resumeStep($)
     await refreshPlan($)
     try {
@@ -1060,7 +1090,7 @@ export function register(on, options = {}) {
     $.clock.every(HEARTBEAT_EVERY, () => tick($).catch(() => {}))
     await heartbeat($, true)
     $.clock.after(0, () => readFleet($).catch(() => {}).then(() => refreshPlan($)).then(() => $.ui.invalidate('ui.render')).catch(() => {}))
-    // A startup SessionStart that came first left its transcript for here, where the seat and account are known.
+    // A startup or resume SessionStart that came first left its transcript for here, where the seat and account are known.
     // The app reopens a chat without one that names the transcript: find it by id
     const queued = pendingSeed
     pendingSeed = null
@@ -1072,7 +1102,8 @@ export function register(on, options = {}) {
   })
 
   // /clear starts from an unknown cache; /resume is seeded from its transcript; /branch shares its parent's cache.
-  // The process goes on under a new session id, and no session.start fires for it.
+  // The process goes on under a new session id, and no session.start fires for it. (A resume in a fresh process, claude --resume or
+  // --continue, can arrive before session.start: its transcript waits in pendingSeed and is seeded there.)
   on('classic.SessionStart', { source: ['clear', 'resume', 'fork'] }, async ($, e, next) => {
     // the branch's first request reads the same cached prefix as its parent's: what the parent had stands
     if (e.source !== 'fork') {
@@ -1143,14 +1174,16 @@ export function register(on, options = {}) {
     const wake = fromUser && !!cfg.rotatorWake && cfg.rotatorWake.test(String(e.text || ''))
     if (wake) {
       // The wake-up is the rotation reaching this session: take the new seat now
+      wakeSeat = S.seat
+      wakeAccount = S.account
+      identityStale = true // until a read shows a change: the rotator may not have written either file yet
       await readSeat($, true)
       rotationSeenAt = now
       // the seat file may be absent or unchanged: the account is what moved
-      await readAccount($)
-      if (!rotatedCold()) {
-        S.seatChangedAt = now
-        rotatedPending = true
-      }
+      const read = await readAccount($)
+      if ((read && S.account !== wakeAccount) || S.seat !== wakeSeat) identityStale = false // else the ticks look again
+      S.seatChangedAt = now // a second wake-up of an already rotated chat dates it anew
+      rotatedPending = true
     }
     const ttl = ttlMin()
     const left = msLeft(S.lastActivity, ttl)

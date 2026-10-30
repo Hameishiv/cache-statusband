@@ -1008,3 +1008,150 @@ for (const source of ['clear', 'resume']) {
     expect(seen.asks).toBe(1)
   })
 }
+
+const WAKE = { options: { rotatorWakePattern: String.raw`account was rotated` } }
+
+// The rotator woke the session but has not rewritten the account file yet: a re-read gives the old account
+test('a wake-up whose re-read shows the old account leaves the identity unknown: a resumed chat of that account is cold', WAKE, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  answer(on, seen, 'Send anyway')
+  on('classic.SessionStart', () => ({}))
+  const step = stepper($, on)
+  await clock.advance(60000)
+  const xAt = await clock.now()
+  await clock.advance(10 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await $.session.measure({ context: { tokens: 100000, window: 1000000, percent: 10 }, rateLimits: [], changed: [] } as never)
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  await step(usage({ cache_read_input_tokens: 100000 }))
+  await clock.advance(1000)
+  kept.set('last:sid-test', { ctx: 300000, at: xAt, model: 'claude-opus-5-5', account: 'a@x', desktop: false })
+  await ($ as any).classic.SessionStart({ source: 'resume' })
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/account rotated/)
+  await $.prompt.submit({ text: 'carry on', origin: COMPOSER, wait: false } as never)
+  expect(seen.asks).toBe(1)
+})
+
+test('a wake-up whose seat file is unchanged leaves the identity unknown: a resumed chat of that seat is cold', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, 'Send anyway')
+  on('classic.SessionStart', () => ({}))
+  const step = stepper($, on)
+  await clock.advance(30 * 60000)
+  await start($, 100000, clock)
+  const xAt = (await clock.now()) - 5 * 60000
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  await step(usage({ cache_read_input_tokens: 100000 }))
+  await clock.advance(1000)
+  kept.set('last:sid-test', { ctx: 300000, at: xAt, model: 'claude-opus-5-5', seat: 'A', desktop: false })
+  await ($ as any).classic.SessionStart({ source: 'resume' })
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/account rotated/)
+  await $.prompt.submit({ text: 'carry on', origin: COMPOSER, wait: false } as never)
+  expect(seen.asks).toBe(1)
+})
+
+test('a record written while the identity is unknown names neither seat nor account', WAKE, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  const step = stepper($, on)
+  await start($, 100000, clock)
+  await step(usage({ cache_read_input_tokens: 100000 }))
+  expect((kept.get('last:sid-test') as any).account).toBe('a@x')
+  await clock.advance(60000)
+  delete disk.files['.claude.json']
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  await step(usage({ cache_read_input_tokens: 100000 }))
+  const rec = kept.get('last:sid-test') as any
+  expect(rec.account).toBeUndefined()
+  expect(rec.seat).toBeUndefined()
+  expect(rec.desktop).toBe(false)
+})
+
+test('a later tick that finds the account file rewritten makes the identity known again', WAKE, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  answer(on, seen, 'Send anyway')
+  on('classic.SessionStart', () => ({}))
+  const step = stepper($, on)
+  await start($, 100000, clock)
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  await step(usage({ cache_read_input_tokens: 100000 }))
+  await clock.advance(60000)
+  disk.files['.claude.json'] = account('b@x') // the rotator wrote it at last
+  await clock.advance(60000)
+  const xAt = (await clock.now()) - 5 * 60000
+  kept.set('last:sid-test', { ctx: 300000, at: xAt, model: 'claude-opus-5-5', account: 'b@x', desktop: false })
+  await ($ as any).classic.SessionStart({ source: 'resume' })
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/account rotated/)
+  await $.prompt.submit({ text: 'carry on', origin: COMPOSER, wait: false } as never)
+  expect(seen.asks).toBe(0)
+})
+
+test('a later tick that finds the seat file rewritten adopts the seat without dating a second rotation', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const seat = { label: 'A' }
+  const { clock, seen } = engine($, on, seat, kept)
+  answer(on, seen, 'Send anyway')
+  on('classic.SessionStart', () => ({}))
+  await start($, 100000, clock)
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never) // no request lands yet
+  await clock.advance(60000)
+  seat.label = 'B'
+  await clock.advance(60000)
+  let r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/account rotated 2m ago \(now B\)/)
+  // the identity is known again: a record of seat B, written after the wake-up, is the new account's cache
+  kept.set('last:sid-test', { ctx: 300000, at: (await clock.now()) - 30000, model: 'claude-opus-5-5', seat: 'B', desktop: false })
+  await ($ as any).classic.SessionStart({ source: 'resume' })
+  r = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/account rotated/)
+})
+
+test('a keep-warm ping after a rotation this process saw keeps the resumed chat warm', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const seat = { label: 'A' }
+  const disk: { files: Record<string, string> } = { files: {} }
+  const { clock, seen } = engine($, on, seat, kept, undefined, disk)
+  answer(on, seen, 'Send anyway')
+  on('classic.SessionStart', () => ({}))
+  const step = stepper($, on)
+  await start($, 100000, clock)
+  const xAt = await clock.now()
+  disk.files['x.jsonl'] = reply(xAt, 300000)
+  await clock.advance(10 * 60000)
+  seat.label = 'B'
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  await step(usage({ cache_read_input_tokens: 100000 }))
+  await clock.advance(10 * 60000)
+  // the chat's last ping, after the rotation, from a process that kept no seat or account
+  for (const k of [...kept.keys()]) if (k.startsWith('last:')) kept.delete(k)
+  kept.set('last:sid-test', { ctx: 300004, at: (await clock.now()) - 60000, model: 'claude-opus-5-5' })
+  await ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/x.jsonl' })
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/Cache is warm/)
+  expect(r.text).not.toMatch(/account rotated/)
+  await $.prompt.submit({ text: 'carry on', origin: COMPOSER, wait: false } as never)
+  expect(seen.asks).toBe(0)
+})
+
+test('a second wake-up of an already rotated chat dates the rotation anew', WAKE, async ($, on) => {
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock } = engine($, on, { label: 'A' }, undefined, undefined, disk)
+  await start($, 100000, clock)
+  disk.files['.claude.json'] = account('b@x')
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  await clock.advance(10 * 60000)
+  disk.files['.claude.json'] = account('c@x')
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  await clock.advance(60000)
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/account rotated 1m ago/)
+})
