@@ -436,6 +436,10 @@ let resumeFromReadings = false // the pending resume rests on plan windows, not 
 let submitsSeen = 0 // messages handed on to the chat so far (not dropped, not ours, not a local command) and each "Compact first" the person picks, so an unattended send can tell the person sent something meanwhile
 let sendsHeld = 0 // a cold-send dialog is open, any send of the person's is being handed on down the chain, or a compact-then-send is in flight: a due resume waits
 let wakePendingId = 0 // the wakeCount of a rotator wake-up that has arrived and whose own request has not started (0: none): a due resume waits and a drop of the readings does not re-arm it, as the wake-up's turn settles it. A wake-up lowers it only if it is still its own id, so an earlier one giving up cannot release a later one's hold
+let sendPending = new Map() // id -> deadline: a send of the person's (or another plugin's) that was handed on and whose request has not started: a due resume waits. A main-loop request, /clear or resuming another chat lowers all; the deadline (SEND_SAFETY after hand-over) covers a send that never starts a request
+let sendPendingId = 0
+let stepsSeen = 0 // main-loop requests started so far
+const SEND_SAFETY = 2 * MIN
 let resumeHeld = false // the due resume is waiting for the seat and account to be known: it goes once they are, or at the window's end
 // Built-in commands that run locally: they neither settle a pending resume nor cancel an unattended send.
 // Checked against engine 2.1.314: each is a local or local-jsx command there (hooks/local-builtins.test.mjs checks only that top-level type). A prompt-type built-in (statusline, init, doctor) goes to the model and must not be listed.
@@ -448,6 +452,11 @@ function isLocalBuiltin(command) {
   if (command.name !== 'plan') return true
   const arg = String(command.args || '').trim()
   return !arg || arg === 'open' || arg === 'share'
+}
+
+function sendIsPending() {
+  for (const [id, until] of sendPending) if (until <= now) sendPending.delete(id)
+  return sendPending.size > 0
 }
 
 // The windows that are full, from the freshest reading this session has
@@ -502,7 +511,7 @@ function armResume($, details) {
 
 // From the heartbeat tick: send "Resume" once its time has come, as the person's own word
 async function resumeStep($) {
-  if (!S.resumeAt || now < S.resumeAt || S.working || sendsHeld || wakePendingId) return // a send of the person's is being handed on or compacting, or a wake-up is on its way: its request settles the resume
+  if (!S.resumeAt || now < S.resumeAt || S.working || sendsHeld || wakePendingId || sendIsPending()) return // a send is being handed on or compacting, one was handed on and its request has not started, or a wake-up is on its way: its request settles the resume
   // the seat or the account is not known yet: the send waits until both are (refreshIdentity then brings it forward) or the window closes, without spending a try or compacting
   if (keyUnsure()) {
     S.resumeAt = wakeWindowEnd
@@ -564,7 +573,10 @@ async function runCompactThenSend($, msg, unattended, seenBefore, wake) {
   if (!msg.slash) {
     for (const asUser of unattended ? [true, false] : [true]) {
       try {
+        const stepsBefore = stepsSeen
         await $.prompt.submit({ ...send, asUser })
+        // the person's own message, handed on by this mod: its request may start later (not if one already did)
+        if (!unattended && stepsSeen === stepsBefore) sendPending.set(++sendPendingId, (await $.clock.now()) + SEND_SAFETY)
         return
       } catch {
         // try the next way, then the prompt box
@@ -1275,6 +1287,7 @@ export function register(on, options = {}) {
     resumeFromReadings = false
     resumeHeld = false
     wakePendingId = 0
+    sendPending.clear()
     resumeTries = 0
     submitsSeen++ // the chat is replaced: an unattended send still compacting (our Resume, a wake-up) must not go into the new one
     $.ui.invalidate('ui.render')
@@ -1352,13 +1365,21 @@ export function register(on, options = {}) {
     const mine = counts || fromUser // a send of the person's: a due resume waits while it is handed on, whether or not the guard asked
     const through = async () => {
       if (mine) sendsHeld++
+      const pendingId = counts ? ++sendPendingId : 0 // handed on and not this mod's own: its request may start well after next() returns
+      if (pendingId) sendPending.set(pendingId, now + SEND_SAFETY)
+      let handed = false
       try {
         const r = await next(e)
-        if (counts && !(r && r.drop)) submitsSeen++
-        else if (wake && r && r.drop) lowerWake(wakeId) // dropped further down: no request of the wake-up's is on its way
+        if (counts && !(r && r.drop)) {
+          submitsSeen++
+          handed = true
+        } else if (wake && r && r.drop) lowerWake(wakeId) // dropped further down: no request of the wake-up's is on its way
         return r
       } finally {
         if (mine) sendsHeld--
+        if (handed) {
+          if (sendPending.has(pendingId)) sendPending.set(pendingId, (await $.clock.now()) + SEND_SAFETY) // the safety runs from the hand-over
+        } else sendPending.delete(pendingId) // dropped or failed: no request follows
       }
     }
     if (!settings.guard || !fromUser || !isCold || local || justCompacted || S.ctx < settings.bigTokens || e.turnId) return through()
@@ -1396,6 +1417,7 @@ export function register(on, options = {}) {
   on('turn.start', async ($, e, next) => {
     now = await $.clock.now()
     S.working = true
+    sendPending.clear() // the request the sends handed on started
     if (e.turnId) S.turnId = e.turnId
     await heartbeat($, true)
     return next(e)
@@ -1407,6 +1429,8 @@ export function register(on, options = {}) {
       requestGen = identityGen
       // a main-loop request started: what was sent reached the chat, so a pending resume is settled (our own "Resume" zeroes it before it sends), and a wake-up's own request has arrived. Nothing else settles it: a prompt passing through, even the guard's Send anyway, may still be dropped or fail to start
       wakePendingId = 0
+      sendPending.clear()
+      stepsSeen++
       resumeHeld = false
       resumeFromReadings = false // settled: a later account change must not bring it back
       if (S.resumeAt) {

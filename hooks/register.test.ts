@@ -2381,3 +2381,54 @@ for (const [args, goes] of [['fix x', false], ['', true], ['open', true]] as con
     expect(seen.submits).toEqual(goes ? ['Resume'] : [])
   })
 }
+
+// A plain send returns from the chain at once, but its request may start much later
+async function resumeDueAfterSend(on: any, $: any) {
+  const { clock, seen } = engine($, on)
+  on('classic.StopFailure', () => ({}))
+  on('turn.step', async function* () { return { answer: '', toolUses: [], usage: null } })
+  await start($, 50000, clock)
+  const t0 = await clock.now()
+  await $.session.measure({ context: { tokens: 50000, window: 1000000, percent: 5 }, rateLimits: [{ kind: 'five_hour', percentUsed: 100, resetsAt: new Date(t0 + 90 * 60000).toISOString() }], changed: [] } as never)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  await clock.advance(91 * 60000 - 20000) // the resume is due 20 s from now
+  await $.prompt.submit({ text: 'hello', origin: COMPOSER, wait: false } as never) // handed on at once
+  return { clock, seen }
+}
+
+test('a send handed on at once whose request starts 40 s later holds a due resume until then: no Resume besides the message', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = await resumeDueAfterSend(on, $)
+  await clock.advance(40000) // the resume fell due 20 s ago, the request has not started
+  expect(seen.submits).toEqual([])
+  await mainStep($) // the message's own request starts
+  await clock.advance(5 * 60000)
+  expect(seen.submits).toEqual([])
+})
+
+test('a send that never starts a request holds a due resume only for the 2-minute safety, then the Resume goes', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = await resumeDueAfterSend(on, $)
+  await clock.advance(100000) // inside the safety
+  expect(seen.submits).toEqual([])
+  await clock.advance(60000) // past it
+  expect(seen.submits).toEqual(['Resume'])
+})
+
+test('the person\'s message sent again after "Compact first" whose request starts 40 s later holds a due resume until then', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = engine($, on)
+  answer(on, seen, 'Compact first, then send')
+  on('classic.StopFailure', () => ({}))
+  on('turn.step', async function* () { return { answer: '', toolUses: [], usage: { input_tokens: 10, cache_read_input_tokens: 300000, cache_creation_input_tokens: 0 } } })
+  await start($, 300000, clock)
+  const t0 = await clock.now()
+  await mainStep($)
+  await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [{ kind: 'five_hour', percentUsed: 100, resetsAt: new Date(t0 + 90 * 60000).toISOString() }], changed: [] } as never)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  await clock.advance(91 * 60000 - 20000) // the resume is due 20 s from now
+  await $.prompt.submit({ text: 'hello', origin: COMPOSER, wait: false } as never)
+  await clock.advance(100) // compacted and sent again
+  await clock.advance(40000) // the resume fell due, the message's request has not started
+  expect(seen.submits).toEqual(['hello'])
+  await mainStep($)
+  await clock.advance(5 * 60000)
+  expect(seen.submits).toEqual(['hello'])
+})
