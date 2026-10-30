@@ -232,6 +232,28 @@ test("uses an explicitly configured seat file before the account email", async (
   assert.equal(await displayIdentity({ accountEmail: TEST_EMAIL }, { codexHome: join(root, "missing"), env: {} }), TEST_EMAIL);
 });
 
+test("falls back to the account email when the configured seat file is missing or empty", async (t) => {
+  const root = await fixtureRoot(t);
+  const seatPath = join(root, "active-seat.txt");
+  await mkdir(join(root, "cache-statusband-codex"), { recursive: true });
+  await writeFile(
+    join(root, "cache-statusband-codex", "settings.json"),
+    `${JSON.stringify({ version: 1, seatFile: seatPath })}\n`,
+    "utf8",
+  );
+  const accountReader = async () => ({ email: TEST_EMAIL });
+  for (const content of [null, "  \n"]) {
+    if (content !== null) await writeFile(seatPath, content, "utf8");
+    const identity = await captureUsageIdentity(root, { env: {}, accountReader });
+    assert.deepEqual(identity, { key: `account:${TEST_EMAIL}`, label: TEST_EMAIL, unavailable: false });
+    const snapshot = await getUsageSnapshot({ codexHome: root, now: Date.now(), fetcher: async () => RAW, env: {}, identity });
+    const presented = await usagePresentation(snapshot, { codexHome: root, env: {}, identity });
+    assert.equal(presented.identity, TEST_EMAIL);
+    assert.equal(presented.snapshot.availableCount, 2);
+    assert.equal(await displayIdentity(snapshot, { codexHome: root, env: {} }), TEST_EMAIL);
+  }
+});
+
 async function fixtureRoot(t) {
   const root = await mkdtemp(join(tmpdir(), "cache-statusband-usage-"));
   t.after(() => rm(root, { recursive: true, force: true }));

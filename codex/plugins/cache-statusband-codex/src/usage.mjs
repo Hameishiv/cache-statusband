@@ -95,6 +95,14 @@ export async function captureUsageIdentity(codexHome, {
   }
 }
 
+// Node cannot spawn the npm codex.cmd shim directly on Windows, so the default launch goes through cmd.exe.
+function appServerLaunch(command, args) {
+  if (process.platform === "win32" && command === "codex" && !process.env.CODEX_BIN) {
+    return { command: process.env.ComSpec || "cmd.exe", args: ["/d", "/s", "/c", "codex", ...args] };
+  }
+  return { command, args };
+}
+
 export async function readAccountViaAppServer({
   codexHome,
   command = process.env.CODEX_BIN || "codex",
@@ -105,7 +113,8 @@ export async function readAccountViaAppServer({
 } = {}) {
   const childEnv = { ...env };
   if (codexHome) childEnv.CODEX_HOME = codexHome;
-  const child = spawnImpl(command, args, {
+  const launch = appServerLaunch(command, args);
+  const child = spawnImpl(launch.command, launch.args, {
     env: childEnv,
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
@@ -161,7 +170,8 @@ export async function fetchRateLimitsViaAppServer({
 } = {}) {
   const childEnv = { ...env };
   if (codexHome) childEnv.CODEX_HOME = codexHome;
-  const child = spawnImpl(command, args, {
+  const launch = appServerLaunch(command, args);
+  const child = spawnImpl(launch.command, launch.args, {
     env: childEnv,
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,

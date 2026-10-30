@@ -150,14 +150,20 @@ if (-not (Test-Path -LiteralPath $pluginRoot -PathType Container)) {
 }
 
 New-Item -ItemType Directory -Force -Path $CodexHome | Out-Null
-$configText = if (Test-Path -LiteralPath $configPath) { [IO.File]::ReadAllText($configPath) } else { "" }
-$configText = Set-TomlKey -Text $configText -Section "features" -Key "hooks" -Value "true"
-if (-not $KeepExistingFooter) {
-  $footer = '["model-with-reasoning", "context-remaining", "five-hour-limit", "weekly-limit", "estimated-thread-cost", "current-dir", "git-branch"]'
-  $configText = Set-TomlKey -Text $configText -Section "tui" -Key "status_line" -Value $footer
-  $configText = Set-TomlKey -Text $configText -Section "tui" -Key "status_line_use_colors" -Value "true"
+function Get-EditedConfig {
+  $text = if (Test-Path -LiteralPath $configPath) { [IO.File]::ReadAllText($configPath) } else { "" }
+  $text = Set-TomlKey -Text $text -Section "features" -Key "hooks" -Value "true"
+  if (-not $KeepExistingFooter) {
+    $footer = '["model-with-reasoning", "context-remaining", "five-hour-limit", "weekly-limit", "estimated-thread-cost", "current-dir", "git-branch"]'
+    $text = Set-TomlKey -Text $text -Section "tui" -Key "status_line" -Value $footer
+    $text = Set-TomlKey -Text $text -Section "tui" -Key "status_line_use_colors" -Value "true"
+  }
+  Assert-CodexConfig -Text $text -CodexCommand $codexCommand
+  return $text
 }
-Assert-CodexConfig -Text $configText -CodexCommand $codexCommand
+
+# Validate the edit against the user's config first, so a rejection changes nothing.
+$null = Get-EditedConfig
 
 if (Test-Path -LiteralPath $configPath) {
   $backupRoot = Join-Path $CodexHome ("backups\cache-statusband-codex-" + (Get-Date -Format "yyyyMMdd-HHmmss"))
@@ -177,6 +183,9 @@ try {
   $env:CODEX_HOME = $previousCodexHome
 }
 
+# The plugin commands write their own tables into config.toml, so edit it after them.
+$configText = Get-EditedConfig
+
 $configCandidate = Join-Path $CodexHome (".config.toml.cache-statusband-" + [guid]::NewGuid().ToString("N") + ".tmp")
 try {
   [IO.File]::WriteAllText($configCandidate, $configText, [Text.UTF8Encoding]::new($false))
@@ -191,7 +200,7 @@ if ($PSBoundParameters.ContainsKey("SeatFile")) {
   if ($expandedSeatFile -match '^~[\\/]') {
     $expandedSeatFile = Join-Path $env:USERPROFILE $expandedSeatFile.Substring(2)
   }
-  $expandedSeatFile = [IO.Path]::GetFullPath($expandedSeatFile)
+  $expandedSeatFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($expandedSeatFile)
   $settingsRoot = Join-Path $CodexHome "cache-statusband-codex"
   $settingsPath = Join-Path $settingsRoot "settings.json"
   New-Item -ItemType Directory -Force -Path $settingsRoot | Out-Null

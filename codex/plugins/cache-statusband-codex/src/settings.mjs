@@ -15,9 +15,8 @@ export async function configuredSeatIdentity(codexHome, env = process.env) {
   const configured = env.CACHE_STATUSBAND_CODEX_SEAT_FILE || await configuredSeatFile(codexHome);
   if (!configured) return null;
   const seat = await readSeatLabel(expandPath(configured, codexHome, env));
-  return seat
-    ? { key: `seat:${seat}`, label: `Seat ${seat}`, unavailable: false }
-    : { key: "seat:unavailable", label: null, unavailable: true };
+  // A missing or empty seat file falls back to the account identity.
+  return seat ? { key: `seat:${seat}`, label: `Seat ${seat}`, unavailable: false } : null;
 }
 
 export async function usagePresentation(snapshot, {

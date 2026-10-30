@@ -46,6 +46,8 @@ For an account rotator, optionally point the installer at the file containing th
 
 The setting is stored as `%CODEX_HOME%\cache-statusband-codex\settings.json`. When the file contains a nonempty label, companion output ends with `Seat <label>`; otherwise it ends with the email returned by Codex. `CACHE_STATUSBAND_CODEX_SEAT_FILE` can override the saved path for one process. No seat is inferred when neither setting exists.
 
+`CODEX_BIN` names the Codex executable the usage reads launch; by default they run `codex` from `PATH` (through `cmd.exe` on Windows, so the npm `codex.cmd` shim works).
+
 No token or credential is read, copied, printed, or stored by the installer or runtime.
 
 ## Codex CLI footer

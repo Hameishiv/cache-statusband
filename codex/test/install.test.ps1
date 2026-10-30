@@ -31,6 +31,9 @@ persistence = "save-all"
   }
   if ($updated -notmatch '(?m)^status_line_use_colors = true$') { throw "Footer colors were not enabled" }
   if ($updated -notmatch '(?m)^persistence = "save-all"$') { throw "An unrelated TOML setting was not preserved" }
+  # The plugin commands write their own tables; the final config must keep them.
+  if ($updated -notmatch '(?m)^\[marketplaces\.cache-statusband-codex-local\]') { throw "The marketplace registration was erased" }
+  if ($updated -notmatch '(?ms)^\[plugins\."cache-statusband-codex@cache-statusband-codex-local"\][^\[]*enabled = true') { throw "The plugin registration was erased" }
 
   $unsupported = @'
 [features]
