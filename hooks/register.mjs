@@ -436,11 +436,14 @@ let sendFailures = 0 // Resume submits refused both ways in a row; cleared by a 
 let staleArmedGen = -1 // the identityGen at which a failure of an earlier request was already given its free minute
 let resumeFromReadings = false // the pending resume rests on plan windows, not on the error's wording (nor, after dropReadings, on a re-arm); cleared wherever resumeAt is
 let submitsSeen = 0 // messages handed on to the chat so far (not dropped, not ours, not a local command), each "Compact first" answer, each wake-up that starts compacting and each /clear or resume, so an unattended send (rule B) can tell something was sent or chosen meanwhile
-let dialogsOpen = 0 // cold-send dialogs open for the person: an unattended send that has compacted waits for them to close before it judges whether it was cancelled (Cancel lets it go, except a Resume whose own compaction failed, which is armed again; Send anyway or Compact first cancels it)
+let dialogsOpen = 0 // cold-send dialogs open for the person: an unattended send that has compacted waits for them to close before it judges whether it was cancelled (Cancel lets it go, except a Resume whose own compaction failed, which is armed again, once: compactDeclined; Send anyway or Compact first cancels it, and a /btw question does not, as it never reaches the chat)
 let dialogsClosed = [] // resolvers of the sends waiting for dialogsOpen to reach 0
 let dialogCancels = 0 // cold-send dialogs the person answered Cancel so far: an unattended send compares it with its start, so only a Cancel (not a Send anyway on a message that does not cancel it) re-arms a Resume whose compaction failed
 let compactDeclined = false // a Resume's failed compaction behind a Cancel was armed again: if the next one fails too it is not sent uncompacted. Cleared by a main-loop request, /clear, a resume or fork, a new arm and a successful compaction
 let compacting = null // this mod's compaction in flight (a promise that settles at COMPACT_LIMIT at worst): a second send needing one waits for it, with no timer of its own, and uses its result
+let abandoned = null // the /compact call still out after COMPACT_LIMIT: no send starts another until it settles (its end clears this) or the chat is replaced. A Resume is tried again, the person's and a wake-up's message go back in the prompt box
+let putBackBatch = null // the texts put back in the prompt box because of an abandoned compaction: filled together, in submission order, so the fills do not overwrite each other
+let sendSeq = 0 // submission order of the sends that compact first
 let sendsHeld = 0 // a cold-send dialog is open, any send handed on that is not this mod's own is going down the chain, or a compact-then-send is in flight: a due resume waits
 let wakePendingId = 0 // the wakeCount of a rotator wake-up that has arrived and whose own request has not started (0: none): a due resume waits and a drop of the readings does not re-arm it, as the wake-up's turn settles it. A wake-up lowers it only if it is still its own id, so an earlier one giving up cannot release a later one's hold
 let sendPending = new Map() // id -> deadline: a send handed on that is not this mod's own (and the person's own message this mod sends again after Compact first) whose request has not started: a due resume waits. A main-loop request, /clear or resuming another chat lowers all; the deadline (SEND_SAFETY after hand-over) covers a send that never starts a request
@@ -559,15 +562,15 @@ async function resumeStep($) {
   await sendRefused($, before)
 }
 
-// A Resume neither submit way could send (the direct send and the unattended one after compacting), or whose compaction did not finish in COMPACT_LIMIT: tried again 2 minutes on, four attempts in all, so it is not lost to one refusal.
+// A Resume neither submit way could send (the direct send and the unattended one after compacting), or whose compaction did not finish in COMPACT_LIMIT (or is still out from an earlier send): tried again 2 minutes on, four attempts in all, so it is not lost to one refusal.
 // before: chatGen and stepsSeen from before the submits. A request that started or a chat replaced meanwhile settled it, and a re-arm made meanwhile stands: nothing is armed over either.
-// lead: what the toast says went wrong
-async function sendRefused($, before, lead = 'Could not send Resume.') {
+// lead: what the toast says went wrong. giveUp: what the toast says once the fourth try is spent
+async function sendRefused($, before, lead = 'Could not send Resume.', giveUp = 'Could not send Resume after four tries. Send it yourself when ready.') {
   const t = await $.clock.now() // read first: the check and the arm follow with no await between
   if (chatGen !== before.chat || stepsSeen !== before.steps || S.resumeAt) return
   if (++sendFailures > 3) {
     sendFailures = 0
-    $.ui.toast('Could not send Resume after four tries. Send it yourself when ready.', { timeoutMs: 8000 })
+    $.ui.toast(giveUp, { timeoutMs: 8000 })
     $.ui.invalidate('ui.render')
     return
   }
@@ -578,7 +581,7 @@ async function sendRefused($, before, lead = 'Could not send Resume.') {
 
 // wake: the id of the rotator wake-up this send is (0 for any other send)
 function compactThenSend($, e, unattended, wake = 0) {
-  const msg = { text: e.text, attachments: e.attachments, slash: !!e.command }
+  const msg = { text: e.text, attachments: e.attachments, slash: !!e.command, seq: ++sendSeq }
   const before = { seen: submitsSeen, real: realSends, chat: chatGen, steps: stepsSeen, cancels: dialogCancels }
   sendsHeld++
   $.clock.after(50, () => runCompactThenSend($, msg, unattended, before, wake).catch(() => {}).finally(() => sendsHeld--))
@@ -590,21 +593,57 @@ function lowerWake(id) {
   if (id && wakePendingId === id) wakePendingId = 0
 }
 
+// A /compact still out after COMPACT_LIMIT: no send starts another while it is. It clears this when it settles, however it ends, and one that succeeds late still shortened that chat (not a new one)
+function abandon($, done) {
+  const gen = chatGen
+  abandoned = done
+  done.then(() => {
+    if (abandoned === done) abandoned = null
+    if (chatGen === gen) markCompacted($)
+  }, () => {
+    if (abandoned === done) abandoned = null
+  })
+}
+
+// Puts a message back in the prompt box because compaction is out. Those of one abandonment go in one fill, in submission order, joined by a blank line: a second fill would overwrite the first. A text that comes later is filled with the earlier ones, unless a message was sent or the chat replaced since. Resolves to whether it was filled
+function putBack($, msg) {
+  if (!putBackBatch || putBackBatch.chat !== chatGen || putBackBatch.real !== realSends) putBackBatch = { chat: chatGen, real: realSends, items: [], flush: null }
+  const b = putBackBatch
+  b.items.push({ seq: msg.seq, text: msg.text })
+  if (!b.flush) {
+    b.flush = new Promise((resolve) => {
+      $.clock.after(50, async () => {
+        b.flush = null // a text arriving from here on is filled with the earlier ones
+        const text = [...b.items].sort((x, y) => x.seq - y.seq).map((i) => i.text).join('\n\n')
+        try {
+          resolve(!!(await $.prompt.fill({ text })).isFilled)
+        } catch {
+          resolve(false)
+        }
+      })
+    })
+  }
+  return b.flush
+}
+
 async function runCompactThenSend($, msg, unattended, before, wake) {
   const cancelled = () => unattended && submitsSeen !== before.seen
   const resume = unattended && !wake // this mod's own Resume (a wake-up is the other unattended send)
   let compacted = false
   let timedOut = false // our own compaction was still out after COMPACT_LIMIT: abandoned, and the message does not go uncompacted
+  let blocked = false // an abandoned compaction is still out (ours that this send waited on, or an earlier send's): this send starts no other, and does not go uncompacted
   let failure = '' // why our own compaction failed, said once it is known whether the message still goes
   while (compacting) await compacting.then(() => {}, () => {}) // our own compaction is already running: wait for it (it settles at COMPACT_LIMIT at worst) and do not compact again if it succeeded
   try {
     if (justCompacted) compacted = true // a compaction finished with no request since: the chat is already short
+    else if (abandoned) blocked = true // an earlier compaction is still out: not a second one beside it
     else if (!cancelled()) { // a send already cancelled does not compact for nothing
       const run = (async () => {
         const done = $.command.run({ command: 'compact', args: '' })
         const late = new Promise((resolve) => $.clock.after(COMPACT_LIMIT, () => resolve(true)))
         if (await Promise.race([done.then(() => false), late])) {
           timedOut = true
+          abandon($, done)
           throw new Error('timed out')
         }
         markCompacted($)
@@ -620,6 +659,7 @@ async function runCompactThenSend($, msg, unattended, before, wake) {
   } catch (err) {
     failure = clip(String((err && err.message) || err), 80)
   }
+  const stuck = timedOut || blocked // never sent uncompacted
   // a cold-send dialog is open: what the person answers decides whether this one goes
   while (unattended && dialogsOpen > 0) await new Promise((resolve) => dialogsClosed.push(resolve))
   // the Resume goes again 2 minutes on (resumeAt, shown in the band) unless another request starts, the chat is replaced or it is armed already. The time is read before the check: nothing that clears the re-arm can run between the check and the assignment
@@ -644,10 +684,11 @@ async function runCompactThenSend($, msg, unattended, before, wake) {
     $.ui.toast((compacted ? 'Compacted. ' : '') + text, { timeoutMs: 8000 })
     return
   }
-  if (timedOut) {
-    // never sent uncompacted. The Resume is tried again (a counted try); the person's message and a wake-up's go back in the prompt box below
+  if (stuck) {
+    // The Resume is tried again (a counted try); the person's message and a wake-up's go back in the prompt box below
     if (resume) {
-      await sendRefused($, { chat: before.chat, steps: before.steps }, 'Compaction has not finished after 15 minutes; the Resume was not sent.')
+      const lead = timedOut ? 'Compaction has not finished after 15 minutes; the Resume was not sent.' : 'The earlier compaction is still running; the Resume was not sent.'
+      await sendRefused($, { chat: before.chat, steps: before.steps }, lead, 'Compaction did not finish, so the Resume was not sent after four tries. Send it yourself when ready.')
       return
     }
   } else if (resume && !compacted && compactDeclined) {
@@ -664,10 +705,10 @@ async function runCompactThenSend($, msg, unattended, before, wake) {
     }
     return
   }
-  if (failure && !timedOut) $.ui.toast('Could not compact (' + failure + '), so the message goes as typed.', { timeoutMs: 8000 }) // an automatic message that was cancelled says only the cancel
+  if (failure && !stuck) $.ui.toast('Could not compact (' + failure + '), so the message goes as typed.', { timeoutMs: 8000 }) // an automatic message that was cancelled says only the cancel
   const send = { text: msg.text, ...(msg.attachments ? { attachments: msg.attachments } : {}) }
   // A plugin can't submit a "/" line: those go back in the prompt box
-  if (!msg.slash && !timedOut) {
+  if (!msg.slash && !stuck) {
     const tried = { chat: chatGen, steps: stepsSeen }
     for (const asUser of unattended ? [true, false] : [true]) {
       try {
@@ -688,14 +729,25 @@ async function runCompactThenSend($, msg, unattended, before, wake) {
     }
   }
   let filled = false
-  try {
-    filled = !!(await $.prompt.fill({ text: msg.text })).isFilled
-  } catch {
-    filled = false
+  if (stuck) {
+    filled = await putBack($, msg)
+    // the Resume must not go ahead of a message the person still has to send
+    const t = await $.clock.now()
+    if (S.resumeAt && S.resumeAt < t + CANCEL_REARM) {
+      S.resumeAt = t + CANCEL_REARM
+      $.ui.invalidate('ui.render')
+    }
+  } else {
+    try {
+      filled = !!(await $.prompt.fill({ text: msg.text })).isFilled
+    } catch {
+      filled = false
+    }
   }
   lowerWake(wake) // given up: no request of the wake-up's is on its way
-  const text = timedOut
-    ? filled ? 'Compaction has not finished after 15 minutes; your message is back in the prompt box: press Enter to send it.' : 'Compaction has not finished after 15 minutes, and the message could not be put back: ' + clip(msg.text, 80)
+  const why = timedOut ? 'Compaction has not finished after 15 minutes' : 'The earlier compaction is still running'
+  const text = stuck
+    ? filled ? why + '; your message is back in the prompt box: press Enter to send it.' : why + ', and the message could not be put back: ' + clip(msg.text, 80)
     : filled ? 'Compacted. Your message is back in the prompt box: press Enter to send it.' : 'Compacted, but the message could not be sent again: ' + clip(msg.text, 80)
   $.ui.toast(text, { timeoutMs: 15000 })
 }
@@ -1381,6 +1433,7 @@ export function register(on, options = {}) {
       S.lastActivity = 0
       // the last chat's compaction says nothing about this one, and would mute its cold-send guard
       justCompacted = false
+      abandoned = null // the last chat's compaction, if it ever ends, is not this one's
       compactedCold = false
       S.floor = 0
       S.ctx = 0 // the last chat's size; a resumed chat's own is seeded below (a cleared one starts at 0)

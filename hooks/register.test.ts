@@ -2902,16 +2902,17 @@ test('a compaction that takes 2.5 minutes is waited on: two "Compact first" send
   expect({ compacts: seen.compacts, submits: seen.submits }).toEqual({ compacts: 1, submits: ['one', 'two'] })
 })
 
-test('a compaction that never finishes is abandoned after 15 minutes: that message is put back in the prompt box, never sent uncompacted, and the send that waited on it compacts on its own and goes', SETUP, async ($, on) => {
+test('a compaction that never finishes is abandoned after 15 minutes: that message and the send that waited on it go back in the prompt box in ONE fill, in order, and neither is sent uncompacted nor compacts again', SETUP, async ($, on) => {
   const { clock, seen, fills } = await twoCompactFirst($, on, (n) => (n === 1 ? new Promise(() => {}) : Promise.resolve()))
   await clock.advance(14 * 60000)
   expect({ compacts: seen.compacts, submits: seen.submits, fills }).toEqual({ compacts: 1, submits: [], fills: [] }) // still waiting
   await clock.advance(61000)
-  expect({ compacts: seen.compacts, submits: seen.submits, fills }).toEqual({ compacts: 2, submits: ['two'], fills: ['one'] })
+  expect({ compacts: seen.compacts, submits: seen.submits, fills }).toEqual({ compacts: 1, submits: [], fills: ['one\n\ntwo'] })
   expect(seen.toasts.filter((t) => /Compaction has not finished after 15 minutes; your message is back in the prompt box/.test(t)).length).toBe(1)
+  expect(seen.toasts.filter((t) => /The earlier compaction is still running; your message is back in the prompt box/.test(t)).length).toBe(1) // the waiter's
 })
 
-test('a compaction that never finishes holds a due Resume for 15 minutes, not for good', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+test('a compaction that never finishes holds a due Resume for 15 minutes; after that the Resume is tried again without compacting, and gives up after four tries', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)
   answer(on, seen, 'Compact first, then send')
@@ -2925,12 +2926,14 @@ test('a compaction that never finishes holds a due Resume for 15 minutes, not fo
   seen.duringCompact = () => (++n === 1 ? new Promise(() => {}) : Promise.resolve()) // the person's compaction hangs
   await $.prompt.submit({ text: 'one', origin: COMPOSER, wait: false } as never)
   await clock.advance(100)
-  for (let i = 0; i < 9; i++) await clock.advance(10 * 60000) // the Resume, due an hour on, is held only until the compaction is abandoned
-  expect(seen.submits).toEqual(['Resume'])
+  for (let i = 0; i < 9; i++) await clock.advance(10 * 60000) // the Resume, due an hour on, is held only until the compaction is abandoned: the compaction is still out, so it starts no other
+  expect({ submits: seen.submits, compacts: seen.compacts }).toEqual({ submits: [], compacts: 1 })
   expect(seen.toasts.filter((t) => /Compaction has not finished after 15 minutes/.test(t)).length).toBe(1)
+  expect(seen.toasts.filter((t) => /The earlier compaction is still running; the Resume was not sent\. Trying again at/.test(t)).length).toBe(3)
+  expect(seen.toasts.filter((t) => /Compaction did not finish, so the Resume was not sent after four tries/.test(t)).length).toBe(1)
 })
 
-test('a Resume whose own compaction never finishes is not sent uncompacted after 15 minutes: it is tried again 2 minutes on', { options: { autoResume: true } }, async ($, on) => {
+test('a Resume whose own compaction never finishes is not sent uncompacted after 15 minutes: it is tried again 2 minutes on, without a second compaction while the first is out, and gives up after four tries saying compaction did not finish', { options: { autoResume: true } }, async ($, on) => {
   const { clock, seen } = await resumeCompacting($, on)
   let n = 0
   seen.duringCompact = () => (++n === 1 ? new Promise(() => {}) : Promise.resolve())
@@ -2940,8 +2943,13 @@ test('a Resume whose own compaction never finishes is not sent uncompacted after
   await clock.advance(61000)
   expect({ submits: seen.submits, compacts: seen.compacts }).toEqual({ submits: [], compacts: 1 })
   expect(seen.toasts.filter((t) => /Compaction has not finished after 15 minutes; the Resume was not sent\. Trying again at/.test(t)).length).toBe(1)
-  await clock.advance(200000) // the second try compacts again and goes
-  expect({ submits: seen.submits, compacts: seen.compacts }).toEqual({ submits: ['Resume'], compacts: 2 })
+  await clock.advance(200000) // the second try finds the first compaction still out and starts no other
+  expect({ submits: seen.submits, compacts: seen.compacts }).toEqual({ submits: [], compacts: 1 })
+  expect(seen.toasts.filter((t) => /The earlier compaction is still running; the Resume was not sent\. Trying again at/.test(t)).length).toBe(1)
+  await clock.advance(10 * 60000)
+  expect({ submits: seen.submits, compacts: seen.compacts }).toEqual({ submits: [], compacts: 1 })
+  expect(seen.toasts.filter((t) => /Compaction did not finish, so the Resume was not sent after four tries\. Send it yourself when ready\./.test(t)).length).toBe(1)
+  expect(seen.toasts.filter((t) => /Could not send Resume/.test(t))).toEqual([])
 })
 
 test('a rotator wake-up whose compaction never finishes goes back in the prompt box after 15 minutes', { options: { rotatorWakePattern: WAKE.options.rotatorWakePattern } }, async ($, on) => {
