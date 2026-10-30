@@ -401,7 +401,7 @@ async function readSeat($, adopt = false) {
 }
 
 // The old account's readings, dropped once the account or seat moves: the new one's are borrowed or fetched until a request measures them.
-// A resume still pending that was armed from them is not cancelled: it moves to a minute from now, when the new account presumably has usage, keeping its tries. One already settled, sent or cleared is not revived. A wake-up is itself the resume, so its own drop (rearm false) leaves a pending one as it is: the wake-up's turn settles it.
+// A resume still pending that was armed from them is not cancelled: it moves to a minute from now, when the new account presumably has usage, keeping its tries. One already settled, sent or cleared is not revived. A wake-up is itself the resume, so its own drop (rearm false) leaves a pending one as it is: the wake-up settles it on arrival (committed).
 // A request that started before the drop reports the old account's windows: identityGen lets its readings be told apart.
 let identityGen = 0
 let requestGen = 0 // identityGen as the latest main-loop request started: session.measure names no request, so the latest start stands for the one that reports (a subagent's reading carries the same account)
@@ -540,7 +540,7 @@ async function runCompactThenSend($, msg, unattended, seenBefore) {
     if (!cancelled()) $.ui.toast('Could not compact (' + clip(String((err && err.message) || err), 80) + '), so the message goes as typed.', { timeoutMs: 8000 })
   }
   if (cancelled()) {
-    // anything sent while compacting cancels an automatic message, as it would have before
+    // a message that reached the chat while compacting cancels an automatic one (a local command or a dropped send does not)
     $.ui.toast((compacted ? 'Compacted. A message' : 'A message') + ' was sent meanwhile, so the automatic one was not sent.', { timeoutMs: 8000 })
     return
   }
@@ -1365,7 +1365,7 @@ export function register(on, options = {}) {
   on('turn.step', async function* ($, e, next) {
     if (!e.agentId) {
       requestGen = identityGen
-      // a main-loop request started: what was sent reached the chat, so a pending resume is settled (our own "Resume" zeroes it before it sends)
+      // a main-loop request started: what was sent reached the chat, so a pending resume is settled (our own "Resume" zeroes it before it sends). This also catches one armed by a stale failure while a committed send was still queued
       resumeFromReadings = false // settled: a later account change must not bring it back
       if (S.resumeAt) {
         S.resumeAt = 0
