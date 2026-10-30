@@ -430,7 +430,7 @@ const THROTTLE = /rate[ _-]?limit/i // "rate limit reached" is a short throttle,
 const USAGE_MARKER = /usage limit|hit your limit|out of (extra )?usage|5-hour|weekly/i // a throttle's wording beside one of these is still spent usage
 const RESUME_FALLBACK = 60 * MIN // no reset time known: try once an hour, three times at most
 let resumeTries = 0
-let resumeFromReadings = false // the armed resume came from plan windows, not from the error's wording
+let resumeFromReadings = false // the armed resume rests on plan windows, not on the error's wording (nor, after dropReadings, on a re-arm)
 let submitsSeen = 0 // prompt.submit hooks so far, so an unattended send can tell the person sent something meanwhile
 
 // The windows that are full, from the freshest reading this session has
@@ -607,7 +607,7 @@ function myHeartbeat() {
     ...(S.account && !accountUnsure() ? { account: S.account } : {}), // what an unseated session's windows are borrowed by; left out while unknown after a wake-up
     desktop: !onTerminal,
     signedIn, // an API-key session's windows are not an account's: others must not borrow them
-    rateLimits: keyUnsure() ? [] : S.rateLimits, // the engine's own reading, which a reopened chat borrows; none while the seat or account is unknown, as it may be the old account's
+    rateLimits: keyUnsure() || unidentified() ? [] : S.rateLimits, // the engine's own reading, which a reopened chat borrows; none while the seat or account is unknown, as it may be the old account's, nor from a session that has neither
     updatedAt: now,
   }
 }
@@ -684,7 +684,7 @@ const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
 let planWhy = ''
 let planNext = 0
 // One reading per account, shared by its sessions: the endpoint rate-limits a second schedule within seconds.
-// An older version kept one reading under this bare key for every account: a session with an account or seat never reads it.
+// An older version kept one reading under this bare key for every account: a signed-in session never reads it, nor writes it.
 const PLAN_KEY = 'plan'
 
 // Each account has its own limits: with a seat file configured, a reading per surface and seat
@@ -692,6 +692,12 @@ const PLAN_KEY = 'plan'
 function planKey() {
   if (S.seat) return `${PLAN_KEY}:${onTerminal ? 'cli' : 'app'}:${S.seat}`
   return S.account ? `${PLAN_KEY}:account:${S.account}` : PLAN_KEY
+}
+
+// A signed-in session that can name neither seat nor account has no key of its own: the bare one would be shared with sessions on other accounts.
+// It fetches for itself, shares nothing, lends no windows and borrows none.
+function unidentified() {
+  return signedIn === true && !S.seat && !S.account
 }
 
 async function refreshPlan($) {
@@ -712,9 +718,10 @@ async function refreshPlan($) {
   // a seat or account change, or a wake-up, during any await below: don't restore the old account's readings
   if (stale()) return
   if (signedIn === false) return noSignIn()
+  const alone = unidentified()
   let cached = null
   try {
-    cached = await $.store.get(key)
+    cached = alone ? null : await $.store.get(key)
   } catch {
     cached = null
   }
@@ -729,7 +736,7 @@ async function refreshPlan($) {
   planNext = now + PLAN_EVERY
   // claim the slot first, so a session that wakes meanwhile finds it taken
   try {
-    await $.store.set(key, { ...prior, next: now + PLAN_EVERY })
+    if (!alone) await $.store.set(key, { ...prior, next: now + PLAN_EVERY })
   } catch {
     // lock held: this session's own planNext still holds it back
   }
@@ -769,6 +776,7 @@ async function refreshPlan($) {
   planWhy = why
   try {
     // a failed check must not put its older reading over one another session took meanwhile
+    if (alone) return
     const stored = fetched ? null : await $.store.get(key)
     if (stale()) return
     if (stored && typeof stored === 'object' && (stored.at || 0) > (prior.at || 0)) {

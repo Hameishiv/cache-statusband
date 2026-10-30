@@ -639,18 +639,19 @@ test('auto keep warm stops once its pings cost as much as the rewrite; one start
 
 test('a failed plan check does not overwrite a newer reading another session took', async ($, on) => {
   const kept = new Map<string, unknown>()
-  const { clock } = engine($, on, { label: 'A' }, kept)
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } } // an account to key the reading by: a session with none shares nothing
+  const { clock } = engine($, on, { label: 'A' }, kept, undefined, disk)
   on('session.authorize', () => ({ value: { handle: 'h' } }))
   const fresh = { at: 999999999, next: 999999999 + 300000, fable: { percentUsed: 7 }, windows: [{ kind: 'five_hour', percentUsed: 5 }], why: 'ok' }
   on('http.fetch', () => {
     // another session lands its reading while this one's check is in flight
-    kept.set('plan', fresh)
+    kept.set('plan:account:a@x', fresh)
     return { value: { ok: false, status: 429, text: '', headers: { 'retry-after': '600' } } }
   })
-  kept.set('plan', { at: 1, next: 2, fable: { percentUsed: 1 }, windows: [], why: 'ok' })
+  kept.set('plan:account:a@x', { at: 1, next: 2, fable: { percentUsed: 1 }, windows: [], why: 'ok' })
   await start($, 50000, clock)
   await clock.advance(70000)
-  expect(kept.get('plan')).toEqual(fresh)
+  expect(kept.get('plan:account:a@x')).toEqual(fresh)
 })
 
 test('a seat change while the plan reading is being fetched leaves the old seat\'s figures out of the new one', SETUP, async ($, on) => {
@@ -1654,6 +1655,47 @@ test('a request that started before an account change reports the old account\'s
   await $.session.measure({ context: { tokens: 50000, window: 1000000, percent: 5 }, rateLimits: fiveFull(t0), changed: [] } as never)
   r = await $.command.run({ command: 'cache', args: '' })
   expect(r.text).toMatch(/5h 100%/)
+})
+
+// Signed in, but no seat file and no account in .claude.json: the bare 'plan' key would be shared by such sessions, whatever their accounts
+const fableBody = (pct: number) => JSON.stringify({ five_hour: { utilization: 7, resets_at: 9999999999 }, limits: [{ kind: 'weekly_scoped', scope: { model: { display_name: 'Fable' } }, percent: pct }] })
+
+test('a signed-in session with neither seat nor account does not take the bare plan reading, and lends no windows', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock } = engine($, on, { label: 'A' }, kept)
+  on('session.authorize', () => ({ value: { handle: 'h' } }))
+  await clock.advance(60000)
+  const t0 = await clock.now()
+  const shared = { at: t0, next: t0 + 60 * 60000, fable: { percentUsed: 77, resetsAt: '2099-01-01T00:00:00Z' }, windows: [], why: 'ok' }
+  kept.set('plan', shared)
+  kept.set('hb:other', { ...otherHb('a@x', t0), account: undefined })
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await $.session.measure({ context: { tokens: 100000, window: 1000000, percent: 10 }, rateLimits: [{ kind: 'five_hour', percentUsed: 40, resetsAt: '2099-01-01T00:00:00Z' }], changed: [] } as never)
+  await clock.advance(31000) // the tick checks the sign-in and the plan
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/77%/)
+  expect(kept.get('plan')).toEqual(shared)
+  expect((kept.get('hb:sid-test') as any).signedIn).toBe(true)
+  expect((kept.get('hb:sid-test') as any).rateLimits).toEqual([])
+})
+
+test('a signed-in session with neither seat nor account fetches for itself and writes nothing to the bare plan key', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock } = engine($, on, { label: 'A' }, kept)
+  on('session.authorize', () => ({ value: { handle: 'h' } }))
+  let fetches = 0
+  on('http.fetch', () => (fetches++, { value: { ok: true, status: 200, headers: {}, text: fableBody(20) } }))
+  await clock.advance(10 * 60000)
+  const stale = { at: 1, next: 2, fable: { percentUsed: 77, resetsAt: '2099-01-01T00:00:00Z' }, windows: [], why: 'ok' }
+  kept.set('plan', stale) // long past due, and another account's
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await clock.advance(31000)
+  expect(fetches).toBe(1)
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/Fable weekly: 20% used/)
+  expect(kept.get('plan')).toEqual(stale)
+  await clock.advance(2 * 60000)
+  expect(fetches).toBe(1) // its own planNext holds the next fetch back, with nothing in the store to do it
 })
 
 // Two unseated sessions on one surface: another session's heartbeat in the store
