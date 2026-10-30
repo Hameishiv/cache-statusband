@@ -1559,6 +1559,8 @@ test('with no seat file, the old account\'s full week arms no resume while the a
   disk.files['.claude.json'] = account('b@x')
   await clock.advance(30000)
   expect((kept.get('hb:sid-test') as any).account).toBe('b@x')
+  await ($ as any).classic.StopFailure(throttle) // the old week is gone: the new account has no full window to arm from
+  expect(seen.toasts.some((t) => /resumes on its own/.test(t))).toBe(false)
   await clock.advance(60 * 60000)
   expect(seen.submits).toEqual([])
 })

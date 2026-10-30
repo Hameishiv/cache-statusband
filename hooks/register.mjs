@@ -709,7 +709,7 @@ async function refreshPlan($) {
     }
     signCheckAt = now + PLAN_EVERY
   }
-  // a seat change during any await below resets the readings and planNext: don't restore the old seat's
+  // a seat or account change, or a wake-up, during any await below: don't restore the old account's readings
   if (stale()) return
   if (signedIn === false) return noSignIn()
   let cached = null
@@ -755,7 +755,7 @@ async function refreshPlan($) {
       at = now
       fetched = true
     } else why = 'HTTP ' + r.status
-    // a 429 names how long to stay away; every session waits it out, an hour at most
+    // a 429 names how long to stay away; every session on this key waits it out, an hour at most
     const wait = Number(r.headers && r.headers['retry-after'])
     if (!r.ok && wait > 0) next = now + Math.min(60 * MIN, Math.max(PLAN_EVERY, wait * 1000))
   } catch (err) {
@@ -1678,7 +1678,7 @@ function bandSegments() {
   const week = limits.find((l) => l.kind === 'seven_day')
   if (five) out.push(limitSegment('5h', five, 'purple'))
   if (week) out.push(limitSegment('Week', week, 'green'))
-  // its reset is the weekly one's, already shown; the reading waits for the seat like the windows
+  // its reset is the weekly one's, already shown; the reading waits for the seat and account like the windows
   if (S.fable && !keyUnsure()) out.push(limitSegment('Fable', S.fable, 'pink', false))
   for (const l of S.rateLimits) if (l.kind !== 'five_hour' && l.kind !== 'seven_day') out.push(limitSegment(LIMIT_LABEL[l.kind] || l.kind, l, 'gray'))
   out.push([`session ${money(S.costUsd)}`, 'salmon'])
