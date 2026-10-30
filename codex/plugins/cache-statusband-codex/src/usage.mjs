@@ -105,14 +105,15 @@ function appServerLaunch(command, args) {
   return { command, args };
 }
 
-// child.kill() ends cmd.exe but not the codex it started, which keeps the pipes open and the hook alive
+// child.kill() ends cmd.exe but not the codex it started, which keeps the pipes open and the hook alive.
+// The tree goes first: once cmd.exe is gone, taskkill /T can no longer find the codex under it.
 function stopChild(child, launch, command) {
-  child.kill();
   if (process.platform === "win32" && launch.command !== command && child.pid) {
     try {
       spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore" });
     } catch {}
   }
+  child.kill();
   child.stdout?.destroy?.();
   child.stderr?.destroy?.();
 }
