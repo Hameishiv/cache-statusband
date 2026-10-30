@@ -401,7 +401,7 @@ async function readSeat($, adopt = false) {
 }
 
 // The old account's readings, dropped once the account or seat moves: the new one's are borrowed or fetched until a request measures them.
-// A resume still pending that was armed from them is not cancelled: it moves to a minute from now, when the new account presumably has usage, keeping its tries. One already settled, sent or cleared is not revived. A wake-up is itself the resume, so its own drop (rearm false) leaves a pending one as it is: the wake-up settles it on arrival (committed).
+// A resume still pending that was armed from them is not cancelled: it moves to a minute from now, when the new account presumably has usage, keeping its tries. One already settled, sent or cleared is not revived. While a wake-up is on its way (wakePending) nor does a late adoption re-arm one: the wake-up is itself the resume, and its request settles it.
 // A request that started before the drop reports the old account's windows: identityGen lets its readings be told apart.
 let identityGen = 0
 let requestGen = 0 // identityGen as the latest main-loop request started: session.measure names no request, so the latest start stands for the one that reports (a subagent's reading carries the same account)
@@ -411,9 +411,10 @@ function dropReadings(rearm = true) {
   S.fable = null
   S.planWindows = []
   planNext = 0
-  if (rearm && resumeFromReadings && S.resumeAt) { // only a resume still pending: one settled, fired or cleared stays so
+  if (rearm && !wakePending && resumeFromReadings && S.resumeAt) { // only a resume still pending: one settled, fired or cleared stays so; not while a wake-up is on its way, whose turn settles it
     S.resumeAt = now + MIN
     resumeFromReadings = false
+    resumeHeld = false
   }
 }
 
@@ -432,19 +433,12 @@ const RESUME_FALLBACK = 60 * MIN // no reset time known: try once an hour, three
 let resumeTries = 0
 let staleArmedGen = -1 // the identityGen at which a failure of an earlier request was already given its free minute
 let resumeFromReadings = false // the pending resume rests on plan windows, not on the error's wording (nor, after dropReadings, on a re-arm); cleared wherever resumeAt is
-let submitsSeen = 0 // sends committed so far (see committed), so an unattended send can tell the person sent something meanwhile
-let sendsHeld = 0 // a cold-send dialog is open or a compact-then-send is in flight: a due resume waits
-
-// A send is known to reach the chat: a pending resume is settled (a later account change must not bring it back) and the unattended sends see it.
-// Called where a prompt passes through, when the guard's answer sends it, and at a wake-up before it re-reads anything. Not for a local command, a cancelled send, nor our own Resume or /compact.
-function committed($) {
-  submitsSeen++
-  resumeFromReadings = false
-  if (S.resumeAt) {
-    S.resumeAt = 0
-    $.ui.invalidate('ui.render')
-  }
-}
+let submitsSeen = 0 // messages handed on to the chat so far (not dropped, not ours, not a local command), so an unattended send can tell the person sent something meanwhile
+let sendsHeld = 0 // a cold-send dialog is open, a send is being handed on or a compact-then-send is in flight: a due resume waits
+let wakePending = false // a rotator wake-up has arrived and its own request has not started: a due resume waits and a drop of the readings does not re-arm it, as the wake-up's turn settles it
+let resumeHeld = false // the due resume is waiting for the seat and account to be known: it goes once they are, or at the window's end
+// Built-in commands that run locally and never reach the chat: they neither settle a pending resume nor cancel an unattended send
+const LOCAL_BUILTINS = new Set(['usage', 'status', 'model', 'cost', 'help', 'context', 'login', 'logout', 'config', 'doctor', 'memory', 'permissions', 'hooks', 'mcp', 'agents', 'ide', 'resume', 'export', 'statusline', 'theme', 'vim', 'terminal-setup', 'add-dir', 'bug', 'release-notes', 'upgrade', 'privacy-settings'])
 
 // The windows that are full, from the freshest reading this session has
 export function spentWindows(limits, fable, model) {
@@ -477,6 +471,7 @@ function armResume($, details) {
   if (requestGen !== identityGen && staleArmedGen !== identityGen) {
     staleArmedGen = identityGen
     S.resumeAt = now + MIN
+    resumeHeld = false
     resumeFromReadings = false // it rests on no reading
     $.ui.toast(`Out of usage. This chat resumes on its own at ${resumeText(S.resumeAt, now)}.`, { timeoutMs: 15000 })
     $.ui.invalidate('ui.render')
@@ -488,6 +483,7 @@ function armResume($, details) {
     return
   }
   S.resumeAt = at || now + RESUME_FALLBACK
+  resumeHeld = false
   resumeFromReadings = full.length > 0
   if (!at) resumeTries++
   $.ui.toast(`Out of usage. This chat resumes on its own at ${resumeText(S.resumeAt, now)}.`, { timeoutMs: 15000 })
@@ -496,14 +492,16 @@ function armResume($, details) {
 
 // From the heartbeat tick: send "Resume" once its time has come, as the person's own word
 async function resumeStep($) {
-  if (!S.resumeAt || now < S.resumeAt || S.working || sendsHeld) return // a send of the person's is held by the guard or compacting: it settles the resume once it is sent
-  // the seat or the account is not known yet: the send waits for it or for the window to close, without spending a try or compacting
+  if (!S.resumeAt || now < S.resumeAt || S.working || sendsHeld || wakePending) return // a send of the person's is held by the guard or compacting, or a wake-up is on its way: its request settles the resume
+  // the seat or the account is not known yet: the send waits until both are (refreshIdentity then brings it forward) or the window closes, without spending a try or compacting
   if (keyUnsure()) {
     S.resumeAt = wakeWindowEnd
+    resumeHeld = true
     $.ui.invalidate('ui.render')
     return
   }
   S.resumeAt = 0
+  resumeHeld = false
   resumeFromReadings = false
   $.ui.invalidate('ui.render')
   if (worthCompacting()) {
@@ -520,15 +518,15 @@ async function resumeStep($) {
   }
 }
 
-function compactThenSend($, e, unattended) {
+function compactThenSend($, e, unattended, wake = false) {
   const msg = { text: e.text, attachments: e.attachments, slash: !!e.command }
   const seenBefore = submitsSeen
   sendsHeld++
-  $.clock.after(50, () => runCompactThenSend($, msg, unattended, seenBefore).catch(() => {}).finally(() => sendsHeld--))
+  $.clock.after(50, () => runCompactThenSend($, msg, unattended, seenBefore, wake).catch(() => {}).finally(() => sendsHeld--))
   return { drop: 'cache-keeper: compacting first on a cold cache; the message is sent again once that finishes' }
 }
 
-async function runCompactThenSend($, msg, unattended, seenBefore) {
+async function runCompactThenSend($, msg, unattended, seenBefore, wake) {
   const cancelled = () => unattended && submitsSeen !== seenBefore
   let compacted = false
   try {
@@ -540,7 +538,8 @@ async function runCompactThenSend($, msg, unattended, seenBefore) {
     if (!cancelled()) $.ui.toast('Could not compact (' + clip(String((err && err.message) || err), 80) + '), so the message goes as typed.', { timeoutMs: 8000 })
   }
   if (cancelled()) {
-    // a message that reached the chat while compacting cancels an automatic one (a local command or a dropped send does not)
+    // a message that reached the chat while compacting cancels an automatic one (a local command or a dropped send does not), and with it the wake-up's turn
+    if (wake) wakePending = false
     $.ui.toast((compacted ? 'Compacted. A message' : 'A message') + ' was sent meanwhile, so the automatic one was not sent.', { timeoutMs: 8000 })
     return
   }
@@ -562,6 +561,7 @@ async function runCompactThenSend($, msg, unattended, seenBefore) {
   } catch {
     filled = false
   }
+  if (wake) wakePending = false // given up: no request of the wake-up's is on its way
   $.ui.toast(filled ? 'Compacted. Your message is back in the prompt box: press Enter to send it.' : 'Compacted, but the message could not be sent again: ' + clip(msg.text, 80), { timeoutMs: 15000 })
 }
 
@@ -1068,6 +1068,7 @@ async function refreshIdentity($) {
     seatUnknown = false
     accountUnknown = false
     wakeWindowEnd = 0
+    wakePending = false // the window is over: a wake-up whose request never started no longer holds the resume
     return
   }
   if (!seatUnknown && !accountUnknown) return
@@ -1101,6 +1102,14 @@ async function refreshIdentity($) {
       rotationSeenAt = now
     }
     if (accountAdopted) accountMoved = true
+  }
+  // the seat and account are both known now: a due resume that waited for them goes at once, not at the window's end
+  if (resumeHeld && !keyUnsure()) {
+    resumeHeld = false
+    if (S.resumeAt) {
+      S.resumeAt = now
+      $.ui.invalidate('ui.render')
+    }
   }
 }
 
@@ -1248,7 +1257,10 @@ export function register(on, options = {}) {
     // a resume armed in the last chat must not fire into this one
     S.resumeAt = 0
     resumeFromReadings = false
+    resumeHeld = false
+    wakePending = false
     resumeTries = 0
+    submitsSeen++ // the chat is replaced: an unattended send still compacting (our Resume, a wake-up) must not go into the new one
     $.ui.invalidate('ui.render')
     try {
       S.id = (await $.session.id()) || S.id
@@ -1294,7 +1306,7 @@ export function register(on, options = {}) {
     const wake = fromUser && !!cfg.rotatorWake && cfg.rotatorWake.test(String(e.text || ''))
     if (wake) {
       // The wake-up is the rotation reaching this session: take the new seat now; a late rewrite is taken within WAKE_WINDOW
-      committed($) // before anything is re-read: a re-read must not find a pending resume to re-arm
+      wakePending = true // before anything is re-read: a re-read must not re-arm a pending resume, nor may one fire; the wake-up's own request settles it
       wakeCount++
       wakeSeat = S.seat
       wakeAccount = S.account
@@ -1308,7 +1320,7 @@ export function register(on, options = {}) {
       accountUnknown = !S.account || S.account === wakeAccount
       seatMoved = !!seatFile && S.seat !== wakeSeat
       accountMoved = !accountUnknown
-      if (accountMoved) dropReadings(false) // the account is known to have moved: the readings are the old account's, as on a seat change; the wake-up is itself the resume, so a pending one is not re-armed
+      if (accountMoved) dropReadings(false) // the account is known to have moved: the readings are the old account's, as on a seat change; the wake-up is itself the resume (wakePending), so a pending one is not re-armed
       S.seatChangedAt = now // a second wake-up of an already rotated chat dates it anew
       rotatedPending = true
     }
@@ -1318,39 +1330,41 @@ export function register(on, options = {}) {
     const isCold = rotated || (left !== null && left <= 0)
     // These run locally or start afresh: a cold cache costs them nothing
     const local = e.command && ['compact', 'clear', names.cache, names.keepwarm, names.board, names.handoff].includes(e.command.name)
-    // a prompt that passes straight through reaches the chat: not a local command, our own Resume (a plugin's) or the wake-up (committed above)
-    const through = () => {
-      if (!wake && !local && !(e.origin && e.origin.kind === 'plugin')) committed($)
-      return next(e)
+    // a message handed on and not dropped by a later hook reaches the chat: the unattended sends see it. Not a local command, nor this mod's own Resume or send. Whether it settles a pending resume is up to its request (turn.step)
+    const counts = !local && !(e.command && LOCAL_BUILTINS.has(e.command.name)) && !(e.origin && e.origin.kind === 'plugin' && e.origin.name === $.plugin.name)
+    const through = async () => {
+      const r = await next(e)
+      if (counts && !(r && r.drop)) submitsSeen++
+      else if (wake && r && r.drop) wakePending = false // dropped further down: no request of the wake-up's is on its way
+      return r
     }
     if (!settings.guard || !fromUser || !isCold || local || justCompacted || S.ctx < settings.bigTokens || e.turnId) return through()
     // an attachment's handle lives only while this submit is in flight: a resend after compacting would drop it
     const media = Array.isArray(e.attachments) && e.attachments.length > 0
-    if (wake) return worthCompacting() && !media ? compactThenSend($, e, true) : through()
+    if (wake) return worthCompacting() && !media ? compactThenSend($, e, true, true) : through()
     const cost = money(rewriteCost(S.ctx, S.model, ttl))
     const why = rotated ? `The account rotated to ${mask(S.seat || S.account) || 'another seat'}${rotatedAgo()}, so the cache is cold.` : `Cache went cold ${minutes(-left)} ago.`
     const floor = S.floor ? ` Compacting last left ${tokens(S.floor)}.` : ''
-    let answer = 'Send anyway'
-    sendsHeld++ // the dialog is open: a due resume waits
+    sendsHeld++ // the dialog is open: a due resume waits, until the send is handed on or given up
     try {
-      answer = await $.ui.ask(
-        `${why} Sending now rewrites ${tokens(S.ctx)} tokens of context (about ${cost}).${floor}${media ? ' (Compacting first would drop the attachment: run /compact yourself, then send again.)' : ''} What should happen?`,
-        media ? ['Send anyway', 'Cancel'] : ['Send anyway', 'Compact first, then send', 'Cancel'],
-      )
-    } catch {
-      // nobody to ask (a -p run, or the dialog was dismissed): send as typed
-      return through()
+      let answer = 'Send anyway'
+      try {
+        answer = await $.ui.ask(
+          `${why} Sending now rewrites ${tokens(S.ctx)} tokens of context (about ${cost}).${floor}${media ? ' (Compacting first would drop the attachment: run /compact yourself, then send again.)' : ''} What should happen?`,
+          media ? ['Send anyway', 'Cancel'] : ['Send anyway', 'Compact first, then send', 'Cancel'],
+        )
+      } catch {
+        // nobody to ask (a -p run, or the dialog was dismissed): send as typed
+        return await through()
+      }
+      // $.session.compact() is refused on SDK hosts (the desktop app), so this queues /compact. It takes its own hold, until it has sent or given up
+      if (answer === 'Compact first, then send') return compactThenSend($, e, false)
+      if (answer === 'Send anyway') return await through()
+      $.ui.toast('Not sent. A fresh session with a short handoff avoids the rewrite entirely.', { timeoutMs: 8000 })
+      return { drop: 'Cancelled by cache-keeper before a cold cache rewrite' }
     } finally {
       sendsHeld--
     }
-    // $.session.compact() is refused on SDK hosts (the desktop app), so this queues /compact
-    if (answer === 'Compact first, then send') {
-      committed($) // the send is decided: it settles the resume before it compacts
-      return compactThenSend($, e, false)
-    }
-    if (answer === 'Send anyway') return through()
-    $.ui.toast('Not sent. A fresh session with a short handoff avoids the rewrite entirely.', { timeoutMs: 8000 })
-    return { drop: 'Cancelled by cache-keeper before a cold cache rewrite' }
   })
 
   on('turn.start', async ($, e, next) => {
@@ -1365,7 +1379,9 @@ export function register(on, options = {}) {
   on('turn.step', async function* ($, e, next) {
     if (!e.agentId) {
       requestGen = identityGen
-      // a main-loop request started: what was sent reached the chat, so a pending resume is settled (our own "Resume" zeroes it before it sends). This also catches one armed by a stale failure while a committed send was still queued
+      // a main-loop request started: what was sent reached the chat, so a pending resume is settled (our own "Resume" zeroes it before it sends), and a wake-up's own request has arrived. Nothing else settles it: a prompt passing through, even the guard's Send anyway, may still be dropped or fail to start
+      wakePending = false
+      resumeHeld = false
       resumeFromReadings = false // settled: a later account change must not bring it back
       if (S.resumeAt) {
         S.resumeAt = 0
