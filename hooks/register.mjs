@@ -72,6 +72,8 @@ const alerted = new Map() // sessionId -> state or warning key already announced
 let paneOpen = false
 let justCompacted = false
 let compactedCold = false
+let identityRead = false // session.start has read the seat and account: a chat's record can be compared with them
+let pendingSeed = null // a startup SessionStart's transcript that came before that, seeded once it has
 let rotatedPending = false // a seat change, or a reopened chat's last request on another seat or account, that no request has landed on yet: this account's cache is empty
 let signedIn = null // whether this session has a first-party sign-in (an API-key session has none); null until checked
 let signCheckAt = 0
@@ -289,10 +291,22 @@ function ranElsewhere(r) {
   return !!r.account && !!S.account && r.account !== S.account
 }
 
-// A chat's record says its last request ran on another account, and was not overtaken by a later one
-// (the transcript's `at`, past the minute the two clocks may differ by, says nothing of where it ran)
-function ranBefore(last, at) {
-  return !!last && Math.max(last.at || 0, last.keptAt || 0) >= (at || 0) - MIN && ranElsewhere(last)
+// The one judge of a reopened, resumed or startup-seeded chat's cache, called once this process knows its own
+// identity. `found` is what the transcript says, `last` the chat's record, `rotationAt` a rotation this process saw.
+// The record decides where the last request ran when it can: it is not overtaken by a later request (the
+// transcript's `at`, past the minute the two clocks may differ by, says nothing of where it ran) and it names
+// a seat or account comparable with this process's. Only without one does this process's own rotation date it.
+// Sets rotatedPending and lastActivity; returns whether the rotation is dated (seen here, not found on the record).
+function judgeChat(found, last, rotationAt) {
+  const decides = !!last && Math.max(last.at || 0, last.keptAt || 0) >= (found.at || 0) - MIN && ((!!last.seat && !!S.seat && !!last.desktop === !onTerminal) || (!!last.account && !!S.account))
+  const dated = !decides && rotationAt > 0 && found.at > 0 && rotationAt > found.at
+  rotatedPending = decides ? ranElsewhere(last) : dated
+  if (!found.compacted) {
+    S.lastActivity = found.at // the cache's real age: the band and the cold-send guard read it
+    // keep-warm pings reach the cache but not the transcript: a record of the same chat size dates them
+    if (last && last.at > 0 && !ranElsewhere(last) && Math.abs(last.ctx - found.ctx) <= found.ctx * 0.05) S.lastActivity = Math.max(found.at || 0, last.at)
+  }
+  return dated
 }
 
 // The compacted size isn't known until the next request: keep the one before it, as rememberLast shapes it (keptAt dates an `at` of 0 for the prune)
@@ -746,7 +760,8 @@ async function rememberLast($) {
   }
 }
 
-async function seedFromTranscript($, path) {
+// `rotationAt` is a rotation this process saw before the chat was opened in it (0 when none)
+async function seedFromTranscript($, path, rotationAt) {
   let found = null
   try {
     const st = await $.fs.stat(path)
@@ -776,19 +791,14 @@ async function seedFromTranscript($, path) {
     }
   }
   if (!found) return
-  // a transcript newer than the record (past the minute their clocks may differ by) says nothing of where its request ran
-  if (ranBefore(last, found.at)) rotatedPending = true
   S.ctx = found.ctx
   if (found.model && !S.model) S.model = found.model // the session's own model wins: it may have been switched
   if (found.effort) S.effort = found.effort
+  if (judgeChat(found, last, rotationAt)) S.seatChangedAt = rotationAt
   if (found.compacted) {
     // the next request writes the compacted context whatever happens: nothing to ask
     S.floor = found.ctx
     markCompacted($)
-  } else {
-    S.lastActivity = found.at // the cache's real age: the band and the cold-send guard read it
-    // keep-warm pings reach the cache but not the transcript: a record of the same chat size dates them
-    if (last && last.at > 0 && !ranElsewhere(last) && Math.abs(last.ctx - found.ctx) <= found.ctx * 0.05) S.lastActivity = Math.max(found.at || 0, last.at)
   }
   $.ui.invalidate('ui.render')
 }
@@ -1024,6 +1034,7 @@ export function register(on, options = {}) {
     seatFile = seatPath ? seatPath.replace(/^~(?=[\\/])/, home).replace(/\\/g, '/') : ''
     await readSeat($)
     await readAccount($)
+    identityRead = true
     try {
       // the plan windows the status line already holds: free, and there before the first send
       const usage = await $.session.usage()
@@ -1044,35 +1055,35 @@ export function register(on, options = {}) {
     $.clock.every(HEARTBEAT_EVERY, () => tick($).catch(() => {}))
     await heartbeat($, true)
     $.clock.after(0, () => readFleet($).catch(() => {}).then(() => refreshPlan($)).then(() => $.ui.invalidate('ui.render')).catch(() => {}))
-    // The app reopens a chat without a SessionStart that names the transcript: find it by id
+    // A startup SessionStart that came first left its transcript for here, where the seat and account are known.
+    // The app reopens a chat without one that names the transcript: find it by id
+    const queued = pendingSeed
+    pendingSeed = null
     if (!S.ctx && S.id && S.cwd) {
       const config = ((await $.env.get('CLAUDE_CONFIG_DIR')) || `${home}/.claude`).replace(/\\/g, '/')
-      await seedFromTranscript($, `${config}/projects/${S.cwd.replace(/[^a-zA-Z0-9]/g, '-')}/${S.id}.jsonl`)
-    }
-    // a startup seed may have run before the seat and account were read above: judge its record again
-    if (S.id && S.lastActivity && !rotatedPending) {
-      try {
-        if (ranBefore(await $.store.get('last:' + S.id), S.lastActivity)) rotatedPending = true
-      } catch {
-        // store unavailable: the first request measures it
-      }
+      await seedFromTranscript($, queued || `${config}/projects/${S.cwd.replace(/[^a-zA-Z0-9]/g, '-')}/${S.id}.jsonl`, S.seatChangedAt)
     }
     return next(e)
   })
 
-  // /clear starts from an unknown cache; /resume and /branch are seeded from their transcript.
+  // /clear starts from an unknown cache; /resume is seeded from its transcript; /branch shares its parent's cache.
   // The process goes on under a new session id, and no session.start fires for it.
   on('classic.SessionStart', { source: ['clear', 'resume', 'fork'] }, async ($, e, next) => {
-    S.lastActivity = 0
-    // a cleared chat starts afresh; a resumed one is judged below, once seeded; a fork shares its parent's cache
-    if (e.source !== 'fork') rotatedPending = false
+    // a rotation this process saw dates a resumed chat only where its record cannot say; a cleared one starts afresh
+    const rotationAt = S.seatChangedAt
+    // the branch's first request reads the same cached prefix as its parent's: what the parent had stands
+    if (e.source !== 'fork') {
+      S.seatChangedAt = 0
+      rotatedPending = false
+      S.lastActivity = 0
+      // the last chat's compaction says nothing about this one, and would mute its cold-send guard
+      justCompacted = false
+      compactedCold = false
+      S.floor = 0
+      S.ctx = 0 // the last chat's size; a resumed chat's own is seeded below (a cleared one starts at 0)
+    }
     S.keepWarm = false
     H.armed = false
-    // the last chat's compaction says nothing about this one, and would mute its cold-send guard
-    justCompacted = false
-    compactedCold = false
-    S.floor = 0
-    S.ctx = 0 // the last chat's size; a resumed or forked chat's own is seeded below (a cleared one starts at 0)
     S.coldRestarts = [] // the new chat's own, from its record below
     // a resume armed in the last chat must not fire into this one
     S.resumeAt = 0
@@ -1084,17 +1095,15 @@ export function register(on, options = {}) {
       // keep the old id
     }
     S.label = basename(S.cwd)
-    if (e.source === 'resume' || e.source === 'fork') {
-      await seedFromTranscript($, e.transcript_path)
-      // a seeded last request older than the rotation ran on the other account: this seat's cache is cold
-      rotatedPending = rotatedPending || (S.seatChangedAt > 0 && S.lastActivity > 0 && S.seatChangedAt > S.lastActivity)
-    }
+    if (e.source === 'resume') await seedFromTranscript($, e.transcript_path, rotationAt)
     return next(e)
   })
 
   // A session opened with its history (the app reopening an old chat, claude --continue)
   on('classic.SessionStart', { source: ['startup'] }, async ($, e, next) => {
-    await seedFromTranscript($, e.transcript_path)
+    // before session.start has read the seat and account, the record cannot be compared: seed there
+    if (identityRead) await seedFromTranscript($, e.transcript_path, S.seatChangedAt)
+    else pendingSeed = e.transcript_path
     return next(e)
   })
 

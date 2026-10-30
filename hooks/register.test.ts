@@ -826,3 +826,87 @@ test('a branch keeps its parent\'s pending "ran elsewhere" cold; a clear drops i
   r = await $.command.run({ command: 'cache', args: '' })
   expect(r.text).not.toMatch(/account rotated/)
 })
+
+test('a startup seed before the session starts still reads the chat\'s record: a keep-warm ping dates the cache', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const disk: { files: Record<string, string> } = { files: {} }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  answer(on, seen, 'Send anyway')
+  on('classic.SessionStart', () => ({}))
+  await clock.advance(60000)
+  const replied = await clock.now()
+  await clock.advance(3 * 60 * 60000)
+  // the transcript's last reply is hours old; the record's `at` is a ping 10 minutes ago, on the same seat
+  disk.files['sid-test.jsonl'] = reply(replied, 300000)
+  kept.set('last:sid-test', { ctx: 300004, at: (await clock.now()) - 10 * 60000, model: 'claude-opus-5-5', seat: 'A', desktop: false })
+  await ($ as any).classic.SessionStart({ source: 'startup', transcript_path: '/h/sid-test.jsonl' })
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/Cache is warm/)
+  await $.prompt.submit({ text: 'carry on', origin: COMPOSER, wait: false } as never)
+  expect(seen.asks).toBe(0)
+})
+
+test('a resume whose record ran on the seat this process rotated to is warm, whatever the rotation time says', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const seat = { label: 'A' }
+  const { clock, seen } = engine($, on, seat, kept)
+  answer(on, seen, 'Send anyway')
+  on('classic.SessionStart', () => ({}))
+  await clock.advance(30 * 60000)
+  await start($, 100000, clock)
+  // chat X answered on seat B by another process 5 minutes before this one rotated to B
+  const xAt = (await clock.now()) - 5 * 60000
+  seat.label = 'B'
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: xAt, model: 'claude-opus-5-5', seat: 'B', desktop: false })
+  await ($ as any).classic.SessionStart({ source: 'resume' })
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/account rotated/)
+  await $.prompt.submit({ text: 'carry on', origin: COMPOSER, wait: false } as never)
+  expect(seen.asks).toBe(0)
+})
+
+test('a resume of a chat that ran on another seat is not dated by an earlier rotation of this process', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const seat = { label: 'A' }
+  const { clock } = engine($, on, seat, kept)
+  const step = stepper($, on)
+  on('classic.SessionStart', () => ({}))
+  await start($, 100000, clock)
+  seat.label = 'B'
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  await step(usage({ cache_read_input_tokens: 100000 }))
+  await clock.advance(5 * 60 * 60000)
+  kept.set('last:sid-test', { ctx: 300000, at: (await clock.now()) - 2 * 60000, model: 'claude-opus-5-5', seat: 'C', desktop: false })
+  await ($ as any).classic.SessionStart({ source: 'resume' })
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/account rotated.* since its last request/)
+  expect(r.text).not.toMatch(/5h/)
+})
+
+test('a branch of a chat kept warm by pings stays warm: it shares its parent\'s cache', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const disk: { files: Record<string, string> } = { files: {} }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  answer(on, seen, 'Send anyway')
+  on('classic.SessionStart', () => ({}))
+  on('model.fork', () => ({ value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }))
+  const step = stepper($, on)
+  await start($, 300000, clock)
+  await step(usage({ cache_read_input_tokens: 300000 }))
+  const replied = await clock.now()
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  // keep warm pings the parent for hours: the transcript's last reply is far older than the cache
+  await clock.advance(3 * 60 * 60000)
+  let r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/Keep warm is on/)
+  disk.files['fork.jsonl'] = reply(replied, 300000)
+  kept.delete('last:sid-test') // the branch has a new id, so no record of its own
+  await ($ as any).classic.SessionStart({ source: 'fork', transcript_path: '/h/fork.jsonl' })
+  r = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/Cache is warm/)
+  await $.prompt.submit({ text: 'carry on', origin: COMPOSER, wait: false } as never)
+  expect(seen.asks).toBe(0)
+})
