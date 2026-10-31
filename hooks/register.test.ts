@@ -8,13 +8,14 @@ const SETUP = { options: { seatFileTerminal: '~/.claude-cli-accounts/.active', s
 
 // The engine beneath the mod: a terminal session on seat A, nothing on disk but the seat file
 // `disk` adds files by name (a transcript, the account file); `holdAccount` makes reading the account file wait, `holdEnv` an environment read (its name and how many times that name was read), `hold` a named file's
-function engine($: any, on: any, seat: { label: string; recording?: string } = { label: 'A' }, kept?: Map<string, unknown>, onGet?: (key: string) => Promise<void> | void, disk: { files?: Record<string, string>; holdAccount?: Promise<void>; hold?: Record<string, Promise<void>>; hangSet?: (key: string) => boolean; id?: string; holdEnv?: (name: string, nth: number) => Promise<void> | void; messages?: { role: string; text: string }[] } = {}) {
+function engine($: any, on: any, seat: { label: string; recording?: string } = { label: 'A' }, kept?: Map<string, unknown>, onGet?: (key: string) => Promise<void> | void, disk: { files?: Record<string, string>; holdAccount?: Promise<void>; hold?: Record<string, Promise<void>>; hangSet?: (key: string) => boolean; holdSet?: (key: string) => Promise<void> | undefined; id?: string; holdEnv?: (name: string, nth: number) => Promise<void> | void; messages?: { role: string; text: string }[] } = {}) {
   const clock = mock.clock(on)
   if (kept) {
     // a store already holding what an earlier run of this mod wrote
     on('store.get', async (_: unknown, e: any) => (await onGet?.(e.key), { value: kept.get(e.key) }))
     on('store.set', async (_: unknown, e: any) => {
       if (disk.hangSet?.(e.key)) await new Promise(() => {}) // a store call that never settles
+      await disk.holdSet?.(e.key) // a store call that settles when the test lets it
       kept.set(e.key, e.value)
       return { value: undefined }
     })
@@ -6437,4 +6438,115 @@ test('a size reported during a seed that falls back on the stored record is not 
   expect(await bandText($, /Ctx \d/)).toMatch(/^Ctx 280k/) // not the pre-compaction 590k
   const c: any = await $.command.run({ command: 'cache', args: '' })
   expect(c.text).toMatch(/Cold restarts in this chat: 2/) // the cold history still lands
+})
+// NEW-TESTS-BEGIN (batch 47)
+// An app reopen has no queued seed: session.start takes its mark itself. A size reported while it reads (the account file) is the chat's real one, and the compacted record's pre-compaction size must not replace it
+test('a size reported while session.start reads, with no queued seed, is not replaced by a compacted record\'s', SETUP, async ($, on) => {
+  let release: () => void = () => {}
+  const kept = new Map<string, unknown>()
+  const disk: any = { files: {}, holdAccount: undefined }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  answer(on, seen, 'Send anyway')
+  on('ui.render', engineDraws)
+  on('classic.SessionStart', () => ({}))
+  await clock.advance(60000)
+  const t0 = await clock.now()
+  kept.set('last:sid-test', { ctx: 590004, at: 0, keptAt: t0 - 10 * 60000, model: 'claude-opus-5-5', seat: 'A', desktop: false, cold: COLD_HISTORY(t0) }) // compacted: the size kept is the one before
+  disk.holdAccount = new Promise<void>((r) => (release = r))
+  const started = $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await clock.advance(10)
+  await $.session.measure({ context: { tokens: 280000, window: 1000000, percent: 28 }, rateLimits: [], changed: [] })
+  disk.holdAccount = undefined
+  release()
+  await started
+  await clock.advance(10)
+  expect(await bandText($, /Ctx \d/)).toMatch(/^Ctx 280k/) // not the pre-compaction 590k
+  const c: any = await $.command.run({ command: 'cache', args: '' })
+  expect(c.text).toMatch(/Cold restarts in this chat: 2/) // the cold history still lands
+})
+
+// A write that timed out is a failed one: when its step goes on and settles after a newer record was written, it must not write the older record over it
+test('a timed-out record write whose stored-history read settles late does not overwrite a newer record', SETUP, async ($, on) => {
+  let mode = ''
+  let releaseLate: () => void = () => {}
+  const kept = new Map<string, unknown>()
+  const disk: any = { files: {} }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, async (key) => {
+    if (key !== 'last:sid-test') return
+    if (mode === 'fail') throw new Error('locked')
+    if (mode === 'hangOnce') {
+      mode = ''
+      await new Promise<void>((r) => (releaseLate = r))
+    }
+  }, disk)
+  answer(on, seen, 'Send anyway')
+  const req = heldRequest($, on)
+  on('classic.SessionStart', () => ({}))
+  await start($, 300000, clock)
+  mode = 'fail'
+  await ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/none.jsonl' }) // the seed cannot read the store: the hold stays
+  mode = 'hangOnce'
+  req.begin()
+  const first = req.finish(usage({ cache_read_input_tokens: 310000 })) // its write waits on the stored history, which does not answer
+  await clock.advance(6000)
+  await first
+  expect(kept.get('last:sid-test')).toBeUndefined()
+  req.begin()
+  const second = req.finish(usage({ cache_read_input_tokens: 320000 }))
+  await clock.advance(100)
+  await second
+  expect((kept.get('last:sid-test') as { ctx: number }).ctx).toBe(320010)
+  releaseLate() // the first write's read answers now
+  await clock.advance(100)
+  expect((kept.get('last:sid-test') as { ctx: number }).ctx).toBe(320010) // not the older 310010
+})
+
+// The same for a store.set that is itself stuck and lands after a newer write: the newest record is written again
+test('a stuck record set that lands after a newer record was written is followed by the newest again', SETUP, async ($, on) => {
+  let hangFirst = false
+  const releases: (() => void)[] = []
+  const kept = new Map<string, unknown>()
+  const disk: any = { files: {}, holdSet: (key: string) => (key === 'last:sid-test' && hangFirst ? ((hangFirst = false), new Promise<void>((r) => releases.push(r))) : undefined) }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  answer(on, seen, 'Send anyway')
+  const req = heldRequest($, on)
+  on('classic.SessionStart', () => ({}))
+  await start($, 300000, clock)
+  hangFirst = true
+  req.begin()
+  const first = req.finish(usage({ cache_read_input_tokens: 310000 })) // its set stays out until released, then lands
+  await clock.advance(6000)
+  await first
+  req.begin()
+  const second = req.finish(usage({ cache_read_input_tokens: 320000 }))
+  await clock.advance(100)
+  await second
+  expect((kept.get('last:sid-test') as { ctx: number }).ctx).toBe(320010)
+  expect(releases.length).toBe(1)
+  releases.forEach((r) => r()) // the first set lands now: over the newer record, which is then written again
+  await clock.advance(100)
+  expect((kept.get('last:sid-test') as { ctx: number }).ctx).toBe(320010)
+})
+
+// Every store call a turn.start or a session.start waits on is bounded: a store that never answers does not hang them for good
+test('a store that never answers does not hang turn.start (heartbeat) or session.start (the seed\'s reads)', SETUP, async ($, on) => {
+  let hang = false
+  const kept = new Map<string, unknown>()
+  const disk: any = { files: {}, hangSet: (key: string) => hang && key.startsWith('hb:') }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, async (key) => { if (hang && (key.startsWith('last:') || key.startsWith('hb:'))) await new Promise(() => {}) }, disk)
+  answer(on, seen, 'Send anyway')
+  on('turn.start', () => ({ turnId: 't1' }))
+  await clock.advance(60000)
+  hang = true
+  let started = false
+  const s = $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true }).then(() => { started = true })
+  for (let i = 0; i < 6 && !started; i++) await clock.advance(5000) // the heartbeat's set, then the seed's reads, each bounded
+  expect(started).toBe(true)
+  await s
+  await clock.advance(10000)
+  let began = false
+  const t = ($ as any).turn.start({ turnId: 't1', messages: [] }).then(() => { began = true })
+  for (let i = 0; i < 3 && !began; i++) await clock.advance(5000)
+  expect(began).toBe(true)
+  await t
 })

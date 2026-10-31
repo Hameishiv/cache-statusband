@@ -1254,7 +1254,7 @@ async function heartbeat($, force) {
     // agent list unavailable: keep the last count
   }
   try {
-    await $.store.set('hb:' + S.id, myHeartbeat())
+    await bounded($, () => $.store.set('hb:' + S.id, myHeartbeat()), WRITE_LIMIT) // one that never answers is a failed beat
   } catch {
     // another session holds the store's lock: the next beat writes it
   }
@@ -1431,7 +1431,8 @@ function mergeCold(...lists) {
 }
 
 let coldSeedChat = null // { chat, id, list }: the cold history stored for a chat, once read (by its seed or by the first record written while the seed had not merged it), so a record written meanwhile merges it without another read. Reset whenever a seed is awaited (holdStoredCold)
-let writeChain = Promise.resolve() // the chat's records go to the store in the order they were issued: one waiting on the stored history must not be overtaken by a later one
+let writeChain = Promise.resolve() // the chat's records: each one's write starts when the one before it has finished or timed out (WRITE_LIMIT), so one waiting on the stored history is not overtaken by a later one. A write that timed out writes nothing more (its late flag, in writeRecord): a step that settles late cannot put an older record over a newer. A store.set that was already issued and lands late can: writeRecord then writes the newest issued record again (lastIssued), so the store ends on it. What stays open: two sets of the store's that are both out at once may land in either order, and a store that never answers loses the record (the next request writes it)
+let lastIssued = null // { key, value }: the newest record a write has handed to store.set, for the one that lands late over it
 const WRITE_LIMIT = 5000 // a store call that has not answered by then is a failed write: the chain goes on without it, as turn.step awaits it (rememberLast)
 
 // The chat's stored cold history is now awaited by its seed: a record written before the seed has merged it merges it too (coldToKeep)
@@ -1440,14 +1441,14 @@ function holdStoredCold(chat) {
   coldSeedChat = null
 }
 
-// Reads what is stored for the chat once and keeps it (coldSeedChat); merged into this process's own list, which a seed that could not read it then no longer waits for. False when it could not be read (another session holds the store's lock): then nothing is known of the stored history.
+// Reads what is stored for the chat once and keeps it (coldSeedChat); merged into this process's own list, which a seed that could not read it then no longer waits for. Returns the list it read (the caller merges from it, not from coldSeedChat, which a seed or a resume can reset meanwhile), or null when it could not be read (another session holds the store's lock): then nothing is known of the stored history.
 async function loadStoredCold($, chat, id) {
-  if (coldSeedChat && coldSeedChat.chat === chat && coldSeedChat.id === id) return true
+  if (coldSeedChat && coldSeedChat.chat === chat && coldSeedChat.id === id) return coldSeedChat.list
   let stored = null
   try {
     stored = await $.store.get('last:' + id)
   } catch {
-    return false
+    return null
   }
   const list = stored && Array.isArray(stored.cold) ? stored.cold : []
   coldSeedChat = { chat, id, list }
@@ -1458,7 +1459,7 @@ async function loadStoredCold($, chat, id) {
     if (coldSeedPending === chat) coldSeedPending = null
     if (changed) $.ui.invalidate('ui.render')
   }
-  return true
+  return list
 }
 
 // Writes a chat's record with its cold history, after the ones issued before it. The record is built by the caller in one go (what the request measured and where it ran, as of one moment), and so is the list of cold rewrites it carries: this process's own at that moment. While the chat's seed has not merged the stored history, that is merged into the list too, so a shorter one never replaces what is stored; when the stored history cannot be read the record is not written (the next request writes it).
@@ -1467,18 +1468,27 @@ function writeRecord($, record) {
   const chat = msgChat
   const own = S.coldRestarts.slice(-COLD_KEEP)
   const merge = coldSeedPending === chat
-  const run = writeChain.then(() => bounded($, async () => {
-    try {
-      let cold = own
-      if (merge) {
-        if (!(await loadStoredCold($, chat, id))) return
-        cold = mergeCold(coldSeedChat.list, own)
+  const run = writeChain.then(() => {
+    let late = false // this step has timed out: it goes on in the background, and a newer record may have been written since
+    return bounded($, async () => {
+      try {
+        let cold = own
+        if (merge) {
+          const stored = await loadStoredCold($, chat, id)
+          if (!stored) return
+          cold = mergeCold(stored, own)
+        }
+        if (late) return
+        const mine = { key: 'last:' + id, value: { ...record, cold } }
+        lastIssued = mine
+        await $.store.set(mine.key, mine.value)
+        // this set landed after its step timed out, perhaps over a record written since: the newest goes in again
+        if (late && lastIssued !== mine && lastIssued.key === mine.key) await $.store.set(lastIssued.key, lastIssued.value)
+      } catch {
+        // another session holds the store's lock: the next request writes it
       }
-      await $.store.set('last:' + id, { ...record, cold })
-    } catch {
-      // another session holds the store's lock: the next request writes it
-    }
-  }, WRITE_LIMIT).catch(() => {})) // one that never answers (TIMED_OUT) is a failed write too
+    }, WRITE_LIMIT).then((r) => { if (r === TIMED_OUT) late = true }).catch(() => {}) // one that never answers (TIMED_OUT) is a failed write too
+  })
   writeChain = run
   return run
 }
@@ -1516,7 +1526,8 @@ async function seedFromTranscript($, path, from = seedMark()) {
   let storeRead = true
   const id = S.id
   try {
-    last = id ? await $.store.get('last:' + id) : null
+    last = id ? await bounded($, () => $.store.get('last:' + id), WRITE_LIMIT) : null
+    if (last === TIMED_OUT) throw new Error('store did not answer') // as a failed read
   } catch {
     last = null
     storeRead = false // what is stored is unknown: a record written meanwhile is not written (writeRecord) until it has been read
@@ -1534,7 +1545,8 @@ async function seedFromTranscript($, path, from = seedMark()) {
   if (!found && S.id && !measured()) {
     try {
       // before its first record, a chat open under an earlier version still has its heartbeat
-      const hb = last ? null : await $.store.get('hb:' + S.id)
+      let hb = last ? null : await bounded($, () => $.store.get('hb:' + S.id), WRITE_LIMIT)
+      if (hb === TIMED_OUT) hb = null // as a failed read
       const r = last || (hb && { ctx: hb.ctx, at: hb.lastActivity, model: hb.model, effort: hb.effort })
       if (gone()) return
       // an `at` of 0 was written between a compaction and the next request
@@ -1841,7 +1853,9 @@ export function register(on, options = {}) {
   cfg.prPattern = pattern(options.prPattern)
   cfg.autoResume = options.autoResume === true
   on('session.start', async ($, e, next) => {
-    const chat = msgChat // a /clear or a resume of another chat while this reads: what it reads is the old chat's
+    // taken before the first await, with the chat: the ~20 reads below can outlast a /clear, a resume of another chat, a session.measure or a request, and each of those counts for a seed that has no queued one (a /clear or resume: what it reads is the old chat's)
+    const marked = seedMark()
+    const chat = marked.chat
     now = await $.clock.now()
     home = (await $.env.get('USERPROFILE')) || (await $.env.get('HOME')) || ''
     S.id = await $.session.id()
@@ -1892,9 +1906,9 @@ export function register(on, options = {}) {
     // The app reopens a chat without one that names the transcript: find it by id
     // the chat and the request counts are taken here, with the queued seed, before the env read: the env read below can outlast a /clear, and a seed for the cleared chat's id must not land in it
     const queued = pendingSeed
-    const seedFrom = queued || { ...seedMark(), chat }
+    const seedFrom = queued || marked
     pendingSeed = null
-    // not gated on S.ctx: a session.measure or turn.complete can set it without measuring the chat's request (measuredSteps), and the seed itself leaves to a request that did measure what that wrote (seedFromTranscript)
+    // not gated on S.ctx: a session.measure or turn.complete can set it without measuring the chat's request (measuredSteps), and the seed itself leaves to a request that did measure what that wrote, and keeps a size reported since over a stored record's (seedFromTranscript): both counted from the mark taken when this session.start began, or from the queued seed's
     // a resume that landed while this waited replaced the chat and made its own seed (and its hold on the stored history): this one is the old chat's, and must not undo that hold
     if (S.id && S.cwd && seedFrom.chat === msgChat) {
       holdStoredCold(seedFrom.chat) // until the seed has merged the chat's stored cold history, a record written first keeps it
