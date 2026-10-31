@@ -12,7 +12,7 @@ It does **not** pretend Codex exposes a custom footer renderer, a prompt-cache w
 
 - Codex CLI with plugin and hook support (tested with `codex-cli 0.165.0`).
 - Node.js 20 or newer.
-- PowerShell 7 for the provided installer.
+- PowerShell 7.2 or newer for the provided installer.
 
 ## Install on Windows
 
