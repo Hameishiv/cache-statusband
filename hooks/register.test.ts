@@ -2504,8 +2504,8 @@ async function bandResume($: any) {
   return seg ? String(seg.text).trim() : null
 }
 // The Resume has fallen due on a big chat that has been cold for a while: its compaction is running
-async function resumeCompacting($: any, on: any, before?: () => void) {
-  const e = engine($, on)
+async function resumeCompacting($: any, on: any, before?: () => void, disk?: { files: Record<string, string> }) {
+  const e = engine($, on, undefined, undefined, undefined, disk)
   on('ui.render', engineDraws)
   before?.()
   on('classic.StopFailure', () => ({}))
@@ -4629,7 +4629,7 @@ test('a fill that is rejected late keeps the Resume hold when the box cannot be 
 
 // The fill's answer comes just after the bound, before the hold is set: the hold is then set over an answer that is already in
 test('a fill answered "not filled" just after the bound, before the hold is set, starts no hold that outlives it: the Resume goes', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
-  const { clock, seen } = await resumeLateFill($, on, { held: false, fillHook: async (_e: any, clk: any) => { await clk.advance(2000); return { isFilled: false } } })
+  const { clock, seen } = await resumeLateFill($, on, { held: false, fillHook: async (_e: any, clk: any) => { await clk.sleep(2000); return { isFilled: false } } })
   await clock.advance(10 * 60000)
   expect(seen.submits).toEqual(['Resume'])
 })
@@ -4900,8 +4900,8 @@ test('a /clear while the put-back is being filled still quotes what the fill lef
 })
 
 // ----- a branch carries the conversation on: the Resume with it -----
-async function resumeBranching($: any, on: any, before?: () => void) {
-  return resumeCompacting($, on, () => { on('classic.SessionStart', () => ({})); before?.() })
+async function resumeBranching($: any, on: any, before?: () => void, disk?: { files: Record<string, string> }) {
+  return resumeCompacting($, on, () => { on('classic.SessionStart', () => ({})); before?.() }, disk)
 }
 
 test('a pending Resume survives a /branch and goes', { options: { autoResume: true } }, async ($, on) => {
@@ -4935,12 +4935,12 @@ test('a typed /branch while the Resume compacts is no message sent meanwhile: th
 })
 
 // The typed /branch replaced the text in the box, so the message put back is gone from it: a due Resume has nothing to wait for. A fork that did not come from a typed command (nothing was submitted) keeps the hold
-async function resumeHeldByPutBack($: any, on: any) {
+async function resumeHeldByPutBack($: any, on: any, disk?: { files: Record<string, string> }) {
   let log: ReturnType<typeof askLog> | null = null
   const r = await resumeBranching($, on, () => {
     log = askLog(on) // "Compact first" for 'hello'; the first answer offered otherwise (Send anyway) for the cold-send dialog a typed command would get if it counted as a send
     on('prompt.fill', () => ({ isFilled: true }))
-  })
+  }, disk)
   let n = 0
   r.seen.duringCompact = () => (++n === 1 ? new Promise(() => {}) : Promise.resolve())
   await r.clock.advance(91 * 60000 + 1000)
@@ -5200,19 +5200,33 @@ test('a rotator wake-up submitted from the composer takes the box text: the put-
   expect(fills).toEqual(['one', WAKE_TEXT]) // not 'one\n\n' + WAKE_TEXT
 })
 
-test('a rotator wake-up submitted from the composer ends the hold of a filled put-back, and its own hold (the wake-up\'s request has not started) keeps the Resume back until it does', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
-  const { clock, seen } = await resumeHeldByPutBack($, on)
-  const refused = () => seen.toasts.filter((t) => /Resume was not sent/.test(t)).length
+// The account is known to have moved (no seat file, so nothing is left unknown): only the wake-up's own hold keeps the Resume back
+async function wakeOverPutBack($: any, on: any) {
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const r = await resumeHeldByPutBack($, on, disk)
+  disk.files['.claude.json'] = account('b@x')
+  const refused = () => r.seen.toasts.filter((t: string) => /Resume was not sent/.test(t)).length
   const before = refused()
   await $.prompt.submit({ text: WAKE_TEXT, origin: COMPOSER, turnId: 't1', wait: false } as never) // typed over a running request: handed on as it is
-  await clock.advance(2 * 60000)
-  expect(await bandText($, /⏸ Resume waits for your message/)).toBeNull() // the box text went with the submit: nothing to wait for
+  return { ...r, refused, before }
+}
+
+// (A wake-up handed on also moves realSends and sets a pending send, which end the put-back hold and hold the Resume by themselves: these two guard the behaviour, they do not isolate the composer rule or wakePendingId from those)
+test('a rotator wake-up submitted from the composer over a filled put-back: once its own hold is over (3 minutes, no request) the Resume is tried again', RESUME_WAKE, async ($, on) => {
+  const { clock, refused, before } = await wakeOverPutBack($, on)
+  await clock.advance(5 * 60000)
+  expect(refused()).toBeGreaterThan(before) // the put-back's hold went with the box text: nothing keeps the Resume back now (the abandoned compaction still refuses it)
+})
+
+test('a rotator wake-up submitted from the composer over a filled put-back holds the Resume until its own request starts: no try meanwhile, and none after', RESUME_WAKE, async ($, on) => {
+  const { clock, seen, refused, before } = await wakeOverPutBack($, on)
+  await clock.advance(60000)
+  expect(refused()).toBe(before) // inside the wake-up's hold
   expect(seen.submits).not.toContain('Resume')
-  expect(refused()).toBe(before) // and no try of the Resume: the wake-up's request has not started
-  await mainStep($) // it starts
+  await mainStep($) // its request starts: it settles the Resume
   await clock.advance(10 * 60000)
-  expect(seen.submits).not.toContain('Resume') // its turn settled the Resume
   expect(refused()).toBe(before)
+  expect(seen.submits).not.toContain('Resume')
 })
 
 test('a typed /branch on a cold big chat opens no cold-send dialog and compacts nothing', SETUP, async ($, on) => {
