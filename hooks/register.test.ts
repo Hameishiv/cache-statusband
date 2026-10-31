@@ -7962,14 +7962,51 @@ test('while a ping is out the later ticks send no second one', async ($, on) => 
   expect(await keepWarmLine($)).toMatch(PAID)
 })
 
-test('a ping with no answer in a minute counts as no answer: keep warm stops, and starting it again may ping again', async ($, on) => {
+// the date the chat's last request is recorded at (what a ping that answered moves)
+const recordedAt = (kept: Map<string, any>) => { const r = kept.get('last:sid-A'); return (typeof r === 'string' ? JSON.parse(r) : r).at as number }
+
+test('a ping that never settles stops keep warm once the cache it was to save is gone (its margin, 8 minutes on a 1-hour cache), not at a minute; starting it again may ping again', async ($, on) => {
   const { clock, seen, hold } = await heldPing($, on)
-  await clock.advance(61000)
+  await clock.advance(61000) // a minute: the old bound
+  expect(seen.toasts.filter((t) => /Keep warm off/.test(t)).length).toBe(0)
+  expect(await keepWarmLine($)).toBeDefined()
+  expect(hold.pings).toBe(1)
+  await clock.advance(8 * 60000) // past the margin
   expect(seen.toasts.filter((t) => /Keep warm off \(the ping got no answer/.test(t)).length).toBe(1)
   expect(await keepWarmLine($)).toBeUndefined()
   await $.command.run({ command: 'keepwarm', args: '1' }) // the stuck ping no longer blocks a new one
   await clock.advance(31000)
   expect(hold.pings).toBe(2)
+})
+
+test('a ping that takes 90 seconds on a 1-hour cache keeps keep warm on, is counted, dates the chat, and no second ping goes meanwhile', async ($, on) => {
+  const { clock, seen, kept, hold } = await heldPing($, on)
+  const before = recordedAt(kept)
+  await clock.advance(85000) // 90 s since it went
+  expect(seen.toasts.filter((t) => /Keep warm off/.test(t)).length).toBe(0)
+  expect(await keepWarmLine($)).toBeDefined()
+  expect(hold.pings).toBe(1)
+  hold.release()
+  await clock.advance(1000)
+  expect(hold.pings).toBe(1)
+  expect(await keepWarmLine($)).toMatch(PAID)
+  expect(recordedAt(kept)).toBeGreaterThan(before)
+  expect(seen.toasts.filter((t) => /Keep warm off/.test(t)).length).toBe(0)
+})
+
+test('a ping that answers after its backstop is counted, and dates nothing and restarts nothing', async ($, on) => {
+  const { clock, seen, kept, hold } = await heldPing($, on)
+  await clock.advance(8 * 60000) // past the margin: no answer, keep warm stopped
+  expect(await keepWarmLine($)).toBeUndefined()
+  const recordBefore = JSON.stringify(kept.get('last:sid-A'))
+  hold.release()
+  await clock.advance(1000)
+  expect(JSON.stringify(kept.get('last:sid-A'))).toBe(recordBefore)
+  expect(await keepWarmLine($)).toBeUndefined() // not restarted
+  expect(hold.pings).toBe(1)
+  expect(seen.toasts.filter((t) => /Keep warm off/.test(t)).length).toBe(1) // the one at the backstop
+  await $.command.run({ command: 'keepwarm', args: '1' })
+  expect(await keepWarmLine($)).toMatch(PAID) // but it was billed: counted
 })
 
 test('a rotation while a ping is out: the ping is counted, but nothing of it dates the new account\'s cache', SETUP, async ($, on) => {
@@ -8043,4 +8080,38 @@ test('a keep warm started by hand that reaches its end on a rotated chat does no
   expect(seen.toasts.filter((t) => /Keep warm off \(time limit reached\)/.test(t)).length).toBe(1)
   expect(seen.toasts.filter((t) => /now runs as auto keep warm/.test(t)).length).toBe(0)
   expect(await keepWarmLine($)).toBeUndefined()
+})
+
+// ===== review round 60: a request that began before a rotation must not end it =====
+test('a wake-up rotation while a request is out: when that old request ends the cache still reads rotated/cold, and the cold-send guard still asks', SETUP, async ($, on) => {
+  const seat = { label: 'A' }
+  const { clock, seen } = engine($, on, seat)
+  answer(on, seen, 'Send anyway')
+  let release: () => void = () => {}
+  const gate = new Promise<void>((r) => (release = r))
+  on('turn.step', async function* () {
+    await gate
+    return { answer: '', toolUses: [], usage: usage({ cache_read_input_tokens: 300000 }) }
+  })
+  on('turn.complete', () => ({ text: '' }))
+  await start($, 300000, clock)
+  await $.command.run({ command: 'cache', args: 'guard off' }) // the wake-up goes in as it is: no compaction to end the rotation
+  const request = mainStep($) // began on account A
+  await clock.advance(10) // it is out
+  seat.label = 'B'
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never) // the wake-up is typed while it runs
+  await clock.advance(1000)
+  await $.command.run({ command: 'cache', args: 'guard on' })
+  const asked = seen.asks
+  expect(asked).toBe(0)
+  release()
+  await request // the old request ends, on the old account
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/Cache is cold|went cold/)
+  await $.prompt.submit({ text: 'and then?', origin: COMPOSER, wait: false } as never)
+  expect(seen.asks).toBe(asked + 1) // still a cold send: asks again
+  // control: a request that begins after the rotation does end it
+  await mainStep($)
+  const after: any = await $.command.run({ command: 'cache', args: '' })
+  expect(after.text).not.toMatch(/Cache is cold|went cold/)
 })

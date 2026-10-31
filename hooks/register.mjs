@@ -1744,11 +1744,19 @@ function stopKeepWarm($, why) {
   $.ui.toast(`Keep warm off (${why}). ${S.pings} ping(s), ${money(S.pingUsd)}.`, { timeoutMs: 8000 })
 }
 
-// A keep-warm ping (a fork) is out: no second one goes while it is, however many ticks come (a tick does not wait for the step before it), and it is not waited for for ever: PING_LIMIT, then it counts as no answer
-let pingOut = false
+// A keep-warm ping (a fork) is out: no second one goes while it is, however many ticks come (a tick does not wait for the step before it).
+// Its settling is the real signal, as for fillOut: a ping that is slow is waited for (a tick waits PING_LIMIT for it, then goes on, and what the ping finds is applied when it does settle). The backstop is the ping's own margin, the time the cache had left when it went: a ping still out then has not saved the cache that the chat can count on, so it counts as no answer (keep warm stops, the slot is free), and an answer after that is counted (it was billed) and does nothing else.
+// { at, limit, moved, lost }: when it went, its backstop, whether the chat/account/keep warm changed since it went, and whether the backstop has passed
+let pingOut = null
 const PING_LIMIT = 60000
 
 async function keepWarmStep($) {
+  if (pingOut && now - pingOut.at >= pingOut.limit) {
+    const lost = pingOut
+    lost.lost = true
+    pingOut = null
+    if (!lost.moved()) stopKeepWarm($, 'the ping got no answer, so the cache may already be cold')
+  }
   if (!S.keepWarm || pingOut) return
   // The chat, compaction and account counts this step began with. A /clear, a resume of another chat, a compaction, a rotation or an off that lands while a read or the ping is out makes what comes back the old chat's or the old account's: its date and record are not written (a fork shares the cache and does not move msgChat). A ping that came back was billed whatever happened meanwhile, and is counted all the same (below)
   const chat = msgChat
@@ -1808,43 +1816,48 @@ async function keepWarmStep($) {
   // What this ping is for, taken before it goes: whether it is auto keep warm's, and the idle stretch (chat) its cost is counted in. A resume, a /clear or an off while it is out changes S, not this
   const auto = S.keepWarmAuto
   const capFor = S.capId || S.id
-  let reply = null
-  pingOut = true
-  try {
-    reply = await bounded($, () => $.model.fork({ prompt: 'cache-keeper keep-alive ping. Reply with only: ok' }), PING_LIMIT)
-    if (reply === TIMED_OUT) reply = null
-  } catch {
-    reply = null
-  } finally {
-    pingOut = false
-  }
-  if (!reply || !reply.usage) {
-    if (moved()) return
-    return stopKeepWarm($, 'the ping got no answer, so the cache may already be cold')
-  }
-  const u = reply.usage
-  // The ping was billed: it is counted whether or not the chat, the account or keep warm itself changed while it was out. The cap counts it only while the chat is still the one it was sent in (the same id again is the same idle stretch; another id began a new one)
-  S.pings += 1
-  S.lastPingAt = now
-  const pingCost = requestCost(u, S.model, ttl)
-  S.pingUsd += pingCost
-  if (auto && (S.capId || S.id) === capFor) {
-    S.autoPingUsd += pingCost
-    S.capId = capFor
-  }
-  if (moved()) return
-  // A ping that writes instead of reading did not hit the cache: stop paying for it
-  if ((u.cache_creation_input_tokens || 0) > 0.1 * Math.max(1, u.cache_read_input_tokens || 0)) {
-    return stopKeepWarm($, `the ping wrote ${tokens(u.cache_creation_input_tokens)} tokens instead of reading the cache`)
-  }
-  S.lastActivity = now
-  await rememberLast($)
-  if (moved()) return
-  // Auto keep warm only pays while it costs less than the rewrite it protects: on a 5-minute cache the pings catch up fast
-  if (S.keepWarmAuto && S.autoPingUsd >= rewriteCost(S.ctx, S.model, ttl)) {
-    S.autoCappedStretch = true
-    return stopKeepWarm($, `its pings have cost as much as rewriting the cache (${money(S.autoPingUsd)})`)
-  }
+  const ping = { at: now, limit: margin, moved, lost: false }
+  pingOut = ping
+  // What comes back, whenever it does: a tick waits for it for PING_LIMIT at most, the rest happens when it settles
+  const settled = (async () => {
+    let reply = null
+    try {
+      reply = await $.model.fork({ prompt: 'cache-keeper keep-alive ping. Reply with only: ok' })
+    } catch {
+      reply = null // a thrown error is an answer: no answer, at once
+    }
+    if (pingOut === ping) pingOut = null
+    if (!reply || !reply.usage) {
+      if (ping.lost || moved()) return
+      return stopKeepWarm($, 'the ping got no answer, so the cache may already be cold')
+    }
+    const u = reply.usage
+    // The ping was billed: it is counted whether or not the chat, the account or keep warm itself changed while it was out, and however late it came. The cap counts it only while the chat is still the one it was sent in (the same id again is the same idle stretch; another id began a new one)
+    S.pings += 1
+    S.lastPingAt = now
+    const pingCost = requestCost(u, S.model, ttl)
+    S.pingUsd += pingCost
+    if (auto && (S.capId || S.id) === capFor) {
+      S.autoPingUsd += pingCost
+      S.capId = capFor
+    }
+    $.ui.invalidate('ui.render')
+    // One that came after its backstop has already stopped keep warm (or a new one has started since): it dates and restarts nothing
+    if (ping.lost || moved()) return
+    // A ping that writes instead of reading did not hit the cache: stop paying for it
+    if ((u.cache_creation_input_tokens || 0) > 0.1 * Math.max(1, u.cache_read_input_tokens || 0)) {
+      return stopKeepWarm($, `the ping wrote ${tokens(u.cache_creation_input_tokens)} tokens instead of reading the cache`)
+    }
+    S.lastActivity = ping.at // when the request went, not when the answer came: the cache is dated from the one, and a slow answer must not make it look fresher than it is
+    await rememberLast($)
+    if (ping.lost || moved()) return
+    // Auto keep warm only pays while it costs less than the rewrite it protects: on a 5-minute cache the pings catch up fast
+    if (S.keepWarmAuto && S.autoPingUsd >= rewriteCost(S.ctx, S.model, ttl)) {
+      S.autoCappedStretch = true
+      return stopKeepWarm($, `its pings have cost as much as rewriting the cache (${money(S.autoPingUsd)})`)
+    }
+  })().catch(() => {})
+  await bounded($, () => settled, PING_LIMIT)
 }
 
 function warnStep($) {
@@ -2357,13 +2370,17 @@ export function register(on, options = {}) {
       }
     }
     S.ctx = total
-    S.lastActivity = now
+    // A request that began before an account change (a wake-up typed mid-turn) ran on the old account: it dates and warms nothing on the new one, which is still empty (rotatedPending stays, and so the cold-send guard and keep warm's wait), and its record is not written, as it would name the new account for a request that ran on the old. The wake-up's own request, which began after the change, does all of it
+    const onCurrent = requestGen === identityGen
+    if (onCurrent) S.lastActivity = now
     S.compactedAt = 0 // the request a compaction waited for has landed
     measuredSteps++ // the chat measured itself: a seed still reading its transcript leaves these to it
     S.autoPingUsd = 0 // a real request ends the idle stretch the pings were protecting
     S.autoCappedStretch = false
-    rotatedPending = false
-    await rememberLast($)
+    if (onCurrent) {
+      rotatedPending = false
+      await rememberLast($)
+    }
     return result
   })
 
