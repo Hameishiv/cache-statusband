@@ -41,7 +41,7 @@ const S = {
   pings: 0,
   pingUsd: 0,
   autoPingUsd: 0, // what auto keep warm's pings cost since the last real request
-  autoCappedStretch: false, // auto keep warm stopped on its cost cap since the last real request. autoMayRun() is the single gate for starting auto keep warm or handing over to it (turn.complete, keepWarmStep): it needs auto keep warm on, a big chat, this cap unspent (autoStopReason(), which a running one also meets each step), a turn of this chat within the auto hours, and a cache still warm; so neither a turn that ends without a request, nor a hand-over, re-arms it after the cap stop until a real request
+  autoCappedStretch: false, // auto keep warm stopped on its cost cap since the last real request. autoMayRun() is the single gate for starting auto keep warm or handing over to it (turn.complete, keepWarmStep): it needs auto keep warm on, a big chat, this cap unspent (autoStopReason(), whose settings a running one also meets each step: only the settings while a request runs), a turn of this chat within the auto hours, and a cache still warm; so neither a turn that ends without a request, nor a hand-over, re-arms it after the cap stop until a real request
   capId: '', // the chat (session id) autoPingUsd, autoCappedStretch and lastTurnEnd describe: a /clear or resume into another id starts them clean, one into the same id (or one whose id could not be read: only lastTurnEnd, which dates the chat it replaces) does not; a fork takes its own id
   keepWarmAuto: false, // the running keep warm began on its own, not by hand
   lastPingAt: 0,
@@ -1714,7 +1714,7 @@ function setAutoWarm(on) {
   S.autoWarmOffByPr = false
 }
 
-// Why auto keep warm may not run in this chat now, by what is set (on, big chat) and what it has spent (the cap on its pings in this idle stretch); '' when it may. Checked by every start and hand-over (autoMayRun) and, each step, by an auto keep warm that is running, so a setting changed meanwhile (here or in another session) applies to it
+// Why auto keep warm may not run in this chat now, by what is set (on, big chat) and what it has spent (the cap on its pings in this idle stretch); '' when it may. Checked by every start and hand-over (autoMayRun) and, each step, by an auto keep warm that is running (only the settings while a request runs), so a setting changed meanwhile (here or in another session) applies to it
 function autoStopReason(settingsOnly = false) {
   if (!(settings.autoWarmHours > 0) || !S.autoWarm) return 'auto keep warm was turned off'
   if (S.ctx < settings.bigTokens) return 'this chat is now under the big size'
@@ -1745,6 +1745,10 @@ function stopKeepWarm($, why) {
 
 async function keepWarmStep($) {
   if (!S.keepWarm) return
+  // The chat and compaction count this step began with. A /clear, a resume of another chat, a compaction or an off that lands while a read or the ping is out makes what comes back the old chat's: nothing of it is written (a fork shares the cache and does not move msgChat)
+  const chat = msgChat
+  const gen = compactGen
+  const moved = () => !S.keepWarm || msgChat !== chat || compactGen !== gen
   if (S.keepWarmAuto) {
     // a setting changed while it ran (autowarm off, big 400k, in this session or another): it stops, even while the chat works
     // while the chat works only the settings count: the cap is judged when it is idle (and by a ping that has just been paid)
@@ -1769,6 +1773,7 @@ async function keepWarmStep($) {
   if (S.pr && now - S.prCheckedAt > 15 * MIN) {
     S.prCheckedAt = now
     const state = await prState($)
+    if (moved()) return
     if (state === 'MERGED' || state === 'CLOSED') {
       if (S.autoWarm) {
         S.autoWarm = false
@@ -1796,6 +1801,7 @@ async function keepWarmStep($) {
   } catch {
     reply = null
   }
+  if (moved()) return
   if (!reply || !reply.usage) {
     return stopKeepWarm($, 'the ping got no answer, so the cache may already be cold')
   }
@@ -1814,6 +1820,7 @@ async function keepWarmStep($) {
   }
   S.lastActivity = now
   await rememberLast($)
+  if (moved()) return
   // Auto keep warm only pays while it costs less than the rewrite it protects: on a 5-minute cache the pings catch up fast
   if (S.keepWarmAuto && S.autoPingUsd >= rewriteCost(S.ctx, S.model, ttl)) {
     S.autoCappedStretch = true

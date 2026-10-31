@@ -7751,3 +7751,113 @@ test('Retry-After that is neither seconds nor a date is ignored: the usual five 
   const { at, next } = await planRetry({ 'retry-after': 'soon' }, $, on)
   expect(next).toBe(at + 300000)
 })
+
+// ===== review round 57: a keep warm step whose read or ping is out when the chat changes writes nothing of it =====
+// Auto keep warm running on chat A (300k), its ping due; the ping is held until `release()`. The ping settles with a read of 300k
+async function heldPing($: any, on: any) {
+  const kept = new Map<string, unknown>()
+  const disk: { id: string; files: Record<string, string> } = { id: 'sid-A', files: {} }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  const hold = { release: () => {}, held: false, pings: 0 }
+  on('model.fork', async () => {
+    hold.held = true
+    hold.pings++
+    await new Promise<void>((r) => (hold.release = r))
+    return { value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }
+  })
+  on('classic.SessionStart', () => ({}))
+  answer(on, seen, 'Cancel')
+  const step = stepper($, on)
+  await start($, 300000, clock)
+  await step(usage({ cache_read_input_tokens: 300000 }))
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  await clock.advance(53 * 60000) // the ping is due and out
+  expect(hold.held).toBe(true)
+  return { clock, seen, kept, disk, hold }
+}
+const coldChatB = async (clock: any, disk: { id: string; files: Record<string, string> }) => {
+  disk.id = 'sid-B'
+  disk.files['sid-B.jsonl'] = reply((await clock.now()) - 3 * 3600000, 300000) // last reply 3 hours ago: cold
+}
+
+test('a ping out while the chat is resumed into a cold big chat leaves that chat cold: not dated, not recorded, its send still asks', async ($, on) => {
+  const { clock, seen, kept, disk, hold } = await heldPing($, on)
+  await coldChatB(clock, disk)
+  await ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/sid-B.jsonl' })
+  const coldText = ((await $.command.run({ command: 'cache', args: '' })) as any).text.split('\n').slice(0, 3).join(' | ')
+  expect(coldText).toMatch(/went cold/)
+  const recordBefore = JSON.stringify(kept.get('last:sid-B'))
+  hold.release()
+  await clock.advance(1000)
+  expect(((await $.command.run({ command: 'cache', args: '' })) as any).text.split('\n').slice(0, 3).join(' | ')).toBe(coldText)
+  expect(JSON.stringify(kept.get('last:sid-B'))).toBe(recordBefore)
+  const asks = seen.asks
+  await $.prompt.submit({ text: 'hello', origin: COMPOSER, wait: false } as never)
+  expect(seen.asks - asks).toBe(1)
+})
+
+test('a ping out while the chat is resumed and keep warm is started again by hand in it: the new chat is not dated by the old chat\'s ping', async ($, on) => {
+  const { clock, kept, disk, hold } = await heldPing($, on)
+  await coldChatB(clock, disk)
+  await ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/sid-B.jsonl' })
+  await $.command.run({ command: 'keepwarm', args: '1' }) // keep warm is on again, in chat B
+  const recordBefore = JSON.stringify(kept.get('last:sid-B'))
+  hold.release()
+  await clock.advance(1000)
+  expect(JSON.stringify(kept.get('last:sid-B'))).toBe(recordBefore)
+})
+
+test('a ping out while the chat is cleared dates nothing and records nothing for the new chat', async ($, on) => {
+  const { clock, kept, disk, hold } = await heldPing($, on)
+  disk.id = 'sid-C'
+  await ($ as any).classic.SessionStart({ source: 'clear' })
+  const text = ((await $.command.run({ command: 'cache', args: '' })) as any).text
+  hold.release()
+  await clock.advance(1000)
+  expect(((await $.command.run({ command: 'cache', args: '' })) as any).text).toBe(text)
+  expect(kept.get('last:sid-C')).toBeUndefined()
+})
+
+test('a ping out while the chat is compacted leaves it compacted: the record stays at 0 and no ping of the compacted context follows from that step', async ($, on) => {
+  const { clock, kept, hold } = await heldPing($, on)
+  await $.command.run({ command: 'compact', args: '' })
+  expect((kept.get('last:sid-A') as any).at).toBe(0)
+  hold.release()
+  await clock.advance(1000)
+  expect((kept.get('last:sid-A') as any).at).toBe(0)
+  const pings = hold.pings
+  await clock.advance(10 * 60000)
+  expect(hold.pings).toBe(pings) // nothing dated the compacted context, so nothing is due
+})
+
+test('a PR check out while the chat is resumed does not turn the new chat\'s auto keep warm off for the old chat\'s merged PR', SETUP, async ($, on) => {
+  const disk: { id: string; files: Record<string, string> } = { id: 'sid-A', files: {} }
+  const { clock, seen } = engine($, on, { label: 'A' }, new Map(), undefined, disk)
+  let release = () => {}
+  let asked = 0
+  on('process.run', async () => {
+    asked++
+    await new Promise<void>((r) => (release = r))
+    return { value: { exitCode: 0, stdout: 'MERGED\n', stderr: '' } }
+  })
+  on('session.usage', () => ({ value: { context: { tokens: 300000, window: 1000000 } } }))
+  on('turn.complete', () => ({ text: '' }))
+  on('model.fork', () => ({ value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }))
+  on('classic.SessionStart', () => ({}))
+  const req = bigRequest($, on)
+  await start($, 300000, clock)
+  await $.prompt.submit({ text: '/merge-pr 123', command: { name: 'merge-pr', args: '123' }, origin: COMPOSER, wait: false } as never)
+  await req()
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  await clock.advance(16 * 60000)
+  expect(asked).toBe(1) // the PR check is out
+  disk.id = 'sid-B'
+  disk.files['sid-B.jsonl'] = reply((await clock.now()) - 5 * 60000, 300000)
+  await ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/sid-B.jsonl' })
+  release()
+  await clock.advance(1000)
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/off in this session/) // chat A's merged PR says nothing about chat B: its auto keep warm stays on (the resume itself ended A's keep warm)
+  expect(r.text).toMatch(/Auto keep warm: on/)
+  expect(seen.toasts.filter((t) => /Keep warm off/.test(t)).length).toBe(0)
+})
