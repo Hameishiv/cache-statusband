@@ -7487,3 +7487,109 @@ test('a resume whose id read answers nothing keeps heartbeating under the id it 
   expect((kept.get('hb:sid-old') as any).updatedAt).toBeGreaterThan(at)
   expect([...kept.keys()].filter((k) => k.startsWith('hb:'))).toEqual(['hb:sid-old'])
 })
+
+// A big chat's auto keep warm running on a warm 1-hour cache (300k, the default), five minutes after its turn ended
+async function autoRunning($: any, on: any) {
+  const { clock, seen } = engine($, on)
+  const count = { pings: 0 }
+  on('model.fork', () => {
+    count.pings++
+    return { value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }
+  })
+  const step = stepper($, on)
+  await start($, 300000, clock)
+  await step(usage({ cache_read_input_tokens: 300000 }))
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never) // auto keep warm starts
+  await clock.advance(5 * 60000)
+  expect(seen.toasts.filter((t) => /Keeping this cache warm/.test(t)).length).toBe(1)
+  return { clock, seen, count }
+}
+
+for (const [arg, why] of [['autowarm off', 'auto keep warm was turned off'], ['big 400k', 'this chat is now under the big size']]) {
+  test(`/cache ${arg} while auto keep warm runs stops it with its reason: no more pings, and no "Keep warm is on"`, async ($, on) => {
+    const { clock, seen, count } = await autoRunning($, on)
+    await $.command.run({ command: 'cache', args: arg })
+    await clock.advance(4 * 3600000)
+    expect(count.pings).toBe(0)
+    const off = seen.toasts.filter((t) => /Keep warm off/.test(t))
+    expect(off.length).toBe(1)
+    expect(off[0]).toContain(`Keep warm off (${why}). 0 ping(s)`)
+    const r: any = await $.command.run({ command: 'cache', args: '' })
+    expect(r.text).not.toMatch(/Keep warm is on/)
+  })
+}
+
+test('/cache autowarm lowered while auto keep warm runs ends it at the new hours after the last turn, not the old', async ($, on) => {
+  const { clock, seen, count } = await autoRunning($, on)
+  await $.command.run({ command: 'cache', args: 'autowarm 1' })
+  await clock.advance(2 * 3600000)
+  expect(count.pings).toBeLessThanOrEqual(1) // the one ping before the hour is up; the old 8 hours would have pinged for hours more
+  const off = seen.toasts.filter((t) => /Keep warm off/.test(t))
+  expect(off.length).toBe(1)
+  expect(off[0]).toMatch(/Keep warm off \(time limit reached\)/)
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/Keep warm is on/)
+})
+
+test('a resume whose session id cannot be read does not hand a keep warm started by hand over to auto keep warm from the last chat\'s last turn', async ($, on) => {
+  const disk: { id: string; files: Record<string, string> } = { id: 'sid-A', files: {} }
+  const { clock, seen } = engine($, on, { label: 'A' }, undefined, undefined, disk)
+  on('model.fork', () => ({ value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }))
+  on('classic.SessionStart', () => ({}))
+  const step = stepper($, on)
+  await start($, 300000, clock)
+  await step(usage({ cache_read_input_tokens: 300000 }))
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never) // chat A's turn
+  await clock.advance(10 * 60000)
+  disk.id = '' // chat B, whose id cannot be read
+  disk.files['sid-B.jsonl'] = reply(await clock.now(), 300000)
+  await ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/sid-B.jsonl' })
+  await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [], changed: [] })
+  await $.command.run({ command: 'keepwarm', args: '1' })
+  await clock.advance(61 * 60000)
+  expect(seen.toasts.filter((t) => /now runs as auto keep warm/.test(t)).length).toBe(0)
+  expect(seen.toasts.filter((t) => /time limit reached/.test(t)).length).toBe(1)
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/Keep warm is on/)
+})
+
+test('a fork keeps the cap under its own id: resuming the fork afterwards does not reset it', async ($, on) => {
+  const disk: { id: string; files: Record<string, string> } = { id: 'sid-A', files: {} }
+  const { clock, seen } = engine($, on, { label: 'A' }, undefined, undefined, disk)
+  let pings = 0
+  on('model.fork', () => {
+    pings++
+    return { value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }
+  })
+  on('classic.SessionStart', () => ({}))
+  const step = stepper($, on)
+  await start($, 300000, clock)
+  await $.command.run({ command: 'cache', args: 'ttl 5' })
+  await step(usage({ cache_read_input_tokens: 300000 }))
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  await clock.advance(2 * 3600000) // chat A's auto keep warm stops on its cap
+  const capped = pings
+  expect(capped).toBeGreaterThan(3)
+  disk.id = 'sid-F'
+  await ($ as any).classic.SessionStart({ source: 'fork' })
+  disk.files['sid-F.jsonl'] = reply(await clock.now(), 300000)
+  await ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/sid-F.jsonl' }) // the fork's own id again
+  await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [], changed: [] })
+  const keepToasts = () => seen.toasts.filter((t) => /Keeping this cache warm|Keep warm off/.test(t)).length
+  const toasts = keepToasts()
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: true, turnId: 't2', reason: 'aborted' } as never)
+  await clock.advance(2 * 3600000)
+  expect(pings).toBe(capped) // no new cap's worth of pings
+  expect(keepToasts()).toBe(toasts)
+})
+
+test('a typed /compact while auto keep warm runs on a warm cache is not "the cache had already gone cold": it waits for the next request and goes on', async ($, on) => {
+  const { clock, seen, count } = await autoRunning($, on)
+  await $.command.run({ command: 'compact', args: '' })
+  await clock.advance(5 * 60000)
+  expect(seen.toasts.filter((t) => /already gone cold/.test(t)).length).toBe(0)
+  expect(seen.toasts.filter((t) => /Keep warm off/.test(t)).length).toBe(0)
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/Keep warm is on/) // still running, with no stop and start between
+  expect(count.pings).toBe(0) // a ping on the compacted chat would write, not read
+})
