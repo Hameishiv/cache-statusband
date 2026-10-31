@@ -7753,17 +7753,19 @@ test('Retry-After that is neither seconds nor a date is ignored: the usual five 
 })
 
 // ===== review round 57: a keep warm step whose read or ping is out when the chat changes writes nothing of it =====
-// Auto keep warm running on chat A (300k), its ping due; the ping is held until `release()`. The ping settles with a read of 300k
-async function heldPing($: any, on: any) {
+// Auto keep warm running on chat A (300k), its ping due; the ping is held until `release()`. The ping settles with a read of 300k (or `pingUsage`).
+// Every ping the fork is asked for keeps its own resolver, and release() settles them all: a second ping sent while one is out shows in `pings`
+async function heldPing($: any, on: any, pingUsage: Record<string, unknown> = { cache_read_input_tokens: 300000 }) {
   const kept = new Map<string, unknown>()
   const disk: { id: string; files: Record<string, string> } = { id: 'sid-A', files: {} }
-  const { clock, seen } = engine($, on, { label: 'A' }, kept, undefined, disk)
-  const hold = { release: () => {}, held: false, pings: 0 }
+  const seat = { label: 'A' }
+  const { clock, seen } = engine($, on, seat, kept, undefined, disk)
+  const hold = { releases: [] as (() => void)[], release: () => hold.releases.splice(0).forEach((r) => r()), held: false, pings: 0 }
   on('model.fork', async () => {
     hold.held = true
     hold.pings++
-    await new Promise<void>((r) => (hold.release = r))
-    return { value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }
+    await new Promise<void>((r) => hold.releases.push(r))
+    return { value: { text: 'ok', usage: usage(pingUsage) } }
   })
   on('classic.SessionStart', () => ({}))
   answer(on, seen, 'Cancel')
@@ -7771,9 +7773,9 @@ async function heldPing($: any, on: any) {
   await start($, 300000, clock)
   await step(usage({ cache_read_input_tokens: 300000 }))
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
-  await clock.advance(53 * 60000) // the ping is due and out
+  await clock.advance(52 * 60000 + 5000) // the ping is due (at 52 minutes: 8 before the hour) and out, 5 seconds into its minute: a test has the rest of it
   expect(hold.held).toBe(true)
-  return { clock, seen, kept, disk, hold }
+  return { clock, seen, kept, disk, hold, seat }
 }
 const coldChatB = async (clock: any, disk: { id: string; files: Record<string, string> }) => {
   disk.id = 'sid-B'
@@ -7897,4 +7899,88 @@ test('on a rotated chat the bare /keepwarm does what the band says: Stop K.W. tu
   expect(await bandText($, /K\.W\. until/)).toBeNull()
   expect(await bandButton($, /Stop K\.W\./)).toBe(false)
   expect(await bandText($, /cache cold/i)).not.toBeNull()
+})
+
+// ===== review round 59: a ping that came back is counted; one ping out at a time; keep warm on a rotated chat =====
+const keepWarmLine = async ($: any) => ((await $.command.run({ command: 'cache', args: '' })) as any).text.split('\n').find((l: string) => /Keep warm is on/.test(l)) as string | undefined
+const PAID = /: 1 ping\(s\), \$(?!0\.00\b)\d/ // one ping, and not for nothing
+
+test('a ping that comes back after keep warm was turned off is still counted: it was billed', async ($, on) => {
+  const { clock, hold } = await heldPing($, on)
+  await $.command.run({ command: 'keepwarm', args: 'off' })
+  hold.release()
+  await clock.advance(1000)
+  await $.command.run({ command: 'keepwarm', args: '1' })
+  expect(await keepWarmLine($)).toMatch(PAID)
+})
+
+test('a ping that comes back after the chat was compacted is still counted', async ($, on) => {
+  const { clock, hold } = await heldPing($, on)
+  await $.command.run({ command: 'compact', args: '' })
+  hold.release()
+  await clock.advance(1000)
+  expect(await keepWarmLine($)).toMatch(PAID)
+})
+
+test('a ping that comes back after a resume of the same chat is still counted', async ($, on) => {
+  const { clock, hold, disk } = await heldPing($, on)
+  disk.files['sid-A.jsonl'] = reply((await clock.now()) - 5 * 60000, 300000)
+  await ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/sid-A.jsonl' })
+  hold.release()
+  await clock.advance(1000)
+  await $.command.run({ command: 'keepwarm', args: '1' })
+  expect(await keepWarmLine($)).toMatch(PAID)
+})
+
+// a ping that cost as much as the rewrite, back after the same chat was resumed: the cap stands, so auto keep warm is not started again
+async function resumedAfterPing($: any, on: any, pingUsage: Record<string, unknown>) {
+  const { clock, hold, disk } = await heldPing($, on, pingUsage)
+  disk.files['sid-A.jsonl'] = reply((await clock.now()) - 5 * 60000, 300000)
+  await ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/sid-A.jsonl' })
+  hold.release()
+  await clock.advance(1000)
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't2', reason: 'end_turn' } as never) // a turn that ends with no request: auto keep warm starts if it may
+  return keepWarmLine($)
+}
+
+test('an auto ping that comes back after a resume of the same chat counts toward the cap: auto keep warm does not start again', async ($, on) => {
+  expect(await resumedAfterPing($, on, { cache_read_input_tokens: 300000, input_tokens: 3000000 })).toBeUndefined()
+})
+
+test('control: with a ping far under the cap, auto keep warm does start again after that resume', async ($, on) => {
+  expect(await resumedAfterPing($, on, { cache_read_input_tokens: 300000 })).toMatch(/Keep warm is on/)
+})
+
+test('while a ping is out the later ticks send no second one', async ($, on) => {
+  const { clock, hold } = await heldPing($, on)
+  expect(hold.pings).toBe(1) // the ping that came due
+  await clock.advance(50000) // two more ticks, inside the ping's minute
+  expect(hold.pings).toBe(1)
+  hold.release()
+  await clock.advance(1000)
+  expect(hold.pings).toBe(1)
+  expect(await keepWarmLine($)).toMatch(PAID)
+})
+
+test('a ping with no answer in a minute counts as no answer: keep warm stops, and starting it again may ping again', async ($, on) => {
+  const { clock, seen, hold } = await heldPing($, on)
+  await clock.advance(61000)
+  expect(seen.toasts.filter((t) => /Keep warm off \(the ping got no answer/.test(t)).length).toBe(1)
+  expect(await keepWarmLine($)).toBeUndefined()
+  await $.command.run({ command: 'keepwarm', args: '1' }) // the stuck ping no longer blocks a new one
+  await clock.advance(31000)
+  expect(hold.pings).toBe(2)
+})
+
+test('a rotation while a ping is out: the ping is counted, but nothing of it dates the new account\'s cache', SETUP, async ($, on) => {
+  const { clock, kept, hold, seat } = await heldPing($, on)
+  await $.command.run({ command: 'cache', args: 'guard off' })
+  seat.label = 'B'
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never) // the rotation reaches the chat
+  const recordBefore = JSON.stringify(kept.get('last:sid-A'))
+  hold.release()
+  await clock.advance(1000)
+  expect(JSON.stringify(kept.get('last:sid-A'))).toBe(recordBefore)
+  await $.command.run({ command: 'keepwarm', args: '1' })
+  expect(await keepWarmLine($)).toMatch(PAID)
 })

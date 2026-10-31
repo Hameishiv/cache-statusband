@@ -1743,12 +1743,17 @@ function stopKeepWarm($, why) {
   $.ui.toast(`Keep warm off (${why}). ${S.pings} ping(s), ${money(S.pingUsd)}.`, { timeoutMs: 8000 })
 }
 
+// A keep-warm ping (a fork) is out: no second one goes while it is, however many ticks come (a tick does not wait for the step before it), and it is not waited for for ever: PING_LIMIT, then it counts as no answer
+let pingOut = false
+const PING_LIMIT = 60000
+
 async function keepWarmStep($) {
-  if (!S.keepWarm) return
-  // The chat and compaction count this step began with. A /clear, a resume of another chat, a compaction or an off that lands while a read or the ping is out makes what comes back the old chat's: nothing of it is written (a fork shares the cache and does not move msgChat)
+  if (!S.keepWarm || pingOut) return
+  // The chat, compaction and account counts this step began with. A /clear, a resume of another chat, a compaction, a rotation or an off that lands while a read or the ping is out makes what comes back the old chat's or the old account's: its date and record are not written (a fork shares the cache and does not move msgChat). A ping that came back was billed whatever happened meanwhile, and is counted all the same (below)
   const chat = msgChat
   const gen = compactGen
-  const moved = () => !S.keepWarm || msgChat !== chat || compactGen !== gen
+  const idGen = identityGen
+  const moved = () => !S.keepWarm || msgChat !== chat || compactGen !== gen || identityGen !== idGen
   if (S.keepWarmAuto) {
     // a setting changed while it ran (autowarm off, big 400k, in this session or another): it stops, even while the chat works
     // while the chat works only the settings count: the cap is judged when it is idle (and by a ping that has just been paid)
@@ -1795,25 +1800,34 @@ async function keepWarmStep($) {
   const ttl = ttlMin()
   const margin = ttl >= 60 ? 8 * MIN : 90000
   if (now - S.lastActivity < ttl * MIN - margin) return
+  // What this ping is for, taken before it goes: whether it is auto keep warm's, and the idle stretch (chat) its cost is counted in. A resume, a /clear or an off while it is out changes S, not this
+  const auto = S.keepWarmAuto
+  const capFor = S.capId || S.id
   let reply = null
+  pingOut = true
   try {
-    reply = await $.model.fork({ prompt: 'cache-keeper keep-alive ping. Reply with only: ok' })
+    reply = await bounded($, () => $.model.fork({ prompt: 'cache-keeper keep-alive ping. Reply with only: ok' }), PING_LIMIT)
+    if (reply === TIMED_OUT) reply = null
   } catch {
     reply = null
+  } finally {
+    pingOut = false
   }
-  if (moved()) return
   if (!reply || !reply.usage) {
+    if (moved()) return
     return stopKeepWarm($, 'the ping got no answer, so the cache may already be cold')
   }
   const u = reply.usage
+  // The ping was billed: it is counted whether or not the chat, the account or keep warm itself changed while it was out. The cap counts it only while the chat is still the one it was sent in (the same id again is the same idle stretch; another id began a new one)
   S.pings += 1
   S.lastPingAt = now
   const pingCost = requestCost(u, S.model, ttl)
   S.pingUsd += pingCost
-  if (S.keepWarmAuto) {
+  if (auto && (S.capId || S.id) === capFor) {
     S.autoPingUsd += pingCost
-    S.capId = S.id
+    S.capId = capFor
   }
+  if (moved()) return
   // A ping that writes instead of reading did not hit the cache: stop paying for it
   if ((u.cache_creation_input_tokens || 0) > 0.1 * Math.max(1, u.cache_read_input_tokens || 0)) {
     return stopKeepWarm($, `the ping wrote ${tokens(u.cache_creation_input_tokens)} tokens instead of reading the cache`)
