@@ -3330,6 +3330,21 @@ test('the cold-send guard asks for /btw with a question, which goes to the model
   expect(seen.asks).toBe(1)
 })
 
+test('typing /permissions or /login on a big cold chat shows no cold-send dialog', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, 'Send anyway')
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+  await clock.advance(77 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ text: '/permissions', command: { name: 'permissions', args: '' }, origin: COMPOSER, wait: false } as never)
+  await $.prompt.submit({ text: '/login', command: { name: 'login', args: '' }, origin: COMPOSER, wait: false } as never)
+  expect(seen.asks).toBe(0)
+  await $.prompt.submit({ text: '/goal finish it', command: { name: 'goal', args: 'finish it' }, origin: COMPOSER, wait: false } as never)
+  expect(seen.asks).toBe(1) // a command that goes to the model still asks
+})
+
 // ===== the abandoned compaction, round 2 =====
 // Answers each cold-send dialog with `prefer` when it is offered, else with its first option, and keeps what was asked
 function askLog(on: any) {

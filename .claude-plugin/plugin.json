@@ -29,7 +29,7 @@
     "prPattern": {
       "type": "string",
       "title": "PR session pattern",
-      "description": "A regular expression whose first group is a PR number, matched against a session's first prompt (e.g. (?:^|\\s)/?merge-pr\\s+#?(\\d+)). Keep warm then stops once gh reports that PR merged or closed. Leave empty to turn off.",
+      "description": "A regular expression whose first group is a PR number, matched against any prompt while the session has no PR tracked, and against a resumed session's transcript (e.g. (?:^|\\s)/?merge-pr\\s+#?(\\d+)). Keep warm then stops once gh reports that PR merged or closed. Leave empty to turn off.",
       "default": ""
     },
     "autoResume": {

@@ -48,7 +48,7 @@ const S = {
   seat: '', // the signed-in account label the rotator last wrote
   seatChangedAt: 0, // when that label last changed: the new account's cache is empty
   floor: 0, // context size right after the last compaction: what compacting can't shrink
-  autoWarm: true, // false once keep warm is turned off by hand in this session
+  autoWarm: true, // false once keep warm is turned off by hand in this session, or by a merged PR (autoWarmOffByPr) for that chat
   autoWarmOffByPr: false, // autoWarm went false because the PR merged, not by hand: a new chat starts with it on again
   pr: 0, // a merge-pr session's PR: keep warm stops once it merges or closes
   prCheckedAt: 0,
@@ -110,7 +110,7 @@ const cfg = {
   seatFileTerminal: '', // a file holding the signed-in account's label, as an account rotator writes it
   seatFileDesktop: '',
   rotatorWake: null, // the prompt an unattended account rotator types after rotating: compact without asking
-  prPattern: null, // a first prompt naming a PR: keep warm stops once that PR merges or closes
+  prPattern: null, // a prompt naming a PR (any, while none is tracked; a resumed chat's from its transcript): keep warm stops once that PR merges or closes
   autoResume: false, // send "Resume" to a chat cut short by exhausted usage once it renews
 }
 
@@ -486,8 +486,12 @@ function isLocalBuiltin(command) {
   return !arg || arg === 'open' || arg === 'share'
 }
 
-// What the cold-send guard lets by: the same, except `/btw <question>`, which sends the conversation to the model (a bare /btw stays local). Not while a turn is running: its requests keep the cache warm, so the cold reading is stale
+// Commands that count as sends (they can re-send to the model: a retry picked in /permissions' dialog, a sign-in's re-send in /login) but whose dialog the cold-send guard does not put in front of the person: it would ask before the command's own dialog even opens
+const GUARD_SKIP_ONLY = new Set(['permissions', 'login'])
+
+// What the cold-send guard lets by: the same, plus GUARD_SKIP_ONLY, except `/btw <question>`, which sends the conversation to the model (a bare /btw stays local). Not while a turn is running: its requests keep the cache warm, so the cold reading is stale
 function guardSkips(command) {
+  if (command && GUARD_SKIP_ONLY.has(command.name)) return true
   return isLocalBuiltin(command) && !(command.name === 'btw' && String(command.args || '').trim() && !S.working)
 }
 
@@ -1750,7 +1754,7 @@ export function register(on, options = {}) {
       const first = (await $.session.messages()).find((m) => m.role === 'user' && findPr(m.text))
       if (first) S.pr = findPr(first.text)
     } catch {
-      // no transcript yet: the first prompt sets it
+      // no transcript yet: the first prompt that names a PR sets it
     }
     names.cache = (await registerCommand($, 'cache', 'Cache Keeper status and settings', '[ttl 5|60|auto] [guard on|off] [big 150k] [alerts on|off] [autowarm 8|off]')) || names.cache
     names.keepwarm = (await registerCommand($, 'keepwarm', 'Keep this session\'s prompt cache warm (default 4 hours), or /keepwarm off (also stops auto keep warm here)', '[hours|off]', true)) || names.keepwarm
