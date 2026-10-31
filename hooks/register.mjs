@@ -452,10 +452,10 @@ let compactSeq = 0 // numbers this mod's /compact runs in the order they start
 const RUN_END_GRACE = 5000
 const liveRuns = new Set() // { chat, seq, at } (the conversation's msgChat, the run's number, when it started) of this mod's /compact runs not settled yet (and for RUN_END_GRACE after), abandoned ones too: an engine compaction mark may be one's end, which says nothing about a conversation since replaced (see staleRunOut) nor about a newer abandoned run (see olderRunOut)
 let abandoned = null // { done, at, batch, seq }: the /compact call still out after COMPACT_LIMIT. No send starts another until it settles (its end clears this), a compaction that started before it succeeds (the person's own too, but an engine compaction mark does not count while an older run of ours is still out and started under two COMPACT_LIMITs ago, as the mark may be that run's end), the chat is replaced, or a second COMPACT_LIMIT has passed. A Resume is tried again, the person's and a wake-up's message go back in the prompt box
-let putBackPending = null // { real, steps, at }: the Resume hold. A message was put back in the prompt box (a successful fill of a message that reaches the chat, not a /btw question, not a failed fill; a fill that did not answer in time counts, as it may still land), or quoted in a toast because the box held the person's own text (it is still theirs to send), and nothing has been sent since: a due Resume waits while realSends and stepsSeen are as they were then, for COMPACT_LIMIT at most. Cleared by /clear, a resume or a slash command the person typed in the composer (the box text was replaced); a fork keeps it
-let boxText = null // { real, steps, text }: the text a put-back left in the prompt box, unsent (a /btw question too). Not bound by COMPACT_LIMIT: it stays until a message is handed on or a request starts (realSends, stepsSeen), or /clear, a resume or a slash command the person typed in the composer (a fork keeps it). A later put-back goes in behind it when the box (read when the engine can, within BOX_LIMIT) still holds exactly this text or nothing, and is quoted in a toast, the box untouched, when it holds anything else or the read gave no answer: only this text is the mod's to replace. The tracked text is used in place of a read only when the engine has no read. Dropped when a read shows the box empty or the person's own text, and when a fill did not answer in time (the box is then unknown)
+let putBackPending = null // { real, steps, at, from }: the Resume hold. A message was put back in the prompt box (a successful fill of a message that reaches the chat, not a /btw question, not a failed fill; a fill that did not answer in time counts, as it may still land), or quoted in a toast because the box held the person's own text (it is still theirs to send), and nothing has been sent since: a due Resume waits while realSends and stepsSeen are as they were then, for COMPACT_LIMIT at most. Cleared by /clear, a resume, or anything the person submits from the composer when this hold came from a fill (the box text was taken: `from` is 'fill'; a hold only quoted in a toast, `from: 'quoted'`, was never in the box and is not touched); a fork keeps it
+let boxText = null // { real, steps, text }: the text a put-back left in the prompt box, unsent (a /btw question too). Not bound by COMPACT_LIMIT: it stays until a message is handed on or a request starts (realSends, stepsSeen), or /clear, a resume or anything the person submits from the composer (a fork keeps it). A later put-back goes in behind it when the box (read when the engine can, within BOX_LIMIT) still holds exactly this text or nothing, and is quoted in a toast, the box untouched, when it holds anything else or the read gave no answer: only this text is the mod's to replace. The tracked text is used in place of a read only when the engine has no read. Dropped when a read shows the box empty or the person's own text, and when a fill did not answer in time (the box is then unknown)
 let fillChain = Promise.resolve() // put-back fills run one after another: each reads what the last left in the box (and, behind a fill still out after its bound, finds the box unknown: see fillOut)
-let fillOut = null // the promise of a put-back fill that did not answer within BOX_LIMIT and has not settled since: it may still land, so a read now shows nothing sure about the box (boxNow answers `mine: false`: the next put-back is quoted, the box left alone). Cleared when the fill settles, by /clear and by a resume. The engine's answer carries no box text, so what a late fill left is never tracked: a later read sees it
+let fillOut = null // { p, at }: the promise of a put-back fill that did not answer within BOX_LIMIT and has not settled since, and when it started. It may still land, so a read shows nothing sure about the box while `at` is within FILL_LAND_LIMIT (boxNow answers `mine: false`: the next put-back is quoted, the box left alone). Cleared when the fill settles, or by boxNow once the bound has passed. Not cleared by /clear or a resume: the composer is shared, so the old fill can still land in the new chat's box. The engine's answer carries no box text, so what a late fill left is never tracked: a later read sees it
 let tryCause = '' // why the most recent Resume try failed: 'refused' (neither submit way took it) or 'compaction' (still out, or not finished), named in the give-up toast
 let sendSeq = 0 // submission order of the sends that compact first
 let sendsHeld = 0 // a cold-send dialog is open, any send handed on that is not this mod's own is going down the chain, or a compact-then-send is in flight: a due resume waits
@@ -561,6 +561,8 @@ function boxHeld() {
 // An engine call that is not waited on for ever: resolves to what it answered, or to TIMED_OUT once BOX_LIMIT has passed (the timer is cancelled whichever comes first). A call that throws, or that is missing, rejects as it would unbounded
 const BOX_LIMIT = 2000
 const TIMED_OUT = Symbol('timed out')
+// How long after it started a prompt.fill that did not answer in time is still taken to be able to land: the engine's own fill timeout is 5 s (seen in 2.1.314) past the BOX_LIMIT this mod waits. After that a fill that never settled is taken as lost, and the box can be read again
+const FILL_LAND_LIMIT = BOX_LIMIT + 5000
 async function bounded($, call) {
   let timer = null
   try {
@@ -583,7 +585,10 @@ export function readMissing(err) {
 // What the prompt box holds, as { text, mine }: read from it, so the person's edits are seen and text they deleted does not come back. `mine` says whether the text in it is this mod's to merge with: the box is empty, or holds exactly what the last put-back left there (to a trailing newline) and is still unsent. Anything else (the person's own draft, or their edit of the put-back) is theirs and is never rewritten, and it ends the tracking of the put-back text.
 // The tracked put-back text is used in place of a read only when the engine has no prompt.read at all (and it is then mine). A read that exists but answers without a string text is not a read either: unknown, like one that failed. A read that exists but does not answer within BOX_LIMIT, or fails, shows nothing about the box: it is not mine, and nothing is written over it (the tracked text may be one the person has since edited or deleted).
 async function boxNow($) {
-  if (fillOut) return { text: '', mine: false } // an earlier fill may still land: an empty read now would not mean an empty box
+  if (fillOut) {
+    if ((await $.clock.now()) - fillOut.at < FILL_LAND_LIMIT) return { text: '', mine: false } // an earlier fill may still land: an empty read now would not mean an empty box
+    fillOut = null // it has had the engine's own timeout and more: lost
+  }
   const early = boxHeld() // what the box held when the read began: what its answer is compared with (and only while that put-back is still unsent after the read: a snapshot of text sent meanwhile is not merged)
   let box
   let missing = false // the read failed because the engine has no such method
@@ -720,7 +725,7 @@ function putBack($, msg, batch, chat, hold = true) {
 
 // One fill of the prompt box for items, one after another. Text this mod did not put in the box is never rewritten: when the box holds anything but what the last put-back left there (the person's own draft, or their edit of the put-back; boxNow says), nothing is filled and every item is quoted in full in a toast. Otherwise plain texts are joined with a blank line, behind the plain text the box holds (a fill replaces the box, so that text has to be part of it). A slash command is never joined with other text: what cannot go in is quoted in full in a toast, whether it is an item beside other text, or a slash command this mod left in the box when plain text comes (the plain text is filled, the command quoted). A slash command alone, with an empty box, is filled as it is.
 // The text filled is what boxText then tracks (even for a /btw question). The Resume hold (putBackPending) starts only when hold is set (the put-back of an abandoned compaction, not the message of a compaction that finished, whose Resume goes again 2 minutes on), and for a message that reaches the chat: one filled, one quoted because the box held the person's own text (still theirs to send), or one whose fill did not answer in time (it may be in the box).
-// A fill that does not answer within BOX_LIMIT may still land later: what the box holds is then unknown, so nothing is tracked in boxText (and what was tracked is dropped), the hold starts as if it had, and a put-back while that fill is still out quotes its message and leaves the box alone (fillOut). Once it has settled, the next put-back on an engine that can read the box reads it and trusts no tracking (it leaves the box alone unless it is empty); on an engine with no read there is nothing to read and no tracking, so the box is overwritten.
+// A fill that does not answer within BOX_LIMIT may still land later: what the box holds is then unknown, so nothing is tracked in boxText (and what was tracked is dropped), the hold starts as if it had, and a put-back while that fill is still out (and within FILL_LAND_LIMIT of its start) quotes its message and leaves the box alone (fillOut); when the fill answers late without having filled, the hold it started ends (the message is not in the box). Once it has settled or the bound has passed, the next put-back on an engine that can read the box reads it and trusts no tracking (it leaves the box alone unless it is empty); on an engine with no read there is nothing to read and no tracking, so the box is overwritten.
 // items: the list, or a function giving it once the fill's turn has come and `wait` ms have passed (a batch still collecting its members); an empty list fills nothing
 // chat: the msgChat the items belong to: in a chat since cleared or replaced by a resumed one nothing is filled. Resolves to { filled, quoted, stale, inFill, unsure } (unsure: the fill did not answer in time; inFill: the chat was replaced while the fill was out; what could not go in is already quoted)
 function placeBack($, list, chat, hold = true, wait = 0) {
@@ -762,14 +767,19 @@ function placeBack($, list, chat, hold = true, wait = 0) {
     }
     let filled = false
     let unsure = false // the fill did not answer in time: it may still land
+    let late = null // what that fill answered once it settled: { filled }
+    let lateHold = null // the hold this fill started
+    // A late answer that is not a fill ends the hold this fill started (the message is not in the box), if it is still that hold in this chat. A late fill that landed leaves it
+    const lateEnds = () => { if (late && !late.filled && lateHold && putBackPending === lateHold && msgChat === chat) putBackPending = null }
     if (text) {
       let call = null
+      const startedAt = await $.clock.now() // the box was read (up to BOX_LIMIT) since t: the fill starts now
       try {
         const r = await bounded($, () => (call = Promise.resolve($.prompt.fill({ text })))) // a fill that never answers does not hold the later ones and the Resume for good
         if (r === TIMED_OUT) {
           unsure = true
-          const out = call.then(() => {}, () => {}).then(() => { if (fillOut === out) fillOut = null }) // settled, landed or not: the box can be read again
-          fillOut = out
+          const out = call.then((a) => { late = { filled: !!(a && a.isFilled) } }, () => { late = { filled: false } }).then(() => { if (fillOut && fillOut.p === out) fillOut = null; lateEnds() }) // settled, landed or not: the box can be read again
+          fillOut = { p: out, at: startedAt }
         } else filled = !!r.isFilled
       } catch {
         filled = false
@@ -785,8 +795,9 @@ function placeBack($, list, chat, hold = true, wait = 0) {
     }
     if (unsure) boxText = null // the box is unknown: the next put-back reads it and trusts no tracking
     if (filled) boxText = { real: realSends, steps: stepsSeen, text }
-    if (hold && filled) putBackPending = own.local ? null : { real: realSends, steps: stepsSeen, at } // a local command in the box replaces the hold
-    else if (holds) putBackPending = { real: realSends, steps: stepsSeen, at }
+    if (hold && filled) putBackPending = own.local ? null : { real: realSends, steps: stepsSeen, at, from: 'fill' } // a local command in the box replaces the hold
+    else if (holds) putBackPending = { real: realSends, steps: stepsSeen, at, from: filled || unsure ? 'fill' : 'quoted' }
+    if (unsure && holds) { lateHold = putBackPending; lateEnds() } // the answer may already have come
     for (const q of quoted) $.ui.toast(`Also not sent: ${q.text} — send it again when ready.`, { timeoutMs: 15000 })
     return { filled, quoted: new Set(quoted), unsure }
   }
@@ -1625,12 +1636,11 @@ export function register(on, options = {}) {
       S.floor = 0
       S.ctx = 0 // the last chat's size; a resumed chat's own is seeded below (a cleared one starts at 0)
       pendingSeed = null // a transcript still waiting for session.start belongs to the chat this one replaces
-      fillOut = null // a fill still out belongs to the chat this one replaces
     }
     S.keepWarm = false
     H.armed = false
     S.coldRestarts = [] // a resumed chat's own come back with its seed
-    // The box text and its put-back hold stay with a fork, which is the same conversation: the text put back before the branch is still in the box, to be sent. Not after a typed /branch (or any command typed in the composer): that submit replaced the box text, and prompt.submit has already ended both
+    // The box text and its put-back hold stay with a fork, which is the same conversation: the text put back before the branch is still in the box, to be sent. Not after a typed /branch (or anything submitted from the composer): that submit took the box text, and prompt.submit has already ended the tracking, and the hold too when it came from a fill
     if (e.source !== 'fork') {
       // a resume armed in the last chat must not fire into this one (a fork keeps its pending Resume, and one compacting)
       S.resumeAt = 0
@@ -1689,10 +1699,10 @@ export function register(on, options = {}) {
     }
     if (!S.pr) S.pr = findPr(e.command ? `/${e.command.name} ${e.command.args}` : e.text)
     const fromUser = e.origin && (e.origin.kind === 'composer' || e.origin.kind === 'bridge')
-    // A slash command the person typed in the composer replaced the text in the box (this mod's own put-back of a command is a plugin-origin submit, not this): what a put-back left there is gone, and a due Resume no longer waits for a message that is not in the box. A fork that did not come from such a submit keeps both
-    if (e.command && e.origin && e.origin.kind === 'composer') {
+    // Whatever the person submits from the composer (a command or a plain message, whatever becomes of it: a dialog's Cancel or a lower hook may drop it) takes the box text: what a put-back left there is gone. The Resume hold ends with it only when the put-back was filled into the box (a due Resume no longer waits for a message that is not there); a message that was only quoted in a toast was never in the box, so typing does not send it and does not end its hold. This mod's own put-back of a command is a plugin-origin submit, not this, and neither is another plugin's. A fork that did not come from such a submit keeps both
+    if (e.origin && e.origin.kind === 'composer') {
       boxText = null
-      putBackPending = null
+      if (putBackPending && putBackPending.from === 'fill') putBackPending = null
     }
     const wake = fromUser && !!cfg.rotatorWake && cfg.rotatorWake.test(String(e.text || ''))
     let wakeId = 0 // this wake-up's id, to lower only its own hold
