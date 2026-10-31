@@ -4791,6 +4791,20 @@ test('a fork that came from no typed command keeps the tracking of the text a pu
   expect(fills).toEqual(['one', 'one\n\n' + WAKE_TEXT])
 })
 
+test('a slash command another plugin submits is not the person typing in the composer: the tracking of the put-back text stands, and a later put-back goes in behind it', SETUP, async ($, on) => {
+  askLog(on)
+  const { clock, seen, fills } = await coldChat($, on)
+  hang(seen)
+  await send($, 'one')
+  await clock.advance(15 * 60000 + 1000)
+  expect(fills).toEqual(['one'])
+  await $.prompt.submit({ text: '/cache', command: { name: 'cache', args: '' }, origin: { kind: 'plugin', name: 'some-other-plugin' }, wait: false } as never)
+  await clock.advance(60000)
+  await send($, WAKE_TEXT)
+  await clock.advance(1000)
+  expect(fills).toEqual(['one', 'one\n\n' + WAKE_TEXT])
+})
+
 test('a typed /branch on a cold big chat opens no cold-send dialog and compacts nothing', SETUP, async ($, on) => {
   const log = askLog(on)
   const { clock, seen } = await coldChat($, on, () => on('classic.SessionStart', () => ({})))
