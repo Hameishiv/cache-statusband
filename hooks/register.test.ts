@@ -3070,11 +3070,11 @@ test('a compaction abandoned after 15 minutes that fails late frees the next sen
   expect({ submits: seen.submits, compacts: seen.compacts }).toEqual({ submits: ['Resume'], compacts: 2 })
 })
 
-test('a message sent after the abandonment is put back behind the earlier batch, still unsent in the box: a fill never removes it', SETUP, async ($, on) => {
+test('a message from a remote client (origin bridge) sent after the abandonment is put back behind the earlier batch, still unsent in the box: a fill never removes it', SETUP, async ($, on) => {
   const { clock, seen, fills } = await twoCompactFirst($, on, (n) => (n === 1 ? new Promise(() => {}) : Promise.resolve()))
   await clock.advance(15 * 60000 + 1000)
   expect(fills).toEqual(['one\n\ntwo'])
-  await sendBridge($, 'three') // no second compaction: it goes straight back
+  await sendBridge($, 'three') // not from the composer, so it takes nothing from the box; no second compaction: it goes straight back
   await clock.advance(1000)
   expect({ compacts: seen.compacts, submits: seen.submits, fills }).toEqual({ compacts: 1, submits: [], fills: ['one\n\ntwo', 'one\n\ntwo\n\nthree'] })
 })
@@ -3225,7 +3225,7 @@ async function coldChat($: any, on: any, hooks: (kept: Map<string, unknown>) => 
   return { clock, seen, fills, kept }
 }
 const send = ($: any, text: string, command?: { name: string; args: string }) => $.prompt.submit({ text, ...(command ? { command } : {}), origin: COMPOSER, wait: false } as never)
-// A message that reaches the chat without the person submitting it from the composer (a wake-up from the account rotator, a channel message): it takes nothing from the prompt box, so what a put-back left there is still there. A composer submit takes the box text, whatever becomes of it
+// A message that reaches the chat without being submitted from the composer, from a remote client (origin `bridge`): it takes nothing from the prompt box, so what a put-back left there is still there. A composer submit takes the box text, whatever becomes of it. The rotator's wake-up is typed, so it is a composer submit (`send`); a channel message has origin `channel`, which is neither
 const sendBridge = ($: any, text: string) => $.prompt.submit({ text, origin: { kind: 'bridge' }, wait: false } as never)
 // A typed /branch: the person submits the command, which runs locally and sends nothing to the chat, and the fork's SessionStart follows
 const typeBranch = async ($: any) => {
@@ -3448,7 +3448,7 @@ function heldAsk(on: any, auto = 1) {
 }
 const hang = (seen: any) => { let n = 0; seen.duringCompact = () => (++n === 1 ? new Promise(() => {}) : Promise.resolve()) }
 
-test('a wake-up arriving after the put-back keeps the text still in the box: the fill is the unsent text and then the wake-up\'s', SETUP, async ($, on) => {
+test('a wake-up delivered remotely (origin bridge) after the put-back keeps the text still in the box: the fill is the unsent text and then the wake-up\'s', SETUP, async ($, on) => {
   askLog(on)
   const { clock, seen, fills } = await coldChat($, on)
   hang(seen)
@@ -3778,7 +3778,7 @@ test('a slash command filled after a compaction that finished late does not over
   expect(seen.toasts.filter((t) => t.includes('Also not sent: /merge-pr 1 — send it again when ready.')).length).toBe(1)
 })
 
-test('a /btw question put back is tracked in the box: a wake-up put back after it is filled, and the question is quoted in full in a toast', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+test('a /btw question put back is tracked in the box: a wake-up delivered remotely (origin bridge) and put back after it is filled, and the question is quoted in full in a toast', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
   askLog(on)
   const fills: string[] = []
   const { clock, seen } = await resumeCompacting($, on, () => on('prompt.fill', (_: unknown, e: any) => (fills.push(e.text), { isFilled: true })))
@@ -3793,7 +3793,7 @@ test('a /btw question put back is tracked in the box: a wake-up put back after i
   expect(seen.toasts.filter((t) => t.includes('Also not sent: /btw what is X? — send it again when ready.')).length).toBe(1)
 })
 
-test('a message put back after the Resume hold has lapsed still goes behind the unsent text in the box', SETUP, async ($, on) => {
+test('a message from a remote client (origin bridge) put back after the Resume hold has lapsed still goes behind the unsent text in the box', SETUP, async ($, on) => {
   askLog(on)
   const { clock, seen, fills } = await coldChat($, on)
   let n = 0
@@ -4343,7 +4343,7 @@ test('a prompt.read that answers with the put-back text after it was sent does n
   expect(seen.toasts.filter((t) => t.includes('Also not sent: three — send it again when ready.')).length).toBe(1)
 })
 
-test('a prompt.read that is missing in the engine leaves the tracked put-back text standing: a later put-back goes behind it', SETUP, async ($, on) => {
+test('a prompt.read that is missing in the engine leaves the tracked put-back text standing: a later put-back (a bridge message) goes behind it', SETUP, async ($, on) => {
   askLog(on)
   const { clock, seen, fills } = await coldChat($, on) // no prompt.read hook: the call throws
   let n = 0
@@ -4449,7 +4449,7 @@ test('text the person deleted does not come back when the engine later has no wa
 })
 
 // A fill the engine answers after the 2 s bound may still have landed: the box is unknown
-test('a fill that did not answer in time may still land: the toast says the message may not have been put back, nothing is tracked, and the next put-back leaves the box alone', SETUP, async ($, on) => {
+test('a fill that did not answer in time may still land: the toast says the message may not have been put back, nothing is tracked, and the next put-back (messages here come from a remote client, origin bridge) leaves the box alone', SETUP, async ($, on) => {
   const dialogs = heldAsk(on)
   const box = { text: '' }
   const { clock, seen, fills } = await coldChat($, on, () => on('prompt.read', () => ({ value: { text: box.text, cursor: box.text.length } })), (e) => {
@@ -4695,7 +4695,7 @@ test('a resume of another chat does not release a fill that did not answer in ti
   expect(dialogs).toBeDefined()
 })
 
-test('a fill that answers only after the 2 s bound and lands: the box then holds it, and a later put-back quotes its message instead of writing over the box', SETUP, async ($, on) => {
+test('a fill that answers only after the 2 s bound and lands: the box then holds it, and a later put-back (messages here come from a remote client, origin bridge) quotes its message instead of writing over the box', SETUP, async ($, on) => {
   const dialogs = heldAsk(on)
   const box = { text: '' }
   let land: () => void = () => {}
@@ -5034,6 +5034,92 @@ test('a command typed in the composer does not end the Resume hold of a message 
   expect(seen.submits).toEqual(['Resume'])
 })
 
+// One hold slot: a message quoted in a toast (the box held the person's draft), then a later put-back that is filled. The typed command takes the box text, which ends the fill's part only: the toast-only message is still to be sent
+test('a message put back in the box while another is held only quoted in a toast keeps both holds: a command typed in the composer ends the filled one only, and the Resume goes 15 minutes after the quoted one', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  on('ui.render', engineDraws)
+  const fills: string[] = []
+  on('prompt.fill', (_: unknown, e: any) => (fills.push(e.text), { isFilled: true }))
+  let draft = ''
+  on('prompt.read', () => ({ value: { text: draft, cursor: draft.length } }))
+  answer(on, seen, 'Compact first, then send')
+  on('classic.StopFailure', () => ({}))
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+  await clock.advance(77 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  const t0 = await clock.now()
+  await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [{ kind: 'five_hour', percentUsed: 100, resetsAt: new Date(t0 + 4 * 60000).toISOString() }], changed: [] } as never)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  let finish: () => void = () => {}
+  let n = 0
+  seen.duringCompact = () => (++n === 1 ? new Promise<void>((r) => { finish = r }) : Promise.resolve())
+  await $.prompt.submit({ text: 'stop, do X instead', origin: COMPOSER, wait: false } as never)
+  await clock.advance(60000)
+  draft = 'and also look at Y'
+  let quotedAt = 0
+  for (let i = 0; i < 20 && !quotedAt; i++) {
+    await clock.advance(60000)
+    if (seen.toasts.some((t) => t.includes('Also not sent: stop, do X instead'))) quotedAt = await clock.now()
+  }
+  expect(quotedAt).toBeGreaterThan(0)
+  draft = '' // the person sent their draft away: the box is empty
+  await clock.advance(5 * 60000)
+  await sendBridge($, 'two') // the earlier compaction is still out: it goes back in the box, filled
+  await clock.advance(1000)
+  expect(fills).toEqual(['two'])
+  finish()
+  await clock.advance(1000)
+  await send($, '/usage', { name: 'usage', args: '' }) // takes the box text: 'two' is gone from it
+  await clock.advance(2000)
+  expect(seen.submits).toEqual([])
+  expect(await bandText($, /⏸ Resumes? /)).toBe('⏸ Resume waits for your message') // the quoted message is still to be sent
+  await clock.advance(5 * 60000) // 11 minutes after it was quoted
+  expect(seen.submits).toEqual([])
+  await clock.advance(5 * 60000) // 16 minutes: the quoted one's 15 have passed (the filled one's would not have)
+  expect(seen.submits).toEqual(['Resume'])
+})
+
+// A fill that is still unsure when the person submits from the composer: that submit takes the box text and ends the hold, but the fill may land after it
+test('a fill that lands after the person submitted from the composer holds the Resume again: the text is in the box', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+  const { clock, seen, ctl } = await resumeLateFill($, on)
+  await send($, '/usage', { name: 'usage', args: '' }) // ends the hold (the box text was taken)
+  ctl.land(true) // and the fill lands after it
+  await realMs(50)
+  await clock.advance(10 * 60000)
+  expect(seen.submits).toEqual([]) // the text is in the box and unsent
+  expect(await bandText($, /⏸ Resumes? /)).toBe('⏸ Resume waits for your message')
+  await clock.advance(6 * 60000) // 15 minutes after it landed
+  expect(seen.submits).toEqual(['Resume'])
+})
+
+test('a fill that lands after the person submitted from the composer is tracked: a later put-back on an engine that cannot read the box goes in behind it', SETUP, async ($, on) => {
+  const dialogs = heldAsk(on)
+  const box = { text: '' }
+  const { ctl, fill } = lateFill(on, box)
+  let first = true
+  const { clock, seen, fills } = await coldChat($, on, () => on('classic.SessionStart', () => ({})), (e: any) => { // no prompt.read
+    if (first) { first = false; return fill(e) }
+    box.text = e.text
+    return { isFilled: true }
+  })
+  hang(seen)
+  await send($, 'one')
+  await clock.advance(15 * 60000 + 1000)
+  await clock.advance(2500)
+  expect(fills).toEqual(['one']) // not answered
+  await send($, '/usage', { name: 'usage', args: '' }) // takes the box text
+  ctl.land(true) // and the fill lands after it
+  await realMs(50)
+  await clock.advance(1000)
+  void sendBridge($, 'three')
+  await clock.advance(100)
+  dialogs.release('Compact first, then send')
+  await clock.advance(1000)
+  expect(fills).toEqual(['one', 'one\n\nthree']) // behind the text that landed
+})
+
 test('a fork that came from no typed command keeps the Resume hold of a put-back message: the Resume still waits for it, and goes 15 minutes after the put-back', { options: { autoResume: true } }, async ($, on) => {
   const { clock, seen } = await resumeHeldByPutBack($, on)
   await ($ as any).classic.SessionStart({ source: 'fork', transcript_path: '/h/fork.jsonl' }) // nothing typed: the box text is still there
@@ -5073,7 +5159,7 @@ test('a typed /branch ends the tracking of the text a put-back left in the box: 
   expect(fills).toEqual(['one', WAKE_TEXT]) // not 'one\n\n' + WAKE_TEXT: the text the person replaced does not come back
 })
 
-test('a fork that came from no typed command keeps the tracking of the text a put-back left in the box: a later put-back goes in behind it', SETUP, async ($, on) => {
+test('a fork that came from no typed command keeps the tracking of the text a put-back left in the box: a later put-back (a wake-up delivered remotely, origin bridge) goes in behind it', SETUP, async ($, on) => {
   askLog(on)
   const { clock, seen, fills } = await coldChat($, on, () => on('classic.SessionStart', () => ({})))
   hang(seen)
@@ -5087,7 +5173,7 @@ test('a fork that came from no typed command keeps the tracking of the text a pu
   expect(fills).toEqual(['one', 'one\n\n' + WAKE_TEXT])
 })
 
-test('a slash command another plugin submits is not the person typing in the composer: the tracking of the put-back text stands, and a later put-back goes in behind it', SETUP, async ($, on) => {
+test('a slash command another plugin submits is not the person typing in the composer: the tracking of the put-back text stands, and a later put-back (a wake-up delivered remotely, origin bridge) goes in behind it', SETUP, async ($, on) => {
   askLog(on)
   const { clock, seen, fills } = await coldChat($, on)
   hang(seen)
@@ -5099,6 +5185,34 @@ test('a slash command another plugin submits is not the person typing in the com
   await sendBridge($, WAKE_TEXT)
   await clock.advance(1000)
   expect(fills).toEqual(['one', 'one\n\n' + WAKE_TEXT])
+})
+
+// The rotator types its wake-up, so it is a composer submit like any other (a channel message is origin `channel`, not a composer one): it takes the box text
+test('a rotator wake-up submitted from the composer takes the box text: the put-back text is not tracked any more, so the next put-back (the wake-up\'s own) is filled alone', SETUP, async ($, on) => {
+  askLog(on)
+  const { clock, seen, fills } = await coldChat($, on, () => on('classic.SessionStart', () => ({}))) // no prompt.read: the tracked text would stand in for a read
+  hang(seen)
+  await send($, 'one')
+  await clock.advance(15 * 60000 + 1000)
+  expect(fills).toEqual(['one'])
+  await send($, WAKE_TEXT) // origin composer
+  await clock.advance(1000)
+  expect(fills).toEqual(['one', WAKE_TEXT]) // not 'one\n\n' + WAKE_TEXT
+})
+
+test('a rotator wake-up submitted from the composer ends the hold of a filled put-back, and its own hold (the wake-up\'s request has not started) keeps the Resume back until it does', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+  const { clock, seen } = await resumeHeldByPutBack($, on)
+  const refused = () => seen.toasts.filter((t) => /Resume was not sent/.test(t)).length
+  const before = refused()
+  await $.prompt.submit({ text: WAKE_TEXT, origin: COMPOSER, turnId: 't1', wait: false } as never) // typed over a running request: handed on as it is
+  await clock.advance(2 * 60000)
+  expect(await bandText($, /⏸ Resume waits for your message/)).toBeNull() // the box text went with the submit: nothing to wait for
+  expect(seen.submits).not.toContain('Resume')
+  expect(refused()).toBe(before) // and no try of the Resume: the wake-up's request has not started
+  await mainStep($) // it starts
+  await clock.advance(10 * 60000)
+  expect(seen.submits).not.toContain('Resume') // its turn settled the Resume
+  expect(refused()).toBe(before)
 })
 
 test('a typed /branch on a cold big chat opens no cold-send dialog and compacts nothing', SETUP, async ($, on) => {
