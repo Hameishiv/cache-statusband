@@ -55,6 +55,23 @@ test("reads the rate limits codex-cli writes beside info, and from an event with
   assert.equal(summary.contextUsed, 25000);
 });
 
+test("maps an older rollout's resets_in_seconds to an absolute reset from the event's timestamp", async (t) => {
+  const root = await fixtureRoot(t);
+  const path = join(root, "relative.jsonl");
+  const at = "2026-10-29T12:02:00.000Z";
+  const base = Date.parse(at) / 1000;
+  const event = (timestamp, primary) => ({ timestamp, type: "event_msg", payload: { rate_limits: { primary, secondary: { used_percent: 4, window_minutes: 10080, resets_at: 1790500000, resets_in_seconds: 5 } }, type: "token_count" } });
+  const write = (item) => writeFile(path, [FIXTURE[0], item].map((line) => JSON.stringify(line)).join("\n") + "\n", "utf8");
+  await write(event(at, { used_percent: 12, window_minutes: 300, resets_in_seconds: 600 }));
+  let summary = await parseRollout(path);
+  assert.equal(summary.rateLimits.primary.resetsAt, base + 600);
+  assert.equal(summary.rateLimits.secondary.resetsAt, 1790500000); // an absolute time wins over a relative one
+  await write(event("not a time", { used_percent: 12, window_minutes: 300, resets_in_seconds: 600 }));
+  summary = await parseRollout(path);
+  assert.equal(summary.rateLimits.primary.resetsAt, null);
+  assert.equal(summary.rateLimits.primary.usedPercent, 12);
+});
+
 test("reads metadata from the head and token state from the tail of a large rollout", async (t) => {
   const root = await fixtureRoot(t);
   const path = join(root, "large.jsonl");

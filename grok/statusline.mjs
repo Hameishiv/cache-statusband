@@ -10,7 +10,7 @@
  * weekly, still open, and fetched within the last day. It does not use the network and does not read a token.
  */
 
-import { closeSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -346,7 +346,19 @@ function writeCache(cachePath, logPath, entry) {
     kept.sort((a, b) => (finite(b[1].scannedAt) ?? 0) - (finite(a[1].scannedAt) ?? 0));
     const next = Object.fromEntries([...kept.slice(0, MAX_CACHED_LOGS - 1), [logPath, entry]]);
     mkdirSync(dirname(cachePath), { recursive: true });
-    writeFileSync(cachePath, JSON.stringify({ logs: next }));
+    // A temporary file beside it, then a rename: a reader never sees half a file (two writers can still each lose the other's entry)
+    const temporary = `${cachePath}.${process.pid}.tmp`;
+    try {
+      writeFileSync(temporary, JSON.stringify({ logs: next }));
+      renameSync(temporary, cachePath);
+    } catch (error) {
+      try {
+        unlinkSync(temporary);
+      } catch {
+        // nothing was left to remove
+      }
+      throw error;
+    }
   } catch {
     // This run can still show the reading it already has.
   }

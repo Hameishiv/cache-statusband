@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
@@ -114,6 +114,8 @@ describe("weekly usage", () => {
     const entry = JSON.parse(readFileSync(cachePath, "utf8")).logs[logPath];
     assert.equal(entry.record, null);
     assert.equal(entry.scannedAt, now);
+    // written through a temporary file that is renamed over it: none is left beside the cache
+    assert.deepEqual(readdirSync(dir).filter((name) => name.endsWith(".tmp")), []);
     // A credits line appended within five minutes is not seen until the next rescan.
     writeFileSync(logPath, `no credits line\n${JSON.stringify({
       ts: "2026-10-29T11:40:00Z",

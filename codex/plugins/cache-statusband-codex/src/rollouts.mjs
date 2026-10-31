@@ -85,7 +85,7 @@ function consume(item, summary) {
   if (item?.type !== "event_msg" || payload?.type !== "token_count") return;
   const info = payload.info;
   // codex-cli writes the limits beside info (keys: info, rate_limits, type), and an event may carry them with no info at all
-  summary.rateLimits = rateLimits(payload.rate_limits ?? payload.rateLimits ?? info?.rate_limits ?? info?.rateLimits) ?? summary.rateLimits;
+  summary.rateLimits = rateLimits(payload.rate_limits ?? payload.rateLimits ?? info?.rate_limits ?? info?.rateLimits, item.timestamp) ?? summary.rateLimits;
   if (!info) return;
   const last = info.last_token_usage ?? info.lastTokenUsage;
   const total = info.total_token_usage ?? info.totalTokenUsage;
@@ -96,14 +96,24 @@ function consume(item, summary) {
 }
 
 // Only the two windows' known fields, through the filter the app-server reading uses (plan_type, credits and any other key never get through)
-function rateLimits(value) {
+// An older rollout gives resets_in_seconds instead of an absolute time: counted from the event's own timestamp (null when that is unreadable)
+function rateLimits(value, timestamp) {
   if (!value || typeof value !== "object") return null;
+  const eventSeconds = typeof timestamp === "string" ? Date.parse(timestamp) / 1000 : Number.NaN;
+  const resetsAt = (w) => {
+    const absolute = w.resets_at ?? w.resetsAt;
+    if (absolute !== undefined && absolute !== null) return absolute;
+    const inSeconds = w.resets_in_seconds ?? w.resetsInSeconds;
+    if (inSeconds === undefined || inSeconds === null || inSeconds === "") return null;
+    const relative = Number(inSeconds);
+    return Number.isFinite(eventSeconds) && Number.isFinite(relative) && relative >= 0 ? Math.floor(eventSeconds + relative) : null;
+  };
   const window = (w) =>
     w && typeof w === "object"
       ? safeWindow({
           usedPercent: w.used_percent ?? w.usedPercent,
           windowDurationMins: w.window_minutes ?? w.windowDurationMins,
-          resetsAt: w.resets_at ?? w.resetsAt,
+          resetsAt: resetsAt(w),
         })
       : null;
   return { primary: window(value.primary), secondary: window(value.secondary) };
