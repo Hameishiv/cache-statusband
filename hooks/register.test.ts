@@ -5418,7 +5418,7 @@ test('on an engine with no read, a single fill that answers late "filled" is tra
 // A request that starts while the fill is out may be the very message that was put back and sent: the late "filled" answer then tracks nothing, so a later put-back does not bring the sent text back
 test('on an engine with no read, a late "filled" answer after a request started while the fill was out is not tracked: a later put-back does not bring the text back', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
   const step = stepper($, on)
-  const r = await joinedLateFill($, on, WAKE_TEXT, 'filled', undefined, true, async () => { await step({}) })
+  const r = await joinedLateFill($, on, WAKE_TEXT, 'filled', undefined, true, async () => { await step({ input_tokens: 10, cache_read_input_tokens: 300000, cache_creation_input_tokens: 0 }) })
   await r.clock.advance(77 * 60000) // cold again (the earlier compaction still hangs: the chat is not marked compacted)
   ;(r.seen as any).failSubmit = true // the message is refused after compacting, and put back
   void sendBridge($, 'three')
