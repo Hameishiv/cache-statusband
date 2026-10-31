@@ -5291,15 +5291,14 @@ test('a late "not filled" answer for a message put back over one held only quote
 })
 
 // The earlier put-back is still in the box, unsent, when a later one is joined behind it (the fill replaces the box, so its text is both)
-// lapse: the earlier put-back's own hold (15 minutes) has run out before the later one is joined behind it (its text is still in the box: the tracking does not lapse with time)
-async function joinedLateFill($: any, on: any, second: string, answer: 'none' | 'not filled', boxAfter?: string, lapse = false) {
+async function joinedLateFill($: any, on: any, second: string, answer: 'none' | 'not filled', boxAfter?: string) {
   const box = { text: '' }
   const { clock, seen, fills, late, finish } = await lateJoinSetup($, on, box)
   await $.prompt.submit({ text: 'stop, do X instead', origin: COMPOSER, wait: false } as never)
   await clock.advance(60000)
   for (let i = 0; i < 20 && !fills.length; i++) await clock.advance(60000)
   expect(box.text).toBe('stop, do X instead')
-  await clock.advance(lapse ? 16 * 60000 : 60000)
+  await clock.advance(60000)
   late.armed = true
   await sendBridge($, second) // goes in behind it, but the fill does not answer in time
   await clock.advance(1000)
@@ -5341,8 +5340,32 @@ test('after that late "not filled" answer the earlier text is tracked again: a p
   expect(clock).toBeDefined()
 })
 
-test('after a late "not filled" answer for a message joined behind an earlier put-back whose own hold had lapsed, the earlier text is tracked again: a put-back after it goes in behind it, not quoted', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
-  const { clock, seen, fills } = await joinedLateFill($, on, WAKE_TEXT, 'not filled', undefined, true)
+// The earlier put-back's own hold (15 minutes) has run out before the later one is joined behind it: its compaction failed late, which freed the next send to compact, and that compaction was abandoned in turn. The text of the earlier put-back is still in the box, and the tracking of it does not lapse with time
+async function lapsedJoinLateFill($: any, on: any) {
+  const box = { text: '' }
+  const { clock, seen, fills, late } = await lateJoinSetup($, on, box)
+  let fail: (e: Error) => void = () => {}
+  let n = 0
+  seen.duringCompact = () => (++n === 1 ? new Promise<void>((_, rej) => { fail = rej }) : new Promise<void>(() => {}))
+  await $.prompt.submit({ text: 'stop, do X instead', origin: COMPOSER, wait: false } as never)
+  await clock.advance(60000)
+  for (let i = 0; i < 20 && !fills.length; i++) await clock.advance(60000)
+  expect(box.text).toBe('stop, do X instead')
+  fail(new Error('late boom')) // the abandoned compaction ends: the next send compacts again
+  await clock.advance(16 * 60000) // the hold of the first put-back runs out
+  late.armed = true
+  await sendBridge($, WAKE_TEXT)
+  await clock.advance(15 * 60000 + 1000) // compacting again, abandoned in turn: goes in behind the text still in the box, but the fill does not answer in time
+  await clock.advance(2500)
+  expect(fills).toEqual(['stop, do X instead', 'stop, do X instead\n\n' + WAKE_TEXT])
+  late.resolve({ isFilled: false })
+  await realMs(50)
+  late.armed = false
+  return { clock, seen, fills, box }
+}
+
+test('after a late "not filled" answer for a message joined behind an earlier put-back whose own hold had lapsed, the earlier text is tracked again: a put-back after it goes in behind it, not quoted', SETUP, async ($, on) => {
+  const { clock, seen, fills } = await lapsedJoinLateFill($, on)
   void sendBridge($, 'three')
   await clock.advance(1000)
   expect(fills).toEqual(['stop, do X instead', 'stop, do X instead\n\n' + WAKE_TEXT, 'stop, do X instead\n\nthree'])
