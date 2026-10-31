@@ -200,8 +200,10 @@ test('auto keep warm starts at turn end and stops once the merge-pr PR merges', 
   on('session.usage', () => ({ value: { context: { tokens: 300000, window: 1000000 } } }))
   on('turn.complete', () => ({ text: '' }))
   on('model.fork', () => ({ value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }))
+  const req = bigRequest($, on)
   await start($, 300000, clock)
   await $.prompt.submit({ text: '/merge-pr 123', command: { name: 'merge-pr', args: '123' }, origin: COMPOSER, wait: false } as never)
+  await req()
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
   let r: any = await $.command.run({ command: 'cache', args: '' })
   expect(r.text).toMatch(/Keep warm is on/)
@@ -219,15 +221,18 @@ test('a chat resumed after the old chat\'s PR merged keeps warm: the PR and the 
   on('session.usage', () => ({ value: { context: { tokens: 300000, window: 1000000 } } }))
   on('turn.complete', () => ({ text: '' }))
   on('model.fork', () => ({ value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }))
+  const req = bigRequest($, on)
   on('classic.SessionStart', () => ({}))
   await start($, 300000, clock)
   await $.prompt.submit({ text: '/merge-pr 123', command: { name: 'merge-pr', args: '123' }, origin: COMPOSER, wait: false } as never)
+  await req()
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
   state = 'MERGED'
   await clock.advance(16 * 60000)
   let r: any = await $.command.run({ command: 'cache', args: '' })
   expect(r.text).toMatch(/off in this session/)
   await ($ as any).classic.SessionStart({ source: 'resume' }) // another chat, which has nothing to do with PR 123
+  await req()
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't2', reason: 'end_turn' } as never)
   r = await $.command.run({ command: 'cache', args: '' })
   expect(r.text).toMatch(/Keep warm is on/)
@@ -244,9 +249,11 @@ test('this mod\'s clear and continue keeps the chat\'s PR: keep warm still stops
   on('session.usage', () => ({ value: { context: { tokens: 300000, window: 1000000 } } }))
   on('turn.complete', () => ({ text: '' }))
   on('model.fork', () => ({ value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }))
+  const req = bigRequest($, on)
   on('classic.SessionStart', () => ({}))
   await start($, 300000, clock)
   await $.prompt.submit({ text: '/merge-pr 123', command: { name: 'merge-pr', args: '123' }, origin: COMPOSER, wait: false } as never)
+  await req()
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
   // a handoff is captured, then /handoff continue runs /clear, whose SessionStart fires inside it
   await $.command.run({ command: 'session-handoff', args: '' })
@@ -255,6 +262,7 @@ test('this mod\'s clear and continue keeps the chat\'s PR: keep warm still stops
   await $.command.run({ command: 'handoff', args: 'continue' })
   await clock.advance(100)
   expect(seen.submits.length).toBe(1) // the handoff went into the cleared chat
+  await req()
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't3', reason: 'end_turn' } as never)
   let r: any = await $.command.run({ command: 'cache', args: '' })
   expect(r.text).toMatch(/Keep warm is on/)
@@ -331,11 +339,13 @@ test('after /clear the PR a prompt names is the one keep warm tracks', SETUP, as
   on('session.usage', () => ({ value: { context: { tokens: 300000, window: 1000000 } } }))
   on('turn.complete', () => ({ text: '' }))
   on('model.fork', () => ({ value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }))
+  const req = bigRequest($, on)
   on('classic.SessionStart', () => ({}))
   await start($, 300000, clock)
   await $.prompt.submit({ text: '/merge-pr 123', command: { name: 'merge-pr', args: '123' }, origin: COMPOSER, wait: false } as never)
   await ($ as any).classic.SessionStart({ source: 'clear' })
   await $.prompt.submit({ text: '/merge-pr 456', command: { name: 'merge-pr', args: '456' }, origin: COMPOSER, wait: false } as never)
+  await req()
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
   await clock.advance(16 * 60000)
   expect(asked.length).toBeGreaterThan(0)
@@ -642,6 +652,14 @@ async function cancelledThenRequest($: any, clock: any, seen: { toasts: string[]
   for (let i = 0; i < 300 && !seen.toasts.some((t) => /automatic one/.test(t)); i++) await clock.advance(60000)
   await mainStep($)
 }
+// A main-loop request that reads a 300k cache, for a test that registers its own turn.complete and session.usage: auto keep warm starts only on a cache a request has warmed
+function bigRequest($: any, on: any) {
+  on('turn.step', async function* () {
+    return { answer: '', toolUses: [], usage: usage({ cache_read_input_tokens: 300000 }) }
+  })
+  return () => mainStep($)
+}
+
 const ROTATE = 'Usage reset: the CLI account was rotated to B. Go on.'
 
 test('a compaction after a rotation that a request already landed on is not a cold rewrite', SETUP, async ($, on) => {
@@ -918,15 +936,18 @@ test('a hand-over to auto keep warm says so, and the pings before it count towar
   expect(hand[0]).toMatch(/until [^;]+; it stops sooner once its pings since your last message cost as much as the rewrite/)
 })
 
-// A chat resumed from another one (a SessionStart of source 'resume'), big and warm, whose turn ended without a request of its own measured
-async function resumeBig($: any, clock: any) {
-  await ($ as any).classic.SessionStart({ source: 'resume' })
+// A chat resumed from another one (a SessionStart of source 'resume', under an id of its own), big and warm from its transcript, whose turn ended without a request of its own measured
+async function resumeBig($: any, clock: any, disk: { id?: string; files?: Record<string, string> }) {
+  disk.id = 'sid-B'
+  disk.files!['sid-B.jsonl'] = reply(await clock.now(), 300000)
+  await ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/sid-B.jsonl' })
   await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [], changed: [] })
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'b', reason: 'end_turn' } as never)
 }
 
 test('a resumed chat does not inherit the last chat\'s auto cap stop: a keep warm started by hand there hands over at its end, with a whole cap', async ($, on) => {
-  const { clock, seen } = engine($, on)
+  const disk: { id: string; files: Record<string, string> } = { id: 'sid-A', files: {} }
+  const { clock, seen } = engine($, on, { label: 'A' }, undefined, undefined, disk)
   let pings = 0
   on('model.fork', () => {
     pings++
@@ -941,7 +962,7 @@ test('a resumed chat does not inherit the last chat\'s auto cap stop: a keep war
   await clock.advance(2 * 3600000) // chat A's auto keep warm stops on its cap
   const inA = pings
   expect(inA).toBeGreaterThan(3)
-  await resumeBig($, clock) // chat B
+  await resumeBig($, clock, disk) // chat B
   await $.command.run({ command: 'keepwarm', args: '1' })
   await clock.advance(61 * 60000)
   const handEnd = pings
@@ -954,7 +975,8 @@ test('a resumed chat does not inherit the last chat\'s auto cap stop: a keep war
 })
 
 test('the last chat\'s auto pings do not count toward a resumed chat\'s cap', async ($, on) => {
-  const { clock } = engine($, on)
+  const disk: { id: string; files: Record<string, string> } = { id: 'sid-A', files: {} }
+  const { clock } = engine($, on, { label: 'A' }, undefined, undefined, disk)
   let pings = 0
   on('model.fork', () => {
     pings++
@@ -969,7 +991,7 @@ test('the last chat\'s auto pings do not count toward a resumed chat\'s cap', as
   await clock.advance(40 * 60000) // chat A's auto keep warm pings for a while, under its cap
   const inA = pings
   expect(inA).toBeGreaterThan(5)
-  await resumeBig($, clock) // chat B: its turn ended with no request measured, and auto keep warm starts in it
+  await resumeBig($, clock, disk) // chat B: its turn ended with no request measured, and auto keep warm starts in it
   await clock.advance(6 * 3600000)
   const inB = pings - inA
   const r: any = await $.command.run({ command: 'cache', args: '' })
@@ -979,7 +1001,8 @@ test('the last chat\'s auto pings do not count toward a resumed chat\'s cap', as
 })
 
 test('a keep warm started by hand in a resumed chat does not hand over from the last chat\'s last turn', async ($, on) => {
-  const { clock, seen } = engine($, on)
+  const disk: { id: string; files: Record<string, string> } = { id: 'sid-A', files: {} }
+  const { clock, seen } = engine($, on, { label: 'A' }, undefined, undefined, disk)
   let pings = 0
   on('model.fork', () => {
     pings++
@@ -992,7 +1015,9 @@ test('a keep warm started by hand in a resumed chat does not hand over from the 
   await step(usage({ cache_read_input_tokens: 300000 }))
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
   await clock.advance(10 * 60000)
-  await ($ as any).classic.SessionStart({ source: 'resume' }) // chat B: no turn of its own yet
+  disk.id = 'sid-B'
+  disk.files['sid-B.jsonl'] = reply(await clock.now(), 300000)
+  await ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/sid-B.jsonl' }) // chat B: no turn of its own yet
   await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [], changed: [] })
   await $.command.run({ command: 'keepwarm', args: '1' })
   await clock.advance(61 * 60000)
@@ -1075,6 +1100,162 @@ test('a hand-started keep warm does not hand over when auto pings already cost t
   expect(r.text).not.toMatch(/Keep warm is on/)
   expect(seen.toasts.filter((t) => /now runs as auto keep warm/.test(t)).length).toBe(0)
   expect(seen.toasts.filter((t) => /time limit reached/.test(t)).length).toBe(1)
+})
+
+test('an aborted turn ending long after auto keep warm stopped, on a cache that went cold, does not start it: no ping', async ($, on) => {
+  const { clock, seen } = engine($, on)
+  let pings = 0
+  let afterCold = 0
+  let cold = false
+  on('model.fork', () => {
+    pings++
+    if (pings === 1) throw new Error('overloaded') // the first ping fails: auto keep warm stops, not on its cap
+    if (cold) afterCold++
+    return { value: { text: 'ok', usage: usage(cold ? { cache_creation_input_tokens: 300000 } : { cache_read_input_tokens: 300000 }) } }
+  })
+  const step = stepper($, on)
+  await start($, 300000, clock)
+  await $.command.run({ command: 'cache', args: 'ttl 5' })
+  await step(usage({ cache_read_input_tokens: 300000 }))
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  await clock.advance(10 * 60000)
+  expect(seen.toasts.filter((t) => /Keep warm off/.test(t)).length).toBe(1)
+  await clock.advance(3 * 3600000) // the cache has been cold for hours
+  cold = true
+  const toasts = seen.toasts.length
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: true, turnId: 't2', reason: 'aborted' } as never) // no request of its own
+  await clock.advance(10 * 60000)
+  expect(afterCold).toBe(0) // not one ping, each of which would have paid the whole rewrite
+  expect(seen.toasts.length).toBe(toasts) // and no "Keeping this cache warm" toast
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/Keep warm is on/)
+})
+
+test('auto keep warm running on a cache that went cold stops without a ping: "the cache had already gone cold"', async ($, on) => {
+  const { clock, seen } = engine($, on)
+  let pings = 0
+  on('model.fork', () => {
+    pings++
+    return { value: { text: 'ok', usage: usage({ cache_creation_input_tokens: 300000 }) } }
+  })
+  on('tool.call', () => ({ result: {} }))
+  on('turn.start', () => ({ turnId: 't' }))
+  const step = stepper($, on)
+  await start($, 300000, clock)
+  await $.command.run({ command: 'cache', args: 'ttl 5' })
+  await step(usage({ cache_read_input_tokens: 300000 }))
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never) // auto keep warm starts
+  await $.turn.start({ turnId: 't2' } as never) // a long stretch with no request of its own: no pings while working
+  await clock.advance(20 * 60000)
+  expect(pings).toBe(0)
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: true, turnId: 't2', reason: 'aborted' } as never) // auto keep warm goes on, on a cold cache
+  await clock.advance(5 * 60000)
+  expect(pings).toBe(0)
+  const off = seen.toasts.filter((t) => /Keep warm off/.test(t))
+  expect(off.length).toBe(1)
+  expect(off[0]).toMatch(/Keep warm off \(the cache had already gone cold\)\. 0 ping\(s\)/)
+})
+
+test('a resume of the same chat after auto keep warm stopped on its cap keeps the cap: a turn that ends with no request does not start it again', async ($, on) => {
+  const disk: { id: string; files: Record<string, string> } = { id: 'sid-A', files: {} }
+  const { clock, seen } = engine($, on, { label: 'A' }, undefined, undefined, disk)
+  let pings = 0
+  on('model.fork', () => {
+    pings++
+    return { value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }
+  })
+  on('classic.SessionStart', () => ({}))
+  const step = stepper($, on)
+  await start($, 300000, clock)
+  await $.command.run({ command: 'cache', args: 'ttl 5' })
+  await step(usage({ cache_read_input_tokens: 300000 }))
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  await clock.advance(2 * 3600000) // auto keep warm stops on its cap
+  const capped = pings
+  expect(capped).toBeGreaterThan(3)
+  disk.files['sid-A.jsonl'] = reply(await clock.now(), 300000) // the same chat, reopened warm
+  await ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/sid-A.jsonl' })
+  await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [], changed: [] })
+  const keepToasts = () => seen.toasts.filter((t) => /Keeping this cache warm|Keep warm off/.test(t)).length // (the "cache goes cold" alert is not one)
+  const toasts = keepToasts()
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: true, turnId: 't2', reason: 'aborted' } as never)
+  await clock.advance(2 * 3600000)
+  expect(pings).toBe(capped) // no new cap's worth of pings
+  expect(keepToasts()).toBe(toasts)
+})
+
+test('a resume whose session id cannot be read keeps the cap too: nothing says it is another chat', async ($, on) => {
+  const disk: { id: string; files: Record<string, string> } = { id: 'sid-A', files: {} }
+  const { clock, seen } = engine($, on, { label: 'A' }, undefined, undefined, disk)
+  let pings = 0
+  on('model.fork', () => {
+    pings++
+    return { value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }
+  })
+  on('classic.SessionStart', () => ({}))
+  const step = stepper($, on)
+  await start($, 300000, clock)
+  await $.command.run({ command: 'cache', args: 'ttl 5' })
+  await step(usage({ cache_read_input_tokens: 300000 }))
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  await clock.advance(2 * 3600000) // auto keep warm stops on its cap
+  const capped = pings
+  expect(capped).toBeGreaterThan(3)
+  disk.id = '' // the id read answers nothing
+  disk.files['sid-X.jsonl'] = reply(await clock.now(), 300000)
+  await ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/sid-X.jsonl' })
+  await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [], changed: [] })
+  const keepToasts = () => seen.toasts.filter((t) => /Keeping this cache warm|Keep warm off/.test(t)).length // (the "cache goes cold" alert is not one)
+  const toasts = keepToasts()
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: true, turnId: 't2', reason: 'aborted' } as never)
+  await clock.advance(2 * 3600000)
+  expect(pings).toBe(capped) // no new cap's worth of pings
+  expect(keepToasts()).toBe(toasts)
+})
+
+test('auto pings that cost the cap without stopping on it (a ping wrote the cache) do not restart at an aborted turn that follows', async ($, on) => {
+  const { clock, seen } = engine($, on)
+  let pings = 0
+  on('model.fork', () => {
+    pings++
+    // the first ping (auto's) writes the cache: it costs about the rewrite and stops auto keep warm, but not on its cap flag
+    return { value: { text: 'ok', usage: usage(pings === 1 ? { cache_creation_input_tokens: 300000 } : { cache_read_input_tokens: 300000 }) } }
+  })
+  const step = stepper($, on)
+  await start($, 300000, clock)
+  await $.command.run({ command: 'cache', args: 'ttl 5' })
+  await step(usage({ cache_read_input_tokens: 300000 }))
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  await clock.advance(4 * 60000)
+  expect(pings).toBe(1)
+  expect(seen.toasts.some((t) => /the ping wrote/.test(t))).toBe(true)
+  const toasts = seen.toasts.length
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: true, turnId: 't2', reason: 'aborted' } as never) // a turn with no request of its own, the cache not yet cold
+  await clock.advance(30 * 60000)
+  expect(pings).toBe(1) // not started again
+  expect(seen.toasts.length).toBe(toasts)
+})
+
+test('a keep warm started by hand whose end finds a cache that went cold does not hand over to auto keep warm', async ($, on) => {
+  const { clock, seen } = engine($, on)
+  let pings = 0
+  on('model.fork', () => {
+    pings++
+    return { value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }
+  })
+  on('turn.start', () => ({ turnId: 't' }))
+  const step = stepper($, on)
+  await start($, 300000, clock)
+  await $.command.run({ command: 'cache', args: 'ttl 5' })
+  await step(usage({ cache_read_input_tokens: 300000 }))
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  await $.turn.start({ turnId: 't2' } as never) // a stretch with no request of its own: no pings while working
+  await $.command.run({ command: 'keepwarm', args: '1' })
+  await clock.advance(70 * 60000) // the cache went cold long before the hour ended
+  expect(seen.toasts.filter((t) => /now runs as auto keep warm/.test(t)).length).toBe(0)
+  expect(seen.toasts.filter((t) => /time limit reached/.test(t)).length).toBe(1)
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/Keep warm is on/)
 })
 
 test('with auto keep warm off, a keep warm started by hand stops at its own end', async ($, on) => {
@@ -6223,9 +6404,11 @@ for (const order of ['inside the clear', 'after clear and continue returned']) {
     on('session.usage', () => ({ value: { context: { tokens: 300000, window: 1000000 } } }))
     on('turn.complete', () => ({ text: '' }))
     on('model.fork', () => ({ value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }))
+  const req = bigRequest($, on)
     on('classic.SessionStart', () => ({}))
     await start($, 300000, clock)
     await $.prompt.submit({ text: '/merge-pr 123', command: { name: 'merge-pr', args: '123' }, origin: COMPOSER, wait: false } as never)
+    await req()
     await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
     await $.command.run({ command: 'session-handoff', args: '' })
     await $.turn.complete({ answer: '# Session Handoff\n' + 'work on PR 123 continues. '.repeat(20), durationMs: 1, isAborted: false, turnId: 't2', reason: 'answer' } as never)
@@ -6234,6 +6417,7 @@ for (const order of ['inside the clear', 'after clear and continue returned']) {
     await clock.advance(100)
     expect(seen.submits.length).toBe(1)
     if (order !== 'inside the clear') await clock.advance(5000), await ($ as any).classic.SessionStart({ source: 'clear' }) // the clear's SessionStart, well after everything returned
+    await req()
     await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't3', reason: 'end_turn' } as never)
     state = 'MERGED'
     await clock.advance(16 * 60000)
@@ -6276,9 +6460,11 @@ test('a resumed chat with no readable transcript reads its PR from the session m
   on('session.usage', () => ({ value: { context: { tokens: 300000, window: 1000000 } } }))
   on('turn.complete', () => ({ text: '' }))
   on('model.fork', () => ({ value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }))
+  const req = bigRequest($, on)
   on('classic.SessionStart', () => ({}))
   await start($, 300000, clock)
   await ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/gone.jsonl' })
+  await req()
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
   await clock.advance(16 * 60000)
   expect(asked.length).toBeGreaterThan(0)
@@ -6293,7 +6479,9 @@ test('session.start reads the PR of a reopened chat from its messages, typed com
   on('session.usage', () => ({ value: { context: { tokens: 300000, window: 1000000 } } }))
   on('turn.complete', () => ({ text: '' }))
   on('model.fork', () => ({ value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }))
+  const req = bigRequest($, on)
   await start($, 300000, clock)
+  await req()
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
   await clock.advance(16 * 60000)
   expect(asked.length).toBeGreaterThan(0)
