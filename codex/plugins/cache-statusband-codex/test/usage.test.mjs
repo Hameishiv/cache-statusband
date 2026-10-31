@@ -78,6 +78,19 @@ test("honors a Retry-After longer than the five-minute floor", async (t) => {
   assert.equal(retryAfterMilliseconds({ rpcMessage: "limited; retry after 75 seconds" }, now), 75_000);
 });
 
+test("reads the unit of a textual retry-after: minutes and hours as well as seconds and milliseconds", () => {
+  const ms = (rpcMessage) => retryAfterMilliseconds({ rpcMessage }, 0);
+  assert.equal(ms("rate limited, retry after 30 minutes"), 30 * 60_000);
+  assert.equal(ms("rate limited, retry after 2 hours"), 2 * 3_600_000);
+  assert.equal(ms("retry-after: 500ms"), 500);
+  assert.equal(ms("retry after 45s"), 45_000);
+  assert.equal(ms("retry after 10 min"), 10 * 60_000);
+  assert.equal(ms("retry after 1.5 h"), 1.5 * 3_600_000);
+  assert.equal(ms("retry after 250 milliseconds"), 250);
+  assert.equal(ms("retry after 90"), 90_000);
+  assert.equal(ms("retry after 5 more seconds"), 5_000);
+});
+
 test("caps Retry-After at one hour and keeps the last good reading", async (t) => {
   const root = await fixtureRoot(t);
   const now = Date.parse("2026-10-29T12:00:00.000Z");

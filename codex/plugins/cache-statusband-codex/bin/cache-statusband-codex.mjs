@@ -34,7 +34,7 @@ Commands:
   footer
       Print the recommended native Codex TUI footer setting.
 
-This program never reads authentication files or calls a usage endpoint.
+This program reads usage only through Codex's own app-server, never directly or with a token, and never reads authentication files.
 `);
 }
 
