@@ -1572,7 +1572,9 @@ async function seedFromTranscript($, path, from = seedMark(), priorHb) {
   if (gone()) return
   let last = null
   let storeRead = true
-  const id = S.id
+  // S.id is this chat's only once the chat has read its own (idChat): after a resume whose id read came back empty it is still the chat before's, and that chat's record (its size, age and cold rewrites) is not this one's. The transcript at `path` is the resumed chat's own and still seeds its size and age
+  const own = () => (idChat === from.chat ? S.id : '')
+  const id = own()
   try {
     last = id ? await bounded($, () => $.store.get('last:' + id), WRITE_LIMIT) : null
     if (last === TIMED_OUT) throw new Error('store did not answer') // as a failed read
@@ -1590,12 +1592,13 @@ async function seedFromTranscript($, path, from = seedMark(), priorHb) {
     S.coldRestarts = merged
   }
   if (storeRead && coldSeedPending === from.chat) coldSeedPending = null
-  if (!found && S.id && !measured()) {
+  if (!found && own() && !measured()) {
     try {
       // before its first record, a chat open under an earlier version still has its heartbeat
       // session.start reads it before writing its own (priorHb); for an id this process has written one for, what is stored is its own heartbeat, which is no earlier version's and says nothing of a compaction
-      const earlier = priorHb && priorHb.id === S.id
-      let hb = (last || (!earlier && beaten.has(S.id))) ? null : earlier ? priorHb.hb : await bounded($, () => $.store.get('hb:' + S.id), WRITE_LIMIT)
+      const hbId = own()
+      const earlier = priorHb && priorHb.id === hbId
+      let hb = (last || (!earlier && beaten.has(hbId))) ? null : earlier ? priorHb.hb : await bounded($, () => $.store.get('hb:' + hbId), WRITE_LIMIT)
       if (hb === TIMED_OUT) hb = null // as a failed read
       const r = last || (hb && { ctx: hb.ctx, at: hb.lastActivity, model: hb.model, effort: hb.effort })
       if (gone()) return

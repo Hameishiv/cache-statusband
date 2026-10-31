@@ -6966,3 +6966,61 @@ test('a resume that took its id before session.start: session.start answering no
   expect((kept.get('last:sid-resumed') as any)?.ctx).toBe(50010)
   expect(kept.has('last:')).toBe(false)
 })
+
+// NEW-TESTS-BEGIN (batch 51)
+
+// A resumed chat whose own id read answered nothing: S.id is still the chat before's, and that chat's record is not this one's
+test('a resume whose id read answers nothing does not take the chat before\'s record: no cold restarts, no size', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const disk: any = { files: {}, id: 'sid-old' }
+  const { clock } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  on('classic.SessionStart', () => ({}))
+  await clock.advance(60000)
+  const t0 = await clock.now()
+  kept.set('last:sid-old', { ctx: 400000, at: t0 - 1000, model: 'claude-opus-5-5', cold: [{ at: t0 - 5000, tokens: 400000, usd: 5, gapMin: 70 }] })
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await clock.advance(100)
+  let c: any = await $.command.run({ command: 'cache', args: '' })
+  expect(c.text).toMatch(/Cold restarts in this chat: 1 \(\$5\.00\)/) // the old chat's own history, before the resume
+  disk.files['sid-new.jsonl'] = reply(t0 - 30 * 60000, 120000)
+  disk.id = '' // the resume's own id read answers nothing
+  await ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/sid-new.jsonl' })
+  await clock.advance(100)
+  c = await $.command.run({ command: 'cache', args: '' })
+  expect(c.text).toMatch(/Cold restarts in this chat: 0 \(\$0\)/)
+  expect(c.text.split('\n')[0]).toContain('120k') // the resumed chat's own transcript still seeds its size
+})
+
+// Without a transcript the old record's size and age would be the resumed chat's: nothing of it is read
+test('a resume whose id read answers nothing and has no transcript is not seeded from the chat before\'s record', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const disk: any = { files: {}, id: 'sid-old' }
+  const { clock } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  on('classic.SessionStart', () => ({}))
+  await clock.advance(60000)
+  const t0 = await clock.now()
+  kept.set('last:sid-old', { ctx: 400000, at: t0 - 1000, model: 'claude-opus-5-5' })
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await clock.advance(100)
+  disk.id = ''
+  await ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/missing.jsonl' })
+  await clock.advance(100)
+  const c: any = await $.command.run({ command: 'cache', args: '' })
+  expect(c.text.split('\n')[0]).not.toContain('400k')
+})
+
+// An empty answer keeps the chat's id: the session's heartbeat goes on under its one key, and the old one is not left in the store to read as another session on the board for the next hour
+test('a resume whose id read answers nothing keeps heartbeating under the id it had', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const disk: any = { files: {}, id: 'sid-old' }
+  const { clock } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  on('classic.SessionStart', () => ({}))
+  await start($, 300000, clock)
+  await clock.advance(100)
+  disk.id = ''
+  await ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/missing.jsonl' })
+  const at = await clock.now()
+  await clock.advance(2 * 60000)
+  expect((kept.get('hb:sid-old') as any).updatedAt).toBeGreaterThan(at)
+  expect([...kept.keys()].filter((k) => k.startsWith('hb:'))).toEqual(['hb:sid-old'])
+})
