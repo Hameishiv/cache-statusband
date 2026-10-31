@@ -6146,7 +6146,7 @@ test('a request that starts during the seed read leaves the chat\'s cold history
   release()
   await p
   const mid: any = await $.command.run({ command: 'cache', args: '' })
-  expect(mid.text).toMatch(/Cold restarts this session: 2/)
+  expect(mid.text).toMatch(/Cold restarts in this chat: 2/)
   expect(mid.text).toMatch(/590/) // the seeded size, mid-request
   expect(mid.text).not.toMatch(/no request yet/)
   await req.finish(usage({ cache_read_input_tokens: 600000 }))
@@ -6199,7 +6199,7 @@ test('a request that completes before the seed\'s store read leaves the chat\'s 
   release()
   await p
   const c: any = await $.command.run({ command: 'cache', args: '' })
-  expect(c.text).toMatch(/Cold restarts this session: 2/)
+  expect(c.text).toMatch(/Cold restarts in this chat: 2/)
   expect(c.text).toMatch(/Cache is warm/) // the request's own measurement stands over the seed's
   expect((kept.get('last:sid-test') as { cold: unknown[] }).cold.length).toBe(2)
 })
@@ -6224,5 +6224,5 @@ test('a /compact during the seed read leaves the band on the compacted state, wi
   const c: any = await $.command.run({ command: 'cache', args: '' })
   expect(c.text).not.toMatch(/500k|500,000|500000/) // not the old size
   expect(c.text).not.toMatch(/Cache is cold|went cold/) // not the old date
-  expect(c.text).toMatch(/Cold restarts this session: 2/)
+  expect(c.text).toMatch(/Cold restarts in this chat: 2/)
 })

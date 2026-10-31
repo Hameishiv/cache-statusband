@@ -372,11 +372,7 @@ function judgeChat(found, last) {
 // The compacted size isn't known until the next request: keep the one before it, as rememberLast shapes it (keptAt dates an `at` of 0 for the prune)
 async function rememberCompacted($) {
   if (!S.id || !S.ctx) return
-  try {
-    await $.store.set('last:' + S.id, { ctx: S.ctx, at: 0, keptAt: now, model: S.model, effort: S.effort, cold: await coldToKeep($), ...whoRan() })
-  } catch {
-    // another session holds the store's lock: the next request writes it
-  }
+  await writeRecord($, { ctx: S.ctx, at: 0, keptAt: now, model: S.model, effort: S.effort, ...whoRan() })
 }
 
 // The signed-in account, as Claude Code keeps it in .claude.json: what the band shows
@@ -478,7 +474,7 @@ let sendPendingId = 0
 let stepsSeen = 0 // main-loop requests started so far
 let measuredSteps = 0 // main-loop requests whose usage came back and measured the chat (S.ctx, S.lastActivity): a request that started, or ended with no usage, measured nothing
 let compactGen = 0 // compactions marked so far (markCompacted): one that lands while a seed reads has made the chat's size and date its own
-let coldSeedPending = 0 // the msgChat whose cold-rewrite history its seed has not merged yet: until it has, what is stored for the chat is not replaced by a shorter list (coldToKeep)
+let coldSeedPending = 0 // the msgChat whose cold-rewrite history its seed has not merged yet: until it has, what is stored for the chat is not replaced by a shorter list (writeRecord)
 let realSends = 0 // messages handed on to the chat (submitsSeen without "Compact first" answers, wake-ups and /clear)
 let msgChat = 0 // the conversation, bumped by /clear and by resuming another chat, not by a fork, which carries the conversation on. A message from before a fork is still the new chat's, so is a pending Resume (and one compacting, or being re-armed), and so is a compaction in flight (it is waited for, and its success or abandonment is recorded: compacting, liveRuns, abandoned); /clear and resuming another chat start another conversation, where neither is sent or recorded
 let msgChatCause = '' // why msgChat last moved, in words for the toast: 'cleared' or 'replaced by a resumed chat'
@@ -1433,26 +1429,62 @@ function mergeCold(...lists) {
   return out.sort((a, b) => (a.at || 0) - (b.at || 0)).slice(-COLD_KEEP)
 }
 
-// The cold history a record of this chat is written with. Once the chat's seed has merged what is stored (and in a chat with no seed to wait for) that is this process's own list. Before then a request that ends first would write a list lacking the history a reopened chat brought, over the one the seed is about to read: so what is stored is merged into it.
-async function coldToKeep($) {
-  const own = S.coldRestarts.slice(-COLD_KEEP)
-  if (coldSeedPending !== msgChat) return own
+let coldSeedChat = null // { chat, id, list }: the cold history stored for a chat, once read (by its seed or by the first record written while the seed had not merged it), so a record written meanwhile merges it without another read. Reset whenever a seed is awaited (holdStoredCold)
+let writeChain = Promise.resolve() // the chat's records go to the store in the order they were issued: one waiting on the stored history must not be overtaken by a later one
+
+// The chat's stored cold history is now awaited by its seed: a record written before the seed has merged it merges it too (coldToKeep)
+function holdStoredCold(chat) {
+  coldSeedPending = chat
+  coldSeedChat = null
+}
+
+// Reads what is stored for the chat once and keeps it (coldSeedChat); merged into this process's own list, which a seed that could not read it then no longer waits for. False when it could not be read (another session holds the store's lock): then nothing is known of the stored history.
+async function loadStoredCold($, chat, id) {
+  if (coldSeedChat && coldSeedChat.chat === chat && coldSeedChat.id === id) return true
+  let stored = null
   try {
-    const stored = await $.store.get('last:' + S.id)
-    return mergeCold(stored && stored.cold, own)
+    stored = await $.store.get('last:' + id)
   } catch {
-    return own
+    return false
   }
+  const list = stored && Array.isArray(stored.cold) ? stored.cold : []
+  coldSeedChat = { chat, id, list }
+  if (chat === msgChat && id === S.id) {
+    const merged = mergeCold(list, S.coldRestarts)
+    const changed = merged.length !== S.coldRestarts.length
+    S.coldRestarts = merged
+    if (coldSeedPending === chat) coldSeedPending = 0
+    if (changed) $.ui.invalidate('ui.render')
+  }
+  return true
+}
+
+// Writes a chat's record with its cold history, after the ones issued before it. The record is built by the caller in one go (what the request measured and where it ran, as of one moment), and so is the list of cold rewrites it carries: this process's own at that moment. While the chat's seed has not merged the stored history, that is merged into the list too, so a shorter one never replaces what is stored; when the stored history cannot be read the record is not written (the next request writes it).
+function writeRecord($, record) {
+  const id = S.id
+  const chat = msgChat
+  const own = S.coldRestarts.slice(-COLD_KEEP)
+  const merge = coldSeedPending === chat
+  const run = writeChain.then(async () => {
+    try {
+      let cold = own
+      if (merge) {
+        if (!(await loadStoredCold($, chat, id))) return
+        cold = mergeCold(coldSeedChat.list, own)
+      }
+      await $.store.set('last:' + id, { ...record, cold })
+    } catch {
+      // another session holds the store's lock: the next request writes it
+    }
+  })
+  writeChain = run
+  return run
 }
 
 async function rememberLast($) {
   if (!S.id || !S.ctx) return
-  try {
-    // the chat's cold rewrites too, so their cost survives a reopen
-    await $.store.set('last:' + S.id, { ctx: S.ctx, at: S.lastActivity, model: S.model, effort: S.effort, cold: await coldToKeep($), ...whoRan() })
-  } catch {
-    // another session holds the store's lock: the next request writes it
-  }
+  // the chat's cold rewrites too, so their cost survives a reopen
+  await writeRecord($, { ctx: S.ctx, at: S.lastActivity, model: S.model, effort: S.effort, ...whoRan() })
 }
 
 // What a seed was asked for at: the chat (msgChat) its transcript belongs to, and the counts that say what has happened to that chat since. Taken before any await, and carried by a seed that waits (pendingSeed)
@@ -1478,12 +1510,14 @@ async function seedFromTranscript($, path, from = seedMark()) {
   if (gone()) return
   let last = null
   let storeRead = true
+  const id = S.id
   try {
-    last = S.id ? await $.store.get('last:' + S.id) : null
+    last = id ? await $.store.get('last:' + id) : null
   } catch {
     last = null
-    storeRead = false // what is stored is unknown: rememberLast goes on merging it
+    storeRead = false // what is stored is unknown: a record written meanwhile is not written (writeRecord) until it has been read
   }
+  if (storeRead && id) coldSeedChat = { chat: from.chat, id, list: last && Array.isArray(last.cold) ? last.cold : [] }
   if (gone()) return
   // the cold history is the chat's own whatever has been measured since: kept with what this process has recorded meanwhile
   let changed = false
@@ -1778,7 +1812,7 @@ function statusText() {
   if (S.rateLimits.length) lines.push(`Plan limits used: ${limitsText(S.rateLimits)}.`)
   if (keyUnsure()) lines.push('Fable weekly: waiting for the rotator to name the new seat or account.')
   else lines.push(S.fable ? `Fable weekly: ${Math.round(S.fable.percentUsed)}% used.` : `Fable weekly: no reading yet${planWhy && planWhy !== 'ok' ? ` (last check: ${planWhy})` : ''}.`)
-  lines.push(`Session cost so far: ${money(S.costUsd)}. Cold restarts this session: ${S.coldRestarts.length} (${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))}).`)
+  lines.push(`Session cost so far: ${money(S.costUsd)}. Cold restarts in this chat: ${S.coldRestarts.length} (${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))}).`)
   lines.push(`Cold-send guard: ${settings.guard ? 'on' : 'off'} for contexts over ${tokens(settings.bigTokens)} tokens. Alerts: ${settings.alerts ? 'on' : 'off'}.`)
   lines.push(`Auto keep warm: ${settings.autoWarmHours ? `on, until ${settings.autoWarmHours}h after the last turn (sooner once its pings cost as much as the rewrite), for contexts over ${tokens(settings.bigTokens)}${S.autoWarm ? '' : ' (off in this session)'}` : 'off'}.`)
   lines.push(`Settings: /${names.cache} ttl 5|60|auto, /${names.cache} guard on|off, /${names.cache} big 150k, /${names.cache} alerts on|off, /${names.cache} autowarm 8|off. Board: /${names.board}.`)
@@ -1851,8 +1885,9 @@ export function register(on, options = {}) {
     const queued = pendingSeed
     const seedFrom = queued || { ...seedMark(), chat }
     pendingSeed = null
-    if (!S.ctx && S.id && S.cwd) {
-      coldSeedPending = seedFrom.chat // until the seed has merged the chat's stored cold history, a record written first keeps it
+    // not gated on S.ctx: a session.measure or turn.complete can set it without measuring the chat's request (measuredSteps), and the seed itself leaves to a request that did measure what that wrote (seedFromTranscript)
+    if (S.id && S.cwd) {
+      holdStoredCold(seedFrom.chat) // until the seed has merged the chat's stored cold history, a record written first keeps it
       const config = ((await $.env.get('CLAUDE_CONFIG_DIR')) || `${home}/.claude`).replace(/\\/g, '/')
       await seedFromTranscript($, queued ? queued.path : `${config}/projects/${S.cwd.replace(/[^a-zA-Z0-9]/g, '-')}/${S.id}.jsonl`, seedFrom)
     }
@@ -1917,7 +1952,7 @@ export function register(on, options = {}) {
     // a fork keeps its parent's cache, so only a resume seeds; before session.start has read the seat and account it waits for there
     if (e.source === 'resume' && msgChat === chat) {
       // a /clear or another resume while the transcript is read makes it the old chat's: nothing of it is written (seedFromTranscript checks, and so does the PR)
-      coldSeedPending = chat
+      holdStoredCold(chat)
       if (identityRead) await seedFromTranscript($, e.transcript_path, mark)
       else pendingSeed = { path: e.transcript_path, ...mark }
       // either order with session.start ends with the resumed chat's PR: read here from its transcript, not left for its next prompt
@@ -1929,7 +1964,7 @@ export function register(on, options = {}) {
   // A session opened with its history (the app reopening an old chat). claude --continue may arrive here or as a resume above
   on('classic.SessionStart', { source: ['startup'] }, async ($, e, next) => {
     // before session.start has read the seat and account, the record cannot be compared: seed there
-    coldSeedPending = msgChat
+    holdStoredCold(msgChat)
     if (identityRead) await seedFromTranscript($, e.transcript_path)
     else pendingSeed = { path: e.transcript_path, ...seedMark() }
     return next(e)
@@ -2555,7 +2590,7 @@ function drawBoard($, e) {
     const detail = []
     if (hb.state === 'waiting' && hb.waitingFor) detail.push(`needs you: ${hb.waitingFor}`)
     else if (hb.state === 'working' && hb.tool) detail.push(`running ${hb.tool}`)
-    if (hb.coldCount) detail.push(`${hb.coldCount} cold restart${hb.coldCount === 1 ? '' : 's'} ${money(hb.coldUsd)}`)
+    if (hb.coldCount) detail.push(`${hb.coldCount} cold restart${hb.coldCount === 1 ? '' : 's'} in this chat ${money(hb.coldUsd)}`)
     if (hb.keepWarm) detail.push(`warm until ${clock(hb.keepWarmUntil)}, ${hb.pings} ping(s) ${money(hb.pingUsd)}`)
     if (detail.length === 0) return line
     return Box({ flexDirection: 'column', children: [line, Text({ dimColor: true, children: ['            └ ' + detail.join(' · ')] })] })
@@ -2565,7 +2600,7 @@ function drawBoard($, e) {
   const waiting = list.filter((hb) => hb.state === 'waiting').length
   const footer = Text({
     dimColor: true,
-    children: [`${list.length} session${list.length === 1 ? '' : 's'} · ${money(totalCost)} total · ${waiting} waiting on you · cold restarts ${money(totalCold)} · keep warm reads the cache before it expires · Esc closes`],
+    children: [`${list.length} session${list.length === 1 ? '' : 's'} · ${money(totalCost)} total · ${waiting} waiting on you · cold restarts in these chats ${money(totalCold)} · keep warm reads the cache before it expires · Esc closes`],
   })
   return Box({ flexDirection: 'column', children: [header, ...rows, Text({ children: [' '] }), footer] })
 }
