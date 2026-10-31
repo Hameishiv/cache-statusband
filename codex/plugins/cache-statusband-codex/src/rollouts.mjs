@@ -1,5 +1,6 @@
 import { open, readdir, stat } from "node:fs/promises";
 import { basename, join, resolve, sep } from "node:path";
+import { safeWindow } from "./usage.mjs";
 
 const HEAD_BYTES = 256 * 1024;
 const TAIL_BYTES = 2 * 1024 * 1024;
@@ -84,7 +85,7 @@ function consume(item, summary) {
   if (item?.type !== "event_msg" || payload?.type !== "token_count") return;
   const info = payload.info;
   // codex-cli writes the limits beside info (keys: info, rate_limits, type), and an event may carry them with no info at all
-  summary.rateLimits = payload.rate_limits ?? payload.rateLimits ?? info?.rate_limits ?? info?.rateLimits ?? summary.rateLimits;
+  summary.rateLimits = rateLimits(payload.rate_limits ?? payload.rateLimits ?? info?.rate_limits ?? info?.rateLimits) ?? summary.rateLimits;
   if (!info) return;
   const last = info.last_token_usage ?? info.lastTokenUsage;
   const total = info.total_token_usage ?? info.totalTokenUsage;
@@ -92,6 +93,20 @@ function consume(item, summary) {
   summary.contextUsed = number(last?.total_tokens ?? last?.totalTokens) ?? summary.contextUsed;
   summary.contextWindow = number(info.model_context_window ?? info.modelContextWindow) ?? summary.contextWindow;
   summary.totalUsage = usage(total) ?? summary.totalUsage;
+}
+
+// Only the two windows' known fields, through the filter the app-server reading uses (plan_type, credits and any other key never get through)
+function rateLimits(value) {
+  if (!value || typeof value !== "object") return null;
+  const window = (w) =>
+    w && typeof w === "object"
+      ? safeWindow({
+          usedPercent: w.used_percent ?? w.usedPercent,
+          windowDurationMins: w.window_minutes ?? w.windowDurationMins,
+          resetsAt: w.resets_at ?? w.resetsAt,
+        })
+      : null;
+  return { primary: window(value.primary), secondary: window(value.secondary) };
 }
 
 function usage(value) {

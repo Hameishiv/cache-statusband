@@ -404,7 +404,7 @@ async function acquireLock(path, now) {
   }
 }
 
-function safeWindow(value) {
+export function safeWindow(value) {
   if (!value || typeof value !== "object") return null;
   return {
     usedPercent: finiteNonnegative(value.usedPercent),
