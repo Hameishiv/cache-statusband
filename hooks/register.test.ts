@@ -5094,32 +5094,6 @@ test('a fill that lands after the person submitted from the composer holds the R
   expect(seen.submits).toEqual(['Resume'])
 })
 
-test('a fill that lands after the person submitted from the composer is tracked: a later put-back on an engine that cannot read the box goes in behind it', SETUP, async ($, on) => {
-  const dialogs = heldAsk(on)
-  const box = { text: '' }
-  const { ctl, fill } = lateFill(on, box)
-  let first = true
-  const { clock, seen, fills } = await coldChat($, on, () => on('classic.SessionStart', () => ({})), (e: any) => { // no prompt.read
-    if (first) { first = false; return fill(e) }
-    box.text = e.text
-    return { isFilled: true }
-  })
-  hang(seen)
-  await send($, 'one')
-  await clock.advance(15 * 60000 + 1000)
-  await clock.advance(2500)
-  expect(fills).toEqual(['one']) // not answered
-  await send($, '/usage', { name: 'usage', args: '' }) // takes the box text
-  ctl.land(true) // and the fill lands after it
-  await realMs(50)
-  await clock.advance(1000)
-  void sendBridge($, 'three')
-  await clock.advance(100)
-  dialogs.release('Compact first, then send')
-  await clock.advance(1000)
-  expect(fills).toEqual(['one', 'one\n\nthree']) // behind the text that landed
-})
-
 test('a fork that came from no typed command keeps the Resume hold of a put-back message: the Resume still waits for it, and goes 15 minutes after the put-back', { options: { autoResume: true } }, async ($, on) => {
   const { clock, seen } = await resumeHeldByPutBack($, on)
   await ($ as any).classic.SessionStart({ source: 'fork', transcript_path: '/h/fork.jsonl' }) // nothing typed: the box text is still there
@@ -5247,3 +5221,237 @@ for (const source of ['clear', 'resume']) {
     expect(seen.submits).toEqual([])
   })
 }
+
+// ---- the fill part of the Resume hold ends through one rule (endFillPart) ----
+// Setup shared by the tests below: a cold chat whose first compaction (the Resume's) stays out until finish(), so every message sent meanwhile is put back at once. The box is `box`; a fill answers at once, or stays out until `late.resolve` once `late.armed`
+async function lateJoinSetup($: any, on: any, box: { text: string }) {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  on('ui.render', engineDraws)
+  const fills: string[] = []
+  const late: { resolve: (v: any) => void; armed: boolean } = { resolve: () => {}, armed: false }
+  on('prompt.fill', (_: unknown, e: any) => {
+    fills.push(e.text)
+    if (late.armed) return new Promise((r) => { late.resolve = r })
+    box.text = e.text
+    return { isFilled: true }
+  })
+  on('prompt.read', () => ({ value: { text: box.text, cursor: box.text.length } }))
+  answer(on, seen, 'Compact first, then send')
+  on('classic.StopFailure', () => ({}))
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+  await clock.advance(77 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  const t0 = await clock.now()
+  await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [{ kind: 'five_hour', percentUsed: 100, resetsAt: new Date(t0 + 4 * 60000).toISOString() }], changed: [] } as never)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  let finish: () => void = () => {}
+  let n = 0
+  seen.duringCompact = () => (++n === 1 ? new Promise<void>((r) => { finish = r }) : Promise.resolve())
+  return { clock, seen, fills, late, finish: () => finish() }
+}
+
+// A message quoted in a toast (the box held the person's draft, which they then deleted), then a message put back whose fill does not answer in time
+async function quotedThenLateFill($: any, on: any, second: string, answer: 'none' | 'not filled') {
+  const box = { text: '' }
+  const { clock, seen, fills, late, finish } = await lateJoinSetup($, on, box)
+  await $.prompt.submit({ text: 'stop, do X instead', origin: COMPOSER, wait: false } as never)
+  await clock.advance(60000)
+  box.text = 'and also look at Y' // the person's draft
+  let quotedAt = 0
+  for (let i = 0; i < 20 && !quotedAt; i++) {
+    await clock.advance(60000)
+    if (seen.toasts.some((t) => t.includes('Also not sent: stop, do X instead'))) quotedAt = await clock.now()
+  }
+  expect(quotedAt).toBeGreaterThan(0)
+  box.text = '' // the person deleted the draft
+  await clock.advance(5 * 60000)
+  late.armed = true
+  await sendBridge($, second) // put back; its fill does not answer in time
+  await clock.advance(1000)
+  await clock.advance(2500)
+  expect(fills).toEqual([second])
+  if (answer === 'not filled') late.resolve({ isFilled: false }) // and answers late that it did not fill; the box is empty
+  await realMs(50)
+  finish()
+  await clock.advance(1000)
+  await clock.advance(2000)
+  await clock.advance(3 * 60000) // about 9 minutes after the quote
+  return seen
+}
+
+test('a message put back over one held only quoted in a toast, whose fill answers nothing in time: the Resume still waits (control)', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+  expect((await quotedThenLateFill($, on, WAKE_TEXT, 'none')).submits).toEqual([])
+})
+
+test('a late "not filled" answer for a message put back over one held only quoted in a toast ends the fill part only: the quoted message still holds the Resume', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+  const seen = await quotedThenLateFill($, on, WAKE_TEXT, 'not filled')
+  expect(seen.submits).toEqual([]) // the quoted message is still to be sent
+})
+
+// The earlier put-back is still in the box, unsent, when a later one is joined behind it (the fill replaces the box, so its text is both)
+async function joinedLateFill($: any, on: any, second: string, answer: 'none' | 'not filled', boxAfter?: string) {
+  const box = { text: '' }
+  const { clock, seen, fills, late, finish } = await lateJoinSetup($, on, box)
+  await $.prompt.submit({ text: 'stop, do X instead', origin: COMPOSER, wait: false } as never)
+  await clock.advance(60000)
+  for (let i = 0; i < 20 && !fills.length; i++) await clock.advance(60000)
+  expect(box.text).toBe('stop, do X instead')
+  await clock.advance(60000)
+  late.armed = true
+  await sendBridge($, second) // goes in behind it, but the fill does not answer in time
+  await clock.advance(1000)
+  await clock.advance(2500)
+  expect(fills).toEqual(['stop, do X instead', 'stop, do X instead\n\n' + second])
+  if (boxAfter !== undefined) box.text = boxAfter
+  if (answer === 'not filled') late.resolve({ isFilled: false })
+  await realMs(50)
+  late.armed = false
+  return { clock, seen, fills, box, finish }
+}
+
+test('a message joined behind an unsent put-back whose fill answers nothing in time: the text in the box keeps the Resume back (control)', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+  const { clock, seen, box, finish } = await joinedLateFill($, on, WAKE_TEXT, 'none')
+  finish()
+  await clock.advance(1000)
+  await clock.advance(3 * 60000)
+  expect(box.text).toBe('stop, do X instead')
+  expect(seen.submits).toEqual([])
+})
+
+test('a late "not filled" answer for a message joined behind an unsent put-back still shown in the box: that put-back keeps holding the Resume', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+  const { clock, seen, box, finish } = await joinedLateFill($, on, WAKE_TEXT, 'not filled')
+  finish()
+  await clock.advance(1000)
+  await clock.advance(3 * 60000)
+  expect(box.text).toBe('stop, do X instead')
+  expect(seen.submits).toEqual([]) // the Resume must not go ahead of the message still in the box
+})
+
+test('after that late "not filled" answer the earlier text is tracked again: a put-back after it goes in behind it', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+  const { clock, fills } = await (async () => {
+    const r = await joinedLateFill($, on, WAKE_TEXT, 'not filled')
+    void sendBridge($, 'three')
+    await r.clock.advance(1000)
+    return r
+  })()
+  expect(fills).toEqual(['stop, do X instead', 'stop, do X instead\n\n' + WAKE_TEXT, 'stop, do X instead\n\nthree'])
+  expect(clock).toBeDefined()
+})
+
+test('a late "not filled" answer for a joined message, while the box no longer holds the earlier text either, ends the hold: the Resume goes', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+  const { clock, seen, finish } = await joinedLateFill($, on, WAKE_TEXT, 'not filled', '') // the person deleted it before the answer was read
+  finish()
+  await clock.advance(1000)
+  await clock.advance(3 * 60000)
+  expect(seen.submits).toEqual(['Resume'])
+})
+
+// A local command (/btw) put back alone never reaches the chat: it holds nothing and ends nothing
+test('a /btw question put back while an earlier message is held only quoted in a toast leaves that hold: the Resume still waits for the quoted message', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+  const box = { text: '' }
+  const { clock, seen, fills, finish } = await lateJoinSetup($, on, box)
+  await $.prompt.submit({ text: 'stop, do X instead', origin: COMPOSER, wait: false } as never)
+  await clock.advance(60000)
+  box.text = 'and also look at Y'
+  let quotedAt = 0
+  for (let i = 0; i < 20 && !quotedAt; i++) {
+    await clock.advance(60000)
+    if (seen.toasts.some((t) => t.includes('Also not sent: stop, do X instead'))) quotedAt = await clock.now()
+  }
+  expect(quotedAt).toBeGreaterThan(0)
+  box.text = '' // the person deleted the draft
+  await clock.advance(5 * 60000)
+  await send($, '/btw what is X?', { name: 'btw', args: 'what is X?' }) // the earlier compaction is still out: it goes back in the box, filled
+  await clock.advance(1000)
+  expect(fills).toEqual(['/btw what is X?'])
+  finish()
+  await clock.advance(1000)
+  await clock.advance(2000)
+  await clock.advance(3 * 60000) // about 9 minutes after the quote
+  expect(seen.submits).toEqual([]) // the quoted message is still to be sent
+})
+
+// A fill that lands after a composer submit (which took the box text) holds and tracks again only when a read of the box confirms the text is there
+test('a fill that lands after the person submitted from the composer is tracked once a read confirms it: a later put-back goes in behind it', SETUP, async ($, on) => {
+  const dialogs = heldAsk(on)
+  const box = { text: '' }
+  const { ctl, fill } = lateFill(on, box)
+  let first = true
+  const { clock, seen, fills } = await coldChat($, on, () => { on('classic.SessionStart', () => ({})); on('prompt.read', () => ({ value: { text: box.text, cursor: box.text.length } })) }, (e: any) => {
+    if (first) { first = false; return fill(e) }
+    box.text = e.text
+    return { isFilled: true }
+  })
+  hang(seen)
+  await send($, 'one')
+  await clock.advance(15 * 60000 + 1000)
+  await clock.advance(2500)
+  expect(fills).toEqual(['one']) // not answered
+  await send($, '/usage', { name: 'usage', args: '' }) // takes the box text
+  ctl.land(true) // and the fill lands after it: the box holds 'one'
+  await realMs(50)
+  await clock.advance(1000)
+  void sendBridge($, 'three')
+  await clock.advance(100)
+  dialogs.release('Compact first, then send')
+  await clock.advance(1000)
+  expect(fills).toEqual(['one', 'one\n\nthree']) // behind the text that landed
+})
+
+test('a fill that lands after the person submitted from the composer, on an engine that cannot read the box, holds again but tracks nothing: a later put-back fills only its own text', SETUP, async ($, on) => {
+  const dialogs = heldAsk(on)
+  const box = { text: '' }
+  const { ctl, fill } = lateFill(on, box)
+  let first = true
+  const { clock, seen, fills } = await coldChat($, on, () => on('classic.SessionStart', () => ({})), (e: any) => { // no prompt.read
+    if (first) { first = false; return fill(e) }
+    box.text = e.text
+    return { isFilled: true }
+  })
+  hang(seen)
+  await send($, 'one')
+  await clock.advance(15 * 60000 + 1000)
+  await clock.advance(2500)
+  expect(fills).toEqual(['one'])
+  await send($, '/usage', { name: 'usage', args: '' })
+  ctl.land(true)
+  await realMs(50)
+  await clock.advance(1000)
+  void sendBridge($, 'three')
+  await clock.advance(100)
+  dialogs.release('Compact first, then send')
+  await clock.advance(1000)
+  expect(fills).toEqual(['one', 'three']) // nothing known about the box: not merged behind 'one'
+})
+
+test('a fill that lands after the person submitted from the composer, while a read of the box does not show the text, starts no hold: the Resume goes', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+  const { clock, seen, ctl, box } = await resumeLateFill($, on)
+  await send($, '/usage', { name: 'usage', args: '' }) // ends the hold (the box text was taken)
+  ctl.land(true)
+  box.text = '' // the person's submit took the text out of the box all the same: it was sent, not left there
+  await realMs(50)
+  await clock.advance(10 * 60000)
+  expect(seen.submits).toEqual(['Resume'])
+})
+
+test('a fill that lands after the person submitted from the composer, on an engine that cannot read the box, holds the Resume again', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+  const { clock, seen, ctl } = await resumeLateFill($, on, { read: 'none' })
+  await send($, '/usage', { name: 'usage', args: '' })
+  ctl.land(true)
+  await realMs(50)
+  await clock.advance(10 * 60000)
+  expect(seen.submits).toEqual([]) // may be in the box: held
+  await clock.advance(6 * 60000)
+  expect(seen.submits).toEqual(['Resume'])
+})
+
+test('a fill that lands after the person submitted from the composer, while the read of the box fails, starts no hold', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+  const { clock, seen, ctl } = await resumeLateFill($, on, { read: 'deny' })
+  await send($, '/usage', { name: 'usage', args: '' })
+  ctl.land(true)
+  await realMs(50)
+  await clock.advance(10 * 60000)
+  expect(seen.submits).toEqual(['Resume'])
+})
