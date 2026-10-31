@@ -8154,12 +8154,11 @@ test('a ping that wrote instead of read, settling after a real request, does not
 })
 
 test('a ping hung past its margin after a real request does not stop keep warm: the cache is warm from that request', async ($, on) => {
-  const { clock, seen } = await requestWhilePingOut($, on)
+  const { clock, seen, kept, reqAt } = await requestWhilePingOut($, on)
   await clock.advance(8 * 60000)
   expect(seen.toasts.filter((t) => /Keep warm off/.test(t)).length).toBe(0)
-  const r: any = await $.command.run({ command: 'cache', args: '' })
-  expect(r.text).toMatch(/Cache is warm for about 5\dm more/)
   expect(await keepWarmLine($)).toBeDefined()
+  expect(recordedAt(kept)).toBe(reqAt)
 })
 
 // The wake-up's own request is out when the seat, or the account, is adopted a tick later
