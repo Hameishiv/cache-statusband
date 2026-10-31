@@ -1435,7 +1435,9 @@ function mergeCold(...lists) {
 
 let coldSeedChat = null // { chat, id, list }: the cold history stored for a chat, once read (by its seed or by the first record written while the seed had not merged it), so a record written meanwhile merges it without another read. Reset whenever a seed is awaited (holdStoredCold)
 let writeChain = Promise.resolve() // the chat's records: each one's write starts when the one before it has finished or timed out (WRITE_LIMIT), so one waiting on the stored history is not overtaken by a later one. A write that timed out writes nothing more (its late flag, in writeRecord): a step that settles late cannot put an older record over a newer. A store.set that was already issued and lands late can: the newest record issued for that key is then written again (lastIssued), queued here, so every write issued after that waits for it, and a re-write that itself lands late is followed by another. What holds: once no set of this mod's is still out past its limit, the store has the newest record issued for each key. What stays open: two sets of the store's that are both out at once may land in either order, a re-write or record set still out past its limit may land after a later one (until it lands, and its follow-up is written), and a store that never answers loses the record (the next request writes it)
-const lastIssued = new Map() // key -> { key, value }: the newest record a write has handed to store.set for that key, for the one that lands late over it
+const lastIssued = new Map() // key -> { key, value }: the newest record a write has handed to store.set for that key, for the one that lands late over it. An entry goes once its set has settled with nothing newer issued for the key and no set of the key still out (putIssued), so it holds the current chat's key and the keys with a set still out, not every id the process has had
+const setsOut = new Map() // key -> how many sets handed to store.set for it have not settled yet (a stuck one counts until it lands)
+const reissuing = new Set() // the keys with a re-write queued on writeChain and not started: one is enough, it reads the newest record when its turn comes
 const WRITE_LIMIT = 5000 // a store call that has not answered by then is a failed write: the chain goes on without it, as turn.step awaits it (rememberLast)
 
 // The chat's stored cold history is now awaited by its seed: a record written before the seed has merged it merges it too (coldToKeep)
@@ -1486,9 +1488,9 @@ function writeRecord($, record) {
         if (late) return
         const mine = { key: 'last:' + id, value: { ...record, cold } }
         lastIssued.set(mine.key, mine)
-        await $.store.set(mine.key, mine.value)
+        await putIssued($, mine)
         // this set landed after its step timed out, perhaps over a record written since: the newest for the key goes in again
-        if (late && lastIssued.get(mine.key) !== mine) reissue($, mine.key)
+        if (late && newerIssued(mine)) reissue($, mine.key)
       } catch {
         // another session holds the store's lock: the next request writes it
       }
@@ -1498,16 +1500,40 @@ function writeRecord($, record) {
   return run
 }
 
-// Writes the newest record issued for a key again, after what is queued on writeChain (so a later record waits for it, and this one reads lastIssued only when its turn comes). Bounded like a record's write, and a failure is swallowed; one that lands late over a still newer record is followed by another
+// store.set for an issued record (lastIssued), counted while it is out; its entry is dropped when it settles with nothing newer issued for the key and no other set of the key still out: nothing can land over it that it would then have to be written again over
+async function putIssued($, rec) {
+  setsOut.set(rec.key, (setsOut.get(rec.key) || 0) + 1)
+  try {
+    await $.store.set(rec.key, rec.value)
+  } finally {
+    const n = (setsOut.get(rec.key) || 1) - 1
+    if (n > 0) setsOut.set(rec.key, n)
+    else {
+      setsOut.delete(rec.key)
+      if (lastIssued.get(rec.key) === rec) lastIssued.delete(rec.key)
+    }
+  }
+}
+
+// A record newer than this one has been issued for its key
+function newerIssued(rec) {
+  const cur = lastIssued.get(rec.key)
+  return !!cur && cur !== rec
+}
+
+// Writes the newest record issued for a key again, after what is queued on writeChain (so a later record waits for it, and this one reads lastIssued only when its turn comes). At most one is queued per key (reissuing): several sets landing late before it starts are all covered by it. Bounded like a record's write, and a failure is swallowed; one that lands late over a still newer record is followed by another
 function reissue($, key) {
+  if (reissuing.has(key)) return
+  reissuing.add(key)
   writeChain = writeChain.then(() => {
+    reissuing.delete(key)
     const newest = lastIssued.get(key)
     if (!newest) return
     let late = false
     return bounded($, async () => {
       try {
-        await $.store.set(newest.key, newest.value)
-        if (late && lastIssued.get(key) !== newest) reissue($, key)
+        await putIssued($, newest)
+        if (late && newerIssued(newest)) reissue($, key)
       } catch {
         // another session holds the store's lock: the next request writes it
       }
@@ -1883,8 +1909,24 @@ export function register(on, options = {}) {
     const chat = marked.chat
     now = await $.clock.now()
     home = (await $.env.get('USERPROFILE')) || (await $.env.get('HOME')) || ''
-    S.id = await $.session.id()
-    idChat = msgChat
+    // the id belongs to the chat current when it is asked for: a /clear or a resume that took its own id meanwhile keeps it (a later answer wins), and one that answers nothing leaves S.id and idChat as they were
+    const idFor = msgChat
+    const id = await $.session.id()
+    if (id && msgChat === idFor) {
+      S.id = id
+      idChat = idFor
+    }
+    // an earlier version's heartbeat for this chat is the seed's fallback, and this session.start's own heartbeat (below) replaces it: read right after the id, before the reads that let this process's own heartbeat (turn.start's) in
+    const priorHb = S.id ? { id: S.id, hb: null } : null // what was stored for this id before this process wrote its own (null: none, or not readable)
+    if (priorHb) {
+      try {
+        const hb = await bounded($, () => $.store.get('hb:' + priorHb.id), WRITE_LIMIT)
+        // a heartbeat of this process's own was written (beaten) before the read came back: what it returned may be that one, which is no earlier version's
+        if (hb !== TIMED_OUT && hb && typeof hb === 'object' && !beaten.has(priorHb.id)) priorHb.hb = hb
+      } catch {
+        // store unavailable: no fallback
+      }
+    }
     S.cwd = await $.session.cwd()
     S.label = basename(S.cwd)
     S.model = await $.session.model()
@@ -1892,16 +1934,6 @@ export function register(on, options = {}) {
       await loadSettings($)
     } catch {
       // a store lock held by another session: the defaults stand until the next tick
-    }
-    // an earlier version's heartbeat for this chat is the seed's fallback, and this session.start's own heartbeat (below) replaces it: read first
-    const priorHb = S.id ? { id: S.id, hb: null } : null // what was stored for this id before this process wrote its own (null: none, or not readable)
-    if (priorHb) {
-      try {
-        const hb = await bounded($, () => $.store.get('hb:' + priorHb.id), WRITE_LIMIT)
-        if (hb !== TIMED_OUT && hb && typeof hb === 'object') priorHb.hb = hb
-      } catch {
-        // store unavailable: no fallback
-      }
     }
     await readRecording($)
     let surface = null
@@ -2004,8 +2036,12 @@ export function register(on, options = {}) {
     const chat = msgChat // this SessionStart's chat: a fork's is the one it carries on
     const mark = seedMark() // a request that lands while the transcript is read measured this chat itself
     try {
-      S.id = (await $.session.id()) || S.id
-      idChat = chat
+      // the chat's own id, or nothing: an empty answer keeps the old id and the old idChat (no record is written for the chat meanwhile, writeRecord), and one that came back after a later /clear or resume took its own id is not that chat's anymore
+      const id = await $.session.id()
+      if (id && msgChat === chat) {
+        S.id = id
+        idChat = chat
+      }
     } catch {
       // keep the old id
     }

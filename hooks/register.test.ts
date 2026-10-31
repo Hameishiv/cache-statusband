@@ -6707,3 +6707,125 @@ test('a request that ends between a /clear and its new id does not rewrite the o
   await clock.advance(100)
   expect((kept.get('last:sid-test') as any).cold).toEqual(cold)
 })
+
+// A /clear whose new id cannot be read keeps the old id, and is not the old chat's record's to write: nothing is recorded for it meanwhile
+test('a /clear whose session.id answers nothing leaves the old chat\'s record untouched, whatever the next request writes', SETUP, async ($, on) => {
+  const cold = [{ at: 1000, tokens: 200000, usd: 1.5, gapMin: 70 }]
+  const kept = new Map<string, unknown>([['last:sid-test', { ctx: 250000, at: 0, keptAt: 1, cold }]])
+  const disk: any = { files: {} }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  answer(on, seen, 'Send anyway')
+  const req = heldRequest($, on)
+  on('classic.SessionStart', () => ({}))
+  await start($, 300000, clock)
+  disk.id = ''
+  await ($ as any).classic.SessionStart({ source: 'clear' })
+  req.begin()
+  await req.finish(usage({ cache_read_input_tokens: 50000 }))
+  await clock.advance(100)
+  expect((kept.get('last:sid-test') as any).ctx).toBe(250000)
+  expect((kept.get('last:sid-test') as any).cold).toEqual(cold)
+})
+
+// A /clear that lands while session.start waits for the id: the clear's chat is the later one, and its answer wins (two /clears in a row cannot overlap: the engine runs one SessionStart at a time)
+test('a /clear while session.start waits for the id: the clear\'s id stands, not the start\'s late answer', SETUP, async ($, on) => {
+  let calls = 0
+  const rel: (() => void)[] = []
+  const kept = new Map<string, unknown>()
+  const disk: any = { files: {}, holdId: () => (++calls === 1 ? new Promise<void>((r) => rel.push(r)) : undefined) }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  answer(on, seen, 'Send anyway')
+  const req = heldRequest($, on)
+  on('classic.SessionStart', () => ({}))
+  await clock.advance(60000)
+  disk.id = 'sid-start-answer'
+  const st = $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await clock.advance(10)
+  disk.id = 'sid-clear'
+  await ($ as any).classic.SessionStart({ source: 'clear' })
+  disk.id = 'sid-start-stale'
+  rel.forEach((r) => r())
+  await st
+  await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [], changed: [] })
+  req.begin()
+  await req.finish(usage({ cache_read_input_tokens: 50000 }))
+  await clock.advance(100)
+  expect((kept.get('last:sid-clear') as any)?.ctx).toBe(50010)
+  expect(kept.has('last:sid-start-stale')).toBe(false)
+})
+
+// Several sets landing late queue one re-write between them, not one each
+test('several record sets landing late are covered by one re-write: store writes stay bounded and the newest record wins', SETUP, async ($, on) => {
+  let armed = false
+  let sets = 0
+  const rel: (() => void)[] = []
+  const kept = new Map<string, unknown>()
+  const disk: any = { files: {}, holdSet: (key: string) => {
+    if (key !== 'last:sid-test' || !armed) return undefined
+    sets++
+    return sets <= 3 ? new Promise<void>((r) => rel.push(r)) : undefined
+  } }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  answer(on, seen, 'Send anyway')
+  const req = heldRequest($, on)
+  on('classic.SessionStart', () => ({}))
+  await start($, 300000, clock)
+  armed = true
+  for (let i = 0; i < 4; i++) {
+    req.begin()
+    const p = req.finish(usage({ cache_read_input_tokens: 310000 + i * 1000 }))
+    await clock.advance(6000)
+    await p
+  }
+  expect(sets).toBe(4)
+  rel.forEach((r) => r())
+  for (let i = 0; i < 10; i++) await clock.advance(100)
+  expect(sets).toBe(5) // the four writes and one re-write
+  expect((kept.get('last:sid-test') as any).ctx).toBe(313010)
+})
+
+// session.start's own reads let a turn.start heartbeat in; it is this process's, not an earlier version's
+for (const withTurn of [false, true]) test(`a heartbeat this process wrote during session.start's first reads is no earlier version's: the chat is not marked compacted (turn.start ${withTurn})`, SETUP, async ($, on) => {
+  let rel: () => void = () => {}
+  let holdSettings = false
+  const kept = new Map<string, unknown>()
+  const disk: any = { files: {} }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, async (k) => { if (holdSettings && k === 'settings') await new Promise<void>((r) => (rel = r)) }, disk)
+  answer(on, seen, 'Send anyway')
+  on('turn.start', () => ({ turnId: 't' }))
+  await clock.advance(60000)
+  await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [], changed: [] })
+  holdSettings = true
+  const st = $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await clock.advance(10)
+  if (withTurn) await ($ as any).turn.start({ turnId: 't', messages: [] })
+  holdSettings = false
+  rel()
+  await clock.advance(10)
+  await st
+  // taken for an earlier version's (la 0 = written after a compaction), the beat would mark the chat compacted, which writes a compaction record for it
+  await clock.advance(100)
+  expect(kept.has('last:sid-test')).toBe(false)
+})
+
+test('a heartbeat written while the earlier version\'s heartbeat is being read is discarded, not taken for it', SETUP, async ($, on) => {
+  let rel: () => void = () => {}
+  let holdHb = false
+  const kept = new Map<string, unknown>()
+  const disk: any = { files: {} }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, async (k) => { if (holdHb && k === 'hb:sid-test') { holdHb = false; await new Promise<void>((r) => (rel = r)) } }, disk)
+  answer(on, seen, 'Send anyway')
+  on('turn.start', () => ({ turnId: 't' }))
+  await clock.advance(60000)
+  await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [], changed: [] })
+  holdHb = true
+  const st = $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await clock.advance(10)
+  // this process's own beat lands while the read waits: what the read then returns is that beat (la 0)
+  await ($ as any).turn.start({ turnId: 't', messages: [] })
+  rel()
+  await clock.advance(10)
+  await st
+  await clock.advance(100)
+  expect(kept.has('last:sid-test')).toBe(false)
+})
