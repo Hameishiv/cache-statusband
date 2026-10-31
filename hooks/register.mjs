@@ -40,7 +40,7 @@ const S = {
   pings: 0,
   pingUsd: 0,
   autoPingUsd: 0, // what auto keep warm's pings cost since the last real request
-  autoCappedStretch: false, // auto keep warm stopped on its cost cap since the last real request: nothing re-arms it until one
+  autoCappedStretch: false, // auto keep warm stopped on its cost cap since the last real request: neither a turn that ends without one, nor a hand-over, re-arms it until one
   keepWarmAuto: false, // the running keep warm began on its own, not by hand
   lastPingAt: 0,
   warnedFor: 0,
@@ -1719,9 +1719,11 @@ async function keepWarmStep($) {
     // One started by hand ends at its own time, but if auto keep warm would still be covering this chat, it takes over
     // (with its cost cap) rather than leaving the cache to go cold sooner than if nothing had been pressed. The pings
     // so far stay counted (the cap is per idle stretch, not per keep warm), and once auto keep warm has stopped on that
-    // cap in this stretch nothing hands over again
+    // cap in this stretch nothing hands over again (nor once the pings have already cost the cap without stopping on it,
+    // as when a ping wrote the cache)
+    // (no turn of this chat yet, lastTurnEnd 0: nothing for auto keep warm to be covering)
     const autoEnd = S.lastTurnEnd + settings.autoWarmHours * 60 * MIN
-    if (!S.keepWarmAuto && !S.autoCappedStretch && settings.autoWarmHours > 0 && S.autoWarm && S.ctx >= settings.bigTokens && now < autoEnd) {
+    if (!S.keepWarmAuto && S.lastTurnEnd && !S.autoCappedStretch && S.autoPingUsd < rewriteCost(S.ctx, S.model, ttlMin()) && settings.autoWarmHours > 0 && S.autoWarm && S.ctx >= settings.bigTokens && now < autoEnd) {
       S.keepWarmAuto = true
       S.keepWarmUntil = autoEnd
       $.ui.toast(`Keep warm now runs as auto keep warm until ${clock(S.keepWarmUntil)}; it stops sooner once its pings since your last message cost as much as the rewrite.`)
@@ -2017,6 +2019,10 @@ export function register(on, options = {}) {
       compactedCold = false
       S.floor = 0
       S.ctx = 0 // the last chat's size; a resumed chat's own is seeded below (a cleared one starts at 0)
+      // the last chat's idle stretch says nothing about this one: its auto pings must not count toward this chat's cap, its cap stop must not block this chat's hand-over, and its last turn must not date this chat's auto window (a fork is the same conversation: all three stand)
+      S.autoPingUsd = 0
+      S.autoCappedStretch = false
+      S.lastTurnEnd = 0
       pendingSeed = null // a transcript still waiting for session.start belongs to the chat this one replaces
       // the last chat's merge-pr PR says nothing about this one: its keep warm must not stop when that PR merges, and an auto keep warm that merge switched off starts on again. The new chat's own PR is read from its first prompt that names one (prompt.submit); a resumed chat's from its transcript (below). A fork is the same conversation and keeps both, and so does this mod's own clear and continue (keepPrOnClear), which carries the same work into the cleared chat
       const keepPr = e.source === 'clear' && keepPrOnClear
@@ -2302,11 +2308,11 @@ export function register(on, options = {}) {
       // usage unavailable: keep the per-request figures
     }
     if (H.armed && e.turnId !== H.notTurn) await captureHandoff($, e)
-    // Auto keep warm: a big chat stays warm until autoWarmHours after its last turn, or sooner once its pings cost as much as the rewrite
+    // Auto keep warm: a big chat stays warm until autoWarmHours after its last turn, or sooner once its pings cost as much as the rewrite (and a turn that ends with no request of its own, such as an aborted one, does not start it again after that stop)
     if (settings.autoWarmHours > 0 && S.autoWarm && S.ctx >= settings.bigTokens) {
-      if (!S.keepWarm) startKeepWarm($, settings.autoWarmHours, true)
+      if (!S.keepWarm && !S.autoCappedStretch) startKeepWarm($, settings.autoWarmHours, true)
       // only the auto one is extended: one started by hand (/keepwarm N, the band's button, the board's) keeps its own end; at that end auto keep warm takes it over (see keepWarmStep), and its cap applies from then
-      else if (S.keepWarmAuto) S.keepWarmUntil = Math.max(S.keepWarmUntil, now + settings.autoWarmHours * 60 * MIN)
+      else if (S.keepWarm && S.keepWarmAuto) S.keepWarmUntil = Math.max(S.keepWarmUntil, now + settings.autoWarmHours * 60 * MIN)
     }
     await heartbeat($, true)
     $.ui.invalidate('ui.render')

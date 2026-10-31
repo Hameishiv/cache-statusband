@@ -910,11 +910,171 @@ test('a hand-over to auto keep warm says so, and the pings before it count towar
   expect(r.text).not.toMatch(/Keep warm is on/)
   const autoAfter = pings - handEnd
   expect(autoAfter).toBeGreaterThan(0) // auto keep warm did take over
-  // the auto-only bound: a whole auto run on this chat ends within 30 pings, those before the hand press counted
-  expect(autoBefore + autoAfter).toBeLessThan(30)
+  // the auto-only bound: a whole auto run on this chat ends within 30 pings, those before the hand press counted. Tight: 24
+  // measured (the cap-only run of the tests above), 29 with the hand-over zeroing the auto spend again
+  expect(autoBefore + autoAfter).toBeLessThanOrEqual(25)
   const hand = seen.toasts.filter((t) => /now runs as auto keep warm/.test(t))
   expect(hand.length).toBe(1)
   expect(hand[0]).toMatch(/until [^;]+; it stops sooner once its pings since your last message cost as much as the rewrite/)
+})
+
+// A chat resumed from another one (a SessionStart of source 'resume'), big and warm, whose turn ended without a request of its own measured
+async function resumeBig($: any, clock: any) {
+  await ($ as any).classic.SessionStart({ source: 'resume' })
+  await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [], changed: [] })
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 'b', reason: 'end_turn' } as never)
+}
+
+test('a resumed chat does not inherit the last chat\'s auto cap stop: a keep warm started by hand there hands over at its end, with a whole cap', async ($, on) => {
+  const { clock, seen } = engine($, on)
+  let pings = 0
+  on('model.fork', () => {
+    pings++
+    return { value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }
+  })
+  on('classic.SessionStart', () => ({}))
+  const step = stepper($, on)
+  await start($, 300000, clock)
+  await $.command.run({ command: 'cache', args: 'ttl 5' })
+  await step(usage({ cache_read_input_tokens: 300000 }))
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  await clock.advance(2 * 3600000) // chat A's auto keep warm stops on its cap
+  const inA = pings
+  expect(inA).toBeGreaterThan(3)
+  await resumeBig($, clock) // chat B
+  await $.command.run({ command: 'keepwarm', args: '1' })
+  await clock.advance(61 * 60000)
+  const handEnd = pings
+  await clock.advance(6 * 3600000)
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/Keep warm is on/)
+  expect(seen.toasts.filter((t) => /now runs as auto keep warm/.test(t)).length).toBe(1) // A's cap stop did not block it
+  // B's auto keep warm has a whole cap of its own: about what A's had (A's pings were all auto)
+  expect(pings - handEnd).toBeGreaterThan(3)
+})
+
+test('the last chat\'s auto pings do not count toward a resumed chat\'s cap', async ($, on) => {
+  const { clock } = engine($, on)
+  let pings = 0
+  on('model.fork', () => {
+    pings++
+    return { value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }
+  })
+  on('classic.SessionStart', () => ({}))
+  const step = stepper($, on)
+  await start($, 300000, clock)
+  await $.command.run({ command: 'cache', args: 'ttl 5' })
+  await step(usage({ cache_read_input_tokens: 300000 }))
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  await clock.advance(40 * 60000) // chat A's auto keep warm pings for a while, under its cap
+  const inA = pings
+  expect(inA).toBeGreaterThan(5)
+  await resumeBig($, clock) // chat B: its turn ended with no request measured, and auto keep warm starts in it
+  await clock.advance(6 * 3600000)
+  const inB = pings - inA
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/Keep warm is on/)
+  // a whole cap for B: more pings than the cap leaves after A's share (A's 40 minutes cost it a third of its pings)
+  expect(inB).toBeGreaterThan(inA + 8)
+})
+
+test('a keep warm started by hand in a resumed chat does not hand over from the last chat\'s last turn', async ($, on) => {
+  const { clock, seen } = engine($, on)
+  let pings = 0
+  on('model.fork', () => {
+    pings++
+    return { value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }
+  })
+  on('classic.SessionStart', () => ({}))
+  const step = stepper($, on)
+  await start($, 300000, clock)
+  await $.command.run({ command: 'cache', args: 'ttl 5' })
+  await step(usage({ cache_read_input_tokens: 300000 }))
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  await clock.advance(10 * 60000)
+  await ($ as any).classic.SessionStart({ source: 'resume' }) // chat B: no turn of its own yet
+  await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [], changed: [] })
+  await $.command.run({ command: 'keepwarm', args: '1' })
+  await clock.advance(61 * 60000)
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/Keep warm is on/) // its own hour ended it: A's last turn is not B's
+  expect(seen.toasts.filter((t) => /now runs as auto keep warm/.test(t)).length).toBe(0)
+  expect(seen.toasts.filter((t) => /time limit reached/.test(t)).length).toBe(1)
+})
+
+test('a fork keeps what the parent\'s auto keep warm had spent and its last turn', async ($, on) => {
+  const { clock, seen } = engine($, on)
+  let pings = 0
+  on('model.fork', () => {
+    pings++
+    return { value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }
+  })
+  on('classic.SessionStart', () => ({}))
+  const step = stepper($, on)
+  await start($, 300000, clock)
+  await $.command.run({ command: 'cache', args: 'ttl 5' })
+  await step(usage({ cache_read_input_tokens: 300000 }))
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  await clock.advance(2 * 3600000) // the parent's auto keep warm stops on its cap
+  const inParent = pings
+  await ($ as any).classic.SessionStart({ source: 'fork' }) // the same conversation, same cache
+  await $.command.run({ command: 'keepwarm', args: '1' })
+  await clock.advance(61 * 60000)
+  const ownHour = pings
+  await clock.advance(3 * 3600000)
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/Keep warm is on/)
+  expect(seen.toasts.filter((t) => /now runs as auto keep warm/.test(t)).length).toBe(0) // the cap stop stands
+  expect(ownHour - inParent).toBeGreaterThan(8) // it pinged through its own hour
+  expect(pings).toBe(ownHour) // and not after it
+})
+
+test('after auto keep warm stopped on its cap, a turn that ends with no request of its own does not start it again', async ($, on) => {
+  const { clock, seen } = engine($, on)
+  let pings = 0
+  on('model.fork', () => {
+    pings++
+    return { value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }
+  })
+  const step = stepper($, on)
+  await start($, 300000, clock)
+  await $.command.run({ command: 'cache', args: 'ttl 5' })
+  await step(usage({ cache_read_input_tokens: 300000 }))
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  await clock.advance(2 * 3600000) // auto keep warm stops on its cap
+  const capped = pings
+  expect(capped).toBeGreaterThan(3)
+  const toasts = seen.toasts.length
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: true, turnId: 't2', reason: 'aborted' } as never) // an aborted turn: no turn.step
+  await clock.advance(2 * 3600000)
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/Keep warm is on/)
+  expect(pings).toBe(capped) // no extra ping
+  expect(seen.toasts.length).toBe(toasts) // and no "Keeping warm" / "Keep warm off" toast
+})
+
+test('a hand-started keep warm does not hand over when auto pings already cost the cap without stopping on it', async ($, on) => {
+  const { clock, seen } = engine($, on)
+  let pings = 0
+  on('model.fork', () => {
+    pings++
+    // the first ping (auto's) writes the cache: it costs about the rewrite and stops auto keep warm, but not on its cap
+    return { value: { text: 'ok', usage: usage(pings === 1 ? { cache_creation_input_tokens: 300000 } : { cache_read_input_tokens: 300000 }) } }
+  })
+  const step = stepper($, on)
+  await start($, 300000, clock)
+  await $.command.run({ command: 'cache', args: 'ttl 5' })
+  await step(usage({ cache_read_input_tokens: 300000 }))
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  await clock.advance(30 * 60000)
+  expect(pings).toBe(1)
+  expect(seen.toasts.some((t) => /the ping wrote/.test(t))).toBe(true)
+  await $.command.run({ command: 'keepwarm', args: '1' })
+  await clock.advance(61 * 60000)
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/Keep warm is on/)
+  expect(seen.toasts.filter((t) => /now runs as auto keep warm/.test(t)).length).toBe(0)
+  expect(seen.toasts.filter((t) => /time limit reached/.test(t)).length).toBe(1)
 })
 
 test('with auto keep warm off, a keep warm started by hand stops at its own end', async ($, on) => {
