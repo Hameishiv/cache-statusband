@@ -7,8 +7,8 @@ const SETUP = { options: { seatFileTerminal: '~/.claude-cli-accounts/.active', s
 
 
 // The engine beneath the mod: a terminal session on seat A, nothing on disk but the seat file
-// `disk` adds files by name (a transcript, the account file); `holdAccount` makes reading the account file wait, `hold` a named file's
-function engine($: any, on: any, seat: { label: string; recording?: string } = { label: 'A' }, kept?: Map<string, unknown>, onGet?: (key: string) => Promise<void> | void, disk: { files?: Record<string, string>; holdAccount?: Promise<void>; hold?: Record<string, Promise<void>>; messages?: { role: string; text: string }[] } = {}) {
+// `disk` adds files by name (a transcript, the account file); `holdAccount` makes reading the account file wait, `holdEnv` an environment read (its name and how many times that name was read), `hold` a named file's
+function engine($: any, on: any, seat: { label: string; recording?: string } = { label: 'A' }, kept?: Map<string, unknown>, onGet?: (key: string) => Promise<void> | void, disk: { files?: Record<string, string>; holdAccount?: Promise<void>; hold?: Record<string, Promise<void>>; holdEnv?: (name: string, nth: number) => Promise<void> | void; messages?: { role: string; text: string }[] } = {}) {
   const clock = mock.clock(on)
   if (kept) {
     // a store already holding what an earlier run of this mod wrote
@@ -17,7 +17,10 @@ function engine($: any, on: any, seat: { label: string; recording?: string } = {
     on('store.delete', (_: unknown, e: any) => (kept.delete(e.key), { value: undefined }))
     on('store.keys', () => ({ value: [...kept.keys()] }))
   } else mock.store(on)
-  mock.env(on, { USERPROFILE: 'C:/Users/T' })
+  if (disk.holdEnv) {
+    const reads: Record<string, number> = {}
+    on('env.get', async (_: unknown, e: any) => (await disk.holdEnv!(e.name, (reads[e.name] = (reads[e.name] || 0) + 1)), { value: e.name === 'USERPROFILE' ? 'C:/Users/T' : undefined }))
+  } else mock.env(on, { USERPROFILE: 'C:/Users/T' })
   const seen = { compacts: 0, submits: [] as string[], asks: 0, toasts: [] as string[], failCompact: false, failSubmit: false, duringCompact: null as null | (() => Promise<unknown>), duringSubmit: null as null | (() => Promise<unknown>), duringClear: null as null | (() => Promise<unknown>) }
   on('session.id', () => ({ value: 'sid-test' }))
   on('session.cwd', () => ({ value: '/repo' }))
@@ -6038,4 +6041,53 @@ test('a resumed chat\'s history PR replaces one only a prompt typed during the r
   await clock.advance(16 * 60000)
   expect(asked.length).toBeGreaterThan(0)
   expect(asked.every((n) => n === '456')).toBe(true)
+})
+
+// NEW-TESTS-BEGIN (batch 43)
+// A resumed chat's transcript read that lands after the chat's own first request must not write the older transcript over what that request measured
+for (const variant of ['the request lands first', 'control: the read lands first']) {
+  test(`a resumed chat's slow transcript read leaves the band warm when the chat's first request landed first (${variant})`, SETUP, async ($, on) => {
+    let release: () => void = () => {}
+    const disk: any = { files: {}, hold: { 'x.jsonl': new Promise<void>((r) => (release = r)) } }
+    const kept = new Map<string, unknown>()
+    const { clock, seen } = engine($, on, { label: 'A' }, kept, undefined, disk)
+    answer(on, seen, 'Send anyway')
+    const step = stepper($, on)
+    on('classic.SessionStart', () => ({}))
+    await start($, 300000, clock)
+    const t0 = await clock.now()
+    disk.files['x.jsonl'] = prompt('hello') + reply(t0 - 2 * 3600000, 500000) // two hours old: cold
+    const p = ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/x.jsonl' })
+    await clock.advance(10)
+    if (variant.startsWith('control')) { release(); await p }
+    await step(usage({ cache_read_input_tokens: 600000 })) // the resumed chat's first request: a warm read of 600k
+    if (!variant.startsWith('control')) { release(); await p }
+    const c: any = await $.command.run({ command: 'cache', args: '' })
+    expect(c.text).toMatch(/Cache is warm/)
+    expect(c.text).not.toMatch(/Cache is cold|went cold/)
+    await $.prompt.submit({ text: 'next message', origin: COMPOSER, wait: false } as never)
+    expect(seen.asks).toBe(0) // no cold-send dialog
+  })
+}
+
+// A startup transcript queued for session.start is read after an env read there: a /clear landing during that read makes the transcript the old chat's, and it seeds nothing into the cleared chat
+test('a startup transcript queued for session.start is not seeded into a chat cleared during the config-dir read', SETUP, async ($, on) => {
+  let release: () => void = () => {}
+  let configReads = 0
+  const gate = new Promise<void>((r) => (release = r))
+  // the second read of CLAUDE_CONFIG_DIR is session.start's, for the transcript seed (the first is the account's)
+  const disk: any = { files: {}, holdEnv: async (name: string, nth: number) => { if (name === 'CLAUDE_CONFIG_DIR') { configReads = nth; if (nth === 2) await gate } } }
+  const { clock } = engine($, on, { label: 'A' }, undefined, undefined, disk)
+  on('classic.SessionStart', () => ({}))
+  await clock.advance(60000)
+  disk.files['sid-test.jsonl'] = prompt('hello') + reply((await clock.now()) - 3600000, 500000)
+  await ($ as any).classic.SessionStart({ source: 'startup', transcript_path: '/h/sid-test.jsonl' }) // before session.start: queued
+  const started = $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await clock.advance(10)
+  expect(configReads).toBe(2) // session.start is waiting on the second
+  await ($ as any).classic.SessionStart({ source: 'clear' })
+  release()
+  await started
+  const c: any = await $.command.run({ command: 'cache', args: '' })
+  expect(c.text).not.toMatch(/500k|500,000|500000/)
 })

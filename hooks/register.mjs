@@ -75,7 +75,7 @@ let paneOpen = false
 let justCompacted = false
 let compactedCold = false
 let identityRead = false // session.start has read the seat and account: a chat's record can be compared with them
-let pendingSeed = null // a startup or resume SessionStart's transcript that came before that, seeded once it has
+let pendingSeed = null // { path, chat, steps }: a startup or resume SessionStart's transcript that came before that, seeded once it has, for the chat (msgChat) and request count (stepsSeen) it was queued at
 let rotationSeenAt = 0 // when this process last saw a rotation: a process fact, kept across /clear, resume and fork
 const WAKE_WINDOW = 3 * MIN // how long after a wake-up a late rewrite of the seat file or .claude.json is still taken as that rotation
 let seatUnknown = false // after a wake-up, until the seat file names a new seat: the rotator may not have written it yet, so S.seat may be the old one: its plan fetch, borrowing and lending of usage windows, and the shared windows and Fable reading it shows wait for it
@@ -1422,7 +1422,9 @@ async function rememberLast($) {
 }
 
 // chat: the msgChat the transcript belongs to (default: the chat now). Every read here can outlast a /clear or a resume of another chat, whose own seed it must not write over: nothing is written once the chat has moved on
-async function seedFromTranscript($, path, chat = msgChat) {
+// steps: stepsSeen when the seed was asked for (default: now). A main-loop request that started since measured this chat itself (S.ctx, S.lastActivity), and the transcript, read before it, is older: nothing is written over it either
+async function seedFromTranscript($, path, chat = msgChat, steps = stepsSeen) {
+  const moved = () => msgChat !== chat || stepsSeen !== steps
   let found = null
   try {
     const st = await $.fs.stat(path)
@@ -1433,21 +1435,21 @@ async function seedFromTranscript($, path, chat = msgChat) {
   } catch {
     // no transcript yet, or too big to read here (the app): fall back on what this mod kept
   }
-  if (msgChat !== chat) return
+  if (moved()) return
   let last = null
   try {
     last = S.id ? await $.store.get('last:' + S.id) : null
   } catch {
     last = null
   }
-  if (msgChat !== chat) return
+  if (moved()) return
   if (last && Array.isArray(last.cold) && !S.coldRestarts.length) S.coldRestarts = last.cold
   if (!found && S.id) {
     try {
       // before its first record, a chat open under an earlier version still has its heartbeat
       const hb = last ? null : await $.store.get('hb:' + S.id)
       const r = last || (hb && { ctx: hb.ctx, at: hb.lastActivity, model: hb.model, effort: hb.effort })
-      if (msgChat !== chat) return
+      if (moved()) return
       // an `at` of 0 was written between a compaction and the next request
       if (r && r.ctx) found = { ctx: r.ctx, at: r.at, model: r.model, effort: r.effort, compacted: !r.at }
     } catch {
@@ -1792,11 +1794,14 @@ export function register(on, options = {}) {
     $.clock.after(0, () => readFleet($).catch(() => {}).then(() => refreshPlan($)).then(() => $.ui.invalidate('ui.render')).catch(() => {}))
     // A startup or resume SessionStart that came first left its transcript for here, where the seat and account are known.
     // The app reopens a chat without one that names the transcript: find it by id
+    // the chat and request count are taken here, with the queued seed, before any await: the env read below can outlast a /clear, and a seed for the cleared chat's id must not land in it
     const queued = pendingSeed
+    const seedChat = queued ? queued.chat : chat
+    const seedSteps = queued ? queued.steps : stepsSeen
     pendingSeed = null
     if (!S.ctx && S.id && S.cwd) {
       const config = ((await $.env.get('CLAUDE_CONFIG_DIR')) || `${home}/.claude`).replace(/\\/g, '/')
-      await seedFromTranscript($, queued || `${config}/projects/${S.cwd.replace(/[^a-zA-Z0-9]/g, '-')}/${S.id}.jsonl`)
+      await seedFromTranscript($, queued ? queued.path : `${config}/projects/${S.cwd.replace(/[^a-zA-Z0-9]/g, '-')}/${S.id}.jsonl`, seedChat, seedSteps)
     }
     return next(e)
   })
@@ -1849,6 +1854,7 @@ export function register(on, options = {}) {
     }
     $.ui.invalidate('ui.render')
     const chat = msgChat // this SessionStart's chat: a fork's is the one it carries on
+    const steps = stepsSeen // a request that starts while the transcript is read measured this chat itself
     try {
       S.id = (await $.session.id()) || S.id
     } catch {
@@ -1858,8 +1864,8 @@ export function register(on, options = {}) {
     // a fork keeps its parent's cache, so only a resume seeds; before session.start has read the seat and account it waits for there
     if (e.source === 'resume' && msgChat === chat) {
       // a /clear or another resume while the transcript is read makes it the old chat's: nothing of it is written (seedFromTranscript checks, and so does the PR)
-      if (identityRead) await seedFromTranscript($, e.transcript_path, chat)
-      else pendingSeed = e.transcript_path
+      if (identityRead) await seedFromTranscript($, e.transcript_path, chat, steps)
+      else pendingSeed = { path: e.transcript_path, chat, steps }
       // either order with session.start ends with the resumed chat's PR: read here from its transcript, not left for its next prompt
       adoptHistoryPr(chat, await resumedPr($, e.transcript_path))
     }
@@ -1870,7 +1876,7 @@ export function register(on, options = {}) {
   on('classic.SessionStart', { source: ['startup'] }, async ($, e, next) => {
     // before session.start has read the seat and account, the record cannot be compared: seed there
     if (identityRead) await seedFromTranscript($, e.transcript_path)
-    else pendingSeed = e.transcript_path
+    else pendingSeed = { path: e.transcript_path, chat: msgChat, steps: stepsSeen }
     return next(e)
   })
 
