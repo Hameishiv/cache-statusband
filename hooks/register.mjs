@@ -1754,8 +1754,8 @@ function stopKeepWarm($, why) {
 
 // A keep-warm ping (a fork) is out: no second one goes while it is, however many ticks come (a tick does not wait for the step before it).
 // Its settling is the real signal, as for fillOut: a ping that is slow is waited for (a tick waits PING_LIMIT for it, then goes on, and what the ping finds is applied when it does settle). The backstop is the time the cache had left when the ping went (at least PING_FLOOR, so that a ping that went with the cache already gone is not given up on before it can answer): a ping still out then has not saved the cache that the chat can count on, so it counts as no answer (keep warm stops, the slot is free), and an answer after that is counted (it was billed) and does nothing else.
-// A ping whose chat, account, keep warm or cache has changed since it went (moved: a /clear, a resume, a compaction, an off, a rotation, or a real request, which warmed the cache for a whole window from its own start) is let go of at once: its slot is free, nothing stops, and its answer, whenever it comes, is counted and does nothing else.
-// { at, limit, moved, lost }: when it went, its backstop, whether the chat/account/keep warm/cache changed since it went, and whether it has been let go of
+// A ping whose chat, account, keep warm or cache has changed since it went (moved: a /clear, a resume, a compaction, an off, a rotation (an account or seat change, or a wake-up that showed neither), or a real request, which warmed the cache for a whole window from its own start) is let go of: nothing stops, and its answer, whenever it comes, is counted and does nothing else. Its slot is free at once, except when only keep warm went off (changed() false: an off, and perhaps on again): the fork is still out and billed, and a new keep warm must not stack a second ping on it, so the slot stays held until it settles or its limit passes (no stop either: the new keep warm is not this ping's to end).
+// { at, limit, moved, changed, lost }: when it went, its backstop, whether the chat/account/keep warm/cache changed since it went, whether anything but keep warm changed, and whether it has been let go of
 let pingOut = null
 const PING_LIMIT = 60000
 const PING_FLOOR = 30000 // the least a ping is waited for: one that goes with the cache nearly or already gone (a hand keep warm on a cold chat, a tick that came late) still needs the seconds a healthy ping takes to answer
@@ -1763,10 +1763,10 @@ const PING_FLOOR = 30000 // the least a ping is waited for: one that goes with t
 async function keepWarmStep($) {
   if (pingOut) {
     const lost = pingOut
-    if (lost.moved()) {
-      // its chat, account or keep warm has changed, or a real request has warmed the cache since: it is no longer this step's to wait for, and not a failure either
-      lost.lost = true
-      pingOut = null
+    if (!lost.lost && lost.moved()) lost.lost = true // its chat, account or keep warm has changed, or a real request has warmed the cache since: it is no longer this step's to wait for, and not a failure either
+    if (lost.lost) {
+      // free at once, but for keep warm alone having been turned off: that ping is still out and billed, so no new one goes over it until it settles or its limit passes (and nothing stops: a keep warm started since is not its to end)
+      if (lost.changed() || now - lost.at >= lost.limit) pingOut = null
     } else if (now - lost.at >= lost.limit) {
       lost.lost = true
       pingOut = null
@@ -1779,8 +1779,10 @@ async function keepWarmStep($) {
   const gen = compactGen
   const idGen = identityGen
   const steps = measuredSteps // a main-loop request that measures the chat while a read or the ping is out has dated the cache itself, and warmed it for a whole window from its own start
+  const rotGen = rotationGen // a wake-up that showed neither the seat nor the account changed marks a rotation (rotationGen) without moving identityGen: what comes back may still be the old account's
   const requested = () => measuredSteps !== steps
-  const moved = () => !S.keepWarm || msgChat !== chat || compactGen !== gen || identityGen !== idGen || requested()
+  const changed = () => msgChat !== chat || compactGen !== gen || identityGen !== idGen || rotationGen !== rotGen || requested()
+  const moved = () => !S.keepWarm || changed()
   if (S.keepWarmAuto) {
     // a setting changed while it ran (autowarm off, big 400k, in this session or another): it stops, even while the chat works
     // while the chat works only the settings count: the cap is judged when it is idle (and by a ping that has just been paid)
@@ -1834,7 +1836,7 @@ async function keepWarmStep($) {
   // What this ping is for, taken before it goes: whether it is auto keep warm's, and the idle stretch (chat) its cost is counted in. A resume, a /clear or an off while it is out changes S, not this
   const auto = S.keepWarmAuto
   const capFor = S.capId || S.id
-  const ping = { at: now, limit: Math.max(PING_FLOOR, ttl * MIN - (now - S.lastActivity)), moved, lost: false } // the time the cache had left as the ping went, which is the margin when the tick was on time and less when it came late
+  const ping = { at: now, limit: Math.max(PING_FLOOR, ttl * MIN - (now - S.lastActivity)), moved, changed, lost: false } // the time the cache had left as the ping went, which is the margin when the tick was on time and less when it came late
   pingOut = ping
   // What comes back, whenever it does: a tick waits for it for PING_LIMIT at most, the rest happens when it settles
   const settled = (async () => {

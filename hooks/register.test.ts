@@ -8265,3 +8265,44 @@ test('a ping that goes on a cache already gone is given up on after the floor (3
   await clock.advance(31000)
   expect(keepWarmOffs(seen)).toBe(1)
 })
+
+// ===== review round 62: an off does not free a ping's slot; a wake-up that showed nothing changed lets a ping go =====
+test('keep warm off, a tick, keep warm on again while the ping is still out: no second ping; once it settles, the next due tick pings', async ($, on) => {
+  const { clock, seen, hold } = await heldPing($, on)
+  expect(hold.pings).toBe(1)
+  await $.command.run({ command: 'keepwarm', args: 'off' })
+  await clock.advance(31000) // a tick with keep warm off: the ping is let go of, its slot is not free
+  await $.command.run({ command: 'keepwarm', args: '1' })
+  await clock.advance(31000) // a tick with keep warm on again
+  expect(hold.pings).toBe(1) // still the one fork out
+  expect(seen.toasts.filter((t) => /Keep warm off \(the ping got no answer/.test(t)).length).toBe(0)
+  hold.release()
+  await clock.advance(1000)
+  expect(await keepWarmLine($)).toMatch(PAID) // counted: it was billed
+  await clock.advance(31000) // its slot is free: the next due tick pings (it was let go of, so it did not date the cache)
+  expect(hold.pings).toBe(2)
+})
+
+test('an off alone does not free the slot forever: after the ping\'s limit a keep warm started again pings, and the old ping stops nothing', async ($, on) => {
+  const { clock, seen, hold } = await heldPing($, on)
+  await $.command.run({ command: 'keepwarm', args: 'off' })
+  await clock.advance(31000)
+  await $.command.run({ command: 'keepwarm', args: '1' })
+  await clock.advance(7 * 60000) // inside the ping's limit (8 minutes on a 1-hour cache)
+  expect(hold.pings).toBe(1)
+  for (let i = 0; i < 12 && hold.pings < 2; i++) await clock.advance(10000) // until the old ping's limit passes and the slot is free
+  expect(keepWarmOffs(seen)).toBe(0) // the old ping's backstop does not end the new keep warm
+  expect(hold.pings).toBe(2)
+})
+
+test('a wake-up that showed neither the seat nor the account changed, while a ping is out: the ping\'s answer dates nothing and records nothing', SETUP, async ($, on) => {
+  const { clock, kept, hold } = await heldPing($, on)
+  await $.command.run({ command: 'cache', args: 'guard off' })
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never) // seat and account both read as before: unknown, not moved (identityGen stays)
+  const recordBefore = JSON.stringify(kept.get('last:sid-A'))
+  hold.release()
+  await clock.advance(1000)
+  expect(JSON.stringify(kept.get('last:sid-A'))).toBe(recordBefore)
+  await $.command.run({ command: 'keepwarm', args: '1' })
+  expect(await keepWarmLine($)).toMatch(PAID) // billed: counted
+})
