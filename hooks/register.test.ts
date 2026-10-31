@@ -4595,20 +4595,34 @@ test('a typed /branch while the Resume compacts is no message sent meanwhile: th
   expect(seen.toasts.filter((t) => /sent meanwhile|the automatic one|Not sent/.test(t))).toEqual([])
 })
 
-test('a typed /branch keeps the Resume hold of a put-back message: the Resume still waits for it, and goes 15 minutes after the put-back', { options: { autoResume: true } }, async ($, on) => {
-  const { clock, seen } = await resumeBranching($, on, () => {
+// The typed /branch replaced the text in the box, so the message put back is gone from it: a due Resume has nothing to wait for. A fork that did not come from a typed command (nothing was submitted) keeps the hold
+async function resumeHeldByPutBack($: any, on: any) {
+  const r = await resumeBranching($, on, () => {
     askLog(on) // "Compact first" for 'hello'; the first answer offered otherwise (Send anyway) for the cold-send dialog a typed command would get if it counted as a send
     on('prompt.fill', () => ({ isFilled: true }))
   })
   let n = 0
-  seen.duringCompact = () => (++n === 1 ? new Promise(() => {}) : Promise.resolve())
-  await clock.advance(91 * 60000 + 1000)
-  await clock.advance(5 * 60000)
+  r.seen.duringCompact = () => (++n === 1 ? new Promise(() => {}) : Promise.resolve())
+  await r.clock.advance(91 * 60000 + 1000)
+  await r.clock.advance(5 * 60000)
   await $.prompt.submit({ text: 'hello', origin: COMPOSER, wait: false } as never)
-  await clock.advance(10 * 60000 + 2000) // abandoned: 'hello' is back in the box
-  await clock.advance(3 * 60000)
+  await r.clock.advance(10 * 60000 + 2000) // abandoned: 'hello' is back in the box
+  await r.clock.advance(3 * 60000)
   expect(await bandText($, /⏸ Resumes? /)).toBe('⏸ Resume waits for your message')
+  return r
+}
+
+test('a typed /branch ends the Resume hold of a put-back message: the typed command replaced the box text, so the Resume no longer waits for it and goes', { options: { autoResume: true } }, async ($, on) => {
+  const { clock } = await resumeHeldByPutBack($, on)
   await typeBranch($)
+  await clock.advance(10000)
+  // the Resume is attempted again on its own schedule (it shows a time), not held for a message that is no longer in the box. (It cannot go within this scenario: the abandoned compaction of 'hello' is still out, so it is armed again, as in the held case until the hold lapses)
+  expect(await bandText($, /⏸ Resumes? /)).toMatch(/^⏸ Resumes? \d/)
+})
+
+test('a fork that came from no typed command keeps the Resume hold of a put-back message: the Resume still waits for it, and goes 15 minutes after the put-back', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = await resumeHeldByPutBack($, on)
+  await ($ as any).classic.SessionStart({ source: 'fork', transcript_path: '/h/fork.jsonl' }) // nothing typed: the box text is still there
   await clock.advance(5 * 60000)
   expect(seen.submits).toEqual([])
   expect(await bandText($, /⏸ Resumes? /)).toBe('⏸ Resume waits for your message')
@@ -4631,14 +4645,28 @@ test('a typed /branch leaves no send pending: a due Resume is not delayed by it'
   expect(seen.submits).toEqual(['Resume']) // a send handed on, its request not started, would hold it for 2 minutes
 })
 
-test('a typed /branch keeps the tracking of the text a put-back left in the box: a later put-back goes in behind it', SETUP, async ($, on) => {
+test('a typed /branch ends the tracking of the text a put-back left in the box: the box text was replaced, so a later put-back on an engine that cannot read the box fills only its own text', SETUP, async ($, on) => {
+  askLog(on)
+  const { clock, seen, fills } = await coldChat($, on, () => on('classic.SessionStart', () => ({}))) // no prompt.read: the tracked text would stand in for a read
+  hang(seen)
+  await send($, 'one')
+  await clock.advance(15 * 60000 + 1000)
+  expect(fills).toEqual(['one'])
+  await typeBranch($)
+  await clock.advance(60000)
+  await send($, WAKE_TEXT)
+  await clock.advance(1000)
+  expect(fills).toEqual(['one', WAKE_TEXT]) // not 'one\n\n' + WAKE_TEXT: the text the person replaced does not come back
+})
+
+test('a fork that came from no typed command keeps the tracking of the text a put-back left in the box: a later put-back goes in behind it', SETUP, async ($, on) => {
   askLog(on)
   const { clock, seen, fills } = await coldChat($, on, () => on('classic.SessionStart', () => ({})))
   hang(seen)
   await send($, 'one')
   await clock.advance(15 * 60000 + 1000)
   expect(fills).toEqual(['one'])
-  await typeBranch($)
+  await ($ as any).classic.SessionStart({ source: 'fork', transcript_path: '/h/fork.jsonl' })
   await clock.advance(60000)
   await send($, WAKE_TEXT)
   await clock.advance(1000)

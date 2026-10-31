@@ -1620,7 +1620,7 @@ export function register(on, options = {}) {
     S.keepWarm = false
     H.armed = false
     S.coldRestarts = [] // a resumed chat's own come back with its seed
-    // The box text and its put-back hold stay with a fork, which is the same conversation: the text put back before the branch is still in the box, to be sent
+    // The box text and its put-back hold stay with a fork, which is the same conversation: the text put back before the branch is still in the box, to be sent. Not after a typed /branch (or any command typed in the composer): that submit replaced the box text, and prompt.submit has already ended both
     if (e.source !== 'fork') {
       // a resume armed in the last chat must not fire into this one (a fork keeps its pending Resume, and one compacting)
       S.resumeAt = 0
@@ -1679,6 +1679,11 @@ export function register(on, options = {}) {
     }
     if (!S.pr) S.pr = findPr(e.command ? `/${e.command.name} ${e.command.args}` : e.text)
     const fromUser = e.origin && (e.origin.kind === 'composer' || e.origin.kind === 'bridge')
+    // A slash command the person typed in the composer replaced the text in the box (this mod's own put-back of a command is a plugin-origin submit, not this): what a put-back left there is gone, and a due Resume no longer waits for a message that is not in the box. A fork that did not come from such a submit keeps both
+    if (e.command && e.origin && e.origin.kind === 'composer') {
+      boxText = null
+      putBackPending = null
+    }
     const wake = fromUser && !!cfg.rotatorWake && cfg.rotatorWake.test(String(e.text || ''))
     let wakeId = 0 // this wake-up's id, to lower only its own hold
     if (wake) {
