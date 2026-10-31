@@ -5610,3 +5610,80 @@ test('a fill that lands after the person submitted from the composer, while the 
   await clock.advance(6 * 60000)
   expect(seen.submits).toEqual(['Resume']) // and the hold lapses as any other
 })
+
+// "Compact first" whose compaction failed, and the message is then put back (a slash command, a send refused, the box holding the person's draft): "Could not compact" already said so, and no toast after it claims "Compacted"
+const toastTexts = (seen: { toasts: string[] }) => seen.toasts.map((t) => JSON.parse(t).text as string)
+test('a slash command on a big cold chat whose "Compact first" compaction failed is put back with a toast that does not say "Compacted"', SETUP, async ($, on) => {
+  heldAsk(on)
+  const { clock, seen, fills } = await coldChat($, on)
+  seen.failCompact = true
+  await send($, '/merge-pr 1', { name: 'merge-pr', args: '1' })
+  await clock.advance(1000)
+  const texts = toastTexts(seen)
+  expect(fills).toEqual(['/merge-pr 1'])
+  expect(texts.filter((t) => /^Could not compact \(.*\), so the message goes as typed\.$/.test(t))).toHaveLength(1)
+  expect(texts).toContain('Your message is back in the prompt box: press Enter to send it.')
+  expect(texts.filter((t) => /Compacted/.test(t))).toEqual([])
+})
+
+test('a message refused after a failed "Compact first" compaction, and not put back, says so without "Compacted"', SETUP, async ($, on) => {
+  heldAsk(on)
+  const { clock, seen, fills } = await coldChat($, on, () => {}, () => ({ isFilled: false }))
+  seen.failCompact = true
+  seen.failSubmit = true
+  await send($, 'approve, B')
+  await clock.advance(1000)
+  const texts = toastTexts(seen)
+  expect(fills).toEqual(['approve, B'])
+  expect(texts).toContain('The message could not be sent again: approve, B')
+  expect(texts.filter((t) => /Compacted/.test(t))).toEqual([])
+})
+
+test('a slash command quoted because the box holds a draft, after a failed "Compact first" compaction, adds no "Compacted." toast', SETUP, async ($, on) => {
+  heldAsk(on)
+  const { clock, seen, fills } = await coldChat($, on, () => on('prompt.read', () => ({ value: { text: 'my draft', cursor: 8 } })))
+  seen.failCompact = true
+  await send($, '/merge-pr 1', { name: 'merge-pr', args: '1' })
+  await clock.advance(1000)
+  const texts = toastTexts(seen)
+  expect(fills).toEqual([])
+  expect(texts.filter((t) => t.includes('Also not sent: /merge-pr 1'))).toHaveLength(1)
+  expect(texts.filter((t) => /Compacted/.test(t))).toEqual([])
+})
+
+// A fill that answers late must not undo what a later fill left. F1 (joined behind the put-back 'stop, do X instead') does not answer and is out past COMPACT_LIMIT, when the backstop clears it; F2 then fills and does not answer either (the box is unknown); F1 answers "not filled" first. Its tracking of the text the box held when it started is stale (F2 followed it), so it is not brought back: the put-back after both fills only its own text, not behind the old one. No read on the engine
+test('on an engine with no read, a late "not filled" answer of a fill that a later fill has followed does not bring back the tracking of the text it saw', SETUP, async ($, on) => {
+  const box = { text: '' }
+  const { clock, seen, fills, late } = await lateJoinSetup($, on, box, true)
+  let fail: (e: Error) => void = () => {}
+  let n = 0
+  seen.duringCompact = () => (++n === 1 ? new Promise<void>((_, rej) => { fail = rej }) : Promise.reject(new Error('no room')))
+  await $.prompt.submit({ text: 'stop, do X instead', origin: COMPOSER, wait: false } as never)
+  await clock.advance(60000)
+  for (let i = 0; i < 20 && !fills.length; i++) await clock.advance(60000)
+  fail(new Error('late boom'))
+  await clock.advance(16 * 60000)
+  seen.failSubmit = true
+  late.armed = true
+  await sendBridge($, WAKE_TEXT) // F1: joined behind 'stop, do X instead', does not answer
+  for (let i = 0; i < 10 && fills.length < 2; i++) await clock.advance(1000)
+  await clock.advance(2500)
+  await clock.advance(2500)
+  const answerF1 = late.resolve
+  await clock.advance(16 * 60000) // out past COMPACT_LIMIT: the backstop takes it as lost
+  await sendBridge($, WAKE_TEXT.replace('Go on.', 'three')) // F2: the box looks empty to a mod that cannot read it, so it fills alone, and does not answer either
+  for (let i = 0; i < 10 && fills.length < 3; i++) await clock.advance(1000)
+  await clock.advance(2500)
+  await clock.advance(2500)
+  const answerF2 = late.resolve
+  expect(fills).toEqual(['stop, do X instead', 'stop, do X instead\n\n' + WAKE_TEXT, WAKE_TEXT.replace('Go on.', 'three')])
+  answerF1({ isFilled: false })
+  await realMs(50)
+  answerF2({ isFilled: false })
+  await realMs(50)
+  late.armed = false
+  void sendBridge($, WAKE_TEXT.replace('Go on.', 'four'))
+  for (let i = 0; i < 10 && fills.length < 4; i++) await clock.advance(1000)
+  await clock.advance(2500)
+  expect(fills[3]).toBe(WAKE_TEXT.replace('Go on.', 'four')) // not 'stop, do X instead\n\n' + ...: that text is not known to be in the box
+})
