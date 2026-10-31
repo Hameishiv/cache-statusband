@@ -5374,30 +5374,24 @@ for (const answerLate of ['not filled', 'filled'] as const) {
   })
 }
 
-// A put-back that holds nothing (a send refused after a compaction that finished): no hold, but the text it joins behind is still tracked, and its late answer gives that tracking back
-test('on an engine with no read, a late "not filled" answer for a fill that holds nothing (a refused send after a finished compaction) gives the earlier text back: the next put-back goes in behind it', SETUP, async ($, on) => {
-  heldAsk(on, 99)
-  const late: { resolve: (v: any) => void; armed: boolean } = { resolve: () => {}, armed: false }
-  const { clock, seen, fills } = await coldChat($, on, () => {}, (e) => (late.armed ? new Promise((r) => { late.resolve = r }) : { isFilled: true })) // no prompt.read
-  seen.failSubmit = true // after "Compact first" the message is refused, and put back
-  await send($, 'one')
-  await clock.advance(1000)
-  expect(fills).toEqual(['one'])
-  await clock.advance(77 * 60000) // cold again, the text of 'one' still unsent in the box
+// A put-back that holds nothing (a local command such as /btw never reaches the chat): no hold, but what its fill puts in is still tracked when it answers late "filled". (A joined hold-less fill, behind earlier text after a finished compaction, cannot be built here: the chat counts as compacted until a request starts, and a request ends the tracking of the earlier text, while a composer submit takes it)
+test('on an engine with no read, a /btw question whose fill answers late "filled" is tracked though it holds nothing: the next put-back quotes it instead of overwriting it', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+  const box = { text: '' }
+  const { clock, seen, fills, late } = await lateJoinSetup($, on, box, true)
   late.armed = true
-  void sendBridge($, 'two') // refused after compacting, put back behind 'one', and the fill does not answer in time
+  await send($, '/btw what is X?', { name: 'btw', args: 'what is X?' }) // waits on the Resume's compaction, which is abandoned after 15 minutes
+  for (let i = 0; i < 20 && !fills.length; i++) await clock.advance(60000)
   await clock.advance(1000)
   await clock.advance(2500)
-  expect(fills).toEqual(['one', 'one\n\ntwo'])
-  late.resolve({ isFilled: false })
+  expect(fills).toEqual(['/btw what is X?'])
+  late.resolve({ isFilled: true })
   await realMs(50)
   late.armed = false
-  await clock.advance(77 * 60000)
   void sendBridge($, 'three')
   await clock.advance(1000)
   await clock.advance(2500)
-  expect(fills).toEqual(['one', 'one\n\ntwo', 'one\n\nthree'])
-  expect(seen.toasts.filter((t) => t.includes('Also not sent'))).toEqual([])
+  expect(fills).toEqual(['/btw what is X?', 'three'])
+  expect(seen.toasts.filter((t: string) => t.includes('Also not sent: /btw what is X?'))).toHaveLength(1)
 })
 
 // A single fill (nothing earlier in the box) that answers late "filled": the text it filled is the remembered one, joined or not
@@ -5425,9 +5419,7 @@ test('on an engine with no read, a single fill that answers late "filled" is tra
 test('on an engine with no read, a late "filled" answer after a request started while the fill was out is not tracked: a later put-back does not bring the text back', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
   const step = stepper($, on)
   const r = await joinedLateFill($, on, WAKE_TEXT, 'filled', undefined, true, async () => { await step({}) })
-  r.finish()
-  await r.clock.advance(1000)
-  await r.clock.advance(77 * 60000) // cold again
+  await r.clock.advance(77 * 60000) // cold again (the earlier compaction still hangs: the chat is not marked compacted)
   ;(r.seen as any).failSubmit = true // the message is refused after compacting, and put back
   void sendBridge($, 'three')
   await r.clock.advance(1000)
