@@ -5689,7 +5689,7 @@ test('on an engine with no read, a late "not filled" answer of a fill that a lat
 })
 
 // Same set-up, but both late answers are "filled". F1's (joined: 'stop, do X instead' + the wake-up) is stale, F2 followed it, so it tracks nothing (the `seq === fillSeq` check in stillUntouched); F2's own answer tracks its text, and the put-back after both goes in behind F2's text only, not behind F1's joined text. No read on the engine
-test('on an engine with no read, a late "filled" answer of a fill that a later fill has followed tracks nothing: a put-back after both goes in behind the later fill's text only', SETUP, async ($, on) => {
+test('on an engine with no read, a late "filled" answer of a fill that a later fill has followed tracks nothing: a put-back after both goes in behind the text of the later fill only', SETUP, async ($, on) => {
   const box = { text: '' }
   const { clock, seen, fills, late } = await lateJoinSetup($, on, box, true)
   let fail: (e: Error) => void = () => {}
