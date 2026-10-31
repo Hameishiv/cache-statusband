@@ -120,6 +120,7 @@ function localCommandNames() {
 const EXCLUDED = {
   // can send to the model
   login: 'after signing in it re-sends when the last message was an authentication_failed error (shouldQuery)',
+  permissions: 'picking retry on a denied tool in its dialog re-sends (shouldQuery)',
   goal: 'setting a goal returns type "query" / shouldQuery: Claude starts working on it',
   import: 'the local variant returns type "query" with an import prompt',
   ultrareview: 'launches the review and returns type "query" / shouldQuery',
