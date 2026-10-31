@@ -8505,6 +8505,42 @@ test('a 429 on every ping: keep warm stops once the first ping\'s limit has pass
   expect(JSON.stringify(kept.get('last:sid-test'))).toBe(record)
 })
 
+test('a 429, then a real request before the first ping\'s limit: its failure is forgotten, so passing that limit stops nothing', async ($, on) => {
+  const { clock, seen, hold } = await failingFork($, on, () => apiError(), 3.6) // the ping went at 3:30 on a 5-minute cache (limit 90 s: until 5:00) and was turned away
+  expect(hold.pings).toBeGreaterThanOrEqual(1)
+  await mainStep($) // a real request lands (the one usage the fork's stepper holds): it warms the cache for a whole window
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't2', reason: 'end_turn' } as never)
+  await clock.advance(3 * 60000) // 6:36: past 5:00, before the next ping is due (3:30 after the request)
+  expect(seen.toasts.filter((t) => /Keep warm off/.test(t)).length).toBe(0)
+  expect(await keepWarmLine($)).toBeDefined() // still on
+})
+
+test('a fork that fails with an undefined status (no status at all) is retried like a 429, and a read that works after it keeps keep warm on', async ($, on) => {
+  const { seen, hold } = await failingFork($, on, (n) => (n === 1 ? apiError({ status: undefined }) : answered()), 5)
+  expect(hold.pings).toBe(2)
+  expect(seen.toasts.filter((t) => /Keep warm off/.test(t)).length).toBe(0)
+})
+
+test('a 429 on every ping of a 1-hour cache: retried every second tick from the second failure, not every tick, and one stop toast at the limit', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  let pings = 0
+  on('model.fork', () => {
+    pings++
+    return { value: apiError() }
+  })
+  const step = stepper($, on)
+  await start($, 300000, clock)
+  await step(usage({ cache_read_input_tokens: 300000 }))
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  await clock.advance(70 * 60000) // the first ping goes at 52 minutes, its limit is 8 minutes: 60
+  expect(pings).toBeGreaterThan(2)
+  expect(pings).toBeLessThanOrEqual(10) // every tick would be about 16
+  const offs = seen.toasts.filter((t) => /Keep warm off/.test(t))
+  expect(offs.length).toBe(1)
+  expect(offs[0]).toMatch(/the ping failed \(429\)/)
+})
+
 test('a 429 that is billed (usage) stops at once, counted', async ($, on) => {
   const { seen, hold } = await failingFork($, on, () => apiError({ usage: usage({ input_tokens: 40, output_tokens: 0 }) }))
   expect(hold.pings).toBe(1)
