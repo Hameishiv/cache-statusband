@@ -68,7 +68,7 @@ If you also have Nate Herk's `cache-keeper` installed, turn one of them off: the
 | Command | What it does |
 |---|---|
 | `/cache` | Status and settings: `ttl 5\|60\|auto`, `guard on\|off`, `big 150k`, `alerts on\|off`, `autowarm 8\|off` |
-| `/keepwarm [hours\|off]` | Keep this chat's cache warm (default 4 hours); at the end of those hours auto keep warm carries it on (with its cost cap, below) while it would still cover this chat |
+| `/keepwarm [hours\|off]` | Keep this chat's cache warm (default 4 hours); at the end of those hours auto keep warm carries it on (with its cost cap, below) while it would still cover this chat; a bare `/keepwarm` turns keep warm off when it is on (as the band's `Stop K.W.` does), and starts it when it is off |
 | `/board` | Every local Claude Code chat: state, context, cache, cost |
 | `/handoff [continue]` | Session handoff, then clear this chat and continue with it |
 

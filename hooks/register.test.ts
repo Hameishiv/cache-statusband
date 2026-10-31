@@ -7861,3 +7861,40 @@ test('a PR check out while the chat is resumed does not turn the new chat\'s aut
   expect(r.text).toMatch(/Auto keep warm: on/)
   expect(seen.toasts.filter((t) => /Keep warm off/.test(t)).length).toBe(0)
 })
+
+// ===== review round 57: keep warm on a chat the rotation made cold =====
+async function rotatedWithKeepWarm($: any, on: any) {
+  const seat = { label: 'A' }
+  const { clock, seen } = engine($, on, seat)
+  on('ui.render', engineDraws)
+  await start($, 300000, clock)
+  await $.command.run({ command: 'cache', args: 'guard off' }) // the wake-up goes in as it is: no compaction to end the rotation
+  await $.command.run({ command: 'keepwarm', args: '1' })
+  seat.label = 'B'
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never) // the rotation reaches the chat
+  await clock.advance(1000)
+  return { clock, seen }
+}
+
+test('a rotated chat with keep warm on shows K.W. (waits for next message) and Stop K.W. in the band, still styled cold, and /cache says it waits', SETUP, async ($, on) => {
+  await rotatedWithKeepWarm($, on)
+  const kw = await bandText($, /K\.W\. until/)
+  expect(kw).not.toBeNull()
+  expect(kw).toContain('waits for next message')
+  expect(await bandButton($, /Stop K\.W\./)).toBe(true)
+  expect(await bandText($, /Next send rewrites ≈/)).not.toBeNull() // the cold look stays
+  expect(await bandText($, /cache cold/i)).not.toBeNull()
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/Cache is cold|went cold/)
+  expect(r.text).toMatch(/Keep warm is on until [^\n]*It waits for the next message before it pings\./)
+})
+
+test('on a rotated chat the bare /keepwarm does what the band says: Stop K.W. turns keep warm off', SETUP, async ($, on) => {
+  const { seen } = await rotatedWithKeepWarm($, on)
+  expect(await bandButton($, /Stop K\.W\./)).toBe(true)
+  await $.command.run({ command: 'keepwarm', args: '' })
+  expect(seen.toasts.filter((t) => /Keep warm off \(turned off\)/.test(t)).length).toBe(1)
+  expect(await bandText($, /K\.W\. until/)).toBeNull()
+  expect(await bandButton($, /Stop K\.W\./)).toBe(false)
+  expect(await bandText($, /cache cold/i)).not.toBeNull()
+})

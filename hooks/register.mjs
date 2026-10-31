@@ -1953,7 +1953,7 @@ function statusText() {
   if (st.kind === 'warm' || st.kind === 'cooling') lines.push(`Cache is warm for about ${minutes(st.left)} more.`)
   if (st.kind === 'cold') lines.push(`Cache ${st.left === null ? 'is cold' : `went cold ${minutes(-st.left)} ago`}. The next message rewrites it for about ${money(rewriteCost(S.ctx, S.model, ttl))}.`)
   if (rotatedCold()) lines.push(`The account rotated${rotatedAgo()} (now ${mask(S.seat || S.account)}), so the cache is cold.`)
-  if (S.keepWarm) lines.push(`Keep warm is on until ${clock(S.keepWarmUntil)}: ${S.pings} ping(s), ${money(S.pingUsd)} so far.${st.left === null ? ' It waits for the next message before it pings.' : ''}`)
+  if (S.keepWarm) lines.push(`Keep warm is on until ${clock(S.keepWarmUntil)}: ${S.pings} ping(s), ${money(S.pingUsd)} so far.${st.left === null || rotatedCold() ? ' It waits for the next message before it pings.' : ''}`)
   if (S.rateLimits.length) lines.push(`Plan limits used: ${limitsText(S.rateLimits)}.`)
   if (keyUnsure()) lines.push('Fable weekly: waiting for the rotator to name the new seat or account.')
   else lines.push(S.fable ? `Fable weekly: ${Math.round(S.fable.percentUsed)}% used.` : `Fable weekly: no reading yet${planWhy && planWhy !== 'ok' ? ` (last check: ${planWhy})` : ''}.`)
@@ -2556,7 +2556,7 @@ export function register(on, options = {}) {
     const big = S.ctx >= settings.bigTokens
     if (st.kind === 'cooling' && big) {
       actions.push(Button({ key: 'keepwarm', label: 'K.W.', hotkey: '1', plain: true, onPress: async () => { now = await $.clock.now(); setAutoWarm(true); startKeepWarm($, settings.keepWarmHours); await heartbeat($, true); $.ui.invalidate('ui.render') } }))
-    } else if (st.kind === 'kept') {
+    } else if (S.keepWarm) {
       actions.push(Button({ key: 'keepwarm', label: 'Stop K.W.', hotkey: '1', plain: true, onPress: async () => { now = await $.clock.now(); setAutoWarm(false); stopKeepWarm($, 'turned off'); await heartbeat($, true); $.ui.invalidate('ui.render') } }))
     }
     // Right edge: one click runs /session-handoff (h while the band has the focus;
@@ -2654,11 +2654,12 @@ function bandSegments() {
   if (onTerminal && S.effort) out.push([S.effort, 'yellow'])
   const rewrite = money(rewriteCost(S.ctx, S.model, ttl))
   out.push([`Ctx ${tokens(S.ctx)} · ${st.kind === 'cold' && big ? 'Next send rewrites ≈ ' : 'Rewrite ≈ '}${rewrite}`, st.kind === 'cold' && big ? HOT : 'blue'])
-  if (st.kind === 'kept') out.push([`◆ K.W. until ${clock(S.keepWarmUntil)} · ${S.pings} ping${S.pings === 1 ? '' : 's'} ${money(S.pingUsd)}${st.left === null ? ' · waits for next message' : ''}`, 'cyan'])
-  else if (st.kind === 'warm') out.push([`● cache warm ${minutes(st.left)}`, 'green'])
+  // keep warm on shows as K.W. whatever the cache state says: after a rotation it is cold (and styled so, below) and keep warm waits for the next message, which pays the rewrite
+  if (S.keepWarm) out.push([`◆ K.W. until ${clock(S.keepWarmUntil)} · ${S.pings} ping${S.pings === 1 ? '' : 's'} ${money(S.pingUsd)}${st.kind !== 'kept' || st.left === null ? ' · waits for next message' : ''}`, 'cyan'])
+  if (st.kind === 'warm') out.push([`● cache warm ${minutes(st.left)}`, 'green'])
   else if (st.kind === 'cooling') out.push([`◐ cache cools in ${minutes(st.left)}`, WARN])
   else if (st.kind === 'cold') out.push([`○ cache cold${st.left === null ? '' : ' ' + ago(-st.left)}`, big ? HOT : 'gray'])
-  else out.push(['cache –', 'gray'])
+  else if (st.kind !== 'kept') out.push(['cache –', 'gray']) // a kept cache's state is the K.W. segment above
   // what this chat has already paid to rewrite cold caches, beside the next send's estimate
   if (S.coldRestarts.length) out.push([`Chat cold rewrites ${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))} (${S.coldRestarts.length})`, 'gray'])
   // the engine's own reading once a request has run; before that another session's on the same account, then the shared usage reading
