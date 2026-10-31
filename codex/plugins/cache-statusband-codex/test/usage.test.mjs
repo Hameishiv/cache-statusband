@@ -89,6 +89,12 @@ test("reads the unit of a textual retry-after: minutes and hours as well as seco
   assert.equal(ms("retry after 250 milliseconds"), 250);
   assert.equal(ms("retry after 90"), 90_000);
   assert.equal(ms("retry after 5 more seconds"), 5_000);
+  assert.equal(ms("retry_after_ms=1500"), 1500);
+  assert.equal(ms("Retry-After-Ms: 1500"), 1500);
+  assert.equal(ms("retry after ms 1500"), 1500);
+  assert.equal(ms("retry after 10 msec"), 10);
+  assert.equal(ms("retry after 10 msecs"), 10);
+  assert.equal(ms("retry after 90 more"), 90_000);
 });
 
 test("caps Retry-After at one hour and keeps the last good reading", async (t) => {

@@ -306,8 +306,11 @@ export function retryAfterMilliseconds(error, now = Date.now()) {
   const message = error?.rpcMessage ?? error?.message;
   if (typeof message === "string") {
     // a bare number is seconds; ms and milliseconds are tried before m (minutes), and the unit must end at a word boundary ("5 more" is not minutes)
-    const match = message.match(/retry[\s_-]*after[^0-9]*(\d+(?:\.\d+)?)(?:\s*(ms|milliseconds?|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)\b)?/i);
-    if (match) {
+    // a key named for milliseconds (retry_after_ms=1500, Retry-After-Ms: 1500) holds milliseconds
+    const named = message.match(/retry[\s_-]*after[\s_-]*ms\b[^0-9]*(\d+(?:\.\d+)?)/i);
+    const match = named ? null : message.match(/retry[\s_-]*after[^0-9]*(\d+(?:\.\d+)?)(?:\s*(msecs?|ms|milliseconds?|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)\b)?/i);
+    if (named) candidates.push(Number(named[1]));
+    else if (match) {
       const unit = (match[2] ?? "s").toLowerCase();
       const scale = unit.startsWith("ms") || unit.startsWith("milli") ? 1 : unit.startsWith("m") ? 60_000 : unit.startsWith("h") ? 3_600_000 : 1000;
       candidates.push(Number(match[1]) * scale);
