@@ -5291,14 +5291,15 @@ test('a late "not filled" answer for a message put back over one held only quote
 })
 
 // The earlier put-back is still in the box, unsent, when a later one is joined behind it (the fill replaces the box, so its text is both)
-async function joinedLateFill($: any, on: any, second: string, answer: 'none' | 'not filled', boxAfter?: string) {
+// lapse: the earlier put-back's own hold (15 minutes) has run out before the later one is joined behind it (its text is still in the box: the tracking does not lapse with time)
+async function joinedLateFill($: any, on: any, second: string, answer: 'none' | 'not filled', boxAfter?: string, lapse = false) {
   const box = { text: '' }
   const { clock, seen, fills, late, finish } = await lateJoinSetup($, on, box)
   await $.prompt.submit({ text: 'stop, do X instead', origin: COMPOSER, wait: false } as never)
   await clock.advance(60000)
   for (let i = 0; i < 20 && !fills.length; i++) await clock.advance(60000)
   expect(box.text).toBe('stop, do X instead')
-  await clock.advance(60000)
+  await clock.advance(lapse ? 16 * 60000 : 60000)
   late.armed = true
   await sendBridge($, second) // goes in behind it, but the fill does not answer in time
   await clock.advance(1000)
@@ -5338,6 +5339,14 @@ test('after that late "not filled" answer the earlier text is tracked again: a p
   })()
   expect(fills).toEqual(['stop, do X instead', 'stop, do X instead\n\n' + WAKE_TEXT, 'stop, do X instead\n\nthree'])
   expect(clock).toBeDefined()
+})
+
+test('after a late "not filled" answer for a message joined behind an earlier put-back whose own hold had lapsed, the earlier text is tracked again: a put-back after it goes in behind it, not quoted', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+  const { clock, seen, fills } = await joinedLateFill($, on, WAKE_TEXT, 'not filled', undefined, true)
+  void sendBridge($, 'three')
+  await clock.advance(1000)
+  expect(fills).toEqual(['stop, do X instead', 'stop, do X instead\n\n' + WAKE_TEXT, 'stop, do X instead\n\nthree'])
+  expect(seen.toasts.filter((t) => t.includes('Also not sent: three'))).toEqual([])
 })
 
 test('a late "not filled" answer for a joined message, while the box no longer holds the earlier text either, ends the hold: the Resume goes', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
@@ -5447,11 +5456,13 @@ test('a fill that lands after the person submitted from the composer, on an engi
   expect(seen.submits).toEqual(['Resume'])
 })
 
-test('a fill that lands after the person submitted from the composer, while the read of the box fails, starts no hold', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+test('a fill that lands after the person submitted from the composer, while the read of the box fails, holds the Resume again, as with no read at all', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
   const { clock, seen, ctl } = await resumeLateFill($, on, { read: 'deny' })
   await send($, '/usage', { name: 'usage', args: '' })
   ctl.land(true)
   await realMs(50)
   await clock.advance(10 * 60000)
-  expect(seen.submits).toEqual(['Resume'])
+  expect(seen.submits).toEqual([]) // may be in the box: held, not released by a read that told nothing (a swallowed error would have let the Resume go here)
+  await clock.advance(6 * 60000)
+  expect(seen.submits).toEqual(['Resume']) // and the hold lapses as any other
 })
