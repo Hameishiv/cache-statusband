@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { link, mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 import { configuredSeatIdentity } from "./settings.mjs";
@@ -52,7 +52,8 @@ export async function getUsageSnapshot({
     try {
       const raw = await fetcher({ codexHome, env, ...(timeoutMs ? { timeoutMs } : {}) });
       const safe = sanitizeRateLimits(raw);
-      if (identity?.key?.startsWith("account:") && safe.accountEmail && safe.accountEmail !== identity.label) {
+      // An account-keyed read must show the same account: one that shows another, or none, cannot be told apart from a switch, so it is not saved under this key
+      if (identity?.key?.startsWith("account:") && safe.accountEmail !== identity.label) {
         throw new Error("Codex account changed during the usage read");
       }
       const saved = {
@@ -394,10 +395,26 @@ async function acquireLock(path, now) {
   } catch (error) {
     if (error.code !== "EEXIST") throw error;
   }
+  // A stale lock is broken by renaming it to a name only this process uses: of several that find it stale, one rename succeeds
+  // (the others find no file and treat the lock as held), where stat, unlink and open let a second unlink remove the lock a
+  // first had just taken
+  const stale = `${path}.${process.pid}.${Date.now()}.stale`;
   try {
     const info = await stat(path);
     if (now - info.mtimeMs <= LOCK_STALE_MS) return null;
-    await unlink(path);
+    await rename(path, stale);
+  } catch {
+    return null;
+  }
+  // The file renamed may not be the one that was seen: another process may have broken that lock and taken a new one in between. A fresh one is put back (link does not overwrite) and the lock is held
+  const taken = await stat(stale).catch(() => null);
+  if (taken && now - taken.mtimeMs <= LOCK_STALE_MS) {
+    await link(stale, path).catch(() => {});
+    await unlink(stale).catch(() => {});
+    return null;
+  }
+  await unlink(stale).catch(() => {});
+  try {
     return await open(path, "wx", 0o600);
   } catch {
     return null;

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -191,6 +191,40 @@ test("captures the account identity once when no seat file is configured", async
   });
   assert.deepEqual(identity, { key: `account:${TEST_EMAIL}`, label: TEST_EMAIL, unavailable: false });
   assert.equal(reads, 1);
+});
+
+test("an account-keyed read that shows no account is not saved under that account", async (t) => {
+  const root = await fixtureRoot(t);
+  const now = Date.parse("2026-10-29T12:00:00.000Z");
+  const identity = { key: `account:${TEST_EMAIL}`, label: TEST_EMAIL, unavailable: false };
+  const noAccount = { ...RAW, account: null };
+  const read = await getUsageSnapshot({ codexHome: root, now, fetcher: async () => noAccount, env: {}, identity });
+  assert.equal(read.source, "stale");
+  assert.equal(read.fetchedAt, null);
+  assert.equal(read.primary, null);
+  const other = { ...RAW, account: { type: "chatgpt", email: ["someone", "example.invalid"].join("@") } };
+  const mismatch = await getUsageSnapshot({ codexHome: root, now: now + MIN_POLL_INTERVAL_MS, fetcher: async () => other, env: {}, identity });
+  assert.equal(mismatch.source, "stale");
+  assert.equal(mismatch.fetchedAt, null);
+});
+
+test("a stale lock is broken by a rename that leaves nothing behind, and a fresh lock is left alone", async (t) => {
+  const root = await fixtureRoot(t);
+  const dataDir = join(root, "cache-statusband-codex");
+  await mkdir(dataDir, { recursive: true });
+  const lockPath = join(dataDir, "rate-limits.lock");
+  let calls = 0;
+  const fetcher = async () => { calls += 1; return RAW; };
+  await writeFile(lockPath, "");
+  const busy = await getUsageSnapshot({ codexHome: root, now: Date.now(), fetcher, env: {}, identity: null });
+  assert.equal(busy.source, "cache-busy");
+  assert.equal(calls, 0);
+  const old = new Date(Date.now() - 120_000);
+  await utimes(lockPath, old, old);
+  const live = await getUsageSnapshot({ codexHome: root, now: Date.now(), fetcher, env: {}, identity: null });
+  assert.equal(live.source, "live");
+  assert.equal(calls, 1);
+  assert.deepEqual((await readdir(dataDir)).filter((name) => name.includes("lock")), []);
 });
 
 test("prints every supplied expiry as an absolute local date in detailed output", () => {
