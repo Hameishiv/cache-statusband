@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { ago, borrowedLimits, capFirst, fableLimit, HUES, paint, pattern, resumeText, resumeTime, spentWindows, lastContext, modelName, planWindows, untilText } from './register.mjs'
+import { ago, borrowedLimits, capFirst, fableLimit, HUES, paint, pattern, readMissing, resumeText, resumeTime, spentWindows, lastContext, modelName, planWindows, untilText } from './register.mjs'
 
 const COMPOSER = { kind: 'composer' } as never
 // An example setup: an account rotator and a merge-pr workflow, as the README describes
@@ -4378,6 +4378,44 @@ test('a prompt.read the engine rejects once does not make the tracked text the b
   await clock.advance(1000)
   expect(fills).toEqual(['one']) // nothing written over the edit
   expect(seen.toasts.filter((t) => t.includes('Also not sent: three — send it again when ready.'))).toHaveLength(1)
+})
+
+// A read that answers, but not with the box's text, is no read: the box is unknown, not the tracked text
+test('a prompt.read that answers without any text is as unknown as one that failed: the person\'s edit of the put-back is left alone and the message quoted', SETUP, async ($, on) => {
+  const dialogs = heldAsk(on)
+  const box: { edit: string | null; odd: boolean } = { edit: null, odd: false }
+  const ref: { fills: string[] } = { fills: [] }
+  const { clock, seen, fills } = await coldChat($, on, () => on('prompt.read', () => {
+    if (box.odd) return { value: { cursor: 3 } } // no text field
+    const text = box.edit ?? ref.fills[ref.fills.length - 1] ?? ''
+    return { value: { text, cursor: text.length } }
+  }))
+  ref.fills = fills
+  hang(seen)
+  await send($, 'one')
+  await clock.advance(1000)
+  void send($, 'three')
+  await clock.advance(15 * 60000)
+  expect(fills).toEqual(['one'])
+  box.edit = 'one, edited by me'
+  box.odd = true
+  dialogs.release('Compact first, then send')
+  await clock.advance(1000)
+  expect(fills).toEqual(['one']) // nothing written over the edit
+  expect(seen.toasts.filter((t) => t.includes('Also not sent: three — send it again when ready.'))).toHaveLength(1)
+})
+
+// $.prompt.read cannot be made to throw a TypeError through the test engine (a hook that throws is skipped, so the call rejects as "no implementation"), so the judgement is tested on its own
+test('readMissing: the engine\'s "no implementation" rejection and a TypeError that says it is not a function (by name, so one from another realm counts) mean no read method; anything else is a read that failed', () => {
+  expect(readMissing(new Error('no implementation for prompt.read'))).toBe(true)
+  expect(readMissing(new TypeError('$.prompt.read is not a function'))).toBe(true)
+  const foreign = Object.assign(new Error('$.prompt.read is not a function'), { name: 'TypeError' }) // not an instanceof this realm's TypeError
+  expect(foreign instanceof TypeError).toBe(false)
+  expect(readMissing(foreign)).toBe(true)
+  expect(readMissing(new Error('cache-statusband: $.prompt.read: refused here'))).toBe(false)
+  expect(readMissing(new Error('$.prompt.read is not a function'))).toBe(false) // an Error of another name
+  expect(readMissing(new TypeError('cannot read properties of undefined'))).toBe(false)
+  expect(readMissing(undefined)).toBe(false)
 })
 
 test('text the person deleted does not come back when the engine later has no way to read the box: a read that showed the box empty ended the tracking', SETUP, async ($, on) => {

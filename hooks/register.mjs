@@ -575,9 +575,9 @@ async function bounded($, call) {
 const sameText = (a, b) => a.replace(/\r\n/g, '\n').trimEnd() === b.replace(/\r\n/g, '\n').trimEnd()
 
 // Whether a failed prompt.read means the engine has no such method: the engine rejects a call nothing answers with "no implementation for prompt.read", and a loader without the method throws a TypeError that says it is not a function. $.prompt.read cannot be tested with typeof (the mod loader refuses a call target used as a value), so the failure itself is what tells. Any other failure is a read that exists and did not work
-function readMissing(err) {
+export function readMissing(err) {
   const msg = String((err && err.message) || err)
-  return /no implementation for prompt\.read/.test(msg) || (err instanceof TypeError && /is not a function/.test(msg))
+  return /no implementation for prompt\.read/.test(msg) || (!!err && err.name === 'TypeError' && /is not a function/.test(msg)) // by name: a TypeError from the loader's own realm is not an instanceof this one
 }
 
 // What the prompt box holds, as { text, mine }: read from it, so the person's edits are seen and text they deleted does not come back. `mine` says whether the text in it is this mod's to merge with: the box is empty, or holds exactly what the last put-back left there (to a trailing newline) and is still unsent. Anything else (the person's own draft, or their edit of the put-back) is theirs and is never rewritten, and it ends the tracking of the put-back text.
@@ -586,10 +586,12 @@ async function boxNow($) {
   if (fillOut) return { text: '', mine: false } // an earlier fill may still land: an empty read now would not mean an empty box
   const early = boxHeld() // what the box held when the read began: what its answer is compared with (and only while that put-back is still unsent after the read: a snapshot of text sent meanwhile is not merged)
   let box
+  let missing = false // the read failed because the engine has no such method
   try {
     box = await bounded($, () => $.prompt.read())
   } catch (err) {
     if (!readMissing(err)) return { text: '', mine: false } // the engine has the method and it failed: as unknown as one that did not answer
+    missing = true
     box = undefined
   }
   if (box === TIMED_OUT) return { text: '', mine: false }
@@ -603,6 +605,7 @@ async function boxNow($) {
     boxText = null // the person's own text: what was put back is no longer in the box
     return { text, mine: false }
   }
+  if (!missing) return { text: '', mine: false } // an answer that does not hold the box's text is no read of it: as unknown as one that did not answer
   const held = boxHeld() // read again: a put-back may have been handed on, or a request started, while the read was out
   return { text: held ? held.text : '', mine: true }
 }
