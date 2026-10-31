@@ -6091,3 +6091,138 @@ test('a startup transcript queued for session.start is not seeded into a chat cl
   const c: any = await $.command.run({ command: 'cache', args: '' })
   expect(c.text).not.toMatch(/500k|500,000|500000/)
 })
+
+// NEW-TESTS-BEGIN (batch 44)
+// A main-loop request the test can hold in flight: begin() starts it, finish() lets it end with the given usage (null: it ended with none, as Esc or an API error does)
+function heldRequest($: any, on: any) {
+  let release: () => void = () => {}
+  let gate = new Promise<void>((r) => (release = r))
+  let result: unknown = null
+  on('turn.step', async function* () {
+    await gate
+    return { answer: '', toolUses: [], usage: result }
+  })
+  on('turn.complete', () => ({ text: '' }))
+  on('session.usage', () => ({ value: {} }))
+  let running: Promise<void> = Promise.resolve()
+  return {
+    begin() {
+      gate = new Promise<void>((r) => (release = r))
+      running = (async () => {
+        const it = $.turn.step({ model: 'claude-opus-5-5', messages: [] })
+        if (it && typeof it[Symbol.asyncIterator] === 'function') for await (const _ of it) void _
+        else await it
+      })()
+    },
+    async finish(u: unknown) {
+      result = u
+      release()
+      await running
+    },
+  }
+}
+const COLD_HISTORY = (t0: number) => [
+  { at: t0 - 5 * 3600000, tokens: 400000, usd: 7.5, gapMin: 90 },
+  { at: t0 - 3 * 3600000, tokens: 450000, usd: 7.5, gapMin: 80 },
+]
+
+// A request that starts while the resume's seed reads: it has measured nothing yet, so the seed still restores the chat's record, cold-rewrite history included
+test('a request that starts during the seed read leaves the chat\'s cold history in its record and in /cache', SETUP, async ($, on) => {
+  let release: () => void = () => {}
+  const disk: any = { files: {}, hold: { 'x.jsonl': new Promise<void>((r) => (release = r)) } }
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  answer(on, seen, 'Send anyway')
+  const req = heldRequest($, on)
+  on('classic.SessionStart', () => ({}))
+  await start($, 300000, clock)
+  const t0 = await clock.now()
+  disk.files['x.jsonl'] = prompt('hello') + reply(t0 - 10 * 60000, 590000)
+  kept.set('last:sid-test', { ctx: 590004, at: t0 - 10 * 60000, model: 'claude-opus-5-5', seat: 'A', desktop: false, cold: COLD_HISTORY(t0) })
+  const p = ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/x.jsonl' })
+  await clock.advance(10)
+  req.begin() // started, nothing measured yet
+  await clock.advance(10)
+  release()
+  await p
+  const mid: any = await $.command.run({ command: 'cache', args: '' })
+  expect(mid.text).toMatch(/Cold restarts this session: 2/)
+  expect(mid.text).toMatch(/590/) // the seeded size, mid-request
+  expect(mid.text).not.toMatch(/no request yet/)
+  await req.finish(usage({ cache_read_input_tokens: 600000 }))
+  expect((kept.get('last:sid-test') as { cold: unknown[] }).cold.length).toBe(2)
+})
+
+// The first request ended with no usage (Esc, an API error): nothing measured the chat, so the seed is what the next send's guard has
+test('a first request that ends with no usage still leaves the chat seeded: the next send meets the cold-send dialog', SETUP, async ($, on) => {
+  let release: () => void = () => {}
+  const disk: any = { files: {}, hold: { 'x.jsonl': new Promise<void>((r) => (release = r)) } }
+  const { clock, seen } = engine($, on, { label: 'A' }, undefined, undefined, disk)
+  answer(on, seen, 'Send anyway')
+  const req = heldRequest($, on)
+  on('classic.SessionStart', () => ({}))
+  await start($, 300000, clock)
+  const t0 = await clock.now()
+  disk.files['x.jsonl'] = prompt('hello') + reply(t0 - 2 * 3600000, 500000) // two hours old: cold
+  const p = ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/x.jsonl' })
+  await clock.advance(10)
+  req.begin()
+  await clock.advance(10)
+  release()
+  await p
+  await req.finish(null)
+  await $.prompt.submit({ text: 'next message', origin: COMPOSER, wait: false } as never)
+  expect(seen.asks).toBe(1)
+})
+
+// The request completes before the seed's store read: what it writes must not replace the history the seed is about to read
+test('a request that completes before the seed\'s store read leaves the chat\'s cold history', SETUP, async ($, on) => {
+  let release: () => void = () => {}
+  const gate = new Promise<void>((r) => (release = r))
+  let armed = false
+  const kept = new Map<string, unknown>()
+  const disk: any = { files: {} }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, async (key) => { if (armed && key === 'last:sid-test') { armed = false; await gate } }, disk)
+  answer(on, seen, 'Send anyway')
+  const req = heldRequest($, on)
+  on('classic.SessionStart', () => ({}))
+  await start($, 300000, clock)
+  const t0 = await clock.now()
+  disk.files['x.jsonl'] = prompt('hello') + reply(t0 - 10 * 60000, 590000)
+  kept.set('last:sid-test', { ctx: 590004, at: t0 - 10 * 60000, model: 'claude-opus-5-5', seat: 'A', desktop: false, cold: COLD_HISTORY(t0) })
+  armed = true // the seed's own read of the record waits
+  const p = ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/x.jsonl' })
+  await clock.advance(10)
+  req.begin()
+  await req.finish(usage({ cache_read_input_tokens: 600000 })) // the whole request, before the seed read the record
+  expect((kept.get('last:sid-test') as { cold: unknown[] }).cold.length).toBe(2) // its write kept what was stored
+  release()
+  await p
+  const c: any = await $.command.run({ command: 'cache', args: '' })
+  expect(c.text).toMatch(/Cold restarts this session: 2/)
+  expect(c.text).toMatch(/Cache is warm/) // the request's own measurement stands over the seed's
+  expect((kept.get('last:sid-test') as { cold: unknown[] }).cold.length).toBe(2)
+})
+
+// A compaction marked while the seed reads makes the chat's size and date its own: the older transcript does not bring them back
+test('a /compact during the seed read leaves the band on the compacted state, with the cold history kept', SETUP, async ($, on) => {
+  let release: () => void = () => {}
+  const disk: any = { files: {}, hold: { 'x.jsonl': new Promise<void>((r) => (release = r)) } }
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  answer(on, seen, 'Send anyway')
+  on('classic.SessionStart', () => ({}))
+  await start($, 300000, clock)
+  const t0 = await clock.now()
+  disk.files['x.jsonl'] = prompt('hello') + reply(t0 - 2 * 3600000, 500000) // two hours old: cold
+  kept.set('last:sid-test', { ctx: 500004, at: t0 - 2 * 3600000, model: 'claude-opus-5-5', seat: 'A', desktop: false, cold: COLD_HISTORY(t0) })
+  const p = ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/x.jsonl' })
+  await clock.advance(10)
+  await $.command.run({ command: 'compact', args: '' }) // marked compacted while the transcript is read
+  release()
+  await p
+  const c: any = await $.command.run({ command: 'cache', args: '' })
+  expect(c.text).not.toMatch(/500k|500,000|500000/) // not the old size
+  expect(c.text).not.toMatch(/Cache is cold|went cold/) // not the old date
+  expect(c.text).toMatch(/Cold restarts this session: 2/)
+})
