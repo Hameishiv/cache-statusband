@@ -66,6 +66,16 @@ function topLevelType(s) {
   return ''
 }
 
+// Where the string literal opened by the quote at `k` of `text` ends (the index of its closing quote, a backslash escape skipped), -1 when it does not end
+function stringEnd(text, k) {
+  const q = text[k]
+  for (let i = k + 1; i < text.length; i++) {
+    if (text[i] === '\\') i++
+    else if (text[i] === q) return i
+  }
+  return -1
+}
+
 // The source text of each argument of the call whose `(` is at `open` (trimmed), null when the call does not end within reach
 function callArgs(open) {
   const args = []
@@ -74,7 +84,7 @@ function callArgs(open) {
   for (let k = open + 1; k < src.length && k - open < 600; k++) {
     const c = src[k]
     if (c === '"' || c === "'" || c === '`') {
-      k = src.indexOf(c, k + 1)
+      k = stringEnd(src, k)
       if (k < 0) return null
     } else if (c === '(' || c === '[' || c === '{') d++
     else if (c === ')' || c === ']' || c === '}') {
@@ -99,14 +109,19 @@ function stringArg(args, i) {
 }
 
 // A call of the factory `fn(...)` is found by its name alone, and the minifier reuses a name for unrelated functions in other modules (`ren()`, `ren({turnGoesOn:!0})`, a second `function A2(e)`). So a match is a call of the factory only when it is not a declaration (`function fn(`) and passes at most as many arguments as the factory has parameters (`arity`) and at least two when it has two or more (the trailing ones are optional: `ren("vim","Editor mode")` for `function ren(e,n,r)`); `need` 'object' also asks for an object literal first (a factory taking one object)
-function factoryCalls(fn, arity, need) {
+function factoryCalls(fn, arity, need, skipped) {
   const calls = []
   const re = new RegExp('(?<![\\w$.])' + escId(fn) + '\\(', 'g')
   let m
   while ((m = re.exec(src))) {
     if (/function\s+$/.test(src.slice(Math.max(0, m.index - 12), m.index))) continue
     const args = callArgs(m.index + m[0].length - 1)
-    if (!args || args.length > arity || args.length < Math.min(2, arity)) continue
+    // a call that cannot be read is not known to be another function's: it is listed, and the test fails on it
+    if (!args) {
+      skipped.add(fn + '(…) could not be read')
+      continue
+    }
+    if (args.length > arity || args.length < Math.min(2, arity)) continue
     if (need === 'object' && !args[0].startsWith('{')) continue
     calls.push({ at: m.index + m[0].length, args })
   }
@@ -137,7 +152,7 @@ function nameLiteralOf(obj) {
   for (let k = 0; k < obj.length; k++) {
     const c = obj[k]
     if (c === '"' || c === "'" || c === '`') {
-      k = obj.indexOf(c, k + 1)
+      k = stringEnd(obj, k)
       if (k < 0) return null
     } else if (c === '{' || c === '[' || c === '(') d++
     else if (c === '}' || c === ']' || c === ')') d--
@@ -156,7 +171,7 @@ function resolveMember(expr, objectStart, skipped) {
   const m = /^([A-Za-z_$][\w$]*)\.name$/.exec(expr)
   if (!f || !m || f.params[0] !== m[1]) return []
   const names = new Set()
-  for (const c of factoryCalls(f.fn, f.params.length, 'object')) {
+  for (const c of factoryCalls(f.fn, f.params.length, 'object', skipped)) {
     const v = nameLiteralOf(objectAt(c.at))
     if (v) names.add(v)
     else skipped.add(f.fn + '(' + c.args[0].slice(0, 60) + (c.args.length > 1 ? ',...' : '') + ') has no literal name:')
@@ -170,7 +185,7 @@ function resolveIdent(id, objectStart, skipped) {
   const f = factoryBefore(objectStart)
   const at = f ? f.params.indexOf(id) : -1
   if (at >= 0) {
-    for (const c of factoryCalls(f.fn, f.params.length)) {
+    for (const c of factoryCalls(f.fn, f.params.length, undefined, skipped)) {
       const v = stringArg(c.args, at)
       if (v !== null && NAME_SHAPE.test(v)) literals.add(v)
       else skipped.add(f.fn + '(' + c.args.slice(0, at + 1).map((x) => x.slice(0, 40)).join(',') + ',...) has no command-shaped string literal as argument ' + (at + 1))
@@ -186,8 +201,21 @@ function resolveIdent(id, objectStart, skipped) {
 }
 
 let defsCache = null
-function commandDefs() {
-  if (defsCache) return defsCache
+// srcOverride: scan that text instead of the engine's (the parser's own tests), uncached
+function commandDefs(srcOverride) {
+  if (srcOverride !== undefined) {
+    const saved = src
+    src = srcOverride
+    try {
+      return scanDefs()
+    } finally {
+      src = saved
+    }
+  }
+  return defsCache || (defsCache = scanDefs())
+}
+
+function scanDefs() {
   const defs = []
   const unresolved = new Set()
   // a literal of any shape, an identifier or member expression, or any other expression up to its `,` or `}`
@@ -217,7 +245,7 @@ function commandDefs() {
       else unresolved.add(expr.trim())
     }
   }
-  return (defsCache = { defs, unresolved: [...unresolved].sort() })
+  return { defs, unresolved: [...unresolved].sort() }
 }
 
 // The `type:"..."` of each object literal naming the command
@@ -344,4 +372,31 @@ test('commands made by a factory taking an object ({name:"..."}) are found by th
   const names = localCommandNames()
   for (const n of ['ultraplan', 'ultrareview', 'teleport', 'remote-control', 'schedule', 'autofix-pr']) assert.ok(names.has(n), n + ' is not found')
   assert.ok(names.has('__remote-workflow'), 'a literal name that is not a plain command name is skipped')
+})
+
+// The parser on synthetic text: a factory call it cannot resolve must be listed, never passed over
+test('parser: a factory call whose name argument is a variable is unresolved', () => {
+  const r = commandDefs('function ren(e,n,r){return{type:"local-jsx",name:e}}ren(x,"d")')
+  assert.deepEqual(r.defs, [])
+  assert.ok(r.unresolved.length > 0)
+})
+
+test('parser: a factory taking an object whose call has no literal name is unresolved, and a literal one resolves', () => {
+  const bad = commandDefs('function A2(e){return{type:"local",name:e.name}}A2({name:x})')
+  assert.deepEqual(bad.defs, [])
+  assert.ok(bad.unresolved.length > 0)
+  const good = commandDefs('function A2(e){return{type:"local",name:e.name}}A2({name:"abc"})')
+  assert.deepEqual(good.defs.map((d) => d.names), [['abc']])
+  assert.deepEqual(good.unresolved, [])
+})
+
+test('parser: a factory call that cannot be read to its end is unresolved', () => {
+  const r = commandDefs('function ren(e,n,r){return{type:"local-jsx",name:e}}ren("vim","' + 'x'.repeat(700) + '")')
+  assert.ok(r.unresolved.some((x) => /ren\(…\) could not be read/.test(x)), r.unresolved.join('|'))
+})
+
+test('parser: an escaped quote in a string argument does not end the string', () => {
+  const r = commandDefs('function ren(e,n,r){return{type:"local-jsx",name:e}}ren("vim","a\\"b,c")ren("other","d")')
+  assert.deepEqual(r.defs.flatMap((d) => d.names).sort(), ['other', 'vim'])
+  assert.deepEqual(r.unresolved, [])
 })
