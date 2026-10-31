@@ -746,7 +746,7 @@ function putBack($, msg, batch, chat, hold = true) {
 
 // One fill of the prompt box for items, one after another. Text this mod did not put in the box is never rewritten: when the box holds anything but what the last put-back left there (the person's own draft, or their edit of the put-back; boxNow says), nothing is filled and every item is quoted in full in a toast. Otherwise plain texts are joined with a blank line, behind the plain text the box holds (a fill replaces the box, so that text has to be part of it). A slash command is never joined with other text: what cannot go in is quoted in full in a toast, whether it is an item beside other text, or a slash command this mod left in the box when plain text comes (the plain text is filled, the command quoted). A slash command alone, with an empty box, is filled as it is.
 // The text filled is what boxText then tracks (even for a /btw question). The Resume hold (putBackPending) starts only when hold is set (the put-back of an abandoned compaction, not the message of a compaction that finished, whose Resume goes again 2 minutes on), and for a message that reaches the chat: one filled, one quoted because the box held the person's own text (still theirs to send), or one whose fill did not answer in time (it may be in the box).
-// A fill that does not answer within BOX_LIMIT may still land later: what the box holds is then unknown, so nothing is tracked in boxText (and what was tracked is dropped), the hold starts as if it had, and a put-back while that fill is still out quotes its message and leaves the box alone (fillOut: until the fill settles, with COMPACT_LIMIT as a backstop for one that never does). When the fill answers late `isFilled: false` (or fails), that may be only the engine giving up (its own fill timeout, per client, resolves it so) with the client still to write the text: the fill part of the hold it started ends (endFillPart: a quoted message it kept holds on) only if the box, read afterwards, shows the text is not in it, and a joined fill (behind an earlier put-back) gives that earlier hold back while the read still shows its text; with no read, or one that fails or does not answer, the hold stays (it lapses at COMPACT_LIMIT). When it lands after the person submitted from the composer meanwhile (which ended the hold and the tracking), the hold starts again and the text is tracked once a read shows it in the box (with no read at all, or one that fails or does not answer: held again, not tracked; a read that succeeds and does not show the text starts nothing). Once it has settled or the backstop has passed, the next put-back on an engine that can read the box reads it and trusts no tracking (it leaves the box alone unless it is empty); on an engine with no read at all there is nothing to read, and what is tracked is only what the late answer says: a late `isFilled: false` for a fill joined behind an earlier put-back gives that put-back's tracking back (the box is unchanged, so it still starts with that text), and a late `isFilled: true` with nothing submitted from the composer meanwhile tracks the text the fill put in, so the next put-back goes in behind it; with neither (a single fill that did not land, or one that landed after a composer submit), no tracking and the box is overwritten. A read that exists but failed or did not answer gets none of this: it shows nothing, and nothing is tracked.
+// A fill that does not answer within BOX_LIMIT may still land later: what the box holds is then unknown, so nothing is tracked in boxText (and what was tracked is dropped), the hold starts as if it had, and a put-back while that fill is still out quotes its message and leaves the box alone (fillOut: until the fill settles, with COMPACT_LIMIT as a backstop for one that never does). When the fill answers late `isFilled: false` (or fails), that may be only the engine giving up (its own fill timeout, per client, resolves it so) with the client still to write the text: the fill part of the hold it started ends (endFillPart: a quoted message it kept holds on) only if the box, read afterwards, shows the text is not in it, and a joined fill (behind an earlier put-back) gives that earlier hold back while the read still shows its text; with no read, or one that fails or does not answer, the hold stays (it lapses at COMPACT_LIMIT). When it lands after the person submitted from the composer meanwhile (which ended the hold and the tracking), the hold starts again and the text is tracked once a read shows it in the box (with no read at all, or one that fails or does not answer: held again, not tracked; a read that succeeds and does not show the text starts nothing). Once it has settled or the backstop has passed, the next put-back on an engine that can read the box reads it and trusts no tracking (it leaves the box alone unless it is empty); on an engine with no read at all there is nothing to read, and what is tracked is only what the late answer says: a late `isFilled: false` gives back the tracking of the text the box held when the fill started (best effort: the box most likely still starts with it, but when that answer is the engine giving up with the client still to write the joined text, the next put-back may replace the newer part), and a late `isFilled: true` tracks the text the fill put in (joined or not), so the next put-back goes in behind it. Both need the same chat, nothing submitted from the composer, no message handed on and no request started since the fill began; they do not depend on the hold (a local command's fill, or a message of a compaction that finished, holds nothing, and a put-back quoted while the fill was out replaced the hold). Otherwise no tracking, and the box is overwritten. A read that exists but failed or did not answer gets none of this: it shows nothing, and nothing is tracked.
 // items: the list, or a function giving it once the fill's turn has come and `wait` ms have passed (a batch still collecting its members); an empty list fills nothing
 // chat: the msgChat the items belong to: in a chat since cleared or replaced by a resumed one nothing is filled. Resolves to { filled, quoted, stale, inFill, unsure } (unsure: the fill did not answer in time; inFill: the chat was replaced while the fill was out; what could not go in is already quoted)
 function placeBack($, list, chat, hold = true, wait = 0) {
@@ -760,6 +760,8 @@ function placeBack($, list, chat, hold = true, wait = 0) {
     const box = await boxNow($)
     if (msgChat !== chat) return { filled: false, stale: true }
     const existing = box.text
+    const fillReal = realSends // the counters when the box was read: a late "filled" answer is tracked only if neither has moved since (a message handed on or a request started while the fill was out means the text may already be sent)
+    const fillSteps = stepsSeen
     const plain = items.filter((i) => !i.slash)
     const slash = items.filter((i) => i.slash)
     let text = ''
@@ -791,7 +793,7 @@ function placeBack($, list, chat, hold = true, wait = 0) {
     let late = null // what that fill answered once it settled: { filled }
     let lateHold = null // the hold this fill started
     let prior = null // the hold this fill replaced, when the box held text of an earlier put-back (what the fill joins its text behind)
-    let priorBox = null // and the tracking of that text
+    let priorBox = null // the tracking of the text the box held when an unsure fill started (kept whether or not the fill holds anything; null when none was tracked or a message was handed on or a request started since)
     let probing = false
     let out = null // the promise of this fill's settling (what fillOut holds)
     const composerAtFill = composerSubmits
@@ -809,15 +811,15 @@ function placeBack($, list, chat, hold = true, wait = 0) {
     const holdsText = (shown, t) => shown.includes(t.replace(/\r\n/g, '\n').trimEnd())
     // A late answer that is not a fill does not prove the text is absent: it may be the engine's own give-up while the client still writes it. The fill part of the hold this fill started ends (endFillPart) only when a read of the box afterwards (bounded) succeeds and does not show the text; no read, a failing or unanswered one, or an answer with the text keeps it. Not if it is no longer that hold in this chat. A joined fill (the text is what the box held, the earlier put-back, plus the new one) replaced the hold that covered the earlier text: when the read still shows that text in the box, that hold is back (prior), and so is the tracking of it
     const lateEnds = async () => {
-      if (probing || !late || late.filled || !lateHold) return
+      if (probing || !late || late.filled || !(lateHold || priorBox)) return
       probing = true
       try {
         const shown = await readBoxText()
-        if (shown === undefined) { // the engine has no read at all (not one that failed or did not answer: those show nothing and change nothing): the fill did not land, so the box is as it was and still starts with the earlier put-back's text, which is tracked again (its hold stays as it is, nothing says whether the fill part may end)
-          if (priorBox && !boxText && putBackPending === lateHold && msgChat === chat) { boxText = priorBox; boxHeld() }
+        if (shown === undefined) { // the engine has no read at all (not one that failed or did not answer: those show nothing and change nothing): best effort, the fill most likely did not land, so the box still starts with the earlier put-back's text, which is tracked again (boxHeld drops it if a message was handed on or a request started since). Whether or not the fill held anything, and whatever became of the hold meanwhile; the hold itself stays as it is, nothing says whether the fill part may end
+          if (priorBox && !boxText && composerSubmits === composerAtFill && msgChat === chat) { boxText = priorBox; boxHeld() }
           return
         }
-        if (typeof shown !== 'string' || holdsText(shown, text)) return
+        if (!lateHold || typeof shown !== 'string' || holdsText(shown, text)) return
         if (putBackPending !== lateHold || msgChat !== chat) return
         if (priorBox && !boxText && existing && sameText(shown, existing)) { boxText = priorBox; boxHeld() } // the tracking does not lapse with time, so it comes back even when the earlier hold has (prior is then null)
         if (prior && existing && holdsText(shown, existing)) {
@@ -829,6 +831,7 @@ function placeBack($, list, chat, hold = true, wait = 0) {
       }
     }
     // The fill settled. Landed after the person submitted from the composer since it started (that took the box text and ended the hold): the text may be in the box now, unsent, so a read of the box confirms it before it is tracked and held again. With no read on the engine, or a read that exists and failed or did not answer, there is nothing to confirm with: it is held again but not tracked (the box is unknown); only a read that succeeds and does not show the text starts nothing
+    const stillUntouched = () => msgChat === chat && composerSubmits === composerAtFill && !boxText && realSends === fillReal && stepsSeen === fillSteps
     const lateSettled = async () => {
       try {
         if (late.filled) {
@@ -840,9 +843,9 @@ function placeBack($, list, chat, hold = true, wait = 0) {
               if (typeof shown === 'string') boxText = { real: realSends, steps: stepsSeen, text }
               putBackPending = lateHold = fillHold(t)
             }
-          } else if (lateHold && msgChat === chat && putBackPending === lateHold && composerSubmits === composerAtFill && !boxText && (await readBoxText()) === undefined && msgChat === chat && putBackPending === lateHold && composerSubmits === composerAtFill && !boxText) {
-            // landed with nothing submitted from the composer meanwhile, on an engine with no read at all: no read can show the box, but the fill put in exactly `text` (behind the earlier put-back when joined), so that is tracked and the next put-back goes in behind it instead of overwriting the box. A read that exists and failed or did not answer shows nothing and tracks nothing
-            boxText = { real: realSends, steps: stepsSeen, text }
+          } else if (stillUntouched() && (await readBoxText()) === undefined && stillUntouched()) {
+            // landed with nothing submitted from the composer meanwhile, on an engine with no read at all: no read can show the box, but the fill put in exactly `text` (behind the earlier put-back when joined), so that is tracked, from when the fill started, and the next put-back goes in behind it instead of overwriting the box. Whether or not the fill held anything, and whatever became of the hold meanwhile. A message handed on or a request started while it was out means the text may already be sent: not tracked. A read that exists and failed or did not answer shows nothing and tracks nothing
+            boxText = { real: fillReal, steps: fillSteps, text }
             boxHeld()
           }
         } else await lateEnds()
@@ -872,7 +875,10 @@ function placeBack($, list, chat, hold = true, wait = 0) {
       for (const q of quoted) $.ui.toast(`Also not sent: ${q.text} — send it again when ready.`, { timeoutMs: 15000 })
       return { filled: false, stale: true, quoted: new Set(quoted), inFill: true }
     }
-    if (unsure && holds && existing) { putBackHeld(at); prior = putBackPending; priorBox = boxHeld() }
+    if (unsure && existing) {
+      if (holds) { putBackHeld(at); prior = putBackPending }
+      priorBox = boxHeld()
+    }
     if (unsure) boxText = null // the box is unknown: the next put-back reads it and trusts no tracking
     if (filled) boxText = { real: realSends, steps: stepsSeen, text }
     if (hold && filled) { // a local command never reaches the chat: it holds nothing and ends nothing, the hold there already is stays as it is
