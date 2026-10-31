@@ -49,7 +49,7 @@ function objectsOf(name) {
 
 // Every command object in the engine, as { names, type }: one pass over the source (a scan per name would take 100 passes).
 // An object's `name:` is a string literal (any shape, `__remote-workflow` too), or something the minifier left that a literal gives: an identifier (`name:pPe` with `var pPe="low-priority"` somewhere, or `name:e` inside a factory `function ren(e,n,r){return{type:"local-jsx",name:e,...}}` whose calls `ren("vim",...)` give it), or a member of a factory's object parameter (`name:e.name` in `function A2(e){return{type:"local",name:e.name,...}}`, whose calls `A2({name:"schedule",...})` give it). Any other `name:` in a local / local-jsx object is listed in `unresolved`, and a test fails on it: the one exception is PLUGIN_FACTORY below.
-// Limit: the engine is minified, so a factory's calls are found by its name alone; a same-named function elsewhere adds only calls whose argument is a string literal shaped like a command name.
+// Limit: the engine is minified, so a factory's calls are found by its name alone, and the minifier reuses a name for unrelated functions in other modules. A call counts as the factory's when it is not a declaration and passes at most as many arguments as the factory has parameters and at least two when it has two or more (for a factory taking one object, an object literal): a differently shaped call of a same-named function (`ren()`, `ren({turnGoesOn:!0})`) is not read, so a call of the factory with a single argument is not either. Of the calls that count, one whose name argument is a string literal shaped like a command name gives that name; any other (a variable or expression as the name, a literal of another shape, an object with no literal `name:`) is listed in `unresolved`, written as the call (`ren(someVar,...)`), and the test fails naming it.
 const NAME_SHAPE = /^[a-z][a-z0-9-]*$/
 const escId = (id) => id.replace(/\$/g, '\\$')
 // The one local-command factory whose names are not in the engine: it turns a mod's `$.command.register` (this mod's own /cache, /board, ...) into a command at run time, `({plugin:e,spec:n})=>({type:"local",name:n.name,...loadedFrom:"plugin"...})`. Those are not built-ins; this mod's own are handled by name in register.mjs. Only an object holding `loadedFrom:"plugin"` and `name:<param>.name` is let by.
@@ -66,29 +66,51 @@ function topLevelType(s) {
   return ''
 }
 
-// The i-th argument of the call whose `(` is at `open`, when it is a plain string literal
-function stringArg(open, i) {
-  let arg = 0
+// The source text of each argument of the call whose `(` is at `open` (trimmed), null when the call does not end within reach
+function callArgs(open) {
+  const args = []
   let d = 0
-  let k = open + 1
-  for (; k < src.length && k - open < 600; k++) {
+  let start = open + 1
+  for (let k = open + 1; k < src.length && k - open < 600; k++) {
     const c = src[k]
     if (c === '"' || c === "'" || c === '`') {
-      const end = src.indexOf(c, k + 1)
-      if (end < 0) return null
-      if (d === 0 && arg === i) {
-        const rest = src[end + 1]
-        return c === '"' && (rest === ',' || rest === ')') ? src.slice(k + 1, end) : null
-      }
-      k = end
+      k = src.indexOf(c, k + 1)
+      if (k < 0) return null
     } else if (c === '(' || c === '[' || c === '{') d++
     else if (c === ')' || c === ']' || c === '}') {
-      if (d === 0) return null
+      if (d === 0) {
+        const last = src.slice(start, k).trim()
+        if (last || args.length) args.push(last)
+        return args
+      }
       d--
-    } else if (c === ',' && d === 0) arg++
-    if (arg > i && d === 0) return null
+    } else if (c === ',' && d === 0) {
+      args.push(src.slice(start, k).trim())
+      start = k + 1
+    }
   }
   return null
+}
+
+// The i-th argument of the call when it is a plain string literal, else null
+function stringArg(args, i) {
+  const m = /^"([^"]*)"$/.exec(args[i] ?? '')
+  return m ? m[1] : null
+}
+
+// A call of the factory `fn(...)` is found by its name alone, and the minifier reuses a name for unrelated functions in other modules (`ren()`, `ren({turnGoesOn:!0})`, a second `function A2(e)`). So a match is a call of the factory only when it is not a declaration (`function fn(`) and passes at most as many arguments as the factory has parameters (`arity`) and at least two when it has two or more (the trailing ones are optional: `ren("vim","Editor mode")` for `function ren(e,n,r)`); `need` 'object' also asks for an object literal first (a factory taking one object)
+function factoryCalls(fn, arity, need) {
+  const calls = []
+  const re = new RegExp('(?<![\\w$.])' + escId(fn) + '\\(', 'g')
+  let m
+  while ((m = re.exec(src))) {
+    if (/function\s+$/.test(src.slice(Math.max(0, m.index - 12), m.index))) continue
+    const args = callArgs(m.index + m[0].length - 1)
+    if (!args || args.length > arity || args.length < Math.min(2, arity)) continue
+    if (need === 'object' && !args[0].startsWith('{')) continue
+    calls.push({ at: m.index + m[0].length, args })
+  }
+  return calls
 }
 
 // The object literal opening at `s`, as text
@@ -128,31 +150,30 @@ function nameLiteralOf(obj) {
 }
 
 // `name:<param>.name` in a factory `function F(param){return{...}}`: the `name:"..."` of the object each call `F({...})` passes
-function resolveMember(expr, objectStart) {
+// skipped: collects each call whose object has no literal `name:`, written as the call
+function resolveMember(expr, objectStart, skipped) {
   const f = factoryBefore(objectStart)
   const m = /^([A-Za-z_$][\w$]*)\.name$/.exec(expr)
   if (!f || !m || f.params[0] !== m[1]) return []
   const names = new Set()
-  const call = new RegExp('(?<![\\w$.])' + escId(f.fn) + '\\(\\{', 'g')
-  let c
-  while ((c = call.exec(src))) {
-    const v = nameLiteralOf(objectAt(c.index + c[0].length - 1))
+  for (const c of factoryCalls(f.fn, f.params.length, 'object')) {
+    const v = nameLiteralOf(objectAt(c.at))
     if (v) names.add(v)
+    else skipped.add(f.fn + '(' + c.args[0].slice(0, 60) + (c.args.length > 1 ? ',...' : '') + ') has no literal name:')
   }
   return [...names]
 }
 
-function resolveIdent(id, objectStart) {
+function resolveIdent(id, objectStart, skipped) {
   const literals = new Set()
   // a factory's parameter: `function F(a,b){return{...name:a...}}` (or an arrow) and each call `F("literal",...)`
   const f = factoryBefore(objectStart)
   const at = f ? f.params.indexOf(id) : -1
   if (at >= 0) {
-    const call = new RegExp('(?<![\\w$.])' + escId(f.fn) + '\\(', 'g')
-    let m
-    while ((m = call.exec(src))) {
-      const v = stringArg(m.index + m[0].length - 1, at)
+    for (const c of factoryCalls(f.fn, f.params.length)) {
+      const v = stringArg(c.args, at)
       if (v !== null && NAME_SHAPE.test(v)) literals.add(v)
+      else skipped.add(f.fn + '(' + c.args.slice(0, at + 1).map((x) => x.slice(0, 40)).join(',') + ',...) has no command-shaped string literal as argument ' + (at + 1))
     }
     return [...literals]
   }
@@ -191,7 +212,7 @@ function commandDefs() {
     else if (local) {
       const expr = m[2] || m[3]
       if (m[2] && /\.name$/.test(m[2]) && PLUGIN_FACTORY.test(objectAt(s))) continue // the plugin-registration factory: names given at run time
-      const names = m[2] && !m[2].includes('.') ? resolveIdent(m[2], s) : m[2] ? resolveMember(m[2], s) : []
+      const names = m[2] && !m[2].includes('.') ? resolveIdent(m[2], s, unresolved) : m[2] ? resolveMember(m[2], s, unresolved) : []
       if (names.length) defs.push({ names, type, ufn })
       else unresolved.add(expr.trim())
     }
