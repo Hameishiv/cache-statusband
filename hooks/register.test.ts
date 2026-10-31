@@ -105,6 +105,18 @@ test('the rotator wake-up compacts and resumes on its own, with no dialog', SETU
   expect(seen.asks).toBe(0)
 })
 
+test('with the cold-send guard off, a big context woken by the rotator is sent as is, uncompacted', SETUP, async ($, on) => {
+  const { clock, seen } = engine($, on)
+  answer(on, seen, null)
+  await start($, 300000, clock)
+  await $.command.run({ command: 'cache', args: 'guard off' })
+  const r = await $.prompt.submit({ text: 'Usage reset: the weekly limit capped, so the CLI account was rotated to G. Fresh weekly quota is available now - continue where you left off.', origin: COMPOSER, wait: false } as never)
+  expect('drop' in (r as object)).toBe(false)
+  await clock.advance(100)
+  expect(seen.compacts).toBe(0)
+  expect(seen.asks).toBe(0)
+})
+
 test('a small context woken by the rotator is sent as is', SETUP, async ($, on) => {
   const { clock, seen } = engine($, on)
   await start($, 100000, clock)
