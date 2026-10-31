@@ -47,21 +47,103 @@ function objectsOf(name) {
   return out
 }
 
-// The `type:"..."` of each object literal holding `name:"<name>"`
-function typesOf(name) {
-  const out = []
-  for (const obj of objectsOf(name)) {
+// Every command object in the engine, as { names, type }: one pass over the source (a scan per name would take 100 passes).
+// An object's `name:` is a string literal, or an identifier the minifier left: `name:pPe` with `var pPe="low-priority"` somewhere, or `name:e` inside a factory `function ren(e,n,r){return{type:"local-jsx",name:e,...}}` whose calls `ren("vim",...)` give it. A name no literal gives is listed in `unresolved`, and a test fails on it.
+// Limit: the engine is minified, so a factory's calls are found by its name alone; a same-named function elsewhere adds only calls whose argument is a string literal shaped like a command name.
+const NAME_SHAPE = /^[a-z][a-z0-9-]*$/
+const escId = (id) => id.replace(/\$/g, '\\$')
+
+function topLevelType(s) {
+  let d = 0
+  for (let k = s; k < src.length && k - s <= 6000; k++) {
+    if (src[k] === '{') d++
+    else if (src[k] === '}') {
+      if (--d === 0) return ''
+    } else if (d === 1 && src.startsWith('type:"', k) && /[,{]/.test(src[k - 1])) return src.slice(k + 6, src.indexOf('"', k + 6))
+  }
+  return ''
+}
+
+// The i-th argument of the call whose `(` is at `open`, when it is a plain string literal
+function stringArg(open, i) {
+  let arg = 0
+  let d = 0
+  let k = open + 1
+  for (; k < src.length && k - open < 600; k++) {
+    const c = src[k]
+    if (c === '"' || c === "'" || c === '`') {
+      const end = src.indexOf(c, k + 1)
+      if (end < 0) return null
+      if (d === 0 && arg === i) {
+        const rest = src[end + 1]
+        return c === '"' && (rest === ',' || rest === ')') ? src.slice(k + 1, end) : null
+      }
+      k = end
+    } else if (c === '(' || c === '[' || c === '{') d++
+    else if (c === ')' || c === ']' || c === '}') {
+      if (d === 0) return null
+      d--
+    } else if (c === ',' && d === 0) arg++
+    if (arg > i && d === 0) return null
+  }
+  return null
+}
+
+function resolveIdent(id, objectStart) {
+  const literals = new Set()
+  // a factory's parameter: `function F(a,b){return{...name:a...}}` (or an arrow) and each call `F("literal",...)`
+  const before = src.slice(Math.max(0, objectStart - 300), objectStart)
+  const f = /(?:function\s+([\w$]+)\s*\(([^)]*)\)\s*\{\s*return\s*|(?:const|let|var)\s+([\w$]+)\s*=\s*\(([^)]*)\)\s*=>\s*\(?\s*)$/.exec(before)
+  const at = f ? (f[2] ?? f[4]).split(',').map((x) => x.trim()).indexOf(id) : -1
+  if (at >= 0) {
+    const call = new RegExp('(?<![\\w$.])' + escId(f[1] || f[3]) + '\\(', 'g')
+    let m
+    while ((m = call.exec(src))) {
+      const v = stringArg(m.index + m[0].length - 1, at)
+      if (v !== null && NAME_SHAPE.test(v)) literals.add(v)
+    }
+    return [...literals]
+  }
+  // a variable, declared in another module of the bundle (`var pPe="low-priority"`): the minifier reuses names across modules, so it counts only when exactly one command-shaped literal is ever assigned to it
+  const def = new RegExp('(?<![\\w$.:"])' + escId(id) + '="([^"]*)"', 'g')
+  const all = new Set()
+  let m
+  while ((m = def.exec(src))) if (NAME_SHAPE.test(m[1])) all.add(m[1])
+  return all.size === 1 ? [...all] : []
+}
+
+let defsCache = null
+function commandDefs() {
+  if (defsCache) return defsCache
+  const defs = []
+  const unresolved = new Set()
+  const re = /name:(?:"([a-z][a-z0-9-]*)"|([A-Za-z_$][\w$]*)(?=[,}]))/g
+  let m
+  while ((m = re.exec(src))) {
     let d = 0
-    for (let k = 0; k < obj.length; k++) {
-      if (obj[k] === '{') d++
-      else if (obj[k] === '}') d--
-      else if (d === 1 && obj.startsWith('type:"', k) && /[,{]/.test(obj[k - 1])) {
-        out.push(obj.slice(k + 6, obj.indexOf('"', k + 6)))
-        break
+    let s = m.index
+    for (; s >= 0; s--) {
+      if (src[s] === '}') d++
+      else if (src[s] === '{') {
+        if (d === 0) break
+        d--
       }
     }
+    const type = topLevelType(s)
+    if (!type) continue
+    if (m[1]) defs.push({ names: [m[1]], type })
+    else if (type === 'local' || type === 'local-jsx') {
+      const names = resolveIdent(m[2], s)
+      if (names.length) defs.push({ names, type })
+      else unresolved.add(m[2])
+    }
   }
-  return out
+  return (defsCache = { defs, unresolved: [...unresolved].sort() })
+}
+
+// The `type:"..."` of each object literal naming the command
+function typesOf(name) {
+  return commandDefs().defs.filter((x) => x.names.includes(name)).map((x) => x.type)
 }
 
 test('every LOCAL_BUILTINS entry is a local or local-jsx command in the installed engine, never a prompt', { skip: skipWhy || (typesOf('compact').length === 0 ? 'the engine\'s command definitions are not readable here' : false) }, () => {
@@ -83,39 +165,14 @@ test('/branch is in LOCAL_BUILTINS, and the engine gives it no alias that would 
   assert.equal(LOCAL_BUILTINS.has('fork'), false)
 })
 
-// Every `local` / `local-jsx` command in the engine, as a name: one pass over the source (a `typesOf` per name would scan it 100 times)
+// Every `local` / `local-jsx` command in the engine, as a name
 function localCommandNames() {
-  const names = new Set()
-  const re = /name:"([a-z][a-z0-9-]*)"/g
-  let m
-  while ((m = re.exec(src))) {
-    let d = 0
-    let s = m.index
-    for (; s >= 0; s--) {
-      if (src[s] === '}') d++
-      else if (src[s] === '{') {
-        if (d === 0) break
-        d--
-      }
-    }
-    // the object's top-level `type:"..."`, scanned forward and stopped at the object's end
-    d = 0
-    for (let k = s; k < src.length && k - s <= 6000; k++) {
-      if (src[k] === '{') d++
-      else if (src[k] === '}') {
-        if (--d === 0) break
-      } else if (d === 1 && src.startsWith('type:"', k) && /[,{]/.test(src[k - 1])) {
-        const t = src.slice(k + 6, src.indexOf('"', k + 6))
-        if (t === 'local' || t === 'local-jsx') names.add(m[1])
-        break
-      }
-    }
-  }
-  return names
+  return new Set(commandDefs().defs.filter((x) => x.type === 'local' || x.type === 'local-jsx').flatMap((x) => x.names))
 }
 
-// Local commands left OUT of LOCAL_BUILTINS, each with why (reviewed against engine 2.1.316). A typed command in this list counts as a send.
+// Local commands left OUT of LOCAL_BUILTINS, each with why (reviewed against engine 2.1.316). A typed command in this list counts as a send, except clear and compact, which register.mjs handles by name (see below).
 // An entry the engine later drops is harmless. A command new to the engine must be added to LOCAL_BUILTINS (after reading that it never sends to the model) or here, with a reason.
+// The criterion for LOCAL_BUILTINS: the command never sends the conversation to the model. A dialog action that only compacts it counts like /compact, which is exempt: `rewind` stays listed although its dialog offers "Summarize from here" and "Summarize up to here", a partial compaction.
 // How the model is reached: a local command's result `type:"query"` (only ultrareview, import, goal), a local-jsx `onDone(.., { shouldQuery: true })` (only login, workflows, ultrareview, permissions, plan, goal), or a model request the command makes itself.
 const EXCLUDED = {
   // can send to the model
@@ -132,6 +189,10 @@ const EXCLUDED = {
   ultraplan: 'drafts the plan in a cloud session from the prompt',
   'autofix-pr': 'a cloud session works on the PR\'s issues',
   'workflow-launch-exec': 'runs a server-launched workflow handoff',
+  // can continue the model's work or open a page; hidden or gated, and not read to the end
+  'low-priority': 'continues the request the 5-hour limit stopped at lower priority, which sends to the model; its chunk is not read to the end',
+  'limit-reset': 'uses a limit reset and keeps working, which continues the request; not read to the end',
+  'claim-credit': 'opens the page of the offer shown at start-up; hidden and gated; not read to the end',
   // handled in register.mjs code, not by the list
   clear: 'handled by name in prompt.submit and by its SessionStart (source clear)',
   compact: 'handled by name in prompt.submit and by the compaction tracking',
@@ -183,4 +244,9 @@ test('no command is both in LOCAL_BUILTINS and in the exclusion list, and every 
     assert.equal(LOCAL_BUILTINS.has(name), false, name + ' is excluded and listed')
     assert.ok(typeof why === 'string' && why.length > 10, name + ' has no reason')
   }
+})
+
+// A command whose `name:` is an identifier no string literal explains would pass unseen: fail on it, naming the identifier
+test('every local or local-jsx command whose name is an identifier resolves to a string literal', { skip: skipWhy || (typesOf('compact').length === 0 ? 'the engine\'s command definitions are not readable here' : false) }, () => {
+  assert.deepEqual(commandDefs().unresolved, [], 'name:<identifier> in a local command the test cannot resolve to a literal: read that command and extend resolveIdent, or list it by hand')
 })
