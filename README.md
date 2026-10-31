@@ -3,7 +3,7 @@
 A status band and prompt-cache guard for coding agents. The main version is a Claude Code mod. It keeps a big chat's prompt cache warm, warns before an expensive cold rewrite, resumes chats cut short by spent usage, and draws a colour-blocked status band above the prompt with the numbers you'd otherwise need a status line for.
 
 ```
- Opus 5.5 ▶ High ▶ Ctx 287k · Rewrite ≈ $2.29 ▶ ● Cache warm 42m ▶ Cold rewrites $4.10 (2) ▶ 5h 27% · 3h22m ▶ Week 33% · 5d19h ▶ Fable 6% ▶ Session $23 ▶ you@example.com
+ Opus 5.5 ▶ High ▶ Ctx 287k · Rewrite ≈ $2.29 ▶ ● Cache warm 42m ▶ Chat cold rewrites $4.10 (2) ▶ 5h 27% · 3h22m ▶ Week 33% · 5d19h ▶ Fable 6% ▶ Session $23 ▶ you@example.com
 ```
 
 It works in the terminal and in the Desktop app's Code tab, so it replaces a command status line.

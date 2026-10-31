@@ -8,12 +8,16 @@ const SETUP = { options: { seatFileTerminal: '~/.claude-cli-accounts/.active', s
 
 // The engine beneath the mod: a terminal session on seat A, nothing on disk but the seat file
 // `disk` adds files by name (a transcript, the account file); `holdAccount` makes reading the account file wait, `holdEnv` an environment read (its name and how many times that name was read), `hold` a named file's
-function engine($: any, on: any, seat: { label: string; recording?: string } = { label: 'A' }, kept?: Map<string, unknown>, onGet?: (key: string) => Promise<void> | void, disk: { files?: Record<string, string>; holdAccount?: Promise<void>; hold?: Record<string, Promise<void>>; holdEnv?: (name: string, nth: number) => Promise<void> | void; messages?: { role: string; text: string }[] } = {}) {
+function engine($: any, on: any, seat: { label: string; recording?: string } = { label: 'A' }, kept?: Map<string, unknown>, onGet?: (key: string) => Promise<void> | void, disk: { files?: Record<string, string>; holdAccount?: Promise<void>; hold?: Record<string, Promise<void>>; hangSet?: (key: string) => boolean; id?: string; holdEnv?: (name: string, nth: number) => Promise<void> | void; messages?: { role: string; text: string }[] } = {}) {
   const clock = mock.clock(on)
   if (kept) {
     // a store already holding what an earlier run of this mod wrote
     on('store.get', async (_: unknown, e: any) => (await onGet?.(e.key), { value: kept.get(e.key) }))
-    on('store.set', (_: unknown, e: any) => (kept.set(e.key, e.value), { value: undefined }))
+    on('store.set', async (_: unknown, e: any) => {
+      if (disk.hangSet?.(e.key)) await new Promise(() => {}) // a store call that never settles
+      kept.set(e.key, e.value)
+      return { value: undefined }
+    })
     on('store.delete', (_: unknown, e: any) => (kept.delete(e.key), { value: undefined }))
     on('store.keys', () => ({ value: [...kept.keys()] }))
   } else mock.store(on)
@@ -22,7 +26,7 @@ function engine($: any, on: any, seat: { label: string; recording?: string } = {
     on('env.get', async (_: unknown, e: any) => (await disk.holdEnv!(e.name, (reads[e.name] = (reads[e.name] || 0) + 1)), { value: e.name === 'USERPROFILE' ? 'C:/Users/T' : undefined }))
   } else mock.env(on, { USERPROFILE: 'C:/Users/T' })
   const seen = { compacts: 0, submits: [] as string[], asks: 0, toasts: [] as string[], failCompact: false, failSubmit: false, duringCompact: null as null | (() => Promise<unknown>), duringSubmit: null as null | (() => Promise<unknown>), duringClear: null as null | (() => Promise<unknown>) }
-  on('session.id', () => ({ value: 'sid-test' }))
+  on('session.id', () => ({ value: disk.id ?? 'sid-test' }))
   on('session.cwd', () => ({ value: '/repo' }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
   on('session.surface', () => ({ value: 'terminal' }))
@@ -6094,7 +6098,7 @@ test('a startup transcript queued for session.start is not seeded into a chat cl
 
 // NEW-TESTS-BEGIN (batch 44)
 // A main-loop request the test can hold in flight: begin() starts it, finish() lets it end with the given usage (null: it ended with none, as Esc or an API error does)
-function heldRequest($: any, on: any) {
+function heldRequest($: any, on: any, usageHold?: () => Promise<void> | undefined) {
   let release: () => void = () => {}
   let gate = new Promise<void>((r) => (release = r))
   let result: unknown = null
@@ -6103,7 +6107,7 @@ function heldRequest($: any, on: any) {
     return { answer: '', toolUses: [], usage: result }
   })
   on('turn.complete', () => ({ text: '' }))
-  on('session.usage', () => ({ value: {} }))
+  on('session.usage', async () => (await usageHold?.(), { value: {} }))
   let running: Promise<void> = Promise.resolve()
   return {
     begin(effort?: string) {
@@ -6329,4 +6333,107 @@ test('a session.measure during session.start\'s account read does not drop the q
   await step(usage({ cache_read_input_tokens: 500000 }))
   await step(usage({ cache_read_input_tokens: 510000 }))
   expect(storeGets).toBe(reads) // the chat's history was merged and no longer waited for: no read of its record per request
+})
+
+// NEW-TESTS-BEGIN (batch 46)
+// A resume that arrives while session.start waits (its session.usage read) replaced the chat and holds its stored history for its own seed: session.start's seed, the old chat's, must not undo that hold
+test('a resume arriving while session.start waits keeps the stored cold history safe from a request that ends first', SETUP, async ($, on) => {
+  let releaseSeed: () => void = () => {}
+  let releaseUsage: () => void = () => {}
+  let usageGate: Promise<void> | undefined
+  const disk: any = { files: {}, hold: { 'x.jsonl': new Promise<void>((r) => (releaseSeed = r)) } }
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  answer(on, seen, 'Send anyway')
+  const req = heldRequest($, on, () => usageGate)
+  on('ui.render', engineDraws)
+  on('classic.SessionStart', () => ({}))
+  await clock.advance(60000)
+  const t0 = await clock.now()
+  disk.files['x.jsonl'] = prompt('hello') + reply(t0 - 10 * 60000, 590000)
+  kept.set('last:sid-test', { ctx: 590004, at: t0 - 10 * 60000, model: 'claude-opus-5-5', seat: 'A', desktop: false, cold: COLD_HISTORY(t0) })
+  usageGate = new Promise<void>((r) => (releaseUsage = r))
+  const started = $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true }) // waits on session.usage, after reading the seat and account
+  await clock.advance(10)
+  const p = ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/x.jsonl' }) // the resume's seed waits on its transcript
+  await clock.advance(10)
+  usageGate = undefined
+  releaseUsage()
+  await started // session.start goes on, with the chat it captured before the resume
+  await clock.advance(10)
+  req.begin()
+  await req.finish(usage({ cache_read_input_tokens: 600000 })) // a request ends before the resume's seed has merged the stored history
+  expect((kept.get('last:sid-test') as { cold: unknown[] }).cold.length).toBe(2) // not replaced by this process's own, empty list
+  releaseSeed()
+  await p
+  await clock.advance(10)
+  expect((kept.get('last:sid-test') as { cold: unknown[] }).cold.length).toBe(2)
+  const c: any = await $.command.run({ command: 'cache', args: '' })
+  expect(c.text).toMatch(/Cold restarts in this chat: 2/)
+  expect(await bandText($, /cold rewrites/i)).toMatch(/^Chat cold rewrites \$[\d.]+ \(2\)$/) // the band says it is this chat's
+})
+
+// Chat 0 is the first chat: no seed pending is not chat 0's number. A fork keeps the chat and changes the id, and its record is written without waiting on a read of the new id
+test('a fork in the first chat writes its record even when the store cannot be read for the new id', SETUP, async ($, on) => {
+  const disk: any = { files: {} }
+  const kept = new Map<string, unknown>()
+  let failReads = false
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, (key) => { if (failReads && key === 'last:sid-fork') throw new Error('locked') }, disk)
+  answer(on, seen, 'Send anyway')
+  const req = heldRequest($, on)
+  on('classic.SessionStart', () => ({}))
+  await start($, 300000, clock)
+  disk.id = 'sid-fork'
+  await ($ as any).classic.SessionStart({ source: 'fork', transcript_path: '/h/fork.jsonl' })
+  failReads = true
+  req.begin()
+  await req.finish(usage({ cache_read_input_tokens: 310000 }))
+  expect((kept.get('last:sid-fork') as { ctx: number } | undefined)?.ctx).toBe(310010)
+})
+
+// A store call that never settles is a failed write after WRITE_LIMIT: neither the next write nor the next turn.step waits on it for good
+test('a store write that never settles does not hold later writes or requests', SETUP, async ($, on) => {
+  let hang = true
+  const disk: any = { files: {}, hangSet: (key: string) => hang && key === 'last:sid-test' }
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  answer(on, seen, 'Send anyway')
+  const req = heldRequest($, on)
+  on('classic.SessionStart', () => ({}))
+  await start($, 300000, clock)
+  req.begin()
+  const first = req.finish(usage({ cache_read_input_tokens: 310000 })) // its record's write never settles
+  await clock.advance(6000)
+  await first // the step still returns
+  expect(kept.get('last:sid-test')).toBeUndefined()
+  hang = false
+  req.begin()
+  const second = req.finish(usage({ cache_read_input_tokens: 320000 }))
+  await clock.advance(6000)
+  await second
+  expect((kept.get('last:sid-test') as { ctx: number }).ctx).toBe(320010) // the next request writes it
+})
+
+// No usable transcript: the seed falls back on this mod's record, whose size is the one before a compaction. A session.measure that reported the real size during the seed keeps it
+test('a size reported during a seed that falls back on the stored record is not replaced by the record\'s', SETUP, async ($, on) => {
+  let release: () => void = () => {}
+  let armed = false
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, async (key) => { if (armed && key === 'last:sid-test') { armed = false; await new Promise<void>((r) => (release = r)) } }, { files: {} })
+  answer(on, seen, 'Send anyway')
+  on('ui.render', engineDraws)
+  on('classic.SessionStart', () => ({}))
+  await start($, 300000, clock)
+  const t0 = await clock.now()
+  kept.set('last:sid-test', { ctx: 590004, at: 0, keptAt: t0 - 10 * 60000, model: 'claude-opus-5-5', seat: 'A', desktop: false, cold: COLD_HISTORY(t0) }) // compacted: the size kept is the one before
+  armed = true
+  const p = ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/none.jsonl' }) // no such transcript
+  await clock.advance(10)
+  await $.session.measure({ context: { tokens: 280000, window: 1000000, percent: 28 }, rateLimits: [], changed: [] })
+  release()
+  await p
+  await clock.advance(10)
+  expect(await bandText($, /Ctx \d/)).toMatch(/^Ctx 280k/) // not the pre-compaction 590k
+  const c: any = await $.command.run({ command: 'cache', args: '' })
+  expect(c.text).toMatch(/Cold restarts in this chat: 2/) // the cold history still lands
 })

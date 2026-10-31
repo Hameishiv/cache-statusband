@@ -75,7 +75,7 @@ let paneOpen = false
 let justCompacted = false
 let compactedCold = false
 let identityRead = false // session.start has read the seat and account: a chat's record can be compared with them
-let pendingSeed = null // { path, chat, measured, steps, compact }: a startup or resume SessionStart's transcript that came before that, seeded once it has, with the chat (msgChat) and the counts (measuredSteps, stepsSeen, compactGen) it was queued at (seedMark)
+let pendingSeed = null // { path, chat, measured, steps, compact, sized }: a startup or resume SessionStart's transcript that came before that, seeded once it has, with the chat (msgChat) and the counts (measuredSteps, stepsSeen, compactGen, sizeUpdates) it was queued at (seedMark)
 let rotationSeenAt = 0 // when this process last saw a rotation: a process fact, kept across /clear, resume and fork
 const WAKE_WINDOW = 3 * MIN // how long after a wake-up a late rewrite of the seat file or .claude.json is still taken as that rotation
 let seatUnknown = false // after a wake-up, until the seat file names a new seat: the rotator may not have written it yet, so S.seat may be the old one: its plan fetch, borrowing and lending of usage windows, and the shared windows and Fable reading it shows wait for it
@@ -473,8 +473,9 @@ let sendPending = new Map() // id -> deadline: a send handed on that is not this
 let sendPendingId = 0
 let stepsSeen = 0 // main-loop requests started so far
 let measuredSteps = 0 // main-loop requests whose usage came back and measured the chat (S.ctx, S.lastActivity): a request that started, or ended with no usage, measured nothing
+let sizeUpdates = 0 // times session.measure or turn.complete set the chat's size (S.ctx) without a request measuring it (measuredSteps): a seed that only had this mod's stored record to go on leaves that size to them (seedFromTranscript)
 let compactGen = 0 // compactions marked so far (markCompacted): one that lands while a seed reads has made the chat's size and date its own
-let coldSeedPending = 0 // the msgChat whose cold-rewrite history its seed has not merged yet: until it has, what is stored for the chat is not replaced by a shorter list (writeRecord)
+let coldSeedPending = null // the msgChat whose cold-rewrite history its seed has not merged yet: until it has, what is stored for the chat is not replaced by a shorter list (writeRecord)
 let realSends = 0 // messages handed on to the chat (submitsSeen without "Compact first" answers, wake-ups and /clear)
 let msgChat = 0 // the conversation, bumped by /clear and by resuming another chat, not by a fork, which carries the conversation on. A message from before a fork is still the new chat's, so is a pending Resume (and one compacting, or being re-armed), and so is a compaction in flight (it is waited for, and its success or abandonment is recorded: compacting, liveRuns, abandoned); /clear and resuming another chat start another conversation, where neither is sent or recorded
 let msgChatCause = '' // why msgChat last moved, in words for the toast: 'cleared' or 'replaced by a resumed chat'
@@ -600,10 +601,10 @@ function composerTakesBox() {
 const BOX_LIMIT = 2000
 const TIMED_OUT = Symbol('timed out')
 // A prompt.fill that did not answer in time may still land, and nothing says when it will not: the engine's own fill timeout is 5 s, but per client (seen in 2.1.314: each client is tried in turn, each with its own 5 s), so a fill can settle well after 7 s. Its settling is the signal that it can no longer land (see fillOut); a time bound (COMPACT_LIMIT) only covers a fill that never settles
-async function bounded($, call) {
+async function bounded($, call, limit = BOX_LIMIT) {
   let timer = null
   try {
-    const waited = new Promise((resolve) => { timer = $.clock.after(BOX_LIMIT, () => resolve(TIMED_OUT)) })
+    const waited = new Promise((resolve) => { timer = $.clock.after(limit, () => resolve(TIMED_OUT)) })
     return await Promise.race([call(), waited])
   } finally {
     if (timer) timer.cancel() // nothing is left waiting once the call has answered
@@ -1431,6 +1432,7 @@ function mergeCold(...lists) {
 
 let coldSeedChat = null // { chat, id, list }: the cold history stored for a chat, once read (by its seed or by the first record written while the seed had not merged it), so a record written meanwhile merges it without another read. Reset whenever a seed is awaited (holdStoredCold)
 let writeChain = Promise.resolve() // the chat's records go to the store in the order they were issued: one waiting on the stored history must not be overtaken by a later one
+const WRITE_LIMIT = 5000 // a store call that has not answered by then is a failed write: the chain goes on without it, as turn.step awaits it (rememberLast)
 
 // The chat's stored cold history is now awaited by its seed: a record written before the seed has merged it merges it too (coldToKeep)
 function holdStoredCold(chat) {
@@ -1453,7 +1455,7 @@ async function loadStoredCold($, chat, id) {
     const merged = mergeCold(list, S.coldRestarts)
     const changed = merged.length !== S.coldRestarts.length
     S.coldRestarts = merged
-    if (coldSeedPending === chat) coldSeedPending = 0
+    if (coldSeedPending === chat) coldSeedPending = null
     if (changed) $.ui.invalidate('ui.render')
   }
   return true
@@ -1465,7 +1467,7 @@ function writeRecord($, record) {
   const chat = msgChat
   const own = S.coldRestarts.slice(-COLD_KEEP)
   const merge = coldSeedPending === chat
-  const run = writeChain.then(async () => {
+  const run = writeChain.then(() => bounded($, async () => {
     try {
       let cold = own
       if (merge) {
@@ -1476,7 +1478,7 @@ function writeRecord($, record) {
     } catch {
       // another session holds the store's lock: the next request writes it
     }
-  })
+  }, WRITE_LIMIT).catch(() => {})) // one that never answers (TIMED_OUT) is a failed write too
   writeChain = run
   return run
 }
@@ -1489,7 +1491,7 @@ async function rememberLast($) {
 
 // What a seed was asked for at: the chat (msgChat) its transcript belongs to, and the counts that say what has happened to that chat since. Taken before any await, and carried by a seed that waits (pendingSeed)
 function seedMark() {
-  return { chat: msgChat, measured: measuredSteps, steps: stepsSeen, compact: compactGen }
+  return { chat: msgChat, measured: measuredSteps, steps: stepsSeen, compact: compactGen, sized: sizeUpdates }
 }
 
 // Every read here can outlast a /clear or a resume of another chat, whose own seed it must not write over: nothing is written once the chat has moved on (from.chat).
@@ -1497,6 +1499,8 @@ function seedMark() {
 async function seedFromTranscript($, path, from = seedMark()) {
   const gone = () => msgChat !== from.chat
   const measured = () => measuredSteps !== from.measured || compactGen !== from.compact
+  const sized = () => sizeUpdates !== from.sized // the size was reported meanwhile (session.measure, turn.complete): it is the chat's real one
+  let fromRecord = false
   let found = null
   try {
     const st = await $.fs.stat(path)
@@ -1526,7 +1530,7 @@ async function seedFromTranscript($, path, from = seedMark()) {
     changed = merged.length !== S.coldRestarts.length
     S.coldRestarts = merged
   }
-  if (storeRead && coldSeedPending === from.chat) coldSeedPending = 0
+  if (storeRead && coldSeedPending === from.chat) coldSeedPending = null
   if (!found && S.id && !measured()) {
     try {
       // before its first record, a chat open under an earlier version still has its heartbeat
@@ -1534,15 +1538,20 @@ async function seedFromTranscript($, path, from = seedMark()) {
       const r = last || (hb && { ctx: hb.ctx, at: hb.lastActivity, model: hb.model, effort: hb.effort })
       if (gone()) return
       // an `at` of 0 was written between a compaction and the next request
-      if (r && r.ctx) found = { ctx: r.ctx, at: r.at, model: r.model, effort: r.effort, compacted: !r.at }
+      if (r && r.ctx) {
+        found = { ctx: r.ctx, at: r.at, model: r.model, effort: r.effort, compacted: !r.at }
+        fromRecord = true
+      }
     } catch {
       // store unavailable: the first request measures it
     }
   }
   if (found && !measured()) {
-    S.ctx = found.ctx
+    // the record's size is the one before a compaction's: not over a size reported since, nor its compacted state (the cache's age and the cold history still land)
+    const keepSize = fromRecord && sized()
+    if (!keepSize) S.ctx = found.ctx
     judgeChat(found, last)
-    if (found.compacted) {
+    if (found.compacted && !keepSize) {
       // the next request writes the compacted context whatever happens: nothing to ask
       S.floor = found.ctx
       markCompacted($)
@@ -1886,7 +1895,8 @@ export function register(on, options = {}) {
     const seedFrom = queued || { ...seedMark(), chat }
     pendingSeed = null
     // not gated on S.ctx: a session.measure or turn.complete can set it without measuring the chat's request (measuredSteps), and the seed itself leaves to a request that did measure what that wrote (seedFromTranscript)
-    if (S.id && S.cwd) {
+    // a resume that landed while this waited replaced the chat and made its own seed (and its hold on the stored history): this one is the old chat's, and must not undo that hold
+    if (S.id && S.cwd && seedFrom.chat === msgChat) {
       holdStoredCold(seedFrom.chat) // until the seed has merged the chat's stored cold history, a record written first keeps it
       const config = ((await $.env.get('CLAUDE_CONFIG_DIR')) || `${home}/.claude`).replace(/\\/g, '/')
       await seedFromTranscript($, queued ? queued.path : `${config}/projects/${S.cwd.replace(/[^a-zA-Z0-9]/g, '-')}/${S.id}.jsonl`, seedFrom)
@@ -2175,7 +2185,10 @@ export function register(on, options = {}) {
     if (e.reason === 'answer') resumeTries = 0 // usage is back: a later cap starts its fallback tries afresh
     try {
       const usage = await $.session.usage()
-      if (usage.context && usage.context.tokens) S.ctx = usage.context.tokens
+      if (usage.context && usage.context.tokens) {
+        S.ctx = usage.context.tokens
+        sizeUpdates++
+      }
       if (usage.context && usage.context.window) S.window = usage.context.window
       if (usage.cost) S.costUsd = usage.cost.usd
       // not a request that started before an account change: its windows are the old account's
@@ -2229,7 +2242,10 @@ export function register(on, options = {}) {
   })
 
   on('session.measure', async ($, e, next) => {
-    if (e.context && e.context.tokens) S.ctx = e.context.tokens
+    if (e.context && e.context.tokens) {
+      S.ctx = e.context.tokens
+      sizeUpdates++
+    }
     if (e.context && e.context.window) S.window = e.context.window
     if (e.cost) S.costUsd = e.cost.usd
     if (Array.isArray(e.rateLimits) && e.rateLimits.length && requestGen === identityGen) S.rateLimits = e.rateLimits // as in turn.complete
@@ -2467,7 +2483,7 @@ function bandSegments() {
   else if (st.kind === 'cold') out.push([`○ cache cold${st.left === null ? '' : ' ' + ago(-st.left)}`, big ? HOT : 'gray'])
   else out.push(['cache –', 'gray'])
   // what this chat has already paid to rewrite cold caches, beside the next send's estimate
-  if (S.coldRestarts.length) out.push([`Cold rewrites ${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))} (${S.coldRestarts.length})`, 'gray'])
+  if (S.coldRestarts.length) out.push([`Chat cold rewrites ${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))} (${S.coldRestarts.length})`, 'gray'])
   // the engine's own reading once a request has run; before that another session's on the same account, then the shared usage reading
   let limits = stillOpen(S.rateLimits, now) // a window that reset since is stale
   if (!limits.length && signedIn !== false && !keyUnsure()) limits = borrowedLimits(fleet, { seat: S.seat, account: S.account, desktop: !onTerminal }, now) // not while the seat or account is unknown: the key may name the old one
