@@ -30,6 +30,28 @@ test("parses the latest token count and ignores malformed or prompt records", as
   assert.equal(summary.totalUsage.totalTokens, 30000);
 });
 
+test("reads the rate limits codex-cli writes beside info, and from an event with no info", async (t) => {
+  const root = await fixtureRoot(t);
+  const path = join(root, "limits.jsonl");
+  const limits = (used) => ({ primary: { used_percent: used, window_minutes: 300, resets_at: 1790000000 }, secondary: { used_percent: 4.0, window_minutes: 10080, resets_at: 1790500000 }, credits: null, plan_type: "plus" });
+  const info = { total_token_usage: { total_tokens: 30000 }, last_token_usage: { total_tokens: 25000 }, model_context_window: 200000 };
+  const lines = [
+    FIXTURE[0],
+    // payload keys in the order codex-cli 0.166 writes them: info, rate_limits, type
+    { timestamp: "2026-10-29T12:02:00.000Z", type: "event_msg", payload: { info, rate_limits: limits(12), type: "token_count" } },
+  ];
+  await writeFile(path, lines.map((item) => JSON.stringify(item)).join("\n") + "\n", "utf8");
+  let summary = await parseRollout(path);
+  assert.equal(summary.rateLimits.primary.used_percent, 12);
+  assert.equal(summary.contextUsed, 25000);
+  // a later event carrying only the limits updates them and leaves the token state
+  lines.push({ timestamp: "2026-10-29T12:03:00.000Z", type: "event_msg", payload: { info: null, rate_limits: limits(31), type: "token_count" } });
+  await writeFile(path, lines.map((item) => JSON.stringify(item)).join("\n") + "\n", "utf8");
+  summary = await parseRollout(path);
+  assert.equal(summary.rateLimits.primary.used_percent, 31);
+  assert.equal(summary.contextUsed, 25000);
+});
+
 test("reads metadata from the head and token state from the tail of a large rollout", async (t) => {
   const root = await fixtureRoot(t);
   const path = join(root, "large.jsonl");

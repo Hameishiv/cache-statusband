@@ -83,6 +83,8 @@ function consume(item, summary) {
 
   if (item?.type !== "event_msg" || payload?.type !== "token_count") return;
   const info = payload.info;
+  // codex-cli writes the limits beside info (keys: info, rate_limits, type), and an event may carry them with no info at all
+  summary.rateLimits = payload.rate_limits ?? payload.rateLimits ?? info?.rate_limits ?? info?.rateLimits ?? summary.rateLimits;
   if (!info) return;
   const last = info.last_token_usage ?? info.lastTokenUsage;
   const total = info.total_token_usage ?? info.totalTokenUsage;
@@ -90,7 +92,6 @@ function consume(item, summary) {
   summary.contextUsed = number(last?.total_tokens ?? last?.totalTokens) ?? summary.contextUsed;
   summary.contextWindow = number(info.model_context_window ?? info.modelContextWindow) ?? summary.contextWindow;
   summary.totalUsage = usage(total) ?? summary.totalUsage;
-  summary.rateLimits = info.rate_limits ?? info.rateLimits ?? summary.rateLimits;
 }
 
 function usage(value) {
