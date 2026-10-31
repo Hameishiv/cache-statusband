@@ -339,10 +339,12 @@ function writeCache(cachePath, body) {
 /**
  * Last weekly reading. Re-reads the log at most once per five minutes.
  * A failed re-read keeps the last good record and only moves the next check.
- * The cache stores the percent, period type, period end, and fetch time.
+ * The cache stores the percent, period type, period end, and fetch time, with the log it was read from (a reading from another log is a miss).
  */
 export function loadWeekly(logPath, cachePath, nowMs = Date.now()) {
-  const cached = readCache(cachePath);
+  const stored = readCache(cachePath);
+  // A reading taken from another log (another GROK_HOME or CSB_BILLING_LOG) is another account's: a miss.
+  const cached = stored && stored.logPath === logPath ? stored : null;
   const prior = storedRecord(cached);
   const freshScan = cached && finite(cached.scannedAt) !== null && nowMs - cached.scannedAt < RESCAN_MS;
   if (freshScan) return prior;
@@ -362,6 +364,7 @@ export function loadWeekly(logPath, cachePath, nowMs = Date.now()) {
   if (!found) {
     // A miss is cached too, so a log with no billing line is not rescanned on every run.
     writeCache(cachePath, {
+      logPath,
       sourceMtimeMs: prior ? cached.sourceMtimeMs : st ? st.mtimeMs : null,
       sourceSize: prior ? cached.sourceSize : st ? st.size : null,
       scannedAt: nowMs,
@@ -376,6 +379,7 @@ export function loadWeekly(logPath, cachePath, nowMs = Date.now()) {
     fetchedAt: found.fetchedAt,
   };
   writeCache(cachePath, {
+    logPath,
     sourceMtimeMs: found.sourceMtimeMs,
     sourceSize: found.sourceSize,
     scannedAt: nowMs,

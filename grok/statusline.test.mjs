@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import {
   cacheLabel,
@@ -124,6 +124,26 @@ describe("weekly usage", () => {
     assert.equal(loadWeekly(logPath, cachePath, now + 6 * 60 * 1000).percent, 5);
   });
 
+  it("does not show one Grok home's weekly reading for another home that shares the cache", () => {
+    const dir = mkdtempSync(join(tmpdir(), "csb-homes-"));
+    const cachePath = join(dir, "usage.json");
+    const credits = (percent) => `${JSON.stringify({
+      ts: "2026-10-29T11:37:35.772Z",
+      msg: "billing: fetched credits config",
+      ctx: { config: { creditUsagePercent: percent, currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", end: "2026-11-02T22:57:09.651+00:00" } } },
+    })}\n`;
+    const logs = [10, 90].map((percent, i) => {
+      const logPath = join(dir, `home${i + 1}`, "logs", "unified.jsonl");
+      mkdirSync(dirname(logPath), { recursive: true });
+      writeFileSync(logPath, credits(percent));
+      return logPath;
+    });
+    assert.equal(loadWeekly(logs[0], cachePath, now).percent, 10);
+    assert.equal(loadWeekly(logs[1], cachePath, now + 60 * 1000).percent, 90); // inside the five-minute window
+    assert.equal(loadWeekly(logs[1], cachePath, now + 120 * 1000).percent, 90);
+    assert.equal(loadWeekly(logs[0], cachePath, now + 180 * 1000).percent, 10);
+  });
+
   it("reads the last credits line and keeps every other field out of the cache", () => {
     const dir = mkdtempSync(join(tmpdir(), "csb-week-"));
     const logPath = join(dir, "unified.jsonl");
@@ -147,7 +167,7 @@ describe("weekly usage", () => {
     const first = loadWeekly(logPath, cachePath, now);
     assert.equal(weeklyLabel(first, now), "week 23% · 4d11h");
     const cached = JSON.parse(readFileSync(cachePath, "utf8"));
-    assert.deepEqual(Object.keys(cached).sort(), ["record", "scannedAt", "sourceMtimeMs", "sourceSize"]);
+    assert.deepEqual(Object.keys(cached).sort(), ["logPath", "record", "scannedAt", "sourceMtimeMs", "sourceSize"]);
     assert.deepEqual(Object.keys(cached.record).sort(), ["fetchedAt", "percent", "periodEnd", "periodType"]);
     assert.equal(JSON.stringify(cached).includes("super-secret-tier"), false);
     assert.equal(JSON.stringify(cached).includes("user@example.com"), false);
