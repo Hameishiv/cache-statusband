@@ -5224,7 +5224,7 @@ for (const source of ['clear', 'resume']) {
 
 // ---- the fill part of the Resume hold ends through one rule (endFillPart) ----
 // Setup shared by the tests below: a cold chat whose first compaction (the Resume's) stays out until finish(), so every message sent meanwhile is put back at once. The box is `box`; a fill answers at once, or stays out until `late.resolve` once `late.armed`
-async function lateJoinSetup($: any, on: any, box: { text: string }) {
+async function lateJoinSetup($: any, on: any, box: { text: string }, noRead = false) {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)
   on('ui.render', engineDraws)
@@ -5236,7 +5236,7 @@ async function lateJoinSetup($: any, on: any, box: { text: string }) {
     box.text = e.text
     return { isFilled: true }
   })
-  on('prompt.read', () => ({ value: { text: box.text, cursor: box.text.length } }))
+  if (!noRead) on('prompt.read', () => ({ value: { text: box.text, cursor: box.text.length } })) // noRead: no hook, so the call is rejected as "no implementation": an engine with no read
   answer(on, seen, 'Compact first, then send')
   on('classic.StopFailure', () => ({}))
   await clock.advance(60000)
@@ -5291,9 +5291,9 @@ test('a late "not filled" answer for a message put back over one held only quote
 })
 
 // The earlier put-back is still in the box, unsent, when a later one is joined behind it (the fill replaces the box, so its text is both)
-async function joinedLateFill($: any, on: any, second: string, answer: 'none' | 'not filled', boxAfter?: string) {
+async function joinedLateFill($: any, on: any, second: string, answer: 'none' | 'not filled' | 'filled', boxAfter?: string, noRead = false) {
   const box = { text: '' }
-  const { clock, seen, fills, late, finish } = await lateJoinSetup($, on, box)
+  const { clock, seen, fills, late, finish } = await lateJoinSetup($, on, box, noRead)
   await $.prompt.submit({ text: 'stop, do X instead', origin: COMPOSER, wait: false } as never)
   await clock.advance(60000)
   for (let i = 0; i < 20 && !fills.length; i++) await clock.advance(60000)
@@ -5306,6 +5306,7 @@ async function joinedLateFill($: any, on: any, second: string, answer: 'none' | 
   expect(fills).toEqual(['stop, do X instead', 'stop, do X instead\n\n' + second])
   if (boxAfter !== undefined) box.text = boxAfter
   if (answer === 'not filled') late.resolve({ isFilled: false })
+  if (answer === 'filled') late.resolve({ isFilled: true })
   await realMs(50)
   late.armed = false
   return { clock, seen, fills, box, finish }
@@ -5338,6 +5339,22 @@ test('after that late "not filled" answer the earlier text is tracked again: a p
   })()
   expect(fills).toEqual(['stop, do X instead', 'stop, do X instead\n\n' + WAKE_TEXT, 'stop, do X instead\n\nthree'])
   expect(clock).toBeDefined()
+})
+
+// An engine with no read: the joined fill's late answer is all there is to go on. "Not filled": the box is as it was and still starts with the earlier put-back. "Filled": the box holds the joined text
+test('on an engine with no read, after the joined fill answers late "not filled", a put-back goes in behind the earlier put-back instead of overwriting it', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+  const r = await joinedLateFill($, on, WAKE_TEXT, 'not filled', undefined, true)
+  void sendBridge($, 'three')
+  await r.clock.advance(1000)
+  expect(r.fills).toEqual(['stop, do X instead', 'stop, do X instead\n\n' + WAKE_TEXT, 'stop, do X instead\n\nthree'])
+  expect(r.seen.toasts.filter((t: string) => t.includes('stop, do X instead') && t.includes('Also not sent'))).toEqual([])
+})
+
+test('on an engine with no read, after the joined fill answers late "filled", a put-back goes in behind the joined text instead of overwriting it', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+  const r = await joinedLateFill($, on, WAKE_TEXT, 'filled', undefined, true)
+  void sendBridge($, 'three')
+  await r.clock.advance(1000)
+  expect(r.fills).toEqual(['stop, do X instead', 'stop, do X instead\n\n' + WAKE_TEXT, 'stop, do X instead\n\n' + WAKE_TEXT + '\n\nthree'])
 })
 
 // The earlier put-back's own hold (15 minutes) has run out before the later one is joined behind it: its compaction failed late, which freed the next send to compact, and that compaction was abandoned in turn. The text of the earlier put-back is still in the box, and the tracking of it does not lapse with time
