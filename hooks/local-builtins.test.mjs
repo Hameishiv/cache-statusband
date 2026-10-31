@@ -48,10 +48,12 @@ function objectsOf(name) {
 }
 
 // Every command object in the engine, as { names, type }: one pass over the source (a scan per name would take 100 passes).
-// An object's `name:` is a string literal, or an identifier the minifier left: `name:pPe` with `var pPe="low-priority"` somewhere, or `name:e` inside a factory `function ren(e,n,r){return{type:"local-jsx",name:e,...}}` whose calls `ren("vim",...)` give it. A name no literal gives is listed in `unresolved`, and a test fails on it.
+// An object's `name:` is a string literal (any shape, `__remote-workflow` too), or something the minifier left that a literal gives: an identifier (`name:pPe` with `var pPe="low-priority"` somewhere, or `name:e` inside a factory `function ren(e,n,r){return{type:"local-jsx",name:e,...}}` whose calls `ren("vim",...)` give it), or a member of a factory's object parameter (`name:e.name` in `function A2(e){return{type:"local",name:e.name,...}}`, whose calls `A2({name:"schedule",...})` give it). Any other `name:` in a local / local-jsx object is listed in `unresolved`, and a test fails on it: the one exception is PLUGIN_FACTORY below.
 // Limit: the engine is minified, so a factory's calls are found by its name alone; a same-named function elsewhere adds only calls whose argument is a string literal shaped like a command name.
 const NAME_SHAPE = /^[a-z][a-z0-9-]*$/
 const escId = (id) => id.replace(/\$/g, '\\$')
+// The one local-command factory whose names are not in the engine: it turns a mod's `$.command.register` (this mod's own /cache, /board, ...) into a command at run time, `({plugin:e,spec:n})=>({type:"local",name:n.name,...loadedFrom:"plugin"...})`. Those are not built-ins; this mod's own are handled by name in register.mjs. Only an object holding `loadedFrom:"plugin"` and `name:<param>.name` is let by.
+const PLUGIN_FACTORY = /loadedFrom:"plugin"/
 
 function topLevelType(s) {
   let d = 0
@@ -89,14 +91,64 @@ function stringArg(open, i) {
   return null
 }
 
+// The object literal opening at `s`, as text
+function objectAt(s) {
+  let d = 0
+  let e = s
+  for (; e < src.length && e - s <= 6000; e++) {
+    if (src[e] === '{') d++
+    else if (src[e] === '}' && --d === 0) break
+  }
+  return src.slice(s, e + 1)
+}
+
+// `function F(a,b){return{` (or an arrow) just before the object literal at `objectStart`: the factory's name and parameters
+function factoryBefore(objectStart) {
+  const before = src.slice(Math.max(0, objectStart - 300), objectStart)
+  const f = /(?:function\s+([\w$]+)\s*\(([^)]*)\)\s*\{\s*return\s*|(?:const|let|var)\s+([\w$]+)\s*=\s*\(([^)]*)\)\s*=>\s*\(?\s*)$/.exec(before)
+  return f ? { fn: f[1] || f[3], params: (f[2] ?? f[4]).split(',').map((x) => x.trim()) } : null
+}
+
+// The `name:"..."` literal at the top level of an object literal's text
+function nameLiteralOf(obj) {
+  let d = 0
+  for (let k = 0; k < obj.length; k++) {
+    const c = obj[k]
+    if (c === '"' || c === "'" || c === '`') {
+      k = obj.indexOf(c, k + 1)
+      if (k < 0) return null
+    } else if (c === '{' || c === '[' || c === '(') d++
+    else if (c === '}' || c === ']' || c === ')') d--
+    else if (d === 1 && obj.startsWith('name:"', k) && /[,{]/.test(obj[k - 1])) {
+      const end = obj.indexOf('"', k + 6)
+      return end > 0 ? obj.slice(k + 6, end) : null
+    }
+  }
+  return null
+}
+
+// `name:<param>.name` in a factory `function F(param){return{...}}`: the `name:"..."` of the object each call `F({...})` passes
+function resolveMember(expr, objectStart) {
+  const f = factoryBefore(objectStart)
+  const m = /^([A-Za-z_$][\w$]*)\.name$/.exec(expr)
+  if (!f || !m || f.params[0] !== m[1]) return []
+  const names = new Set()
+  const call = new RegExp('(?<![\\w$.])' + escId(f.fn) + '\\(\\{', 'g')
+  let c
+  while ((c = call.exec(src))) {
+    const v = nameLiteralOf(objectAt(c.index + c[0].length - 1))
+    if (v) names.add(v)
+  }
+  return [...names]
+}
+
 function resolveIdent(id, objectStart) {
   const literals = new Set()
   // a factory's parameter: `function F(a,b){return{...name:a...}}` (or an arrow) and each call `F("literal",...)`
-  const before = src.slice(Math.max(0, objectStart - 300), objectStart)
-  const f = /(?:function\s+([\w$]+)\s*\(([^)]*)\)\s*\{\s*return\s*|(?:const|let|var)\s+([\w$]+)\s*=\s*\(([^)]*)\)\s*=>\s*\(?\s*)$/.exec(before)
-  const at = f ? (f[2] ?? f[4]).split(',').map((x) => x.trim()).indexOf(id) : -1
+  const f = factoryBefore(objectStart)
+  const at = f ? f.params.indexOf(id) : -1
   if (at >= 0) {
-    const call = new RegExp('(?<![\\w$.])' + escId(f[1] || f[3]) + '\\(', 'g')
+    const call = new RegExp('(?<![\\w$.])' + escId(f.fn) + '\\(', 'g')
     let m
     while ((m = call.exec(src))) {
       const v = stringArg(m.index + m[0].length - 1, at)
@@ -117,7 +169,8 @@ function commandDefs() {
   if (defsCache) return defsCache
   const defs = []
   const unresolved = new Set()
-  const re = /name:(?:"([a-z][a-z0-9-]*)"|([A-Za-z_$][\w$]*)(?=[,}]))/g
+  // a literal of any shape, an identifier or member expression, or any other expression up to its `,` or `}`
+  const re = /name:(?:"([^"\n]+)"|([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)(?=[,}])|([^,}"\n][^,}\n]{0,80}))/g
   let m
   while ((m = re.exec(src))) {
     let d = 0
@@ -133,9 +186,11 @@ function commandDefs() {
     if (!type) continue
     if (m[1]) defs.push({ names: [m[1]], type })
     else if (type === 'local' || type === 'local-jsx') {
-      const names = resolveIdent(m[2], s)
+      const expr = m[2] || m[3]
+      if (m[2] && /\.name$/.test(m[2]) && PLUGIN_FACTORY.test(objectAt(s))) continue // the plugin-registration factory: names given at run time
+      const names = m[2] && !m[2].includes('.') ? resolveIdent(m[2], s) : m[2] ? resolveMember(m[2], s) : []
       if (names.length) defs.push({ names, type })
-      else unresolved.add(m[2])
+      else unresolved.add(expr.trim())
     }
   }
   return (defsCache = { defs, unresolved: [...unresolved].sort() })
@@ -189,6 +244,8 @@ const EXCLUDED = {
   ultraplan: 'drafts the plan in a cloud session from the prompt',
   'autofix-pr': 'a cloud session works on the PR\'s issues',
   'workflow-launch-exec': 'runs a server-launched workflow handoff',
+  '__remote-workflow': 'runs the workflow script a server-launched session was handed (hidden, server-launched sessions only)',
+  schedule: 'the engine\'s own /schedule is a hidden Enterprise-upsell text stub (the A2 factory), but `schedule` is also a bundled skill, a prompt command that sends to the model, and which of the two a typed /schedule reaches depends on the account',
   // can continue the model's work or open a page; hidden or gated, and not read to the end
   'low-priority': 'continues the request the 5-hour limit stopped at lower priority, which sends to the model; its chunk is not read to the end',
   'limit-reset': 'uses a limit reset and keeps working, which continues the request; not read to the end',
@@ -246,7 +303,14 @@ test('no command is both in LOCAL_BUILTINS and in the exclusion list, and every 
   }
 })
 
-// A command whose `name:` is an identifier no string literal explains would pass unseen: fail on it, naming the identifier
-test('every local or local-jsx command whose name is an identifier resolves to a string literal', { skip: skipWhy || (typesOf('compact').length === 0 ? 'the engine\'s command definitions are not readable here' : false) }, () => {
-  assert.deepEqual(commandDefs().unresolved, [], 'name:<identifier> in a local command the test cannot resolve to a literal: read that command and extend resolveIdent, or list it by hand')
+// A command whose `name:` is an identifier, member or other expression that no string literal explains would pass unseen: fail on it, naming the expression
+test('every local or local-jsx command whose name is not a literal resolves to a string literal (the plugin-registration factory aside)', { skip: skipWhy || (typesOf('compact').length === 0 ? 'the engine\'s command definitions are not readable here' : false) }, () => {
+  assert.deepEqual(commandDefs().unresolved, [], 'a name: in a local command that the test cannot resolve to a literal: read that command and extend resolveIdent / resolveMember, or list it by hand')
+})
+
+// The upsell factory `A2({name:"schedule",...})` gives six commands a member-expression name (`name:e.name`): they must be found, or this scan would pass without them
+test('commands made by a factory taking an object ({name:"..."}) are found by that name', { skip: skipWhy || (typesOf('compact').length === 0 ? 'the engine\'s command definitions are not readable here' : false) }, () => {
+  const names = localCommandNames()
+  for (const n of ['ultraplan', 'ultrareview', 'teleport', 'remote-control', 'schedule', 'autofix-pr']) assert.ok(names.has(n), n + ' is not found')
+  assert.ok(names.has('__remote-workflow'), 'a literal name that is not a plain command name is skipped')
 })
