@@ -4438,6 +4438,85 @@ test('a fill that did not answer in time may still land: the toast says the mess
   expect(seen.toasts.filter((t) => t.includes('Also not sent: two — send it again when ready.'))).toHaveLength(1)
 })
 
+// The box is empty when the fill of the first put-back times out: a read while that fill is still out shows an empty box, which must not be taken as free to write
+function lateFill(on: any, box: { text: string }) {
+  const ctl: { land: (isFilled?: boolean) => void } = { land: () => {} }
+  const fill = (e: any) => new Promise((resolve) => { ctl.land = (isFilled = true) => { if (isFilled) box.text = e.text; resolve({ isFilled }) } })
+  return { ctl, fill }
+}
+
+test('a put-back while an earlier fill that did not answer in time is still out quotes its message and leaves the box alone, even though a read shows the box empty', SETUP, async ($, on) => {
+  const dialogs = heldAsk(on)
+  const box = { text: '' }
+  const { ctl, fill } = lateFill(on, box)
+  const { clock, seen, fills } = await coldChat($, on, () => on('prompt.read', () => ({ value: { text: box.text, cursor: box.text.length } })), fill)
+  hang(seen)
+  await send($, 'one')
+  await clock.advance(15 * 60000 + 1000)
+  await clock.advance(2500)
+  expect(fills).toEqual(['one'])
+  expect(seen.toasts.filter((t) => t.includes('the message may not have been put back: one'))).toHaveLength(1)
+  void send($, 'two')
+  await clock.advance(100)
+  dialogs.release('Compact first, then send')
+  await clock.advance(1000)
+  expect(fills).toEqual(['one']) // not filled over the late fill
+  expect(seen.toasts.filter((t) => t.includes('Also not sent: two — send it again when ready.'))).toHaveLength(1)
+  ctl.land() // it lands now: the box holds 'one', which 'two' did not overwrite
+  await realMs(50)
+  expect(box.text).toBe('one')
+})
+
+test('once the fill that did not answer in time has settled without landing, the next put-back reads the box and fills it again', SETUP, async ($, on) => {
+  const dialogs = heldAsk(on)
+  const box = { text: '' }
+  const { ctl, fill } = lateFill(on, box)
+  let first = true
+  const { clock, seen, fills } = await coldChat($, on, () => on('prompt.read', () => ({ value: { text: box.text, cursor: box.text.length } })), (e: any) => {
+    if (first) { first = false; return fill(e) }
+    box.text = e.text
+    return { isFilled: true }
+  })
+  hang(seen)
+  await send($, 'one')
+  await clock.advance(15 * 60000 + 1000)
+  await clock.advance(2500)
+  ctl.land(false) // the engine answers late: it did not fill
+  await realMs(50)
+  await clock.advance(1000)
+  void send($, 'two')
+  await clock.advance(100)
+  dialogs.release('Compact first, then send')
+  await clock.advance(1000)
+  expect(fills).toEqual(['one', 'two'])
+  expect(seen.toasts.filter((t) => t.includes('Also not sent: two'))).toEqual([])
+})
+
+test('a /clear while a fill that did not answer in time is still out lets the next chat\'s put-back read the box', SETUP, async ($, on) => {
+  const dialogs = heldAsk(on)
+  const box = { text: '' }
+  const { fill } = lateFill(on, box)
+  let first = true
+  const { clock, seen, fills } = await coldChat($, on, () => { on('classic.SessionStart', () => ({})); on('prompt.read', () => ({ value: { text: box.text, cursor: box.text.length } })) }, (e: any) => {
+    if (first) { first = false; return fill(e) } // never settles
+    box.text = e.text
+    return { isFilled: true }
+  })
+  let n = 0
+  seen.duringCompact = () => (++n <= 2 ? new Promise(() => {}) : Promise.resolve()) // both compactions hang: both messages are put back
+  await send($, 'one')
+  await clock.advance(15 * 60000 + 1000)
+  await clock.advance(2500)
+  await ($ as any).classic.SessionStart({ source: 'clear', transcript_path: '/h/other.jsonl' })
+  await mainStep($) // the new chat has a big request (300k cached)
+  await clock.advance(77 * 60000) // and its cache is cold
+  void send($, 'two')
+  await clock.advance(100)
+  dialogs.release('Compact first, then send')
+  await clock.advance(15 * 60000 + 1000)
+  expect(fills).toEqual(['one', 'two'])
+})
+
 test('a fill that answers only after the 2 s bound and lands: the box then holds it, and a later put-back quotes its message instead of writing over the box', SETUP, async ($, on) => {
   const dialogs = heldAsk(on)
   const box = { text: '' }
@@ -4494,7 +4573,7 @@ test('a box with CRLF line ends is compared as the put-back text', SETUP, async 
   expect(fills).toEqual(['one\ntwo', 'one\ntwo\n\nthree'])
 })
 
-test('a prompt.fill that never answers is not waited for: the message is reported as possibly not put back, and the next put-back is handled', SETUP, async ($, on) => {
+test('a prompt.fill that never answers is not waited for: the message is reported as possibly not put back, and the next put-back is quoted while that fill is still out', SETUP, async ($, on) => {
   askLog(on)
   let asked = 0
   const { clock, seen } = await coldChat($, on, () => {}, () => (asked++, new Promise(() => {})))
@@ -4508,10 +4587,11 @@ test('a prompt.fill that never answers is not waited for: the message is reporte
   await clock.advance(16 * 60000)
   await send($, 'two') // compacts again (hangs) and is put back after 15 minutes
   await clock.advance(15 * 60000 + 1000)
-  expect(asked).toBe(2)
+  expect(asked).toBe(1) // the first fill is still out and may land: the box is not written to again
   await clock.advance(3000)
-  expect(asked).toBe(2)
-  expect(seen.toasts.filter((t) => t.includes('may not have been put back: two')).length).toBe(1)
+  expect(asked).toBe(1)
+  expect(seen.toasts.filter((t) => t.includes('Also not sent: two — send it again when ready.')).length).toBe(1)
+  expect(seen.toasts.filter((t) => t.includes('may not have been put back: two')).length).toBe(0)
 })
 
 test('a prompt.fill that never answers holds a due Resume as a put-back does (the message may be in the box), for 15 minutes and not for good', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
