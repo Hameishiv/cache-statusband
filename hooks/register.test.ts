@@ -816,7 +816,7 @@ test('auto keep warm stops once its pings cost as much as the rewrite; one start
   expect(r.text).toMatch(/Keep warm is on/)
 })
 
-test('a keep warm started by hand keeps its own end: a turn ending after it does not stretch it to the auto keep warm\'s hours', async ($, on) => {
+test('a keep warm started by hand keeps its own end: a turn ending before it does not stretch it to the auto keep warm\'s hours', async ($, on) => {
   const { clock } = engine($, on)
   on('model.fork', () => ({ value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }))
   const step = stepper($, on)
@@ -824,10 +824,54 @@ test('a keep warm started by hand keeps its own end: a turn ending after it does
   await $.command.run({ command: 'cache', args: 'ttl 5' })
   await $.command.run({ command: 'keepwarm', args: '1' })
   await step(usage({ cache_read_input_tokens: 300000 }))
+  const until = (t: string) => /Keep warm is on until [^:]*:\d\d/.exec(t)?.[0]
+  let r: any = await $.command.run({ command: 'cache', args: '' })
+  const before = until(r.text)
+  expect(before).toBeTruthy()
   await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  r = await $.command.run({ command: 'cache', args: '' })
+  expect(until(r.text)).toBe(before)
+})
+
+test('a keep warm started by hand that reaches its own end hands over to auto keep warm, whose cost cap then applies', async ($, on) => {
+  const { clock } = engine($, on)
+  let pings = 0
+  on('model.fork', () => {
+    pings++
+    return { value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }
+  })
+  const step = stepper($, on)
+  await start($, 300000, clock)
+  await $.command.run({ command: 'cache', args: 'ttl 5' })
+  await $.command.run({ command: 'keepwarm', args: '1' })
+  await step(usage({ cache_read_input_tokens: 300000 }))
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  await clock.advance(70 * 60000)
+  const atHandover = pings
+  let r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/Keep warm is on/) // past its own hour, still on: auto took it over
+  await clock.advance(5 * 3600000)
+  r = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/Keep warm is on/) // the cost cap stopped it, well before the 8 hours
+  // the bound the auto-only test above shows for a whole auto run
+  expect(pings - atHandover).toBeGreaterThan(3)
+  expect(pings - atHandover).toBeLessThan(30)
+})
+
+test('with auto keep warm off, a keep warm started by hand stops at its own end', async ($, on) => {
+  const { clock } = engine($, on)
+  on('model.fork', () => ({ value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }))
+  const step = stepper($, on)
+  await start($, 300000, clock)
+  await $.command.run({ command: 'cache', args: 'ttl 5' })
+  await $.command.run({ command: 'cache', args: 'autowarm off' })
+  await $.command.run({ command: 'keepwarm', args: '1' })
+  await step(usage({ cache_read_input_tokens: 300000 }))
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  await clock.advance(50 * 60000)
   let r: any = await $.command.run({ command: 'cache', args: '' })
   expect(r.text).toMatch(/Keep warm is on/)
-  await clock.advance(5 * 3600000)
+  await clock.advance(20 * 60000)
   r = await $.command.run({ command: 'cache', args: '' })
   expect(r.text).not.toMatch(/Keep warm is on/)
 })

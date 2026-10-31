@@ -1714,7 +1714,16 @@ function stopKeepWarm($, why) {
 
 async function keepWarmStep($) {
   if (!S.keepWarm) return
-  if (now >= S.keepWarmUntil) return stopKeepWarm($, 'time limit reached')
+  if (now >= S.keepWarmUntil) {
+    // One started by hand ends at its own time, but if auto keep warm would still be covering this chat, it takes over
+    // (with its cost cap) rather than leaving the cache to go cold sooner than if nothing had been pressed
+    const autoEnd = S.lastTurnEnd + settings.autoWarmHours * 60 * MIN
+    if (!S.keepWarmAuto && settings.autoWarmHours > 0 && S.autoWarm && S.ctx >= settings.bigTokens && now < autoEnd) {
+      S.keepWarmAuto = true
+      S.keepWarmUntil = autoEnd
+      S.autoPingUsd = 0
+    } else return stopKeepWarm($, 'time limit reached')
+  }
   if (S.pr && now - S.prCheckedAt > 15 * MIN) {
     S.prCheckedAt = now
     const state = await prState($)
