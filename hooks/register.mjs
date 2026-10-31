@@ -566,12 +566,18 @@ function fillHold(at) {
   return { real: realSends, steps: stepsSeen, at, from: 'fill', ...(quotedAt === undefined ? {} : { quotedToo: true, quotedAt }) }
 }
 
-// Whatever the person submits from the composer takes the box text: the tracking of what a put-back left there ends, and so does a hold that came from a fill. A hold that was only quoted in a toast is not touched (never in the box), and a fill hold that also keeps a quoted one (quotedToo) is downgraded to it, lapsing from when the message was quoted
+// The one rule for when the fill part of the Resume hold ends (the box text it stood for is taken, sent, or shown not to be in the box): a hold that came from a fill ends, but a quoted message it kept (quotedToo) is downgraded to a hold of its own, lapsing from when the message was quoted; a hold that was only quoted in a toast (never in the box) is left as it is. Returns the hold to set; every place that ends a fill hold goes through it (composerTakesBox, lateEnds, a local command filled alone does not end one at all)
+function endFillPart(p = putBackPending) {
+  if (!p || p.from !== 'fill') return p || null
+  return p.quotedToo ? { real: p.real, steps: p.steps, at: p.quotedAt, from: 'quoted' } : null
+}
+
+// Whatever the person submits from the composer takes the box text: the tracking of what a put-back left there ends, and so does the fill part of the hold (endFillPart)
 let composerSubmits = 0 // composer submits so far: a fill that lands after one was started before it
 function composerTakesBox() {
   boxText = null
   composerSubmits++
-  if (putBackPending && putBackPending.from === 'fill') putBackPending = putBackPending.quotedToo ? { real: putBackPending.real, steps: putBackPending.steps, at: putBackPending.quotedAt, from: 'quoted' } : null
+  putBackPending = endFillPart()
 }
 
 // An engine call that is not waited on for ever: resolves to what it answered, or to TIMED_OUT once BOX_LIMIT has passed (the timer is cancelled whichever comes first). A call that throws, or that is missing, rejects as it would unbounded
@@ -784,36 +790,52 @@ function placeBack($, list, chat, hold = true, wait = 0) {
     let unsure = false // the fill did not answer in time: it may still land
     let late = null // what that fill answered once it settled: { filled }
     let lateHold = null // the hold this fill started
+    let prior = null // the hold this fill replaced, when the box held text of an earlier put-back (what the fill joins its text behind)
+    let priorBox = null // and the tracking of that text
     let probing = false
     let out = null // the promise of this fill's settling (what fillOut holds)
     const composerAtFill = composerSubmits
-    // A late answer that is not a fill does not prove the text is absent: it may be the engine's own give-up while the client still writes it. The hold this fill started ends only when a read of the box afterwards (bounded) succeeds and does not show the text; no read, a failing or unanswered one, or an answer without text keeps it. Not if it is no longer that hold in this chat
+    // The box as a read of it shows it (bounded, CRLF as LF): a string; undefined when the engine has no prompt.read at all; null when the read exists and did not answer in time, failed, or answered without a text (shows nothing about the box)
+    const readBoxText = async () => {
+      let r
+      try {
+        r = await bounded($, () => $.prompt.read())
+      } catch (err) {
+        return readMissing(err) ? undefined : null
+      }
+      if (r === TIMED_OUT || !r || typeof r.text !== 'string') return null
+      return r.text.replace(/\r\n/g, '\n')
+    }
+    const holdsText = (shown, t) => shown.includes(t.replace(/\r\n/g, '\n').trimEnd())
+    // A late answer that is not a fill does not prove the text is absent: it may be the engine's own give-up while the client still writes it. The fill part of the hold this fill started ends (endFillPart) only when a read of the box afterwards (bounded) succeeds and does not show the text; no read, a failing or unanswered one, or an answer with the text keeps it. Not if it is no longer that hold in this chat. A joined fill (the text is what the box held, the earlier put-back, plus the new one) replaced the hold that covered the earlier text: when the read still shows that text in the box, that hold is back (prior), and so is the tracking of it
     const lateEnds = async () => {
       if (probing || !late || late.filled || !lateHold) return
       probing = true
       try {
-        let r
-        try {
-          r = await bounded($, () => $.prompt.read())
-        } catch {
-          return
-        }
-        if (r === TIMED_OUT || !r || typeof r.text !== 'string') return
-        if (r.text.replace(/\r\n/g, '\n').includes(text.replace(/\r\n/g, '\n').trimEnd())) return // the text is in the box: the fill did land
-        if (putBackPending === lateHold && msgChat === chat) putBackPending = null
+        const shown = await readBoxText()
+        if (typeof shown !== 'string' || holdsText(shown, text)) return
+        if (putBackPending !== lateHold || msgChat !== chat) return
+        if (prior && existing && holdsText(shown, existing)) {
+          putBackPending = prior
+          putBackHeld()
+          if (priorBox && !boxText && sameText(shown, existing)) { boxText = priorBox; boxHeld() }
+        } else putBackPending = endFillPart(lateHold)
       } finally {
         probing = false
       }
     }
-    // The fill settled. Landed after the person submitted from the composer since it started (that took the box text and ended the hold): the text is in the box now, unsent, so it is tracked and held again
+    // The fill settled. Landed after the person submitted from the composer since it started (that took the box text and ended the hold): the text may be in the box now, unsent, so a read of the box confirms it before it is tracked and held again. With no read on the engine there is nothing to confirm with: it is held again but not tracked (the box is unknown); a read that exists and failed or did not answer starts nothing
     const lateSettled = async () => {
       try {
         if (late.filled) {
-          const t = await $.clock.now()
-          now = t
           if (lateHold && msgChat === chat && putBackPending !== lateHold && composerSubmits !== composerAtFill) {
-            boxText = { real: realSends, steps: stepsSeen, text }
-            putBackPending = lateHold = fillHold(t)
+            const shown = await readBoxText()
+            const t = await $.clock.now()
+            now = t
+            if (msgChat === chat && putBackPending !== lateHold && composerSubmits !== composerAtFill && shown !== null && (shown === undefined || holdsText(shown, text))) {
+              if (shown !== undefined) boxText = { real: realSends, steps: stepsSeen, text }
+              putBackPending = lateHold = fillHold(t)
+            }
           }
         } else await lateEnds()
       } finally {
@@ -842,9 +864,13 @@ function placeBack($, list, chat, hold = true, wait = 0) {
       for (const q of quoted) $.ui.toast(`Also not sent: ${q.text} — send it again when ready.`, { timeoutMs: 15000 })
       return { filled: false, stale: true, quoted: new Set(quoted), inFill: true }
     }
+    if (unsure && holds && existing) { putBackHeld(at); prior = putBackPending; priorBox = boxHeld() }
     if (unsure) boxText = null // the box is unknown: the next put-back reads it and trusts no tracking
     if (filled) boxText = { real: realSends, steps: stepsSeen, text }
-    if (hold && filled) putBackPending = own.local ? null : fillHold(at) // a local command in the box replaces the hold
+    if (hold && filled) { // a local command never reaches the chat: it holds nothing and ends nothing, the hold there already is stays as it is
+      if (own.local) putBackHeld(at)
+      else putBackPending = fillHold(at)
+    }
     else if (holds) putBackPending = filled || unsure ? fillHold(at) : { real: realSends, steps: stepsSeen, at, from: 'quoted' }
     if (unsure && holds) { lateHold = putBackPending; lateEnds().catch(() => {}) } // the answer may already have come
     for (const q of quoted) $.ui.toast(`Also not sent: ${q.text} — send it again when ready.`, { timeoutMs: 15000 })
