@@ -1435,7 +1435,7 @@ function mergeCold(...lists) {
 
 let coldSeedChat = null // { chat, id, list }: the cold history stored for a chat, once read (by its seed or by the first record written while the seed had not merged it), so a record written meanwhile merges it without another read. Reset whenever a seed is awaited (holdStoredCold)
 let writeChain = Promise.resolve() // the chat's records: each one's write starts when the one before it has finished or timed out (WRITE_LIMIT), so one waiting on the stored history is not overtaken by a later one. A write that timed out writes nothing more (its late flag, in writeRecord): a step that settles late cannot put an older record over a newer. A store.set that was already issued and lands late can: the newest record issued for that key is then written again (lastIssued), queued here, so every write issued after that waits for it, and a re-write that itself lands late is followed by another. What holds: once no set of this mod's is still out past its limit, the store has the newest record issued for each key. What stays open: two sets of the store's that are both out at once may land in either order, a re-write or record set still out past its limit may land after a later one (until it lands, and its follow-up is written), and a store that never answers loses the record (the next request writes it)
-const lastIssued = new Map() // key -> { key, value }: the newest record a write has handed to store.set for that key, for the one that lands late over it. An entry goes once its set has settled with nothing newer issued for the key and no set of the key still out (putIssued), so it holds the current chat's key and the keys with a set still out, not every id the process has had
+const lastIssued = new Map() // key -> { key, value }: the newest record a write has handed to store.set for that key, for the one that lands late over it. An entry goes once its set has settled with nothing newer issued for the key and no set of the key still out (putIssued), so it holds only the keys with a set still out, or a newer record than one still out, not every id the process has had
 const setsOut = new Map() // key -> how many sets handed to store.set for it have not settled yet (a stuck one counts until it lands)
 const reissuing = new Set() // the keys with a re-write queued on writeChain and not started: one is enough, it reads the newest record when its turn comes
 const WRITE_LIMIT = 5000 // a store call that has not answered by then is a failed write: the chain goes on without it, as turn.step awaits it (rememberLast)
@@ -2038,6 +2038,7 @@ export function register(on, options = {}) {
     try {
       // the chat's own id, or nothing: an empty answer keeps the old id and the old idChat (no record is written for the chat meanwhile, writeRecord), and one that came back after a later /clear or resume took its own id is not that chat's anymore
       const id = await $.session.id()
+      // the msgChat check is defensive: SessionStarts run one at a time, so no later /clear or resume has bumped msgChat while this read was out
       if (id && msgChat === chat) {
         S.id = id
         idChat = chat

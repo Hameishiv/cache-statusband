@@ -6829,3 +6829,124 @@ test('a heartbeat written while the earlier version\'s heartbeat is being read i
   await clock.advance(100)
   expect(kept.has('last:sid-test')).toBe(false)
 })
+
+// NEW-TESTS-BEGIN (batch 50)
+
+// Two separate episodes of a set landing late on one key are each corrected: the queued-re-write marker is cleared when the re-write starts
+test('two separate late-landing episodes on one key are each corrected', SETUP, async ($, on) => {
+  let calls = 0
+  let armed = false
+  const rel: Record<number, () => void> = {}
+  const kept = new Map<string, unknown>()
+  const disk: any = { files: {}, holdSet: (key: string) => {
+    if (key !== 'last:sid-test' || !armed) return undefined
+    const n = ++calls
+    if (n === 1 || n === 4) return new Promise<void>((r) => (rel[n] = r))
+    return undefined
+  } }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  answer(on, seen, 'Send anyway')
+  const req = heldRequest($, on)
+  on('classic.SessionStart', () => ({}))
+  await start($, 300000, clock)
+  armed = true
+  req.begin(); let p = req.finish(usage({ cache_read_input_tokens: 310000 })); await clock.advance(6000); await p   // set 1 held
+  req.begin(); p = req.finish(usage({ cache_read_input_tokens: 320000 })); await clock.advance(100); await p        // set 2 lands
+  rel[1](); await clock.advance(100); await clock.advance(100)                                                     // set 3: re-write of 320k
+  expect(calls).toBe(3)
+  expect((kept.get('last:sid-test') as any).ctx).toBe(320010)
+  req.begin(); p = req.finish(usage({ cache_read_input_tokens: 330000 })); await clock.advance(6000); await p       // set 4 held
+  req.begin(); p = req.finish(usage({ cache_read_input_tokens: 340000 })); await clock.advance(100); await p       // set 5 lands
+  expect((kept.get('last:sid-test') as any).ctx).toBe(340010)
+  rel[4](); for (let i = 0; i < 5; i++) await clock.advance(100)                                                  // 330k lands over 340k
+  expect((kept.get('last:sid-test') as any).ctx).toBe(340010)
+})
+
+// A re-write that itself times out and then lands over a newer record is followed by another re-write
+test('a re-write that itself lands late over a newer record is followed by another', SETUP, async ($, on) => {
+  let calls = 0
+  let armed = false
+  const rel: Record<number, () => void> = {}
+  const kept = new Map<string, unknown>()
+  const disk: any = { files: {}, holdSet: (key: string) => {
+    if (key !== 'last:sid-test' || !armed) return undefined
+    const n = ++calls
+    if (n === 1 || n === 3) return new Promise<void>((r) => (rel[n] = r))
+    return undefined
+  } }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  answer(on, seen, 'Send anyway')
+  const req = heldRequest($, on)
+  on('classic.SessionStart', () => ({}))
+  await start($, 300000, clock)
+  armed = true
+  req.begin(); let p = req.finish(usage({ cache_read_input_tokens: 310000 })); await clock.advance(6000); await p   // set 1 held
+  req.begin(); p = req.finish(usage({ cache_read_input_tokens: 320000 })); await clock.advance(100); await p        // set 2 lands
+  rel[1](); await clock.advance(100)                                                                               // set 3: re-write of 320k, held
+  expect(calls).toBe(3)
+  await clock.advance(6000)                                                                                        // the re-write step times out
+  req.begin(); p = req.finish(usage({ cache_read_input_tokens: 330000 })); await clock.advance(100); await p       // set 4 lands 330k
+  expect((kept.get('last:sid-test') as any).ctx).toBe(330010)
+  rel[3](); for (let i = 0; i < 5; i++) await clock.advance(100)                                                  // 320k re-write lands over 330k
+  expect((kept.get('last:sid-test') as any).ctx).toBe(330010)
+})
+
+// Sets landing late while a re-write is itself out past its limit queue one re-write between them: the held set keeps the key's entry, so a second re-write would issue a second set
+test('sets landing late while a re-write is held out queue one re-write, not one each', SETUP, async ($, on) => {
+  let calls = 0
+  let armed = false
+  const rel: Record<number, () => void> = {}
+  const kept = new Map<string, unknown>()
+  const disk: any = { files: {}, holdSet: (key: string) => {
+    if (key !== 'last:sid-test' || !armed) return undefined
+    const n = ++calls
+    if (n <= 3 || n === 5) return new Promise<void>((r) => (rel[n] = r)) // three record sets, and the first re-write
+    return undefined
+  } }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  answer(on, seen, 'Send anyway')
+  const req = heldRequest($, on)
+  on('classic.SessionStart', () => ({}))
+  await start($, 300000, clock)
+  armed = true
+  for (let i = 0; i < 3; i++) {
+    req.begin(); const p = req.finish(usage({ cache_read_input_tokens: 310000 + i * 1000 })); await clock.advance(6000); await p // sets 1-3 held past their limit
+  }
+  req.begin(); const p4 = req.finish(usage({ cache_read_input_tokens: 313000 })); await clock.advance(100); await p4 // set 4 lands
+  rel[1](); await clock.advance(100) // lands late: the re-write (set 5) is issued and held
+  expect(calls).toBe(5)
+  rel[2](); rel[3](); await clock.advance(100) // two more land late meanwhile
+  expect(calls).toBe(5)
+  await clock.advance(6000) // the held re-write times out: the one queued re-write runs
+  await clock.advance(100)
+  expect(calls).toBe(6) // one more set, not two, before the held one settles
+  rel[5](); for (let i = 0; i < 3; i++) await clock.advance(100)
+  expect(calls).toBe(6)
+  expect((kept.get('last:sid-test') as any).ctx).toBe(313010)
+})
+
+// A resumed chat's classic.SessionStart takes its id before session.start reads it: an empty answer from session.start's own read leaves the chat's id as it is
+test('a resume that took its id before session.start: session.start answering no id leaves the resumed id, its seed and its record', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const disk: any = { files: {} }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  answer(on, seen, 'Send anyway')
+  const req = heldRequest($, on)
+  on('classic.SessionStart', () => ({}))
+  await clock.advance(60000)
+  const t0 = await clock.now()
+  disk.files['sid-resumed.jsonl'] = reply(t0 - 60000, 300000)
+  disk.id = 'sid-resumed'
+  await ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/sid-resumed.jsonl' })
+  disk.id = '' // session.start's own read answers nothing
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [], changed: [] })
+  await clock.advance(100)
+  const c: any = await $.command.run({ command: 'cache', args: '' })
+  expect(c.text.split('\n')[0]).toContain('300k') // seeded from the resumed chat's transcript
+  req.begin()
+  await req.finish(usage({ cache_read_input_tokens: 50000 }))
+  await clock.advance(100)
+  expect((kept.get('last:sid-resumed') as any)?.ctx).toBe(50010)
+  expect(kept.has('last:')).toBe(false)
+})
