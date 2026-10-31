@@ -23,6 +23,7 @@ const S = {
   label: '',
   model: '',
   lastActivity: 0, // last main-loop request or keep-warm ping that touched the cache
+  compactedAt: 0, // when the chat was last compacted with no request since (markCompacted zeroed lastActivity): an auto keep warm waiting for that request gives up one TTL on
   ctx: 0,
   window: 0,
   costUsd: 0,
@@ -39,25 +40,93 @@ const S = {
   keepWarmUntil: 0,
   pings: 0,
   pingUsd: 0,
+  autoPingUsd: 0, // what auto keep warm's pings cost since the last real request
+  autoCappedStretch: false, // auto keep warm stopped on its cost cap since the last real request. autoMayRun() is the single gate for starting auto keep warm or handing over to it (turn.complete, keepWarmStep): it needs auto keep warm on, a big chat, this cap unspent (autoStopReason(), which a running one also meets each step), a turn of this chat within the auto hours, and a cache still warm; so neither a turn that ends without a request, nor a hand-over, re-arms it after the cap stop until a real request
+  capId: '', // the chat (session id) autoPingUsd, autoCappedStretch and lastTurnEnd describe: a /clear or resume into another id starts them clean, one into the same id (or one whose id could not be read: only lastTurnEnd, which dates the chat it replaces) does not; a fork takes its own id
+  keepWarmAuto: false, // the running keep warm began on its own, not by hand
   lastPingAt: 0,
   warnedFor: 0,
   agentsRunning: 0,
   rateLimits: [],
+  seat: '', // the signed-in account label the rotator last wrote
+  seatChangedAt: 0, // when that label last changed: the new account's cache is empty
+  floor: 0, // context size right after the last compaction: what compacting can't shrink
+  autoWarm: true, // false once keep warm is turned off by hand in this session, or by a merged PR (autoWarmOffByPr) for that chat
+  autoWarmOffByPr: false, // autoWarm went false because the PR merged, not by hand: a new chat starts with it on again
+  pr: 0, // a merge-pr session's PR: keep warm stops once it merges or closes
+  prLive: false, // pr was set by a prompt submitted in this chat, not read from its history (a history read replaces it: see adoptHistoryPr)
+  prCheckedAt: 0,
+  effort: '', // the main loop's effort, as its last request named it
+  account: '', // the signed-in account's email, shown when no seat file is configured
+  resumeAt: 0, // when an out-of-usage chat sends itself "Resume" (also the re-arm of a cancelled Resume or one that could not be sent, 2 minutes on); 0 when none is pending
+  fable: null, // { percentUsed, resetsAt } from the plan's per-model weekly limits
+  planWindows: [], // 5h and weekly from the same reading, for a session that has sent nothing yet
 }
 
-const settings = { bigTokens: 150000, guard: true, ttlMin: 0, alerts: true, keepWarmHours: 4 }
+const settings = { bigTokens: 150000, guard: true, ttlMin: 0, alerts: true, keepWarmHours: 4, autoWarmHours: 8 }
 const names = { cache: 'cache', keepwarm: 'keepwarm', board: 'board', handoff: 'handoff' }
 
 let now = 0
 let home = ''
 let lastHeartbeat = 0
+let lastPrune = 0
 let rec = { on: false, strict: false }
 let mask = (s) => s
 let fleet = [] // heartbeats of every session, this one included
 const alerted = new Map() // sessionId -> state or warning key already announced
 let paneOpen = false
 let justCompacted = false
+let compactedCold = false
+let identityRead = false // session.start has read the seat and account: a chat's record can be compared with them
+let pendingSeed = null // { path, chat, measured, steps, compact, sized }: a startup or resume SessionStart's transcript that came before that, seeded once it has, with the chat (msgChat) and the counts (measuredSteps, stepsSeen, compactGen, sizeUpdates) it was queued at (seedMark)
+let rotationSeenAt = 0 // when this process last saw a rotation: a process fact, kept across /clear, resume and fork
+const WAKE_WINDOW = 3 * MIN // how long after a wake-up a late rewrite of the seat file or .claude.json is still taken as that rotation
+let seatUnknown = false // after a wake-up, until the seat file names a new seat: the rotator may not have written it yet, so S.seat may be the old one: its plan fetch, borrowing and lending of usage windows, and the shared windows and Fable reading it shows wait for it
+let accountUnknown = false // likewise for the account in .claude.json, which may not have switched though the seat label did: it holds back the same things (keyUnsure); a read with no account is not a change
+let wakeWindowEnd = 0 // when the wake-up's window closes; 0 = no window
+let accountMoved = false // the wake-up's re-read, or a late adoption since, has shown the account change: a seat label arriving after that is not a new rotation
+let seatMoved = false // the wake-up's re-read already showed the seat change. A seat adopted late does not count: its label may be written before the credential switches, so the account can still arrive after it
+let wakeCount = 0 // rotator wake-ups so far: a plan fetch that straddles one is dropped
+
+// A field is unknown only while the window is open: a closed one stands even before the tick that clears the flags
+function seatUnsure() {
+  return seatUnknown && now < wakeWindowEnd
+}
+function accountUnsure() {
+  return accountUnknown && now < wakeWindowEnd
+}
+// Whether the plan key, and the readings borrowed, lent or shown under it, may still be the old account's:
+// the seat file and .claude.json are written separately, and the credential may not have switched when either has
+function keyUnsure() {
+  return seatUnsure() || accountUnsure()
+}
+let wakeSeat = '' // the seat and account as they were when that wake-up came
+let wakeAccount = ''
+let rotatedPending = false // a seat change, or a reopened chat's last request on another seat or account, that no request has landed on yet: this account's cache is empty
+let signedIn = null // whether this session has a first-party sign-in (an API-key session has none); null until checked
+let signCheckAt = 0
 let handoffPending = false
+let seatFile = ''
+let onTerminal = false
+
+// Setup-specific behaviour, all off unless the plugin's userConfig turns it on (see README)
+const cfg = {
+  seatFileTerminal: '', // a file holding the signed-in account's label, as an account rotator writes it
+  seatFileDesktop: '',
+  rotatorWake: null, // the prompt an unattended account rotator types after rotating: compact without asking
+  prPattern: null, // a prompt naming a PR (any, while none is tracked; a resumed chat's from its transcript): keep warm stops once that PR merges or closes
+  autoResume: false, // send "Resume" to a chat cut short by exhausted usage once it renews
+}
+
+// A bad pattern in the settings turns that feature off rather than failing the load
+export function pattern(text, flags) {
+  if (!text) return null
+  try {
+    return new RegExp(text, flags)
+  } catch {
+    return null
+  }
+}
 
 // The handoff flow. When /session-handoff runs (the band's button, /handoff, a
 // typed command, or Claude calling the skill), the answer of the turn it starts
@@ -136,6 +205,10 @@ function continuationPrompt() {
   return `Handoff from my previous session${where}:\n\n${H.text}`
 }
 
+// Set by clearAndContinue for the SessionStart of the /clear it runs: that SessionStart keeps the chat's PR and the keep warm state tied to it (the work carries on), once. It may land inside the clear command or after clearAndContinue has returned, so it is a token the SessionStart consumes, not a window; it lapses KEEP_PR_LAPSE after the clear returns, so a later unrelated /clear still starts from nothing
+const KEEP_PR_LAPSE = 30000
+let keepPrOnClear = null
+
 async function clearAndContinue($) {
   if (H.continuing) return
   if (!H.text) {
@@ -149,10 +222,15 @@ async function clearAndContinue($) {
   const text = continuationPrompt()
   const path = H.path
   H.continuing = true
+  const keep = (keepPrOnClear = {})
   $.ui.invalidate('ui.render')
   try {
     await $.command.run({ command: 'clear', args: '' })
+    $.clock.after(KEEP_PR_LAPSE, () => {
+      if (keepPrOnClear === keep) keepPrOnClear = null
+    })
   } catch (err) {
+    if (keepPrOnClear === keep) keepPrOnClear = null
     H.continuing = false
     $.ui.invalidate('ui.render')
     $.ui.toast('Could not run /clear: ' + clip(String((err && err.message) || err), 100) + (path ? ` The handoff is saved at ${path}.` : ''), { timeoutMs: 10000 })
@@ -211,18 +289,859 @@ function ttlMin() {
   return settings.ttlMin || S.ttlMin
 }
 
+// A rotation moves the session to another account, whose cache is empty, until a request lands on it;
+// so does reopening a chat whose last request ran on another seat or account
+function rotatedCold() {
+  return rotatedPending
+}
+
+// A rotation seen in this process dates a chat the record cannot decide; one found on a reopened chat's record only says it came after its last request
+function rotatedAgo() {
+  return S.seatChangedAt ? ` ${minutes(now - S.seatChangedAt)} ago` : ' since its last request'
+}
+
+// The next request writes the shorter context: no TTL evidence and nothing to warn about.
+// It also keeps the record a reopened chat reads: an `at` of 0 says it was compacted.
+function markCompacted($, seq = 0) {
+  // the several hooks of one compaction must not judge it again once lastActivity is zeroed
+  if (!justCompacted) {
+    // a compaction of a cold cache (Claude Code auto-compacts a big chat as it is sent) still pays a rewrite
+    const left = msLeft(S.lastActivity, ttlMin())
+    compactedCold = compactedCold || (left !== null && left <= 0) || rotatedCold()
+  }
+  justCompacted = true
+  compactGen++
+  compactDeclined = false
+  if (abandoned && !(seq ? abandoned.seq > seq : olderRunOut(abandoned.seq))) abandoned = null // a compaction that succeeded, ours or the person's, makes an earlier hung one moot, not one that started after it (seq: the succeeding run's number; 0 for an engine mark, which can't say whose end it is: while an older run of ours is still out and started less than two COMPACT_LIMITs ago it is probably that one's)
+  rotatedPending = false // the rotation is now part of compactedCold
+  S.lastActivity = 0
+  S.compactedAt = now
+  rememberCompacted($)
+}
+
+// Whether one of this mod's /compact runs that started before run `seq` is still out: an engine compaction mark arriving now may be its end, which says nothing about the newer run. A run out longer than two COMPACT_LIMITs no longer counts, as for staleRunOut, so one that never settles does not keep a newer abandonment for good (a mark that really is that old run's late end is then taken for a compaction of the chat, which it also is: the context is shorter)
+function olderRunOut(seq) {
+  for (const r of liveRuns) if (r.seq < seq && now - r.at < 2 * COMPACT_LIMIT) return true
+  return false
+}
+
+// Where the request ran, kept with the chat's record: the seat (a seat name belongs to one
+// surface's rotator, so the surface goes with it) and the signed-in account
+function whoRan() {
+  // a field still unknown after a wake-up is left out, rather than recorded wrong
+  return {
+    ...(S.seat && !seatUnsure() ? { seat: S.seat } : {}),
+    ...(S.account && !accountUnsure() ? { account: S.account } : {}),
+    desktop: !onTerminal
+  }
+}
+
+// What a record can be compared with this process by: seats when both sides have one on the same surface,
+// else accounts. A field unknown on either side, or still unknown here after a wake-up, can't decide.
+function comparableBy(r) {
+  if (!r) return ''
+  if (r.seat && S.seat && !seatUnsure() && !!r.desktop === !onTerminal) return 'seat'
+  return r.account && S.account && !accountUnsure() ? 'account' : ''
+}
+
+// A record's request ran on another account than this process is on, so the cache it left is that account's.
+// Only comparable fields count: with none, it is no change.
+function ranElsewhere(r) {
+  const by = comparableBy(r)
+  return by === 'seat' ? r.seat !== S.seat : by === 'account' && r.account !== S.account
+}
+
+// The one judge of a reopened, resumed or startup-seeded chat's cache, which seeding defers until session.start
+// has read this process's seat and account. `found` is what the transcript says, `last` the chat's record.
+// The record decides where the last request ran when it can: it is not overtaken by a later request (the
+// transcript's `at`, past the minute the two clocks may differ by, says nothing of where it ran) and it names
+// a seat or account comparable with this process's (a field still unknown after a wake-up is not: it may be the old one).
+// Only without one does this process's own rotation (rotationSeenAt) date it, when it came after the chat's last
+// touch: the transcript's reply, or the record's request or keep-warm ping (not one that ran elsewhere).
+// Sets rotatedPending and lastActivity, and seatChangedAt when the rotation is dated (seen here, not found on the record).
+function judgeChat(found, last) {
+  const lastTouch = last ? Math.max(last.at || 0, last.keptAt || 0) : 0
+  const decides = !!last && lastTouch >= (found.at || 0) - MIN && !!comparableBy(last)
+  const lastSeen = Math.max(found.at || 0, last && !ranElsewhere(last) ? lastTouch : 0)
+  const dated = !decides && rotationSeenAt > 0 && lastSeen > 0 && rotationSeenAt > lastSeen
+  rotatedPending = decides ? ranElsewhere(last) : dated
+  if (dated) S.seatChangedAt = rotationSeenAt
+  if (!found.compacted) {
+    S.lastActivity = found.at // the cache's real age: the band and the cold-send guard read it
+    // keep-warm pings reach the cache but not the transcript: a record of the same chat size dates them
+    if (last && last.at > 0 && !ranElsewhere(last) && Math.abs(last.ctx - found.ctx) <= found.ctx * 0.05) S.lastActivity = Math.max(found.at || 0, last.at)
+  }
+}
+
+// The compacted size isn't known until the next request: keep the one before it, as rememberLast shapes it (keptAt dates an `at` of 0 for the prune)
+async function rememberCompacted($) {
+  if (!S.id || !S.ctx) return
+  await writeRecord($, { ctx: S.ctx, at: 0, keptAt: now, model: S.model, effort: S.effort, ...whoRan() })
+}
+
+// The signed-in account, as Claude Code keeps it in .claude.json: what the band shows
+// in place of a seat when no seat file is configured; false when it could not be read.
+// A re-read after a wake-up (`keep`) that finds no account leaves the one it has: that is a file mid-rewrite, not a change.
+async function readAccount($, keep = false) {
+  try {
+    const dir = await $.env.get('CLAUDE_CONFIG_DIR')
+    const o = JSON.parse(String(await $.fs.read(`${(dir || home).replace(/\\/g, '/')}/.claude.json`))).oauthAccount || {}
+    const account = String(o.emailAddress || o.displayName || '')
+    if (account || !keep) S.account = account
+    return true
+  } catch {
+    // an API-key session, or no file: no account to show
+    return false
+  }
+}
+
+// A running session keeps the account it signed in with: the seat file names the account the
+// rotator moved to, which reaches only a session it then wakes. So the seat is read at start,
+// and a change is taken only from the wake-up prompt (`adopt`), or from the ticks within WAKE_WINDOW
+// after it (refreshIdentity). Terminal sessions run on the CLI rotator's accounts, desktop ones on the app rotator's seats.
+async function readSeat($, adopt = false) {
+  if (!seatFile || (S.seat && !adopt)) return
+  let seat = ''
+  try {
+    if (!(await $.fs.exists(seatFile))) return
+    seat = String(await $.fs.read(seatFile)).trim()
+  } catch {
+    return
+  }
+  // at a wake-up a seat appearing where there was none is a change too
+  if (seat && seat !== S.seat && (S.seat || adopt)) {
+    S.seatChangedAt = now
+    rotationSeenAt = now
+    rotatedPending = true
+    dropReadings(!adopt) // at a wake-up the wake-up is itself the resume: a pending one is not re-armed
+    S.seat = seat // before the await: planKey must name the new account while it runs
+    await readAccount($, true)
+  }
+  if (seat) S.seat = seat
+}
+
+// The old account's readings, dropped once the account or seat moves: the new one's are borrowed or fetched until a request measures them.
+// A resume still pending that was armed from them is not cancelled: it moves to a minute from now, when the new account presumably has usage, keeping its tries. One already settled, sent or cleared is not revived. While a wake-up is on its way (wakePendingId) nor does a late adoption re-arm one: the wake-up is itself the resume, and its request settles it.
+// A request that started before the drop reports the old account's windows: identityGen lets its readings be told apart.
+let identityGen = 0
+let requestGen = 0 // identityGen as the latest main-loop request started: session.measure names no request, so the latest start stands for the one that reports (a subagent's reading carries the same account)
+function dropReadings(rearm = true) {
+  identityGen++
+  S.rateLimits = []
+  S.fable = null
+  S.planWindows = []
+  planNext = 0
+  if (rearm && !wakePendingId && resumeFromReadings && S.resumeAt) { // only a resume still pending: one settled, fired or cleared stays so; not while a wake-up is on its way, whose turn settles it
+    S.resumeAt = now + MIN
+    resumeFromReadings = false
+    resumeHeld = false
+  }
+}
+
+// Compacting on a cold cache pays only when it frees a real share of the context
+function worthCompacting() {
+  return S.ctx >= settings.bigTokens && S.ctx - S.floor >= 100000
+}
+
+// Run off the hook: a command started inside a hook the session waits on is refused
+// Auto-resume: a turn cut short by an exhausted plan window gets "Resume" once it renews.
+// Only usage exhaustion: a short throttle, an overload or any other error is left alone.
+const USAGE_SPENT = /usage limit|limit reached|hit your limit|out of (extra )?usage|limit will reset|resets? (at|in)\b/i
+const THROTTLE = /rate[ _-]?limit/i // "rate limit reached" is a short throttle, not spent usage
+const USAGE_MARKER = /usage limit|hit your limit|out of (extra )?usage|5-hour|weekly/i // a throttle's wording beside one of these is still spent usage
+const RESUME_FALLBACK = 60 * MIN // no reset time known: try once an hour, three times at most
+let resumeTries = 0
+let sendFailures = 0 // Resume submits refused both ways in a row; cleared by a sent Resume, a new arm, a settled resume and a replaced chat
+let staleArmedGen = -1 // the identityGen at which a failure of an earlier request was already given its free minute
+let resumeFromReadings = false // the pending resume rests on plan windows, not on the error's wording (nor, after dropReadings, on a re-arm); cleared wherever resumeAt is
+let submitsSeen = 0 // messages handed on to the chat so far (not dropped, not ours, not a local command), each "Compact first" answer, each wake-up that starts compacting and each /clear or resume, so an unattended send (rule B) can tell something was sent or chosen meanwhile
+let dialogsOpen = 0 // cold-send dialogs open for the person: an unattended send that has compacted waits for them to close before it judges whether it was cancelled (Cancel lets it go, except a Resume whose own compaction failed, which is armed again, once: compactDeclined; Send anyway or Compact first cancels it, and a /btw question does not, as it never reaches the chat)
+let dialogsClosed = [] // resolvers of the sends waiting for dialogsOpen to reach 0
+let dialogCancels = 0 // cold-send dialogs the person answered Cancel so far: an unattended send compares it with its start, so only a Cancel (not a Send anyway on a message that does not cancel it) re-arms a Resume whose compaction failed
+let compactDeclined = false // a Resume's failed compaction behind a Cancel was armed again: if the next one fails too it is not sent uncompacted. Cleared by a main-loop request, /clear, a resume, a new arm and a successful compaction
+let compacting = null // { run, chat }: this mod's compaction in flight (run settles at COMPACT_LIMIT at worst), started in conversation `chat` (msgChat): a second send in that conversation needing one waits for it, with no timer of its own, and uses its result (if it is abandoned instead, that send goes back in the prompt box: see abandoned). A fork is the same conversation and waits too; a send after a /clear or a resume of another chat does not wait for it
+let compactSeq = 0 // numbers this mod's /compact runs in the order they start
+const RUN_END_GRACE = 5000
+const liveRuns = new Set() // { chat, seq, at } (the conversation's msgChat, the run's number, when it started) of this mod's /compact runs not settled yet (and for RUN_END_GRACE after), abandoned ones too: an engine compaction mark may be one's end, which says nothing about a conversation since replaced (see staleRunOut) nor about a newer abandoned run (see olderRunOut)
+let abandoned = null // { done, at, batch, seq }: the /compact call still out after COMPACT_LIMIT. No send starts another until it settles (its end clears this), a compaction that started before it succeeds (the person's own too, but an engine compaction mark does not count while an older run of ours is still out and started under two COMPACT_LIMITs ago, as the mark may be that run's end), the chat is replaced, or a second COMPACT_LIMIT has passed. A Resume is tried again, the person's and a wake-up's message go back in the prompt box
+let putBackPending = null // { real, steps, at, from, quotedToo?, quotedAt? }: the Resume hold. A message was put back in the prompt box (a successful fill of a message that reaches the chat, not a /btw question, not a failed fill; a fill that did not answer in time counts, as it may still land), or quoted in a toast because the box held the person's own text (it is still theirs to send), and nothing has been sent since: a due Resume waits while realSends and stepsSeen are as they were then, for COMPACT_LIMIT at most. Cleared by /clear, a resume, or anything the person submits from the composer when this hold came from a fill (the box text was taken: `from` is 'fill'; a hold only quoted in a toast, `from: 'quoted'`, was never in the box and is not touched); a fork keeps it. One slot: a fill hold set over a quoted one that has not lapsed keeps it (`quotedToo`, started at `quotedAt`), and what the person submits from the composer then leaves the quoted one (see fillHold, composerTakesBox)
+let boxText = null // { real, steps, text }: the text a put-back left in the prompt box, unsent (a /btw question too). Not bound by COMPACT_LIMIT: it stays until a message is handed on or a request starts (realSends, stepsSeen), or /clear, a resume or anything the person submits from the composer (a fork keeps it). A later put-back goes in behind it when the box (read when the engine can, within BOX_LIMIT) still holds exactly this text or nothing, and is quoted in a toast, the box untouched, when it holds anything else or the read gave no answer: only this text is the mod's to replace. The tracked text is used in place of a read only when the engine has no read. Dropped when a read shows the box empty or the person's own text, and when a fill did not answer in time (the box is then unknown); lateEnds gives it back when that fill's late "not filled" answer is followed by a read showing the box still holds exactly this text (the earlier put-back a joined fill was behind), or, with no read at all, as best effort (the box most likely still starts with it); on an engine with no read, a late "filled" answer tracks the text the fill put in (lateSettled)
+let fillChain = Promise.resolve() // put-back fills run one after another: each reads what the last left in the box (and, behind a fill still out after its bound, finds the box unknown: see fillOut)
+let fillSeq = 0 // numbers the put-back fills in the order they start: on an engine with no read, a late answer of one that a later fill has followed tracks nothing; with a read, what the read shows decides
+let fillOut = null // { p, at }: the promise of a put-back fill that did not answer within BOX_LIMIT and has not settled since, and when it started. It may still land, so a read shows nothing sure about the box while it is out (boxNow answers `mine: false`: the next put-back is quoted, the box left alone). Cleared when the fill settles (the real signal: the engine's own timeout is per client, so no fixed time says it is over), and as a backstop by boxNow once COMPACT_LIMIT has passed since `at`, for a fill that never settles. Not cleared by /clear or a resume: the composer is shared, so the old fill can still land in the new chat's box. The engine's answer carries no box text, so what a late fill left is never tracked (except as the next rule says, and for an engine with no read, see placeBack): a later read sees it
+let tryCause = '' // why the most recent Resume try failed: 'refused' (neither submit way took it) or 'compaction' (still out, or not finished), named in the give-up toast
+let sendSeq = 0 // submission order of the sends that compact first
+let sendsHeld = 0 // a cold-send dialog is open, any send handed on that is not this mod's own is going down the chain, or a compact-then-send is in flight: a due resume waits
+let wakePendingId = 0 // the wakeCount of a rotator wake-up that has arrived and whose own request has not started (0: none): a due resume waits and a drop of the readings does not re-arm it, as the wake-up's turn settles it. A wake-up lowers it only if it is still its own id, so an earlier one giving up cannot release a later one's hold
+let sendPending = new Map() // id -> deadline: a send handed on that is not this mod's own (and the person's own message this mod sends again after Compact first) whose request has not started: a due resume waits. A main-loop request, /clear or resuming another chat lowers all; the deadline (SEND_SAFETY after hand-over) covers a send that never starts a request
+let sendPendingId = 0
+let stepsSeen = 0 // main-loop requests started so far
+let measuredSteps = 0 // main-loop requests whose usage came back and measured the chat (S.ctx, S.lastActivity): a request that started, or ended with no usage, measured nothing
+let sizeUpdates = 0 // times session.measure or turn.complete set the chat's size (S.ctx) without a request measuring it (measuredSteps): a seed that only had this mod's stored record to go on leaves that size to them (seedFromTranscript)
+let compactGen = 0 // compactions marked so far (markCompacted): one that lands while a seed reads has made the chat's size and date its own
+let coldSeedPending = null // the msgChat whose cold-rewrite history its seed has not merged yet: until it has, what is stored for the chat is not replaced by a shorter list (writeRecord)
+let realSends = 0 // messages handed on to the chat (submitsSeen without "Compact first" answers, wake-ups and /clear)
+let msgChat = 0 // the conversation, bumped by /clear and by resuming another chat, not by a fork, which carries the conversation on. A message from before a fork is still the new chat's, so is a pending Resume (and one compacting, or being re-armed), and so is a compaction in flight (it is waited for, and its success or abandonment is recorded: compacting, liveRuns, abandoned); /clear and resuming another chat start another conversation, where neither is sent or recorded
+let idChat = 0 // the msgChat that S.id belongs to: set wherever S.id is. While a /clear or a resume has bumped msgChat and not yet read the new id they differ, and nothing is recorded for the chat (writeRecord)
+let msgChatCause = '' // why msgChat last moved, in words for the toast: 'cleared' or 'replaced by a resumed chat'
+const CANCEL_REARM = 2 * MIN // a cancelled Resume with no request started since, a Resume neither submit way could send, one whose compaction did not finish in COMPACT_LIMIT, and one whose compaction failed behind a cancelled dialog are armed again this long after (tries kept)
+const SEND_SAFETY = 2 * MIN
+const COMPACT_LIMIT = 15 * MIN // a generous bound on one /compact, not a measure of a normal one: a compaction still out after it is abandoned, so a hung one holds no send, Resume or wake-up for good
+let resumeHeld = false // the due resume is waiting for the seat and account to be known: it goes once they are, or at the window's end
+// Built-in commands that run locally: they neither settle a pending resume nor cancel an unattended send.
+// Checked against engine 2.1.316: each is a local or local-jsx command there, and hooks/local-builtins.test.mjs fails when the engine has one that is neither listed here nor in its reviewed exclusion list (with the reason each is left out: login, goal, import, recap and others can query the model). Its scan also reads a command whose name the minifier left as an identifier (`vim`, `low-priority`) or as a member of a factory's object argument (the `A2({name:"schedule",...})` upsell factory), and fails on any other non-literal name it cannot resolve, and on a call of such a factory whose name is not a string literal (`ren(someVar,...)`, `A2({name:x,...})`); only the factory that turns a mod's registered commands into commands is let by. The criterion is that the command never sends the conversation to the model, and a dialog action that compacts it is treated like /compact (exempt): `rewind` is listed although its dialog's "Summarize from here" / "Summarize up to here" is a partial compaction. `/branch` is one: it sends nothing to the chat, it only creates the fork, whose SessionStart (source `fork`) follows. `/fork` is another command (a background agent), not an alias of it. A prompt-type built-in (statusline, init, doctor) goes to the model and must not be listed.
+// A local command that can also query the model is handled in code: `/plan <text>` (see isLocalBuiltin), and for the cold-send guard alone `/btw <question>` (see guardSkips).
+export const LOCAL_BUILTINS = new Set(['usage', 'status', 'model', 'help', 'context', 'logout', 'config', 'memory', 'hooks', 'mcp', 'agents', 'ide', 'resume', 'export', 'theme', 'terminal-setup', 'add-dir', 'bug', 'release-notes', 'upgrade', 'privacy-settings', 'exit', 'fast', 'effort', 'plugin', 'output-style', 'tasks', 'copy', 'feedback', 'extra-usage', 'install-github-app', 'skills', 'plan', 'btw', 'rename', 'color', 'powerup', 'branch', 'rewind', 'diff', 'version', 'keybindings', 'stickers', 'mobile', 'voice', 'cd', 'desktop', 'radio', 'reload-plugins', 'reload-skills', 'session', 'vim'])
+
+// Whether a command typed by the person runs locally: a LOCAL_BUILTINS name, except `/plan <description>`, which sends the description to the model (`/plan` alone, `open` and `share` stay local).
+// Unless the chat is already in plan mode, where `/plan <text>` only shows the plan: prompt.submit carries no permission mode (only classic hooks do, after it and stale after a Shift+Tab), so it counts as a send either way
+function isLocalBuiltin(command) {
+  if (!command || !LOCAL_BUILTINS.has(command.name)) return false
+  if (command.name !== 'plan') return true
+  const arg = String(command.args || '').trim()
+  return !arg || arg === 'open' || arg === 'share'
+}
+
+// Commands that count as sends (they can re-send to the model: a retry picked in /permissions' dialog, a sign-in's re-send in /login) but whose dialog the cold-send guard does not put in front of the person: it would ask before the command's own dialog even opens
+const GUARD_SKIP_ONLY = new Set(['permissions', 'login'])
+
+// What the cold-send guard lets by: the same, plus GUARD_SKIP_ONLY, except `/btw <question>`, which sends the conversation to the model (a bare /btw stays local). Not while a turn is running: its requests keep the cache warm, so the cold reading is stale
+function guardSkips(command) {
+  if (command && GUARD_SKIP_ONLY.has(command.name)) return true
+  return isLocalBuiltin(command) && !(command.name === 'btw' && String(command.args || '').trim() && !S.working)
+}
+
+function sendIsPending() {
+  for (const [id, until] of sendPending) if (until <= now) sendPending.delete(id)
+  return sendPending.size > 0
+}
+
+// The windows that are full, from the freshest reading this session has
+export function spentWindows(limits, fable, model) {
+  const full = limits.filter((l) => (l.percentUsed || 0) >= 100)
+  if (fable && fable.percentUsed >= 100 && /fable/i.test(String(model))) full.push({ kind: 'fable', ...fable })
+  return full
+}
+
+// When to resume: a minute after the last full window resets; null when no reset time is known
+export function resumeTime(full, at) {
+  const times = full.map((l) => Date.parse(l.resetsAt || '')).filter((t) => t > at)
+  return times.length ? Math.max(...times) + MIN : null
+}
+
+// The time of day, and how far off it is once that is more than a day away
+export function resumeText(at, from) {
+  return at - from > 24 * 60 * MIN ? `${clock(at)} in ${ago(at - from)}` : clock(at)
+}
+
+function armResume($, details) {
+  const unsure = keyUnsure()
+  let limits = stillOpen(S.rateLimits, now)
+  if (!limits.length && signedIn !== false && !unsure) limits = borrowedLimits(fleet, { seat: S.seat, account: S.account, desktop: !onTerminal }, now) // not while the seat or account is unknown: the key may name the old one
+  if (!limits.length && !unsure) limits = stillOpen(S.planWindows, now) // nor the shared windows or Fable reading while it is unknown: the old account's
+  const full = spentWindows(limits, unsure ? null : S.fable, S.model)
+  const text = String(details || '')
+  if (!full.length && !(USAGE_SPENT.test(text) && (!THROTTLE.test(text) || USAGE_MARKER.test(text)))) return // not usage exhaustion
+  sendFailures = 0 // a new arm: the refusals of an earlier one are not counted against it
+  compactDeclined = false
+  // A request that started before an account change failed on the old account's usage: the new one is tried a minute from now, no try spent.
+  // Once per change, so a failure that reports no request start cannot loop.
+  if (requestGen !== identityGen && staleArmedGen !== identityGen) {
+    staleArmedGen = identityGen
+    S.resumeAt = now + MIN
+    resumeHeld = false
+    resumeFromReadings = false // it rests on no reading
+    $.ui.toast(`Out of usage. This chat resumes on its own at ${resumeText(S.resumeAt, now)}.`, { timeoutMs: 15000 })
+    $.ui.invalidate('ui.render')
+    return
+  }
+  const at = resumeTime(full, now)
+  if (!at && resumeTries >= 3) {
+    $.ui.toast('Auto-resume gave up: no reset time is known. Send a message once usage renews.', { timeoutMs: 15000 })
+    return
+  }
+  S.resumeAt = at || now + RESUME_FALLBACK
+  resumeHeld = false
+  resumeFromReadings = full.length > 0
+  if (!at) resumeTries++
+  $.ui.toast(`Out of usage. This chat resumes on its own at ${resumeText(S.resumeAt, now)}.`, { timeoutMs: 15000 })
+  $.ui.invalidate('ui.render')
+}
+
+// A message was put back in the prompt box and the person has sent nothing since (no message handed on, no request started): a Resume would go ahead of it. Not for longer than COMPACT_LIMIT: text left in the box does not hold a Resume for good
+function putBackHeld(t = now) {
+  if (putBackPending && (putBackPending.real !== realSends || putBackPending.steps !== stepsSeen || t - putBackPending.at >= COMPACT_LIMIT)) putBackPending = null
+  return !!putBackPending
+}
+
+// The put-back text still unsent in the prompt box: gone once a message is handed on or a request has started since (unlike the Resume hold, it does not lapse with time)
+function boxHeld() {
+  if (boxText && (boxText.real !== realSends || boxText.steps !== stepsSeen)) boxText = null
+  return boxText
+}
+
+// The hold a fill starts (from 'fill'). Set over a hold that was only quoted in a toast and has not lapsed, it keeps that one as well (quotedToo, started at quotedAt): the one slot would otherwise lose the wait for the toast-only message when the fill's part ends
+function fillHold(at) {
+  putBackHeld(at) // a lapsed or spent hold is no longer there to keep
+  const p = putBackPending
+  const quotedAt = p ? (p.from === 'quoted' ? p.at : p.quotedToo ? p.quotedAt : undefined) : undefined
+  return { real: realSends, steps: stepsSeen, at, from: 'fill', ...(quotedAt === undefined ? {} : { quotedToo: true, quotedAt }) }
+}
+
+// The one rule for when the fill part of the Resume hold ends (the box text it stood for is taken, sent, or shown not to be in the box): a hold that came from a fill ends, but a quoted message it kept (quotedToo) is downgraded to a hold of its own, lapsing from when the message was quoted; a hold that was only quoted in a toast (never in the box) is left as it is. Returns the hold to set; every place that ends only the fill part of a hold goes through it (composerTakesBox, lateEnds); lateEnds can also give the earlier hold back instead (prior), and a local command filled alone does not end one at all
+function endFillPart(p = putBackPending) {
+  if (!p || p.from !== 'fill') return p || null
+  return p.quotedToo ? { real: p.real, steps: p.steps, at: p.quotedAt, from: 'quoted' } : null
+}
+
+// Whatever the person submits from the composer takes the box text: the tracking of what a put-back left there ends, and so does the fill part of the hold (endFillPart)
+let composerSubmits = 0 // composer submits so far: a fill that lands after one was started before it
+function composerTakesBox() {
+  boxText = null
+  composerSubmits++
+  putBackPending = endFillPart()
+}
+
+// An engine call that is not waited on for ever: resolves to what it answered, or to TIMED_OUT once BOX_LIMIT has passed (the timer is cancelled whichever comes first). A call that throws, or that is missing, rejects as it would unbounded
+const BOX_LIMIT = 2000
+const TIMED_OUT = Symbol('timed out')
+// A prompt.fill that did not answer in time may still land, and nothing says when it will not: the engine's own fill timeout is 5 s, but per client (seen in 2.1.314: each client is tried in turn, each with its own 5 s), so a fill can settle well after 7 s. Its settling is the signal that it can no longer land (see fillOut); a time bound (COMPACT_LIMIT) only covers a fill that never settles
+async function bounded($, call, limit = BOX_LIMIT) {
+  let timer = null
+  try {
+    const waited = new Promise((resolve) => { timer = $.clock.after(limit, () => resolve(TIMED_OUT)) })
+    return await Promise.race([call(), waited])
+  } finally {
+    if (timer) timer.cancel() // nothing is left waiting once the call has answered
+  }
+}
+
+// Text compared as the box gives it back: the host may end it with a newline or use CRLF
+const sameText = (a, b) => a.replace(/\r\n/g, '\n').trimEnd() === b.replace(/\r\n/g, '\n').trimEnd()
+
+// Whether a failed prompt.read means the engine has no such method: the engine rejects a call nothing answers with "no implementation for prompt.read", and a loader without the method throws a TypeError that says it is not a function. $.prompt.read cannot be tested with typeof (the mod loader refuses a call target used as a value), so the failure itself is what tells. Any other failure is a read that exists and did not work
+export function readMissing(err) {
+  const msg = String((err && err.message) || err)
+  return /no implementation for prompt\.read/.test(msg) || (!!err && err.name === 'TypeError' && /is not a function/.test(msg)) // by name: a TypeError from the loader's own realm is not an instanceof this one
+}
+
+// What the prompt box holds, as { text, mine }: read from it, so the person's edits are seen and text they deleted does not come back. `mine` says whether the text in it is this mod's to merge with: the box is empty, or holds exactly what the last put-back left there (to a trailing newline) and is still unsent. Anything else (the person's own draft, or their edit of the put-back) is theirs and is never rewritten, and it ends the tracking of the put-back text.
+// The tracked put-back text is used in place of a read only when the engine has no prompt.read at all (and it is then mine). A read that exists but answers without a string text is not a read either: unknown, like one that failed. A read that exists but does not answer within BOX_LIMIT, or fails, shows nothing about the box: it is not mine, and nothing is written over it (the tracked text may be one the person has since edited or deleted).
+async function boxNow($) {
+  if (fillOut) {
+    if ((await $.clock.now()) - fillOut.at < COMPACT_LIMIT) return { text: '', mine: false } // an earlier fill is still out and may land: an empty read now would not mean an empty box
+    fillOut = null // out for COMPACT_LIMIT and never settled: taken as lost
+  }
+  const early = boxHeld() // what the box held when the read began: what its answer is compared with (and only while that put-back is still unsent after the read: a snapshot of text sent meanwhile is not merged)
+  let box
+  let missing = false // the read failed because the engine has no such method
+  try {
+    box = await bounded($, () => $.prompt.read())
+  } catch (err) {
+    if (!readMissing(err)) return { text: '', mine: false } // the engine has the method and it failed: as unknown as one that did not answer
+    missing = true
+    box = undefined
+  }
+  if (box === TIMED_OUT) return { text: '', mine: false }
+  if (box && typeof box.text === 'string') {
+    const text = box.text
+    if (!text.trim()) {
+      boxText = null // the person deleted what was put back
+      return { text: '', mine: true }
+    }
+    if (early && boxHeld() === early && sameText(text, early.text)) return { text: text.replace(/\r\n/g, '\n').trimEnd(), mine: true }
+    boxText = null // the person's own text: what was put back is no longer in the box
+    return { text, mine: false }
+  }
+  if (!missing) return { text: '', mine: false } // an answer that does not hold the box's text is no read of it: as unknown as one that did not answer
+  const held = boxHeld() // read again: a put-back may have been handed on, or a request started, while the read was out
+  return { text: held ? held.text : '', mine: true }
+}
+
+// From the heartbeat tick: send "Resume" once its time has come, as the person's own word
+async function resumeStep($) {
+  if (!cfg.autoResume || !S.resumeAt || now < S.resumeAt || S.working || sendsHeld || wakePendingId || sendIsPending() || putBackHeld()) return // a send is being handed on or compacting, one was handed on and its request has not started, a wake-up is on its way (its request settles the resume), or a message put back in the prompt box is still unsent
+  // the seat or the account is not known yet: the send waits until both are (refreshIdentity then brings it forward) or the window closes, without spending a try or compacting
+  if (keyUnsure()) {
+    S.resumeAt = wakeWindowEnd
+    resumeHeld = true
+    $.ui.invalidate('ui.render')
+    return
+  }
+  S.resumeAt = 0
+  resumeHeld = false
+  resumeFromReadings = false
+  $.ui.invalidate('ui.render')
+  if (worthCompacting() && !justCompacted) { // not again after a compaction that is already done (a cancelled send's, or the Resume's own): the chat is already short
+    compactThenSend($, { text: 'Resume' }, true)
+    return
+  }
+  const before = { chat: msgChat, steps: stepsSeen }
+  for (const asUser of [true, false]) {
+    try {
+      await $.prompt.submit({ text: 'Resume', ...(asUser ? { asUser } : {}) })
+      sendFailures = 0
+      return
+    } catch {
+      // try the plugin's own voice next
+    }
+  }
+  await sendRefused($, before)
+}
+
+// A Resume neither submit way could send (the direct send and the unattended one after compacting), or whose compaction did not finish in COMPACT_LIMIT (or is still out from an earlier send): tried again 2 minutes on, four attempts in all, so it is not lost to one refusal.
+// before: msgChat and stepsSeen from before the submits. A request that started or a chat replaced meanwhile settled it, and a re-arm made meanwhile stands: nothing is armed over either.
+// cause: why this try failed, 'refused' or 'compaction' (tryCause keeps the latest, which the toast after the fourth try names). lead: what the toast says went wrong
+async function sendRefused($, before, cause = 'refused', lead = 'Could not send Resume.') {
+  const t = await $.clock.now() // read first: the check and the arm follow with no await between
+  if (msgChat !== before.chat || stepsSeen !== before.steps || S.resumeAt) return
+  tryCause = cause
+  if (++sendFailures > 3) {
+    sendFailures = 0
+    $.ui.toast(tryCause === 'compaction' ? 'Compaction did not finish, so the Resume was not sent after four tries. Send it yourself when ready.' : 'Could not send Resume after four tries. Send it yourself when ready.', { timeoutMs: 8000 })
+    $.ui.invalidate('ui.render')
+    return
+  }
+  S.resumeAt = t + CANCEL_REARM
+  $.ui.toast(`${lead} Trying again at ${resumeText(S.resumeAt, t)}.`, { timeoutMs: 8000 })
+  $.ui.invalidate('ui.render')
+}
+
+// wake: the id of the rotator wake-up this send is (0 for any other send)
+function compactThenSend($, e, unattended, wake = 0) {
+  const msg = { text: e.text, attachments: e.attachments, slash: !!e.command, local: isLocalBuiltin(e.command), seq: ++sendSeq }
+  const before = { seen: submitsSeen, real: realSends, msgChat, steps: stepsSeen, cancels: dialogCancels }
+  sendsHeld++
+  $.clock.after(50, () => runCompactThenSend($, msg, unattended, before, wake).catch(() => {}).finally(() => sendsHeld--))
+  return { drop: 'cache-keeper: compacting first on a cold cache; the message is sent again once that finishes' }
+}
+
+// A wake-up that gives up releases the hold only if no later wake-up has taken it over
+function lowerWake(id) {
+  if (id && wakePendingId === id) wakePendingId = 0
+}
+
+// Whether an abandoned /compact is still to be waited for: not once a second COMPACT_LIMIT has passed since it was abandoned
+function compactOut() {
+  if (abandoned && now - abandoned.at >= COMPACT_LIMIT) abandoned = null
+  return !!abandoned
+}
+
+// A /compact still out after COMPACT_LIMIT: no send starts another while it is. It clears this when it settles, however it ends, and one that succeeds late still shortened that conversation (not a new one: a fork is the same one).
+// chat: the msgChat it was started in. After a /clear or a resume of another chat it is not recorded at all: it says nothing about the new one.
+// Returns the batch the put-backs of this abandonment (its owner and the sends that waited on it) go in, or null
+function abandon($, done, chat, seq) {
+  if (msgChat !== chat) return null
+  const batch = { items: [], flush: null, closed: false, chat: msgChat }
+  // the batch takes its turn in the fill order now, not when its first member arrives: a put-back that arrives in the 50 ms its members take to join goes after it
+  batch.flush = placeBack($, () => {
+    batch.closed = true
+    return [...batch.items].sort((x, y) => x.seq - y.seq)
+  }, batch.chat, true, 50)
+  batch.flush.catch(() => {})
+  abandoned = { done, at: now, batch, seq }
+  done.then(() => {
+    if (abandoned && abandoned.done === done) abandoned = null
+    if (msgChat === chat) markCompacted($, seq)
+  }, () => {
+    if (abandoned && abandoned.done === done) abandoned = null
+  })
+  return batch
+}
+
+// Whether one of this mod's /compact runs started in a conversation since replaced (/clear, a resume of another chat; not a fork) is still out (an abandoned one too): the engine's compaction marks may be its late end, which says nothing about this chat. A run out longer than two COMPACT_LIMITs no longer counts, as for abandoned, so a hung one does not mute the marks for good
+function staleRunOut() {
+  for (const r of liveRuns) if (r.chat !== msgChat && now - r.at < 2 * COMPACT_LIMIT) return true
+  return false
+}
+
+// Puts a message back in the prompt box, because compaction is out, or because it cannot be sent as it is (a slash command, a send refused) after one finished. The sends put back when one compaction is abandoned (batch: its owner and those that waited on it) go in one fill (made 50 ms after the abandonment, in the order fills were asked for), plain texts in submission order joined by a blank line: a second fill would overwrite the first. Once its fill starts the batch is closed: a later put-back fills only its own text, behind what the last put-back left in the box (boxNow), or is quoted when the box holds anything else.
+// A slash command is never joined with other text: in a batch, or beside text in the box, it is quoted in a toast instead (alone in an empty box, it is filled as it is). Nothing goes into a box that holds text this mod did not put there: it is quoted (see placeBack).
+// hold: whether a put-back (a fill, or a message quoted because the box was not the mod's) starts the Resume hold (see placeBack); false for a message of a compaction that finished, which holds nothing
+// chat: the msgChat the message belongs to: in a chat since cleared or replaced by a resumed one nothing is filled.
+// Resolves to { filled, quoted, stale, inFill, unsure } (unsure: the fill did not answer in time, so the message may be in the box)
+function putBack($, msg, batch, chat, hold = true) {
+  if (!batch || batch.closed) return placeBack($, [msg], chat, hold).then((r) => ({ filled: r.filled, quoted: !!r.quoted && r.quoted.has(msg), stale: !!r.stale, inFill: !!r.inFill, unsure: !!r.unsure }))
+  batch.items.push(msg)
+  return batch.flush.then((r) => ({ filled: r.filled, quoted: !!r.quoted && r.quoted.has(msg), stale: !!r.stale, inFill: !!r.inFill, unsure: !!r.unsure }))
+}
+
+// One fill of the prompt box for items, one after another. Text this mod did not put in the box is never rewritten: when the box holds anything but what the last put-back left there (the person's own draft, or their edit of the put-back; boxNow says), nothing is filled and every item is quoted in full in a toast. Otherwise plain texts are joined with a blank line, behind the plain text the box holds (a fill replaces the box, so that text has to be part of it). A slash command is never joined with other text: what cannot go in is quoted in full in a toast, whether it is an item beside other text, or a slash command this mod left in the box when plain text comes (the plain text is filled, the command quoted). A slash command alone, with an empty box, is filled as it is.
+// The text filled is what boxText then tracks (even for a /btw question). The Resume hold (putBackPending) starts only when hold is set (the put-back of an abandoned compaction, not the message of a compaction that finished, whose Resume goes again 2 minutes on), and for a message that reaches the chat: one filled, one quoted because the box held the person's own text (still theirs to send), or one whose fill did not answer in time (it may be in the box).
+// A fill that does not answer within BOX_LIMIT may still land later: what the box holds is then unknown, so nothing is tracked in boxText (and what was tracked is dropped), the hold starts as if it had, and a put-back while that fill is still out quotes its message and leaves the box alone (fillOut: until the fill settles, with COMPACT_LIMIT as a backstop for one that never does). When the fill answers late `isFilled: false` (or fails), that may be only the engine giving up (its own fill timeout, per client, resolves it so) with the client still to write the text: the fill part of the hold it started ends (endFillPart: a quoted message it kept holds on) only if the box, read afterwards, shows the text is not in it, and a joined fill (behind an earlier put-back) gives that earlier hold back while the read still shows its text; with no read, or one that fails or does not answer, the hold stays (it lapses at COMPACT_LIMIT). When it lands after the person submitted from the composer meanwhile (which ended the hold and the tracking), the hold starts again and the text is tracked once a read shows it in the box (with no read at all, or one that fails or does not answer: held again, not tracked; a read that succeeds and does not show the text starts nothing). Once it has settled or the backstop has passed, the next put-back on an engine that can read the box reads it and trusts no tracking (it leaves the box alone unless it is empty); on an engine with no read at all there is nothing to read, and what is tracked is only what the late answer says: a late `isFilled: false` gives back the tracking of the text the box held when the fill started (best effort: the box most likely still starts with it, but when that answer is the engine giving up with the client still to write the joined text, the next put-back may replace the newer part), and a late `isFilled: true` tracks the text the fill put in (joined or not), so the next put-back goes in behind it. Both need the same chat, nothing submitted from the composer, no message handed on, no request started and no later fill started since the fill began (fillSeq: the box is then that fill's to say); they do not depend on the hold (a local command's fill, or a message of a compaction that finished, holds nothing, and a put-back quoted while the fill was out replaced the hold). Otherwise no tracking, and the box is overwritten. A read that exists but failed or did not answer gets none of this: it shows nothing, and nothing is tracked.
+// items: the list, or a function giving it once the fill's turn has come and `wait` ms have passed (a batch still collecting its members); an empty list fills nothing
+// chat: the msgChat the items belong to: in a chat since cleared or replaced by a resumed one nothing is filled. Resolves to { filled, quoted, stale, inFill, unsure } (unsure: the fill did not answer in time; inFill: the chat was replaced while the fill was out; what could not go in is already quoted)
+function placeBack($, list, chat, hold = true, wait = 0) {
+  const run = async () => {
+    if (wait) await new Promise((resolve) => $.clock.after(wait, resolve))
+    const items = typeof list === 'function' ? list() : list
+    if (!items.length) return { filled: false, quoted: new Set() }
+    const t = await $.clock.now()
+    now = t
+    if (msgChat !== chat) return { filled: false, stale: true }
+    const box = await boxNow($)
+    if (msgChat !== chat) return { filled: false, stale: true }
+    const existing = box.text
+    const fillReal = realSends // the counters when the box was read: a late "filled" answer is tracked only if neither has moved since (a message handed on or a request started while the fill was out means the text may already be sent)
+    const fillSteps = stepsSeen
+    const plain = items.filter((i) => !i.slash)
+    const slash = items.filter((i) => i.slash)
+    let text = ''
+    let quoted = slash
+    let own = null // the item the fill stands for: a local command starts no hold
+    if (!box.mine) {
+      // the box holds text this mod did not put there (the person's draft, or their edit of the put-back): left exactly as it is, and every item is quoted instead
+      quoted = items
+    } else if (existing && plain.length) {
+      if (existing.startsWith('/')) {
+        text = plain.map((i) => i.text).join('\n\n')
+        quoted = [{ text: existing }, ...slash]
+      } else {
+        text = [existing, ...plain.map((i) => i.text)].join('\n\n')
+      }
+      own = plain[0]
+    } else if (existing) {
+      // nothing plain to add: the box keeps what it holds
+    } else if (plain.length) {
+      text = plain.map((i) => i.text).join('\n\n')
+      own = plain[0]
+    } else {
+      text = slash[0].text
+      quoted = slash.slice(1)
+      own = slash[0]
+    }
+    let filled = false
+    let unsure = false // the fill did not answer in time: it may still land
+    let late = null // what that fill answered once it settled: { filled }
+    let lateHold = null // the hold this fill started
+    let prior = null // the hold this fill replaced, when the box held text of an earlier put-back (what the fill joins its text behind)
+    let priorBox = null // the tracking of the text the box held when an unsure fill started (kept whether or not the fill holds anything; null when none was tracked or a message was handed on or a request started since)
+    let probing = false
+    let out = null // the promise of this fill's settling (what fillOut holds)
+    const composerAtFill = composerSubmits
+    let seq = 0 // this fill's number (fillSeq), set when it starts
+    // The box as a read of it shows it (bounded, CRLF as LF): a string; undefined when the engine has no prompt.read at all; null when the read exists and did not answer in time, failed, or answered without a text (shows nothing about the box)
+    const readBoxText = async () => {
+      let r
+      try {
+        r = await bounded($, () => $.prompt.read())
+      } catch (err) {
+        return readMissing(err) ? undefined : null
+      }
+      if (r === TIMED_OUT || !r || typeof r.text !== 'string') return null
+      return r.text.replace(/\r\n/g, '\n')
+    }
+    const holdsText = (shown, t) => shown.includes(t.replace(/\r\n/g, '\n').trimEnd())
+    // A late answer that is not a fill does not prove the text is absent: it may be the engine's own give-up while the client still writes it. The fill part of the hold this fill started ends (endFillPart) only when a read of the box afterwards (bounded) succeeds and does not show the text; no read, a failing or unanswered one, or an answer with the text keeps it. Not if it is no longer that hold in this chat. A joined fill (the text is what the box held, the earlier put-back, plus the new one) replaced the hold that covered the earlier text: when the read still shows that text in the box, that hold is back (prior), and so is the tracking of it
+    const lateEnds = async () => {
+      if (probing || !late || late.filled || !(lateHold || priorBox)) return
+      probing = true
+      try {
+        const shown = await readBoxText()
+        if (shown === undefined) { // the engine has no read at all (not one that failed or did not answer: those show nothing and change nothing): best effort, the fill most likely did not land, so the box still starts with the earlier put-back's text, which is tracked again (boxHeld drops it if a message was handed on or a request started since). Whether or not the fill held anything, and whatever became of the hold meanwhile; the hold itself stays as it is, nothing says whether the fill part may end
+          if (priorBox && !boxText && composerSubmits === composerAtFill && msgChat === chat && seq === fillSeq) { boxText = priorBox; boxHeld() }
+          return
+        }
+        if (!lateHold || typeof shown !== 'string' || holdsText(shown, text)) return
+        if (putBackPending !== lateHold || msgChat !== chat) return
+        if (priorBox && !boxText && existing && sameText(shown, existing)) { boxText = priorBox; boxHeld() } // the tracking does not lapse with time, so it comes back even when the earlier hold has (prior is then null)
+        if (prior && existing && holdsText(shown, existing)) {
+          putBackPending = prior
+          putBackHeld()
+        } else putBackPending = endFillPart(lateHold)
+      } finally {
+        probing = false
+      }
+    }
+    // The fill settled. Landed after the person submitted from the composer since it started (that took the box text and ended the hold): the text may be in the box now, unsent, so a read of the box confirms it before it is tracked and held again. With no read on the engine, or a read that exists and failed or did not answer, there is nothing to confirm with: it is held again but not tracked (the box is unknown); only a read that succeeds and does not show the text starts nothing
+    const stillUntouched = () => msgChat === chat && composerSubmits === composerAtFill && !boxText && realSends === fillReal && stepsSeen === fillSteps && seq === fillSeq
+    const lateSettled = async () => {
+      try {
+        if (late.filled) {
+          if (lateHold && msgChat === chat && putBackPending !== lateHold && composerSubmits !== composerAtFill) {
+            const shown = await readBoxText()
+            const t = await $.clock.now()
+            now = t
+            if (msgChat === chat && putBackPending !== lateHold && composerSubmits !== composerAtFill && (typeof shown !== 'string' || holdsText(shown, text))) {
+              if (typeof shown === 'string') boxText = { real: realSends, steps: stepsSeen, text }
+              putBackPending = lateHold = fillHold(t)
+            }
+          } else if (stillUntouched() && (await readBoxText()) === undefined && stillUntouched()) {
+            // landed with nothing submitted from the composer meanwhile, on an engine with no read at all: no read can show the box, but the fill put in exactly `text` (behind the earlier put-back when joined), so that is tracked, from when the fill started, and the next put-back goes in behind it instead of overwriting the box. Whether or not the fill held anything, and whatever became of the hold meanwhile. A message handed on or a request started while it was out means the text may already be sent: not tracked. A read that exists and failed or did not answer shows nothing and tracks nothing
+            boxText = { real: fillReal, steps: fillSteps, text }
+            boxHeld()
+          }
+        } else await lateEnds()
+      } finally {
+        if (fillOut && fillOut.p === out) fillOut = null // settled, landed or not: the box can be read again
+      }
+    }
+    if (text) {
+      let call = null
+      const startedAt = await $.clock.now() // the box was read (up to BOX_LIMIT) since t: the fill starts now
+      seq = ++fillSeq
+      try {
+        const r = await bounded($, () => (call = Promise.resolve($.prompt.fill({ text })))) // a fill that never answers does not hold the later ones and the Resume for good
+        if (r === TIMED_OUT) {
+          unsure = true
+          out = call.then((a) => { late = { filled: !!(a && a.isFilled) } }, () => { late = { filled: false } }).then(lateSettled).catch(() => {})
+          fillOut = { p: out, at: startedAt }
+        } else filled = !!r.isFilled
+      } catch {
+        filled = false
+      }
+    }
+    // the person has to send what is in the box, and until then a Resume waits (not for a failed fill, nor a local command, which never reaches the chat); the same for a message quoted because the box holds the person's own text: it is still to be sent, and for a fill that may have landed
+    const holds = hold && (filled || unsure ? !own.local : !box.mine && items.some((i) => !i.local))
+    // the box is unknown for a fill that did not answer: the next put-back reads it and trusts no tracking. Done before the clock is awaited below (a late answer may land during that await and tracks what it knows: the hold logic after it is unchanged)
+    if (unsure && msgChat === chat) {
+      if (existing) priorBox = boxHeld()
+      boxText = null
+    }
+    const at = holds ? await $.clock.now() : 0
+    if (msgChat !== chat) {
+      // /clear or a resume during the fill: nothing is tracked for the new chat, and the items are dropped with the toast of the chat they belonged to (what could not go in is quoted all the same)
+      for (const q of quoted) $.ui.toast(`Also not sent: ${q.text} — send it again when ready.`, { timeoutMs: 15000 })
+      return { filled: false, stale: true, quoted: new Set(quoted), inFill: true }
+    }
+    if (unsure && existing && holds) { putBackHeld(at); prior = putBackPending }
+    if (filled) boxText = { real: realSends, steps: stepsSeen, text }
+    if (hold && filled) { // a local command never reaches the chat: it holds nothing and ends nothing, the hold there already is stays as it is
+      if (own.local) putBackHeld(at)
+      else putBackPending = fillHold(at)
+    }
+    else if (holds) putBackPending = filled || unsure ? fillHold(at) : { real: realSends, steps: stepsSeen, at, from: 'quoted' }
+    if (unsure && holds) { lateHold = putBackPending; lateEnds().catch(() => {}) } // the answer may already have come
+    // ^ an answer that came in during the `await $.clock.now()` above found no hold yet: this call gives a "not filled" one its turn (a 'filled' one is tracked there already on an engine with no read; with a read nothing tracks it, as for any late fill). No test covers it: the test harness cannot land an answer in that window (a `clock.sleep` registered as the fill starts lands after the await, and the tests give the same result before and after); the tests of a late answer reach lateEnds through lateSettled instead
+    for (const q of quoted) $.ui.toast(`Also not sent: ${q.text} — send it again when ready.`, { timeoutMs: 15000 })
+    return { filled, quoted: new Set(quoted), unsure }
+  }
+  const p = fillChain.then(run)
+  fillChain = p.catch(() => {})
+  return p
+}
+
+async function runCompactThenSend($, msg, unattended, before, wake) {
+  const cancelled = () => unattended && submitsSeen !== before.seen
+  const resume = unattended && !wake // this mod's own Resume (a wake-up is the other unattended send)
+  let compacted = false
+  let timedOut = false // our own compaction was still out after COMPACT_LIMIT: abandoned, and the message does not go uncompacted
+  let blocked = false // an abandoned compaction is still out (ours that this send waited on, or an earlier send's): this send starts no other, and does not go uncompacted
+  let failure = '' // why our own compaction failed, said once it is known whether the message still goes
+  let batch = null // the put-back batch of the abandonment this send is part of: its owner, or a send that waited on it
+  let waited = false
+  // a message of the chat before a /clear or a resume of another chat is not sent into the next one, nor put back in its box (a fork carries the conversation on: its message goes)
+  const staleChat = (inFill = false) => {
+    $.ui.toast(inFill ? `The chat was ${msgChatCause} while your message was being put back: ${msg.text}` : `Not sent, because the chat was ${msgChatCause}: ${msg.text}`, { timeoutMs: 15000 })
+    lowerWake(wake)
+  }
+  // our own compaction of this conversation is already running: wait for it (it settles at COMPACT_LIMIT at worst) and do not compact again if it succeeded. One of a conversation since replaced (/clear, a resume of another chat) is not waited for; a send that waited on one when its chat was replaced stops at its end, and is dropped then, not held on a compaction of the new chat. A fork is the same conversation: its sends keep waiting
+  while (compacting && compacting.chat === before.msgChat && msgChat === before.msgChat) {
+    waited = true
+    await compacting.run.then(() => {}, () => {})
+  }
+  if (!unattended && msgChat !== before.msgChat) return staleChat() // an unattended one is cancelled below
+  try {
+    if (justCompacted) compacted = true // a compaction finished with no request since: the chat is already short
+    else if (compactOut()) { // an earlier compaction is still out: not a second one beside it
+      blocked = true
+      if (waited) batch = abandoned.batch // it was abandoned while this send waited on it
+    }
+    else if (!cancelled()) { // a send already cancelled does not compact for nothing
+      const chat = msgChat // a compaction of a conversation since replaced says nothing about the new one (a fork's is the same one)
+      const live = { chat, seq: ++compactSeq, at: now }
+      const run = (async () => {
+        liveRuns.add(live)
+        const done = $.command.run({ command: 'compact', args: '' })
+        const ended = () => $.clock.after(RUN_END_GRACE, () => liveRuns.delete(live)) // kept a few seconds past its end: the engine's compaction marks for it may arrive just after
+        done.then(ended, ended)
+        const late = new Promise((resolve) => $.clock.after(COMPACT_LIMIT, () => resolve(true)))
+        if (await Promise.race([done.then(() => false), late])) {
+          timedOut = true
+          batch = abandon($, done, chat, live.seq)
+          throw new Error('timed out')
+        }
+        if (msgChat === chat) markCompacted($, live.seq)
+      })()
+      const mine = { run, chat }
+      compacting = mine
+      try {
+        await run
+        compacted = true
+      } finally {
+        if (compacting === mine) compacting = null
+      }
+    }
+  } catch (err) {
+    failure = clip(String((err && err.message) || err), 80)
+  }
+  const stuck = timedOut || blocked // never sent uncompacted
+  // a cold-send dialog is open: what the person answers decides whether this one goes
+  while (unattended && dialogsOpen > 0) await new Promise((resolve) => dialogsClosed.push(resolve))
+  // the Resume goes again 2 minutes on (resumeAt, shown in the band) unless another request starts, the chat is replaced or it is armed already. The time is read before the check: nothing that clears the re-arm can run between the check and the assignment
+  const rearmResume = async () => {
+    const t = await $.clock.now()
+    const ok = msgChat === before.msgChat && stepsSeen === before.steps
+    if (ok && !S.resumeAt) {
+      S.resumeAt = t + CANCEL_REARM
+      $.ui.invalidate('ui.render')
+    }
+    return { t, ok }
+  }
+  if (cancelled()) {
+    // a message that reached the chat while compacting (another plugin's too), "Send anyway" or "Compact first" on a cold-send dialog, a wake-up that starts compacting, or /clear or a resume, cancels an automatic one (a local command such as /btw, which never reaches the chat, even answered Compact first, a dropped send or Cancel does not), and with it the wake-up's turn. A cancelled Resume is armed again when no request starts (resumeAt)
+    lowerWake(wake)
+    const { t, ok } = resume ? await rearmResume() : { t: await $.clock.now(), ok: false } // a cancelled wake-up arms nothing: its turn is over, and a Resume sent in its place was never asked for (autoResume may be off)
+    const rearm = ok
+    const handed = realSends !== before.real // a real message reached the chat
+    const text = rearm
+      ? handed ? `A message was sent meanwhile, so the automatic one waits until ${resumeText(S.resumeAt, t)} unless that message's request starts.` : `Something else was sent or chosen meanwhile, so the automatic one waits until ${resumeText(S.resumeAt, t)}.`
+      : handed ? 'A message was sent meanwhile, so the automatic one was not sent.' : 'Something else was sent or chosen meanwhile, so the automatic one was not sent.'
+    $.ui.toast((compacted ? 'Compacted. ' : '') + text, { timeoutMs: 8000 })
+    return
+  }
+  if (msgChat !== before.msgChat) return staleChat()
+  if (stuck) {
+    // The Resume is tried again (a counted try); the person's message and a wake-up's go back in the prompt box below
+    if (resume) {
+      const lead = timedOut ? 'Compaction has not finished after 15 minutes; the Resume was not sent.' : 'The earlier compaction is still running; the Resume was not sent.'
+      await sendRefused($, { chat: before.msgChat, steps: before.steps }, 'compaction', lead)
+      return
+    }
+  } else if (resume && !compacted && compactDeclined) {
+    // the Resume was armed again after a cancelled dialog and its compaction failed again: not sent uncompacted, and not armed a second time
+    compactDeclined = false
+    $.ui.toast(`Could not compact (${failure}). Send Resume yourself when ready.`, { timeoutMs: 8000 })
+    return
+  } else if (resume && !compacted && dialogCancels !== before.cancels) {
+    // a cold-send dialog was answered Cancel while the Resume compacted, and its own compaction failed: sent uncompacted it would rewrite the context the dialog warned about. Armed again, which compacts again
+    const { t, ok } = await rearmResume()
+    if (ok) {
+      compactDeclined = true
+      $.ui.toast(`Could not compact (${failure}), so the Resume waits until ${resumeText(S.resumeAt, t)}.`, { timeoutMs: 8000 })
+    }
+    return
+  }
+  if (failure && !stuck) $.ui.toast('Could not compact (' + failure + '), so the message goes as typed.', { timeoutMs: 8000 }) // an automatic message that was cancelled says only the cancel
+  const send = { text: msg.text, ...(msg.attachments ? { attachments: msg.attachments } : {}) }
+  // A plugin can't submit a "/" line: those go back in the prompt box
+  if (!msg.slash && !stuck) {
+    const tried = { chat: msgChat, steps: stepsSeen }
+    for (const asUser of unattended ? [true, false] : [true]) {
+      try {
+        const stepsBefore = stepsSeen
+        await $.prompt.submit({ ...send, asUser })
+        const t = await $.clock.now() // read first, then check and set with no await between
+        if (resume) sendFailures = 0
+        // the person's own message, handed on by this mod: its request may start later (not if one already did)
+        if (!unattended && stepsSeen === stepsBefore) sendPending.set(++sendPendingId, t + SEND_SAFETY)
+        return
+      } catch {
+        // try the next way, then the prompt box
+      }
+    }
+    if (resume) { // not back in the prompt box: the Resume is tried again in 2 minutes
+      await sendRefused($, tried)
+      return
+    }
+  }
+  let filled = false
+  let quoted = false // a slash command shown in a toast instead of the box, as it must not be joined with other text
+  // one fill at a time, behind whatever the box holds; a put-back of an abandoned compaction also starts the Resume hold, as the Resume must not go ahead of a message the person still has to send
+  const r = await putBack($, msg, stuck ? batch : null, before.msgChat, stuck)
+  if (r.stale) { // the chat was replaced while it was put back: a message already quoted in a toast is not told again
+    if (r.quoted) lowerWake(wake)
+    else staleChat(r.inFill)
+    return
+  }
+  filled = r.filled
+  quoted = r.quoted
+  const unsure = r.unsure // the fill did not answer in time: the message may be in the box
+  lowerWake(wake) // given up: no request of the wake-up's is on its way
+  const why = timedOut ? 'Compaction has not finished after 15 minutes' : 'The earlier compaction is still running'
+  // a failed compaction (not stuck, not compacted) was already said above ("Could not compact"), so its lead does not claim "Compacted"; a quoted message has been told in full already
+  const text = stuck
+    ? quoted ? why + '.' : filled ? why + '; your message is back in the prompt box: press Enter to send it.' : why + (unsure ? ', and the message may not have been put back: ' : ', and the message could not be put back: ') + msg.text
+    : quoted ? (compacted ? 'Compacted.' : '') : filled ? (compacted ? 'Compacted. Your message is back' : 'Your message is back') + ' in the prompt box: press Enter to send it.' : (compacted ? 'Compacted, but the message ' : 'The message ') + (unsure ? 'may not have been sent again: ' : 'could not be sent again: ') + msg.text
+  if (text) $.ui.toast(text, { timeoutMs: 15000 })
+}
+
+function findPr(text) {
+  const m = cfg.prPattern && String(text || '').match(cfg.prPattern)
+  return m && m[1] ? Number(m[1]) || 0 : 0
+}
+
+// A stored prompt as it was typed: a typed command is kept as <command-name>/<command-args> tags, put back into the typed form
+function promptText(text) {
+  text = String(text || '')
+  const name = /<command-name>\s*\/?([^<\s]+)\s*<\/command-name>/.exec(text)
+  if (!name) return text
+  const args = /<command-args>([\s\S]*?)<\/command-args>/.exec(text)
+  return `/${name[1]} ${args ? args[1] : ''}`
+}
+
+// A PR read from a chat's history (a resumed chat's transcript, the messages the session reports): the first prompt of the chat that names one. Settled the same whichever of the resume's SessionStart and session.start comes first, and whatever the person typed meanwhile: the first history read to land stands, and it replaces a PR that only a prompt submitted since set (that prompt is later than the history). Not in a chat since cleared or replaced by a resumed one
+function adoptHistoryPr(chat, pr) {
+  if (!pr || msgChat !== chat) return
+  if (S.pr && !S.prLive) return
+  S.pr = pr
+  S.prLive = false
+}
+
+// The first user prompt in a transcript's rows that names a PR. A typed command is stored as <command-name>/<command-args> tags, put back into the typed form first
+export function prFromTranscript(lines) {
+  for (const line of lines) {
+    let j
+    try {
+      j = JSON.parse(line)
+    } catch {
+      continue // the head's last line may be cut
+    }
+    if (!j || j.type !== 'user' || j.isSidechain || j.isMeta || !j.message) continue
+    const c = j.message.content
+    const text = typeof c === 'string' ? c : Array.isArray(c) ? c.filter((b) => b && b.type === 'text').map((b) => b.text).join('\n') : ''
+    const pr = findPr(promptText(text))
+    if (pr) return pr
+  }
+  return 0
+}
+
+const HEAD_JS = "const fs=require('fs'),p=process.argv[1],n=Math.min(fs.statSync(p).size," + 1024 * 1024 + "),b=Buffer.alloc(n),fd=fs.openSync(p,'r');fs.readSync(fd,b,0,n,0);process.stdout.write(b)"
+
+// The PR a resumed chat's first merge-pr prompt names: from its transcript, else the messages the session reports
+async function resumedPr($, path) {
+  try {
+    const st = await $.fs.stat(path)
+    if (st.kind === 'file' && st.size) {
+      const text = st.size <= 4 * 1024 * 1024 ? String(await $.fs.read(path)) : (await $.process.run(['node', '-e', HEAD_JS, path], { timeoutMs: 15000 })).stdout
+      const pr = prFromTranscript(String(text).split('\n'))
+      if (pr) return pr
+    }
+  } catch {
+    // no transcript to read here: the session's own messages
+  }
+  try {
+    const first = (await $.session.messages()).find((m) => m.role === 'user' && findPr(promptText(m.text)))
+    return first ? findPr(promptText(first.text)) : 0
+  } catch {
+    return 0
+  }
+}
+
+async function prState($) {
+  try {
+    const r = await $.process.run(['gh', 'pr', 'view', String(S.pr), '--json', 'state', '-q', '.state'], { cwd: S.cwd, timeoutMs: 20000 })
+    return r.exitCode === 0 ? String(r.stdout).trim() : ''
+  } catch {
+    return ''
+  }
+}
+
 // Plan limit windows as the API reports them: five_hour, seven_day, spend_limit
 const LIMIT_LABEL = { five_hour: '5h', seven_day: 'week', spend_limit: 'spend' }
 
 function limitsText(limits) {
   return limits.map((l) => `${LIMIT_LABEL[l.kind] || l.kind} ${Math.round(l.percentUsed)}%`).join(' · ')
-}
-
-function limitTone(limits, extra) {
-  const top = Math.max(...limits.map((l) => l.percentUsed || 0))
-  if (top >= 95) return { ...extra, color: 'red', bold: true }
-  if (top >= 80) return { ...extra, color: 'yellow' }
-  return { ...extra, dimColor: true }
 }
 
 function money(v) {
@@ -234,9 +1153,12 @@ function msLeft(lastActivity, ttl) {
   return ttl * MIN - (now - lastActivity)
 }
 
+// `left` is null for a cold cache of no known age (a reopened chat's last request ran on another account)
 function cacheState(hb) {
+  if (hb.rotated) return { kind: 'cold', left: hb.seatChangedAt ? hb.seatChangedAt - now : null }
   const left = msLeft(hb.lastActivity, hb.ttlMin)
-  if (left === null) return { kind: 'unknown', left: 0 }
+  // keep warm on with no activity time (a compaction zeroed it, or a chat with no request yet): it is on and waits for the next request, so the band, /cache and the board all say so
+  if (left === null) return hb.keepWarm ? { kind: 'kept', left: null } : { kind: 'unknown', left: 0 }
   if (hb.keepWarm) return { kind: 'kept', left }
   if (left <= 0) return { kind: 'cold', left }
   if (left <= 5 * MIN) return { kind: 'cooling', left }
@@ -260,6 +1182,8 @@ function myHeartbeat() {
     window: S.window,
     ttlMin: ttlMin(),
     lastActivity: S.lastActivity,
+    rotated: rotatedCold(),
+    seatChangedAt: S.seatChangedAt,
     keepWarm: S.keepWarm,
     keepWarmUntil: S.keepWarmUntil,
     pings: S.pings,
@@ -269,8 +1193,30 @@ function myHeartbeat() {
     coldUsd,
     agentsRunning: S.agentsRunning,
     lastTurnEnd: S.lastTurnEnd,
+    seat: S.seat,
+    ...(S.account && !accountUnsure() ? { account: S.account } : {}), // what an unseated session's windows are borrowed by; left out while unknown after a wake-up
+    desktop: !onTerminal,
+    signedIn, // an API-key session's windows are not an account's: others must not borrow them
+    rateLimits: keyUnsure() || unidentified() ? [] : S.rateLimits, // the engine's own reading, which a reopened chat borrows; none while the seat or account is unknown, as it may be the old account's, nor from a session that has neither
     updatedAt: now,
   }
+}
+
+// A session that has sent nothing has no plan windows of its own: borrow the freshest
+// reading another session on the same account took, dropping a window that has since reset
+export function stillOpen(limits, at) {
+  return limits.filter((l) => !l.resetsAt || Date.parse(l.resetsAt) > at)
+}
+
+export function borrowedLimits(list, self, at) {
+  // a seat on either side must match, on the same surface (each rotator names its seats alone): a seated and an unseated session are not known to share an account.
+  // With no seat on either side the signed-in accounts decide: both must be known, and equal
+  const same = (hb) => hb.desktop === self.desktop && (self.seat || hb.seat ? hb.seat === self.seat : !!self.account && hb.account === self.account)
+  const best = list
+    .filter((hb) => !hb.self && hb.signedIn !== false && Array.isArray(hb.rateLimits) && hb.rateLimits.length && same(hb))
+    .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))[0]
+  if (!best) return []
+  return stillOpen(best.rateLimits, at)
 }
 
 async function registerCommand($, name, description, argumentHint, immediate) {
@@ -303,6 +1249,7 @@ async function readRecording($) {
   mask = rec.on ? makeMasker({ strict: rec.strict }) : (s) => s
 }
 
+const beaten = new Set() // the session ids this process has written a heartbeat for: what is stored under one is its own, not an earlier version's (seedFromTranscript)
 async function heartbeat($, force) {
   if (!S.id) return
   if (!force && now - lastHeartbeat < 5000) return
@@ -313,11 +1260,423 @@ async function heartbeat($, force) {
   } catch {
     // agent list unavailable: keep the last count
   }
-  await $.store.set('hb:' + S.id, myHeartbeat())
+  try {
+    beaten.add(S.id)
+    await bounded($, () => $.store.set('hb:' + S.id, myHeartbeat()), WRITE_LIMIT) // one that never answers is a failed beat
+  } catch {
+    // another session holds the store's lock: the next beat writes it
+  }
+}
+
+// The plan's per-model weekly limits (Fable) aren't in session.measure, so read the
+// usage endpoint the app's usage card reads. One fetch per 5 minutes per account (per seat when a seat file
+// is set), shared through the store by that account's sessions; a 429 backs those sessions off the same 5 minutes.
+const PLAN_EVERY = 5 * MIN
+const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
+let planWhy = ''
+let planNext = 0
+// One reading per account, shared by its sessions: the endpoint rate-limits a second schedule within seconds.
+// An older version kept one reading under this bare key for every account: a signed-in session never reads it, nor writes it.
+const PLAN_KEY = 'plan'
+
+// Each account has its own limits: with a seat file configured, a reading per surface and seat
+// (the terminal's and the app's rotators name their seats independently), else one per signed-in account
+function planKey() {
+  if (S.seat) return `${PLAN_KEY}:${onTerminal ? 'cli' : 'app'}:${S.seat}`
+  return S.account ? `${PLAN_KEY}:account:${S.account}` : PLAN_KEY
+}
+
+// A session that can name neither seat nor account has no key of its own: the bare one would be shared with sessions on other accounts.
+// If signed in (or not yet known to be, where the sign-in check failed) it fetches for itself, shares nothing, lends no windows and borrows none.
+function unidentified() {
+  return signedIn !== false && !S.seat && !S.account // an unchecked sign-in counts: it cannot be told from one that will turn out signed in
+}
+
+async function refreshPlan($) {
+  if (keyUnsure()) return // the key may name the old account: it would take the new account's reading, and planNext waits for the real one
+  const key = planKey() // one account's reading throughout, though the seat can change while the fetch is out
+  const wake = wakeCount
+  // a seat change or a wake-up during an await below: the reading is the old account's, or may be
+  const stale = () => planKey() !== key || wakeCount !== wake || keyUnsure()
+  // An API-key session has no first-party sign-in: the shared reading is another account's
+  if (signedIn === null || (signedIn === false && now >= signCheckAt)) {
+    try {
+      signedIn = !!(await $.session.authorize())
+    } catch {
+      signedIn = null // can't tell: carry on as before
+    }
+    signCheckAt = now + PLAN_EVERY
+  }
+  // a seat or account change, or a wake-up, during any await below: don't restore the old account's readings
+  if (stale()) return
+  if (signedIn === false) return noSignIn()
+  const alone = unidentified() // once: a seat or account change during an await makes stale() return
+  let cached = null
+  try {
+    cached = alone ? null : await $.store.get(key)
+  } catch {
+    cached = null
+  }
+  if (stale()) return
+  const prior = cached && typeof cached === 'object' ? cached : {}
+  if (Array.isArray(prior.windows) && prior.windows.length) S.planWindows = prior.windows
+  // an older version writes null after a failed check: never let that wipe a good reading
+  if (prior.fable) S.fable = prior.fable
+  planWhy = prior.why || planWhy
+  // the store's backoff, or this session's own where a held lock kept it out of the store
+  if (now < Math.max(prior.next || (prior.at || 0) + PLAN_EVERY, planNext)) return
+  planNext = now + PLAN_EVERY
+  // claim the slot first, so a session that wakes meanwhile finds it taken
+  try {
+    if (!alone) await $.store.set(key, { ...prior, next: now + PLAN_EVERY })
+  } catch {
+    // lock held: this session's own planNext still holds it back
+  }
+  if (stale()) return
+  let fable = prior.fable || S.fable
+  let windows = Array.isArray(prior.windows) && prior.windows.length ? prior.windows : S.planWindows
+  let at = prior.at || 0 // when the reading was taken: a failure keeps the last good one
+  let next = now + PLAN_EVERY
+  let why = 'ok' // the last attempt's outcome, kept with the reading for /cache
+  let fetched = false
+  try {
+    const auth = await $.session.authorize()
+    if (!auth) {
+      if (stale()) return
+      signedIn = false
+      return noSignIn()
+    }
+    signedIn = true
+    const r = await $.http.fetch(USAGE_URL, { auth: auth.handle, headers: { 'anthropic-beta': 'oauth-2025-04-20' } })
+    if (r.ok) {
+      const body = JSON.parse(r.text)
+      fable = fableLimit(body)
+      windows = planWindows(body)
+      at = now
+      fetched = true
+    } else why = 'HTTP ' + r.status
+    // a 429 names how long to stay away; every session on this key waits it out, an hour at most
+    const wait = retryAfterMs(r.headers, now)
+    if (!r.ok && wait > 0) next = now + Math.min(60 * MIN, Math.max(PLAN_EVERY, wait))
+  } catch (err) {
+    why = clip(String((err && err.message) || err), 120) // offline or refused: keep the last reading
+  }
+  // the seat moved on meanwhile, or a wake-up came: this is the old account's reading, and the new one's slot is untouched
+  if (stale()) return
+  planNext = next
+  S.fable = fable
+  S.planWindows = windows
+  planWhy = why
+  try {
+    // a failed check must not put its older reading over one another session took meanwhile
+    if (alone) return
+    const stored = fetched ? null : await $.store.get(key)
+    if (stale()) return
+    if (stored && typeof stored === 'object' && (stored.at || 0) > (prior.at || 0)) {
+      if (Array.isArray(stored.windows) && stored.windows.length) S.planWindows = stored.windows
+      if (stored.fable) S.fable = stored.fable
+      return
+    }
+    await $.store.set(key, { at, next, fable, windows, why })
+  } catch {
+    // lock held: another session is writing the same reading
+  }
+}
+
+// A Retry-After header, found whatever its capitals, as milliseconds from `at`: seconds, or an HTTP date. 0 when absent, unreadable, or already past
+function retryAfterMs(headers, at) {
+  if (!headers || typeof headers !== 'object') return 0
+  const key = Object.keys(headers).find((k) => k.toLowerCase() === 'retry-after')
+  const v = key === undefined ? '' : String(headers[key]).trim()
+  if (!v) return 0
+  const ms = /^\d+(\.\d+)?$/.test(v) ? Number(v) * 1000 : Date.parse(v) - at
+  return ms > 0 ? ms : 0 // NaN and a past date are not waits
+}
+
+// Nothing to read or write: the shared plan reading would be another account's
+function noSignIn() {
+  S.fable = null
+  S.planWindows = []
+  planWhy = 'no first-party sign-in'
+}
+
+// An opened or resumed session has sent nothing yet, so measure its first request from the
+// transcript: the last main-loop reply's usage is what that request re-reads, and its time
+// says how long the cache has been idle. A compaction after it leaves its own smaller size.
+export function lastContext(lines) {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    let j
+    try {
+      j = JSON.parse(lines[i])
+    } catch {
+      continue // the tail's first line is cut mid-row
+    }
+    if (!j || j.isSidechain) continue
+    const at = Date.parse(j.timestamp || '') || 0
+    const meta = j.compactMetadata
+    // any compaction boundary ends the walk: what lies before it was compacted away
+    if (j.type === 'system' && j.subtype === 'compact_boundary') return { ctx: (meta && meta.postTokens) || 0, at, compacted: true }
+    const u = j.type === 'assistant' && j.message && j.message.usage
+    // the next request re-reads that reply too, so its output counts
+    if (u && totalInput(u) > 0) return { ctx: totalInput(u) + (u.output_tokens || 0), at, model: j.message.model, effort: typeof j.effort === 'string' ? j.effort : '' }
+  }
+  return null
+}
+
+const TAIL_BYTES = 1024 * 1024
+// $.fs.read stops at 4 MiB and has no offset, so a long transcript's tail comes through node
+const TAIL_JS = "const fs=require('fs'),p=process.argv[1],s=fs.statSync(p).size,n=Math.min(s," + TAIL_BYTES + "),b=Buffer.alloc(n),fd=fs.openSync(p,'r');fs.readSync(fd,b,0,n,s-n);process.stdout.write(b)"
+
+// A chat's last request, kept past the session: the app has no $.process.run, so it cannot
+// read a transcript over 4 MiB, and a big chat is exactly the one the cold-send guard is for
+const LAST_KEEP = 30 * 24 * 60 * MIN
+const COLD_KEEP = 50
+
+// Cold-rewrite entries of several lists as one: the same entry (its time and size) once, oldest first, the newest COLD_KEEP
+function mergeCold(...lists) {
+  const seen = new Set()
+  const out = []
+  for (const l of lists) {
+    for (const c of Array.isArray(l) ? l : []) {
+      if (!c || typeof c !== 'object') continue
+      const key = c.at + ':' + c.tokens
+      if (seen.has(key)) continue
+      seen.add(key)
+      out.push(c)
+    }
+  }
+  return out.sort((a, b) => (a.at || 0) - (b.at || 0)).slice(-COLD_KEEP)
+}
+
+let coldSeedChat = null // { chat, id, list }: the cold history stored for a chat, once read (by its seed or by the first record written while the seed had not merged it), so a record written meanwhile merges it without another read. Reset whenever a seed is awaited (holdStoredCold)
+let writeChain = Promise.resolve() // the chat's records: each one's write starts when the one before it has finished or timed out (WRITE_LIMIT), so one waiting on the stored history is not overtaken by a later one. A write that timed out writes nothing more (its late flag, in writeRecord): a step that settles late cannot put an older record over a newer. A store.set that was already issued and lands late can: the newest record issued for that key is then written again (lastIssued), queued here, so every write issued after that waits for it, and a re-write that itself lands late is followed by another. What holds: once no set of this mod's is still out past its limit, the store has the newest record issued for each key. What stays open: two sets of the store's that are both out at once may land in either order, a re-write or record set still out past its limit may land after a later one (until it lands, and its follow-up is written), and a store that never answers loses the record (the next request writes it)
+const lastIssued = new Map() // key -> { key, value }: the newest record a write has handed to store.set for that key, for the one that lands late over it. An entry goes once its set has settled with nothing newer issued for the key and no set of the key still out (putIssued), so it holds only the keys with a set still out, or a newer record than one still out, not every id the process has had
+const setsOut = new Map() // key -> how many sets handed to store.set for it have not settled yet (a stuck one counts until it lands)
+const reissuing = new Set() // the keys with a re-write queued on writeChain and not started: one is enough, it reads the newest record when its turn comes
+const WRITE_LIMIT = 5000 // a store call that has not answered by then is a failed write: the chain goes on without it, as turn.step awaits it (rememberLast)
+
+// The chat's stored cold history is now awaited by its seed: a record written before the seed has merged it merges it too (coldToKeep)
+function holdStoredCold(chat) {
+  coldSeedPending = chat
+  coldSeedChat = null
+}
+
+// Reads what is stored for the chat once and keeps it (coldSeedChat); merged into this process's own list, which a seed that could not read it then no longer waits for. Returns the list it read (the caller merges from it, not from coldSeedChat, which a seed or a resume can reset meanwhile), or null when it could not be read (another session holds the store's lock): then nothing is known of the stored history.
+async function loadStoredCold($, chat, id) {
+  if (coldSeedChat && coldSeedChat.chat === chat && coldSeedChat.id === id) return coldSeedChat.list
+  let stored = null
+  try {
+    stored = await $.store.get('last:' + id)
+  } catch {
+    return null
+  }
+  const list = stored && Array.isArray(stored.cold) ? stored.cold : []
+  coldSeedChat = { chat, id, list }
+  if (chat === msgChat && id === S.id) {
+    const merged = mergeCold(list, S.coldRestarts)
+    const changed = merged.length !== S.coldRestarts.length
+    S.coldRestarts = merged
+    if (coldSeedPending === chat) coldSeedPending = null
+    if (changed) $.ui.invalidate('ui.render')
+  }
+  return list
+}
+
+// Writes a chat's record with its cold history, after the ones issued before it. The record is built by the caller in one go (what the request measured and where it ran, as of one moment), and so is the list of cold rewrites it carries: this process's own at that moment. While the chat's seed has not merged the stored history, that is merged into the list too, so a shorter one never replaces what is stored; when the stored history cannot be read the record is not written (the next request writes it).
+function writeRecord($, record) {
+  const id = S.id
+  const chat = msgChat
+  // S.id still belongs to the chat before a /clear or a resume has taken its new id: a record written now would be that old chat's, with the cold list the replacement just emptied (idChat)
+  if (chat !== idChat) return Promise.resolve()
+  const own = S.coldRestarts.slice(-COLD_KEEP)
+  const merge = coldSeedPending === chat
+  const run = writeChain.then(() => {
+    let late = false // this step has timed out: it goes on in the background, and a newer record may have been written since
+    return bounded($, async () => {
+      try {
+        let cold = own
+        if (merge) {
+          const stored = await loadStoredCold($, chat, id)
+          if (!stored) return
+          cold = mergeCold(stored, own)
+        }
+        if (late) return
+        const mine = { key: 'last:' + id, value: { ...record, cold } }
+        lastIssued.set(mine.key, mine)
+        await putIssued($, mine)
+        // this set landed after its step timed out, perhaps over a record written since: the newest for the key goes in again
+        if (late && newerIssued(mine)) reissue($, mine.key)
+      } catch {
+        // another session holds the store's lock: the next request writes it
+      }
+    }, WRITE_LIMIT).then((r) => { if (r === TIMED_OUT) late = true }).catch(() => {}) // one that never answers (TIMED_OUT) is a failed write too
+  })
+  writeChain = run
+  return run
+}
+
+// store.set for an issued record (lastIssued), counted while it is out; its entry is dropped when it settles with nothing newer issued for the key and no other set of the key still out: nothing can land over it that it would then have to be written again over
+async function putIssued($, rec) {
+  setsOut.set(rec.key, (setsOut.get(rec.key) || 0) + 1)
+  try {
+    await $.store.set(rec.key, rec.value)
+  } finally {
+    const n = (setsOut.get(rec.key) || 1) - 1
+    if (n > 0) setsOut.set(rec.key, n)
+    else {
+      setsOut.delete(rec.key)
+      if (lastIssued.get(rec.key) === rec) lastIssued.delete(rec.key)
+    }
+  }
+}
+
+// A record newer than this one has been issued for its key
+function newerIssued(rec) {
+  const cur = lastIssued.get(rec.key)
+  return !!cur && cur !== rec
+}
+
+// Writes the newest record issued for a key again, after what is queued on writeChain (so a later record waits for it, and this one reads lastIssued only when its turn comes). At most one is queued per key (reissuing): several sets landing late before it starts are all covered by it. Bounded like a record's write, and a failure is swallowed; one that lands late over a still newer record is followed by another
+function reissue($, key) {
+  if (reissuing.has(key)) return
+  reissuing.add(key)
+  writeChain = writeChain.then(() => {
+    reissuing.delete(key)
+    const newest = lastIssued.get(key)
+    if (!newest) return
+    let late = false
+    return bounded($, async () => {
+      try {
+        await putIssued($, newest)
+        if (late && newerIssued(newest)) reissue($, key)
+      } catch {
+        // another session holds the store's lock: the next request writes it
+      }
+    }, WRITE_LIMIT).then((r) => { if (r === TIMED_OUT) late = true }).catch(() => {})
+  })
+}
+
+async function rememberLast($) {
+  if (!S.id || !S.ctx) return
+  // the chat's cold rewrites too, so their cost survives a reopen
+  await writeRecord($, { ctx: S.ctx, at: S.lastActivity, model: S.model, effort: S.effort, ...whoRan() })
+}
+
+// What a seed was asked for at: the chat (msgChat) its transcript belongs to, and the counts that say what has happened to that chat since. Taken before any await, and carried by a seed that waits (pendingSeed)
+function seedMark() {
+  return { chat: msgChat, measured: measuredSteps, steps: stepsSeen, compact: compactGen, sized: sizeUpdates }
+}
+
+// Every read here can outlast a /clear or a resume of another chat, whose own seed it must not write over: nothing is written once the chat has moved on (from.chat).
+// A main-loop request whose usage came back since (from.measured), or a compaction marked since (from.compact), measured the chat itself, and the transcript, read before it, is older: the writes that measurement makes (S.ctx, S.lastActivity and what judging the chat sets with it, the compacted state) are left to it. The rest still lands: the cold-rewrite history is the chat's own either way, and a request that has only started (from.steps) measured nothing, so the chat is still seeded, but the effort that request started with stands.
+async function seedFromTranscript($, path, from = seedMark(), priorHb) {
+  const gone = () => msgChat !== from.chat
+  const measured = () => measuredSteps !== from.measured || compactGen !== from.compact
+  const sized = () => sizeUpdates !== from.sized // the size was reported meanwhile (session.measure, turn.complete): it is the chat's real one
+  let fromRecord = false
+  let found = null
+  try {
+    const st = await $.fs.stat(path)
+    if (st.kind === 'file' && st.size) {
+      const text = st.size <= 4 * 1024 * 1024 ? String(await $.fs.read(path)) : (await $.process.run(['node', '-e', TAIL_JS, path], { timeoutMs: 15000 })).stdout
+      found = lastContext(String(text).split('\n'))
+    }
+  } catch {
+    // no transcript yet, or too big to read here (the app): fall back on what this mod kept
+  }
+  if (gone()) return
+  let last = null
+  let storeRead = true
+  // S.id is this chat's only once the chat has read its own (idChat): after a resume whose id read came back empty it is still the chat before's, and that chat's record (its size, age and cold rewrites) is not this one's. The transcript at `path` is the resumed chat's own and still seeds its size and age
+  const own = () => (idChat === from.chat ? S.id : '')
+  const id = own()
+  try {
+    last = id ? await bounded($, () => $.store.get('last:' + id), WRITE_LIMIT) : null
+    if (last === TIMED_OUT) throw new Error('store did not answer') // as a failed read
+  } catch {
+    last = null
+    storeRead = false // what is stored is unknown: a record written meanwhile is not written (writeRecord) until it has been read
+  }
+  if (storeRead && id) coldSeedChat = { chat: from.chat, id, list: last && Array.isArray(last.cold) ? last.cold : [] }
+  if (gone()) return
+  // the cold history is the chat's own whatever has been measured since: kept with what this process has recorded meanwhile
+  let changed = false
+  if (last && Array.isArray(last.cold) && last.cold.length) {
+    const merged = mergeCold(last.cold, S.coldRestarts)
+    changed = merged.length !== S.coldRestarts.length
+    S.coldRestarts = merged
+  }
+  if (storeRead && coldSeedPending === from.chat) coldSeedPending = null
+  if (!found && own() && !measured()) {
+    try {
+      // before its first record, a chat open under an earlier version still has its heartbeat
+      // session.start reads it before writing its own (priorHb); for an id this process has written one for, what is stored is its own heartbeat, which is no earlier version's and says nothing of a compaction
+      const hbId = own()
+      const earlier = priorHb && priorHb.id === hbId
+      let hb = (last || (!earlier && beaten.has(hbId))) ? null : earlier ? priorHb.hb : await bounded($, () => $.store.get('hb:' + hbId), WRITE_LIMIT)
+      if (hb === TIMED_OUT) hb = null // as a failed read
+      const r = last || (hb && { ctx: hb.ctx, at: hb.lastActivity, model: hb.model, effort: hb.effort })
+      if (gone()) return
+      // an `at` of 0 was written between a compaction and the next request
+      if (r && r.ctx) {
+        found = { ctx: r.ctx, at: r.at, model: r.model, effort: r.effort, compacted: !r.at }
+        fromRecord = true
+      }
+    } catch {
+      // store unavailable: the first request measures it
+    }
+  }
+  if (found && !measured()) {
+    // the record's size is the one before a compaction's: not over a size reported since, nor its compacted state (the cache's age and the cold history still land)
+    const keepSize = fromRecord && sized()
+    if (!keepSize) S.ctx = found.ctx
+    judgeChat(found, last)
+    if (found.compacted && !keepSize) {
+      // the next request writes the compacted context whatever happens: nothing to ask
+      S.floor = found.ctx
+      markCompacted($)
+    }
+    changed = true
+  }
+  if (found) {
+    if (found.model && !S.model) S.model = found.model // the session's own model wins: it may have been switched
+    if (found.effort && from.steps === stepsSeen && !measured()) S.effort = found.effort // a request that started set its own
+  }
+  if (changed) $.ui.invalidate('ui.render')
+}
+
+// The response's `limits` carries { kind: 'weekly_scoped', scope: { model: { display_name } }, percent, resets_at }
+// The same response's five_hour and seven_day, as { utilization, resets_at }, in session.measure's shape
+export function planWindows(body) {
+  return ['five_hour', 'seven_day'].flatMap((kind) => {
+    const w = body && body[kind]
+    if (!w || typeof w.utilization !== 'number') return []
+    return [{ kind, percentUsed: w.utilization, resetsAt: resetIso(w.resets_at) }]
+  })
+}
+
+function resetIso(at) {
+  return typeof at === 'number' ? new Date(at * 1000).toISOString() : typeof at === 'string' ? at : undefined
+}
+
+export function fableLimit(body) {
+  const list = body && Array.isArray(body.limits) ? body.limits : []
+  const hit = list.find((l) => l && l.kind === 'weekly_scoped' && /fable/i.test(String(l.scope && l.scope.model && l.scope.model.display_name)))
+  if (!hit || typeof hit.percent !== 'number') return null
+  return { percentUsed: hit.percent, resetsAt: resetIso(hit.resets_at) }
 }
 
 async function readFleet($) {
-  const keys = (await $.store.keys()).filter((k) => k.startsWith('hb:'))
+  const all = await $.store.keys()
+  // a chat untouched for a month will not be reopened to send: drop its record
+  if (now - lastPrune > 60 * MIN) {
+    lastPrune = now
+    for (const k of all.filter((k) => k.startsWith('last:'))) {
+      const r = await $.store.get(k)
+      if (!r || now - (r.at || r.keptAt || now) > LAST_KEEP) await $.store.delete(k)
+    }
+  }
+  const keys = all.filter((k) => k.startsWith('hb:'))
   const list = []
   for (const k of keys) {
     const hb = await $.store.get(k)
@@ -339,12 +1698,41 @@ async function applyRemoteCommands($) {
   const c = await $.store.get('cmd:' + S.id)
   if (!c) return
   await $.store.delete('cmd:' + S.id)
-  if (c.keepWarm === true) startKeepWarm($, settings.keepWarmHours)
-  if (c.keepWarm === false) stopKeepWarm($, 'stopped from the board')
+  if (c.keepWarm === true) {
+    setAutoWarm(true)
+    startKeepWarm($, settings.keepWarmHours)
+  }
+  if (c.keepWarm === false) {
+    setAutoWarm(false)
+    stopKeepWarm($, 'stopped from the board')
+  }
 }
 
-function startKeepWarm($, hours) {
+// Auto keep warm switched on or off by hand: the person's choice, which a new chat keeps (unlike an off from a merged PR)
+function setAutoWarm(on) {
+  S.autoWarm = on
+  S.autoWarmOffByPr = false
+}
+
+// Why auto keep warm may not run in this chat now, by what is set (on, big chat) and what it has spent (the cap on its pings in this idle stretch); '' when it may. Checked by every start and hand-over (autoMayRun) and, each step, by an auto keep warm that is running, so a setting changed meanwhile (here or in another session) applies to it
+function autoStopReason(settingsOnly = false) {
+  if (!(settings.autoWarmHours > 0) || !S.autoWarm) return 'auto keep warm was turned off'
+  if (S.ctx < settings.bigTokens) return 'this chat is now under the big size'
+  if (settingsOnly) return '' // the cap is for the idle path: while a request runs, S.model may already be the next request's and the cost of the pings was counted at the old one's price
+  if (S.autoCappedStretch || S.autoPingUsd >= rewriteCost(S.ctx, S.model, ttlMin())) return `its pings have cost as much as rewriting the cache (${money(S.autoPingUsd)})`
+  return ''
+}
+
+// May auto keep warm run now? The one decision behind every place that starts it or hands over to it
+function autoMayRun(t) {
+  if (autoStopReason()) return false
+  if (!S.lastTurnEnd || t >= S.lastTurnEnd + settings.autoWarmHours * 60 * MIN) return false // no turn of this chat yet, or past the auto hours
+  return !!S.lastActivity && S.lastActivity + ttlMin() * MIN > t // a cache that went cold is not one to keep warm: a ping would pay the whole rewrite
+}
+
+function startKeepWarm($, hours, auto = false) {
   S.keepWarm = true
+  S.keepWarmAuto = auto
   S.keepWarmUntil = now + hours * 60 * MIN
   $.ui.toast(`Keeping this cache warm until ${clock(S.keepWarmUntil)}. A ping reads the cache before it expires.`)
 }
@@ -357,8 +1745,48 @@ function stopKeepWarm($, why) {
 
 async function keepWarmStep($) {
   if (!S.keepWarm) return
-  if (now >= S.keepWarmUntil) return stopKeepWarm($, 'time limit reached')
-  if (S.working || !S.lastActivity) return
+  if (S.keepWarmAuto) {
+    // a setting changed while it ran (autowarm off, big 400k, in this session or another): it stops, even while the chat works
+    // while the chat works only the settings count: the cap is judged when it is idle (and by a ping that has just been paid)
+    const why = autoStopReason(S.working)
+    if (why) return stopKeepWarm($, why)
+    // fewer auto hours than it started with: it ends that long after the last turn
+    if (S.lastTurnEnd) S.keepWarmUntil = Math.min(S.keepWarmUntil, S.lastTurnEnd + settings.autoWarmHours * 60 * MIN)
+  }
+  if (now >= S.keepWarmUntil) {
+    // One started by hand ends at its own time, but if auto keep warm would still be covering this chat, it takes over
+    // (with its cost cap) rather than leaving the cache to go cold sooner than if nothing had been pressed. The pings
+    // so far stay counted (the cap is per idle stretch, not per keep warm), and once auto keep warm has stopped on that
+    // cap in this stretch nothing hands over again (nor once the pings have already cost the cap without stopping on it,
+    // as when a ping wrote the cache)
+    // (no turn of this chat yet, or a cache that has already gone cold: nothing for auto keep warm to be covering, see autoMayRun)
+    if (!S.keepWarmAuto && autoMayRun(now)) {
+      S.keepWarmAuto = true
+      S.keepWarmUntil = S.lastTurnEnd + settings.autoWarmHours * 60 * MIN
+      $.ui.toast(`Keep warm now runs as auto keep warm until ${clock(S.keepWarmUntil)}; it stops sooner once its pings since your last message cost as much as the rewrite.`)
+    } else return stopKeepWarm($, 'time limit reached')
+  }
+  if (S.pr && now - S.prCheckedAt > 15 * MIN) {
+    S.prCheckedAt = now
+    const state = await prState($)
+    if (state === 'MERGED' || state === 'CLOSED') {
+      if (S.autoWarm) {
+        S.autoWarm = false
+        S.autoWarmOffByPr = true
+      }
+      return stopKeepWarm($, `PR #${S.pr} is ${state.toLowerCase()}`)
+    }
+  }
+  // After a rotation a ping would pay the whole rewrite: leave that to the next real turn
+  if (S.working || rotatedCold()) return
+  // Auto keep warm never pings a cache that has already gone cold (a long idle with the chat working, or a turn that ended with no request of its own, long after the last one): the ping would pay the whole rewrite. One started by hand goes on as it was
+  // A cache with no activity time at all is not one that went cold: a compaction (typed, automatic or a wake-up's) zeroed it, and the next request writes the shorter context; it waits for that, below
+  if (S.keepWarmAuto && S.lastActivity && msLeft(S.lastActivity, ttlMin()) <= 0) return stopKeepWarm($, 'the cache had already gone cold')
+  if (!S.lastActivity) {
+    // waiting for the request a compaction made room for: if none lands within a TTL of it, the chat is not being used and auto keep warm has nothing to protect
+    if (S.keepWarmAuto && S.compactedAt && now - S.compactedAt >= ttlMin() * MIN) return stopKeepWarm($, 'the chat was compacted and no message followed')
+    return
+  }
   const ttl = ttlMin()
   const margin = ttl >= 60 ? 8 * MIN : 90000
   if (now - S.lastActivity < ttl * MIN - margin) return
@@ -374,12 +1802,23 @@ async function keepWarmStep($) {
   const u = reply.usage
   S.pings += 1
   S.lastPingAt = now
-  S.pingUsd += requestCost(u, S.model, ttl)
+  const pingCost = requestCost(u, S.model, ttl)
+  S.pingUsd += pingCost
+  if (S.keepWarmAuto) {
+    S.autoPingUsd += pingCost
+    S.capId = S.id
+  }
   // A ping that writes instead of reading did not hit the cache: stop paying for it
   if ((u.cache_creation_input_tokens || 0) > 0.1 * Math.max(1, u.cache_read_input_tokens || 0)) {
     return stopKeepWarm($, `the ping wrote ${tokens(u.cache_creation_input_tokens)} tokens instead of reading the cache`)
   }
   S.lastActivity = now
+  await rememberLast($)
+  // Auto keep warm only pays while it costs less than the rewrite it protects: on a 5-minute cache the pings catch up fast
+  if (S.keepWarmAuto && S.autoPingUsd >= rewriteCost(S.ctx, S.model, ttl)) {
+    S.autoCappedStretch = true
+    return stopKeepWarm($, `its pings have cost as much as rewriting the cache (${money(S.autoPingUsd)})`)
+  }
 }
 
 function warnStep($) {
@@ -407,19 +1846,94 @@ function warnStep($) {
   }
 }
 
+// The rotator writes .claude.json and the seat file separately, at times we don't know. So for WAKE_WINDOW after a
+// wake-up, a field still unchanged (or an account that reads empty) is unknown and the ticks look again, each file on its own; once the window is over
+// the session keeps the seat and account it has. Outside a window a change is never taken: only a wake-up carries one.
+// A request that landed since the wake-up may have run on the old account: adopting then marks the cache cold.
+// The account is what switches the credential, and the seat label can be written before it, so an account adopted late re-marks
+// whatever the seat did, unless the wake-up already showed the seat change. A seat adopted after the account was already known
+// never re-marks: that request ran on the new account.
+async function refreshIdentity($) {
+  if (!wakeWindowEnd) return
+  if (now >= wakeWindowEnd) {
+    seatUnknown = false
+    accountUnknown = false
+    wakeWindowEnd = 0
+    wakePendingId = 0 // the window is over: a wake-up whose request never started no longer holds the resume
+    return
+  }
+  if (!seatUnknown && !accountUnknown) return
+  let adopted = false
+  let accountAdopted = false
+  try {
+    if (accountUnknown && (await readAccount($, true)) && S.account !== wakeAccount) {
+      // the readings were the old account's, as at a wake-up that already shows the new one
+      dropReadings()
+      accountUnknown = false
+      adopted = true
+      accountAdopted = true
+    }
+    if (seatUnknown && (await $.fs.exists(seatFile))) {
+      const seat = String(await $.fs.read(seatFile)).trim()
+      if (seat && seat !== wakeSeat) {
+        // the old account's readings, as readSeat drops them
+        dropReadings()
+        S.seat = seat
+        seatUnknown = false
+        adopted = true
+      }
+    }
+  } catch {
+    // unreadable now: the next tick looks again
+  }
+  if (adopted) {
+    if ((accountAdopted ? !seatMoved : !accountMoved) && S.lastActivity > rotationSeenAt) {
+      rotatedPending = true
+      S.seatChangedAt = now
+      rotationSeenAt = now
+    }
+    if (accountAdopted) accountMoved = true
+  }
+  // the seat and account are both known now: a due resume that waited for them goes at once, not at the window's end
+  if (resumeHeld && !keyUnsure()) {
+    resumeHeld = false
+    if (S.resumeAt) {
+      S.resumeAt = now
+      $.ui.invalidate('ui.render')
+    }
+  }
+}
+
 async function tick($) {
   now = await $.clock.now()
-  await readRecording($)
-  await applyRemoteCommands($)
-  await keepWarmStep($)
-  await heartbeat($, true)
-  await readFleet($)
-  warnStep($)
-  $.ui.invalidate('ui.render')
+  try {
+    await refreshIdentity($)
+    await resumeStep($)
+    await refreshPlan($)
+    try {
+      await loadSettings($) // /cache set in another session applies here too
+    } catch {
+      // a store lock held by another session: the settings stay as they were
+    }
+    await readRecording($)
+    try {
+      await applyRemoteCommands($)
+    } catch {
+      // a bad command record must not skip the keep-warm, heartbeat and fleet reads
+    }
+    await keepWarmStep($)
+    await heartbeat($, true)
+    await readFleet($)
+    warnStep($)
+  } finally {
+    // a store lock held by another session must not freeze the band's clocks
+    $.ui.invalidate('ui.render')
+  }
 }
 
 async function loadSettings($) {
-  const saved = await $.store.get('settings')
+  const saved = await bounded($, () => $.store.get('settings'), WRITE_LIMIT)
+  if (saved === TIMED_OUT) return // as a failed read: the settings stay as they were (the defaults, at the start)
   if (saved && typeof saved === 'object') Object.assign(settings, saved)
 }
 
@@ -430,12 +1944,16 @@ function statusText() {
   lines.push(`Cache Keeper: ${tokens(S.ctx)} tokens in context on ${priceFor(S.model).id}, cache window ${ttl} min (${settings.ttlMin ? 'set by you' : S.ttlSource}).`)
   if (st.kind === 'unknown') lines.push('No request yet this session, so the cache state is unknown.')
   if (st.kind === 'warm' || st.kind === 'cooling') lines.push(`Cache is warm for about ${minutes(st.left)} more.`)
-  if (st.kind === 'cold') lines.push(`Cache went cold ${minutes(-st.left)} ago. The next message rewrites it for about ${money(rewriteCost(S.ctx, S.model, ttl))}.`)
-  if (S.keepWarm) lines.push(`Keep warm is on until ${clock(S.keepWarmUntil)}: ${S.pings} ping(s), ${money(S.pingUsd)} so far.`)
+  if (st.kind === 'cold') lines.push(`Cache ${st.left === null ? 'is cold' : `went cold ${minutes(-st.left)} ago`}. The next message rewrites it for about ${money(rewriteCost(S.ctx, S.model, ttl))}.`)
+  if (rotatedCold()) lines.push(`The account rotated${rotatedAgo()} (now ${mask(S.seat || S.account)}), so the cache is cold.`)
+  if (S.keepWarm) lines.push(`Keep warm is on until ${clock(S.keepWarmUntil)}: ${S.pings} ping(s), ${money(S.pingUsd)} so far.${st.left === null ? ' It waits for the next message before it pings.' : ''}`)
   if (S.rateLimits.length) lines.push(`Plan limits used: ${limitsText(S.rateLimits)}.`)
-  lines.push(`Session cost so far: ${money(S.costUsd)}. Cold restarts this session: ${S.coldRestarts.length} (${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))}).`)
+  if (keyUnsure()) lines.push('Fable weekly: waiting for the rotator to name the new seat or account.')
+  else lines.push(S.fable ? `Fable weekly: ${Math.round(S.fable.percentUsed)}% used.` : `Fable weekly: no reading yet${planWhy && planWhy !== 'ok' ? ` (last check: ${planWhy})` : ''}.`)
+  lines.push(`Session cost so far: ${money(S.costUsd)}. Cold restarts in this chat: ${S.coldRestarts.length} (${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))}).`)
   lines.push(`Cold-send guard: ${settings.guard ? 'on' : 'off'} for contexts over ${tokens(settings.bigTokens)} tokens. Alerts: ${settings.alerts ? 'on' : 'off'}.`)
-  lines.push(`Settings: /${names.cache} ttl 5|60|auto, /${names.cache} guard on|off, /${names.cache} big 150k, /${names.cache} alerts on|off. Board: /${names.board}.`)
+  lines.push(`Auto keep warm: ${settings.autoWarmHours ? `on, until ${settings.autoWarmHours}h after the last turn (sooner once its pings cost as much as the rewrite), for contexts over ${tokens(settings.bigTokens)}${S.autoWarm ? '' : ' (off in this session)'}` : 'off'}.`)
+  lines.push(`Settings: /${names.cache} ttl 5|60|auto, /${names.cache} guard on|off, /${names.cache} big 150k, /${names.cache} alerts on|off, /${names.cache} autowarm 8|off. Board: /${names.board}.`)
   return lines.join('\n')
 }
 
@@ -445,42 +1963,190 @@ function parseTokens(text) {
   return Math.round(Number(m[1]) * (m[2] === 'm' ? 1e6 : m[2] === 'k' ? 1e3 : 1))
 }
 
-export function register(on) {
+export function register(on, options = {}) {
+  cfg.seatFileTerminal = String(options.seatFileTerminal || '')
+  cfg.seatFileDesktop = String(options.seatFileDesktop || '')
+  cfg.rotatorWake = pattern(options.rotatorWakePattern, 'i')
+  cfg.prPattern = pattern(options.prPattern)
+  cfg.autoResume = options.autoResume === true
   on('session.start', async ($, e, next) => {
+    // taken before the first await, with the chat: the ~20 reads below can outlast a /clear, a resume of another chat, a session.measure or a request, and each of those counts for a seed that has no queued one (a /clear or resume: what it reads is the old chat's)
+    const marked = seedMark()
+    const chat = marked.chat
     now = await $.clock.now()
     home = (await $.env.get('USERPROFILE')) || (await $.env.get('HOME')) || ''
-    S.id = await $.session.id()
+    // the id belongs to the chat current when it is asked for: a /clear or a resume that took its own id meanwhile keeps it (a later answer wins), and one that answers nothing leaves S.id and idChat as they were
+    const idFor = msgChat
+    const id = await $.session.id()
+    if (id && msgChat === idFor) {
+      S.id = id
+      idChat = idFor
+    }
+    // an earlier version's heartbeat for this chat is the seed's fallback, and this session.start's own heartbeat (below) replaces it: read right after the id, before the reads that let this process's own heartbeat (turn.start's) in
+    const priorHb = S.id ? { id: S.id, hb: null } : null // what was stored for this id before this process wrote its own (null: none, or not readable)
+    if (priorHb) {
+      try {
+        const hb = await bounded($, () => $.store.get('hb:' + priorHb.id), WRITE_LIMIT)
+        // a heartbeat of this process's own was written (beaten) before the read came back: what it returned may be that one, which is no earlier version's
+        if (hb !== TIMED_OUT && hb && typeof hb === 'object' && !beaten.has(priorHb.id)) priorHb.hb = hb
+      } catch {
+        // store unavailable: no fallback
+      }
+    }
     S.cwd = await $.session.cwd()
     S.label = basename(S.cwd)
     S.model = await $.session.model()
-    await loadSettings($)
+    try {
+      await loadSettings($)
+    } catch {
+      // a store lock held by another session: the defaults stand until the next tick
+    }
     await readRecording($)
-    names.cache = (await registerCommand($, 'cache', 'Cache Keeper status and settings', '[ttl 5|60|auto] [guard on|off] [big 150k] [alerts on|off]')) || names.cache
-    names.keepwarm = (await registerCommand($, 'keepwarm', 'Keep this session\'s prompt cache warm (default 4 hours), or /keepwarm off', '[hours|off]', true)) || names.keepwarm
+    let surface = null
+    try {
+      surface = e.surface || (await $.session.surface())
+    } catch {
+      surface = null
+    }
+    onTerminal = surface === 'terminal'
+    // the app starts a session with no surface yet (null), so only 'terminal' means the CLI's rotator
+    const seatPath = onTerminal ? cfg.seatFileTerminal : cfg.seatFileDesktop
+    seatFile = seatPath ? seatPath.replace(/^~(?=[\\/])/, home).replace(/\\/g, '/') : ''
+    await readSeat($)
+    await readAccount($)
+    identityRead = true
+    try {
+      // the plan windows the status line already holds: free, and there before the first send
+      const usage = await $.session.usage()
+      // not a request that started before an account change: its windows are the old account's
+      if (Array.isArray(usage.rateLimits) && usage.rateLimits.length && requestGen === identityGen) S.rateLimits = usage.rateLimits
+    } catch {
+      // none yet: the first measure fills them
+    }
+    try {
+      const first = (await $.session.messages()).find((m) => m.role === 'user' && findPr(promptText(m.text)))
+      if (first) adoptHistoryPr(chat, findPr(promptText(first.text)))
+    } catch {
+      // no transcript yet: the first prompt that names a PR sets it
+    }
+    names.cache = (await registerCommand($, 'cache', 'Cache Keeper status and settings', '[ttl 5|60|auto] [guard on|off] [big 150k] [alerts on|off] [autowarm 8|off]')) || names.cache
+    names.keepwarm = (await registerCommand($, 'keepwarm', 'Keep this session\'s prompt cache warm (default 4 hours), or /keepwarm off (also stops auto keep warm here)', '[hours|off]', true)) || names.keepwarm
     names.board = (await registerCommand($, 'board', 'Every local Claude Code session: state, context, cache, cost', '', true)) || names.board
     names.handoff = (await registerCommand($, 'handoff', 'Session handoff, then clear this chat and continue with it (/handoff continue)', '[continue]')) || names.handoff
     $.clock.every(HEARTBEAT_EVERY, () => tick($).catch(() => {}))
     await heartbeat($, true)
+    $.clock.after(0, () => readFleet($).catch(() => {}).then(() => refreshPlan($)).then(() => $.ui.invalidate('ui.render')).catch(() => {}))
+    // A startup or resume SessionStart that came first left its transcript for here, where the seat and account are known.
+    // The app reopens a chat without one that names the transcript: find it by id
+    // the chat and the request counts come from the queued seed, or from `marked` (taken before this handler's first await): the env read below can outlast a /clear, and a seed for the cleared chat's id must not land in it
+    const queued = pendingSeed
+    const seedFrom = queued || marked
+    pendingSeed = null
+    // not gated on S.ctx: a session.measure or turn.complete can set it without measuring the chat's request (measuredSteps), and the seed itself leaves to a request that did measure what that wrote, and keeps a size reported since over a stored record's (seedFromTranscript): both counted from the mark taken when this session.start began, or from the queued seed's
+    // a resume that landed while this waited replaced the chat and made its own seed (and its hold on the stored history): this one is the old chat's, and must not undo that hold
+    if (S.id && S.cwd && seedFrom.chat === msgChat) {
+      holdStoredCold(seedFrom.chat) // until the seed has merged the chat's stored cold history, a record written first keeps it
+      const config = ((await $.env.get('CLAUDE_CONFIG_DIR')) || `${home}/.claude`).replace(/\\/g, '/')
+      await seedFromTranscript($, queued ? queued.path : `${config}/projects/${S.cwd.replace(/[^a-zA-Z0-9]/g, '-')}/${S.id}.jsonl`, seedFrom, priorHb)
+    }
     return next(e)
   })
 
-  // /clear, /resume and /branch start from an unknown cache. The process goes
-  // on under a new session id, and no session.start fires for it.
+  // /clear starts from an unknown cache; /resume is seeded from its transcript; /branch shares its parent's cache.
+  // The process goes on under a new session id, and no session.start fires for it. (A resume in a fresh process, claude --resume or
+  // --continue, can arrive before session.start: its transcript waits in pendingSeed and is seeded there.)
   on('classic.SessionStart', { source: ['clear', 'resume', 'fork'] }, async ($, e, next) => {
-    S.lastActivity = 0
+    // the branch's first request reads the same cached prefix as its parent's: what the parent had stands
+    if (e.source !== 'fork') {
+      S.seatChangedAt = 0
+      rotatedPending = false
+      S.lastActivity = 0
+      S.compactedAt = 0
+      // the last chat's compaction says nothing about this one, and would mute its cold-send guard
+      justCompacted = false
+      abandoned = null // the last chat's compaction, if it ever ends, is not this one's
+      compactedCold = false
+      S.floor = 0
+      S.ctx = 0 // the last chat's size; a resumed chat's own is seeded below (a cleared one starts at 0)
+      // the last chat's idle stretch (its auto pings, its cap stop, its last turn) is reset below, once the new id is read: only a different chat starts clean
+      pendingSeed = null // a transcript still waiting for session.start belongs to the chat this one replaces
+      // the last chat's merge-pr PR says nothing about this one: its keep warm must not stop when that PR merges, and an auto keep warm that merge switched off starts on again. The new chat's own PR is read from its first prompt that names one (prompt.submit); a resumed chat's from its transcript (below). A fork is the same conversation and keeps both, and so does this mod's own clear and continue (keepPrOnClear), which carries the same work into the cleared chat
+      const keepPr = e.source === 'clear' && keepPrOnClear
+      keepPrOnClear = null // one SessionStart (a clear's) takes it
+      if (!keepPr) {
+        S.pr = 0
+        S.prLive = false
+        S.prCheckedAt = 0
+        if (S.autoWarmOffByPr) setAutoWarm(true)
+      }
+    }
     S.keepWarm = false
     H.armed = false
+    S.coldRestarts = [] // a resumed chat's own come back with its seed
+    // The box text and its put-back hold stay with a fork, which is the same conversation: the text put back before the branch is still in the box, to be sent. Not after a typed /branch (or anything submitted from the composer): that submit took the box text, and prompt.submit has already ended the tracking, and the hold too when it came from a fill
+    if (e.source !== 'fork') {
+      // a resume armed in the last chat must not fire into this one (a fork keeps its pending Resume, and one compacting)
+      S.resumeAt = 0
+      resumeFromReadings = false
+      resumeHeld = false
+      wakePendingId = 0
+      putBackPending = null // the box's text belongs to the chat this one replaces
+      boxText = null
+      sendPending.clear()
+      msgChat++
+      msgChatCause = e.source === 'clear' ? 'cleared' : 'replaced by a resumed chat'
+      resumeTries = 0
+      sendFailures = 0
+      compactDeclined = false
+      submitsSeen++ // the chat is replaced: an unattended send still compacting (our Resume, a wake-up) must not go into the new one
+    }
+    $.ui.invalidate('ui.render')
+    const chat = msgChat // this SessionStart's chat: a fork's is the one it carries on
+    const mark = seedMark() // a request that lands while the transcript is read measured this chat itself
     try {
-      S.id = (await $.session.id()) || S.id
+      // the chat's own id, or nothing: an empty answer keeps the old id and the old idChat (no record is written for the chat meanwhile, writeRecord), and one that came back after a later /clear or resume took its own id is not that chat's anymore
+      const id = await $.session.id()
+      // the msgChat check is defensive: SessionStarts run one at a time, so no later /clear or resume has bumped msgChat while this read was out
+      if (id && msgChat === chat) {
+        // The last chat's idle stretch says nothing about a different chat: its auto pings must not count toward this chat's cap, its cap stop must not block this chat's hand-over, and its last turn must not date this chat's auto window. The same id again (a resume of the chat the cap was counted under) is the same idle stretch: the cap stands. A fork is the same conversation and keeps all three
+        if (e.source !== 'fork' && id !== S.capId) {
+          S.autoPingUsd = 0
+          S.autoCappedStretch = false
+          S.lastTurnEnd = 0
+        }
+        S.capId = id // a fork's too: it is its own chat from here on, so a later resume of its id is the same idle stretch and keeps the cap
+        S.id = id
+        idChat = chat
+      }
     } catch {
       // keep the old id
     }
+    // An id that could not be read says nothing of whether this is another chat: the cap stands (the same chat's spent pings must not be forgiven), but the last turn is dated for the chat it replaces and must not date this one's auto window (a hand-over from it would run under the old chat's hours)
+    if (e.source !== 'fork' && msgChat === chat && idChat !== chat) S.lastTurnEnd = 0
     S.label = basename(S.cwd)
+    // a fork keeps its parent's cache, so only a resume seeds; before session.start has read the seat and account it waits for there
+    if (e.source === 'resume' && msgChat === chat) {
+      // a /clear or another resume while the transcript is read makes it the old chat's: nothing of it is written (seedFromTranscript checks, and so does the PR)
+      holdStoredCold(chat)
+      if (identityRead) await seedFromTranscript($, e.transcript_path, mark)
+      else pendingSeed = { path: e.transcript_path, ...mark }
+      // either order with session.start ends with the resumed chat's PR: read here from its transcript, not left for its next prompt
+      adoptHistoryPr(chat, await resumedPr($, e.transcript_path))
+    }
+    return next(e)
+  })
+
+  // A session opened with its history (the app reopening an old chat). claude --continue may arrive here or as a resume above
+  on('classic.SessionStart', { source: ['startup'] }, async ($, e, next) => {
+    // before session.start has read the seat and account, the record cannot be compared: seed there
+    holdStoredCold(msgChat)
+    if (identityRead) await seedFromTranscript($, e.transcript_path)
+    else pendingSeed = { path: e.transcript_path, ...seedMark() }
     return next(e)
   })
 
   on('session.end', async ($, e, next) => {
-    if (S.id) await $.store.delete('hb:' + S.id)
+    if (S.id) await bounded($, () => $.store.delete('hb:' + S.id), WRITE_LIMIT) // a store that never answers does not hold the session's end
     return next(e)
   })
 
@@ -496,38 +2162,109 @@ export function register(on) {
       H.path = ''
       $.ui.invalidate('ui.render')
     }
+    if (!S.pr) {
+      S.pr = findPr(e.command ? `/${e.command.name} ${e.command.args}` : e.text)
+      S.prLive = !!S.pr
+    }
+    const fromUser = e.origin && (e.origin.kind === 'composer' || e.origin.kind === 'bridge')
+    // Whatever the person submits from the composer (a command or a plain message, whatever becomes of it: a dialog's Cancel or a lower hook may drop it) takes the box text: what a put-back left there is gone. The Resume hold ends with it only when the put-back was filled into the box (a due Resume no longer waits for a message that is not there); a message that was only quoted in a toast was never in the box, so typing does not send it and does not end its hold. This mod's own put-back of a command is a plugin-origin submit, not this, and neither is another plugin's. A fork that did not come from such a submit keeps both. A fill still unsure (see placeBack) that lands after this submit starts the hold again when a read of the box shows its text, or when there is no read or it fails (not when a read that succeeds does not show it)
+    if (e.origin && e.origin.kind === 'composer') composerTakesBox()
+    const wake = fromUser && !!cfg.rotatorWake && cfg.rotatorWake.test(String(e.text || ''))
+    let wakeId = 0 // this wake-up's id, to lower only its own hold
+    if (wake) {
+      // The wake-up is the rotation reaching this session: take the new seat now; a late rewrite is taken within WAKE_WINDOW
+      wakeCount++
+      wakePendingId = wakeId = wakeCount // before anything is re-read: a re-read must not re-arm a pending resume, nor may one fire; the wake-up's own request settles it
+      wakeSeat = S.seat
+      wakeAccount = S.account
+      wakeWindowEnd = now + WAKE_WINDOW
+      await readSeat($, true)
+      rotationSeenAt = now
+      // the seat file may be absent or unchanged: the account is what moved
+      await readAccount($, true)
+      // a field still as it was, or an account that read empty, is unknown: the rotator may not have written it yet, the ticks look again for the window
+      seatUnknown = !!seatFile && S.seat === wakeSeat
+      accountUnknown = !S.account || S.account === wakeAccount
+      seatMoved = !!seatFile && S.seat !== wakeSeat
+      accountMoved = !accountUnknown
+      if (accountMoved) dropReadings(false) // the account is known to have moved: the readings are the old account's, as on a seat change; the wake-up is itself the resume (wakePendingId), so a pending one is not re-armed
+      S.seatChangedAt = now // a second wake-up of an already rotated chat dates it anew
+      rotatedPending = true
+    }
     const ttl = ttlMin()
     const left = msLeft(S.lastActivity, ttl)
-    const isCold = left !== null && left <= 0
-    const fromUser = e.origin && (e.origin.kind === 'composer' || e.origin.kind === 'bridge')
-    if (!settings.guard || !fromUser || !isCold || S.ctx < settings.bigTokens || e.turnId) return next(e)
-    const cost = money(rewriteCost(S.ctx, S.model, ttl))
-    let answer = 'Send anyway'
-    try {
-      answer = await $.ui.ask(
-        `Cache went cold ${minutes(-left)} ago. Sending now rewrites ${tokens(S.ctx)} tokens of context (about ${cost}). What should happen?`,
-        ['Send anyway', 'Compact first, then send', 'Cancel'],
-      )
-    } catch {
-      // nobody to ask (a -p run, or the dialog was dismissed): send as typed
-      return next(e)
-    }
-    if (answer === 'Compact first, then send') {
+    const rotated = rotatedCold()
+    const isCold = rotated || (left !== null && left <= 0)
+    // These run locally or start afresh: a cold cache costs them nothing
+    const local = e.command && ['compact', 'clear', names.cache, names.keepwarm, names.board, names.handoff].includes(e.command.name)
+    // a message handed on and not dropped by a later hook reaches the chat: the unattended sends see it. Not a local command (isLocalBuiltin), nor this mod's own Resume or send. Whether it settles a pending resume is up to its request (turn.step)
+    const counts = !local && !isLocalBuiltin(e.command) && !(e.origin && e.origin.kind === 'plugin' && e.origin.name === $.plugin.name)
+    const mine = counts || fromUser // a send handed on that is not this mod's own, or any command of the person's: a due resume waits while it is handed on, whether or not the guard asked
+    const through = async () => {
+      if (mine) sendsHeld++
+      const pendingId = counts ? ++sendPendingId : 0 // handed on and not this mod's own: its request may start well after next() returns
+      if (pendingId) sendPending.set(pendingId, now + SEND_SAFETY)
+      let handed = false
       try {
-        await $.session.compact()
-      } catch {
-        // compaction refused or failed: send anyway
+        const r = await next(e)
+        if (counts && !(r && r.drop)) {
+          submitsSeen++
+          realSends++
+          handed = true
+        } else if (wake && r && r.drop) lowerWake(wakeId) // dropped further down: no request of the wake-up's is on its way
+        return r
+      } finally {
+        if (mine) sendsHeld--
+        if (handed) {
+          const t = await $.clock.now() // read first: a request starting during the read clears sendPending, and must not be followed by a set
+          if (sendPending.has(pendingId)) sendPending.set(pendingId, t + SEND_SAFETY) // the safety runs from the hand-over
+        } else sendPending.delete(pendingId) // dropped or failed: no request follows
       }
-      return next(e)
     }
-    if (answer === 'Send anyway') return next(e)
-    $.ui.toast('Not sent. A fresh session with a short handoff avoids the rewrite entirely.', { timeoutMs: 8000 })
-    return { drop: 'Cancelled by cache-keeper before a cold cache rewrite' }
+    if (!settings.guard || !fromUser || !isCold || local || guardSkips(e.command) || justCompacted || S.ctx < settings.bigTokens || e.turnId) return through()
+    // an attachment's handle lives only while this submit is in flight: a resend after compacting would drop it
+    const media = Array.isArray(e.attachments) && e.attachments.length > 0
+    if (wake) {
+      if (!worthCompacting() || media) return through()
+      submitsSeen++ // the wake-up is a message of the chat's own: an unattended send still compacting (the Resume) must not go next to it
+      return compactThenSend($, e, true, wakeId)
+    }
+    const cost = money(rewriteCost(S.ctx, S.model, ttl))
+    const stillOut = compactOut() // an earlier compaction is out: a second one would not start
+    const why = rotated ? `The account rotated to ${mask(S.seat || S.account) || 'another seat'}${rotatedAgo()}, so the cache is cold.` : `Cache went cold ${minutes(-left)} ago.`
+    const floor = S.floor ? ` Compacting last left ${tokens(S.floor)}.` : ''
+    sendsHeld++ // the dialog is open: a due resume waits, until the send is handed on or given up
+    dialogsOpen++ // an unattended send that has compacted waits for the answer
+    try {
+      let answer = 'Send anyway'
+      try {
+        answer = await $.ui.ask(
+          `${why} Sending now rewrites ${tokens(S.ctx)} tokens of context (about ${cost}).${floor}${media ? ' (Compacting first would drop the attachment: run /compact yourself, then send again.)' : ''}${stillOut ? ' An earlier compaction is still running, so compacting first is not offered.' : ''} What should happen?`,
+          media || stillOut ? ['Send anyway', 'Cancel'] : ['Send anyway', 'Compact first, then send', 'Cancel'],
+        )
+      } catch {
+        // nobody to ask (a -p run, or the dialog was dismissed): send as typed
+        return await through()
+      }
+      // $.session.compact() is refused on SDK hosts (the desktop app), so this queues /compact. It takes its own hold, until it has sent or given up
+      if (answer === 'Compact first, then send') {
+        if (!isLocalBuiltin(e.command)) submitsSeen++ // the person's own message goes next: an unattended send still compacting (the Resume) must not go beside it. Not a /btw question, which never reaches the chat
+        return compactThenSend($, e, false)
+      }
+      if (answer === 'Send anyway') return await through()
+      dialogCancels++
+      $.ui.toast('Not sent. A fresh session with a short handoff avoids the rewrite entirely.', { timeoutMs: 8000 })
+      return { drop: 'Cancelled by cache-keeper before a cold cache rewrite' }
+    } finally {
+      sendsHeld--
+      if (--dialogsOpen === 0) for (const resolve of dialogsClosed.splice(0)) resolve() // lowered after a Send anyway has been handed on (through counted it)
+    }
   })
 
   on('turn.start', async ($, e, next) => {
     now = await $.clock.now()
     S.working = true
+    sendPending.clear() // the request the sends handed on started
     if (e.turnId) S.turnId = e.turnId
     await heartbeat($, true)
     return next(e)
@@ -535,7 +2272,26 @@ export function register(on) {
 
   // Each main-loop request: did it read the cache, or rewrite it?
   on('turn.step', async function* ($, e, next) {
+    if (!e.agentId) {
+      requestGen = identityGen
+      // a main-loop request started: what was sent reached the chat, so a pending resume is settled (our own "Resume" zeroes it before it sends), and a wake-up's own request has arrived. Nothing else settles it: a prompt passing through, even the guard's Send anyway, may still be dropped or fail to start
+      wakePendingId = 0
+      sendPending.clear()
+      stepsSeen++
+      compactDeclined = false
+      resumeHeld = false
+      resumeFromReadings = false // settled: a later account change must not bring it back
+      sendFailures = 0
+      if (S.resumeAt) {
+        S.resumeAt = 0
+        $.ui.invalidate('ui.render')
+      }
+    }
     const startedAt = await $.clock.now()
+    if (!e.agentId) {
+      S.model = e.model || S.model
+      S.effort = e.effort === undefined ? '' : String(e.effort)
+    }
     const result = yield* next(e)
     if (e.agentId || !result || !result.usage) return result
     now = await $.clock.now()
@@ -546,11 +2302,23 @@ export function register(on) {
     S.model = u.model || S.model
     const afterCompact = justCompacted
     justCompacted = false
+    // The API names the TTL each write used: that beats any guess from idle gaps
+    const split = u.cache_creation
+    if (split && !settings.ttlMin) {
+      if ((split.ephemeral_1h_input_tokens || 0) > 0) S.ttlMin = 60
+      else if ((split.ephemeral_5m_input_tokens || 0) > 0) S.ttlMin = 5
+      if (written > 0) S.ttlSource = 'reported by the API'
+    }
     if (afterCompact) {
-      // the first request after a compaction writes the new, shorter context: expected
+      // the first request after a compaction writes the new, shorter context: expected,
+      // but on a cache that had gone cold it is the cold rewrite, only smaller
+      S.floor = total
+      if (compactedCold && written > 30000) S.coldRestarts.push({ at: now, tokens: written, usd: rewriteCost(written, S.model, ttlMin()), gapMin: 0 })
+      compactedCold = false
     } else if (S.lastActivity && total > 30000 && written / total > 0.5) {
-      // A rewrite after 5-60 idle minutes means this session runs on the 5-minute TTL
-      if (!settings.ttlMin && gap > 5.5 * MIN && gap < S.ttlMin * MIN) {
+      // Without the API's word: a rewrite after 5-60 idle minutes suggests the 5-minute TTL,
+      // unless a rotation emptied the cache (a compaction already cleared lastActivity)
+      if (!settings.ttlMin && !split && !rotatedCold() && gap > 5.5 * MIN && gap < S.ttlMin * MIN) {
         S.ttlMin = 5
         S.ttlSource = 'measured'
       }
@@ -564,6 +2332,12 @@ export function register(on) {
     }
     S.ctx = total
     S.lastActivity = now
+    S.compactedAt = 0 // the request a compaction waited for has landed
+    measuredSteps++ // the chat measured itself: a seed still reading its transcript leaves these to it
+    S.autoPingUsd = 0 // a real request ends the idle stretch the pings were protecting
+    S.autoCappedStretch = false
+    rotatedPending = false
+    await rememberLast($)
     return result
   })
 
@@ -575,32 +2349,76 @@ export function register(on) {
     S.waitingSince = 0
     S.tool = ''
     S.lastTurnEnd = now
+    S.capId = S.id
+    if (e.reason === 'answer') resumeTries = 0 // usage is back: a later cap starts its fallback tries afresh
     try {
       const usage = await $.session.usage()
-      if (usage.context && usage.context.tokens) S.ctx = usage.context.tokens
+      if (usage.context && usage.context.tokens) {
+        S.ctx = usage.context.tokens
+        sizeUpdates++
+      }
       if (usage.context && usage.context.window) S.window = usage.context.window
       if (usage.cost) S.costUsd = usage.cost.usd
-      if (Array.isArray(usage.rateLimits) && usage.rateLimits.length) S.rateLimits = usage.rateLimits
+      // not a request that started before an account change: its windows are the old account's
+      if (Array.isArray(usage.rateLimits) && usage.rateLimits.length && requestGen === identityGen) S.rateLimits = usage.rateLimits
     } catch {
       // usage unavailable: keep the per-request figures
     }
     if (H.armed && e.turnId !== H.notTurn) await captureHandoff($, e)
+    // Auto keep warm: a big chat stays warm until autoWarmHours after its last turn, or sooner once its pings cost as much as the rewrite. Whether it may start is autoMayRun's one decision (a turn that ends with no request of its own, such as an aborted one, does not start it after that stop, nor on a cache that has gone cold)
+    if (!S.keepWarm) {
+      if (autoMayRun(now)) startKeepWarm($, settings.autoWarmHours, true)
+    } else if (S.keepWarmAuto && !autoStopReason()) {
+      // only the auto one is extended: one started by hand (/keepwarm N, the band's button, the board's) keeps its own end; at that end auto keep warm takes it over (see keepWarmStep), and its cap applies from then
+      S.keepWarmUntil = Math.max(S.keepWarmUntil, now + settings.autoWarmHours * 60 * MIN)
+    }
     await heartbeat($, true)
     $.ui.invalidate('ui.render')
     return r
   })
 
+  // A compaction arrives by several roads (typed /compact, auto-compact, a plugin,
+  // the desktop host running it inside a turn); each one marks it
+  // While one of this mod's /compact runs from a replaced chat is still out, the marks are ignored: they may be its late end, not this chat's compaction (the person's own /compact then goes unmarked until it ends).
+  // While a run older than the abandoned one is out (or just ended) and started under 30 minutes ago (2 COMPACT_LIMITs: a hung one stops counting), a mark does not forget the abandonment, as it may be that run's end; the chat is still marked compacted
   on('session.compact', async ($, e, next) => {
+    now = await $.clock.now()
     const r = await next(e)
-    justCompacted = true
+    if (!e.agentId && !staleRunOut()) markCompacted($)
+    return r
+  })
+  on('classic.PostCompact', async ($, e, next) => {
+    if (!staleRunOut()) markCompacted($)
+    return next(e)
+  })
+  on('classic.SessionStart', { source: ['compact'] }, async ($, e, next) => {
+    if (!staleRunOut()) markCompacted($)
+    return next(e)
+  })
+  on('command.run', { command: ['compact'] }, async ($, e, next) => {
+    const r = await next(e)
+    if (!staleRunOut()) markCompacted($)
     return r
   })
 
+  // A main-loop turn the API cut short: arm a resume if what ran out was the plan's usage
+  on('classic.StopFailure', async ($, e, next) => {
+    // a usage cap may be classified rate_limit or unknown; armResume checks it really is usage
+    if (cfg.autoResume && !e.agent_id && (e.error === 'rate_limit' || e.error === 'unknown')) {
+      now = await $.clock.now()
+      armResume($, e.error_details)
+    }
+    return next(e)
+  })
+
   on('session.measure', async ($, e, next) => {
-    if (e.context && e.context.tokens) S.ctx = e.context.tokens
+    if (e.context && e.context.tokens) {
+      S.ctx = e.context.tokens
+      sizeUpdates++
+    }
     if (e.context && e.context.window) S.window = e.context.window
     if (e.cost) S.costUsd = e.cost.usd
-    if (Array.isArray(e.rateLimits) && e.rateLimits.length) S.rateLimits = e.rateLimits
+    if (Array.isArray(e.rateLimits) && e.rateLimits.length && requestGen === identityGen) S.rateLimits = e.rateLimits // as in turn.complete
     return next(e)
   })
 
@@ -664,6 +2482,8 @@ export function register(on) {
       settings.ttlMin = value === '5' ? 5 : value === '60' ? 60 : 0
     } else if (key === 'guard' || key === 'alerts') {
       settings[key] = value !== 'off'
+    } else if (key === 'autowarm') {
+      settings.autoWarmHours = value === 'off' || value === '0' ? 0 : Number(value) > 0 ? Math.min(24, Number(value)) : 8
     } else if (key === 'big') {
       const n = parseTokens(value)
       if (n) settings.bigTokens = n
@@ -679,8 +2499,10 @@ export function register(on) {
     now = await $.clock.now()
     const arg = String(e.args || '').trim().toLowerCase()
     if (arg === 'off' || (arg === '' && S.keepWarm)) {
+      setAutoWarm(false)
       stopKeepWarm($, 'turned off')
     } else {
+      setAutoWarm(true)
       const hours = Number(arg) > 0 ? Math.min(24, Number(arg)) : settings.keepWarmHours
       startKeepWarm($, hours)
     }
@@ -708,42 +2530,37 @@ export function register(on) {
   // The band above the prompt: this session's cache at a glance
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const below = await next(e)
+    // Drawn whenever there's no survey: an unknown cache (a new chat, or just after
+    // /clear or a compaction) still has a model, an effort and plan limits
     if (e.props && e.props.hasSurvey) return below
-    if (!S.lastActivity && !S.keepWarm) return below
     const { Box, Text, Button } = $.ui.resolve(e)
-    const hb = myHeartbeat()
-    const st = cacheState(hb)
-    const ttl = ttlMin()
+    // Powerline look: each segment ends in an arrow in its own colour, on the next one's.
+    // ▶, not the Powerline glyph U+E0B0, which neither the app's font nor the terminal's has
+    const segs = bandSegments()
+    const parts = segs.map(([text, bg, fg], i) => Box({ flexDirection: 'row', flexShrink: 0, children: [
+      Text({ backgroundColor: bg, color: fg, children: [` ${text} `] }),
+      // the last segment ends square
+      ...(segs[i + 1] ? [Text({ color: bg, backgroundColor: segs[i + 1][1], children: ['▶'] })] : []),
+    ] }))
+    const left = Box({ flexDirection: 'row', flexWrap: 'wrap', flexShrink: 1, children: parts })
+    // the buttons stay together on one row, however the segments wrap
+    const actions = []
+    const st = cacheState(myHeartbeat())
     const big = S.ctx >= settings.bigTokens
-    const parts = []
-    if (st.kind === 'kept') parts.push(Text({ color: 'cyan', children: [`◆ kept warm · ${S.pings} ping${S.pings === 1 ? '' : 's'} ${money(S.pingUsd)} · until ${clock(S.keepWarmUntil)}`] }))
-    else if (st.kind === 'warm') parts.push(Text({ color: 'green', children: [`● cache warm ${minutes(st.left)}`] }))
-    else if (st.kind === 'cooling') parts.push(Text({ color: 'yellow', bold: true, children: [`◐ cache cools in ${minutes(st.left)}`] }))
-    else if (st.kind === 'cold') parts.push(Text(big ? { color: 'red', bold: true, children: [`○ cache cold ${minutes(-st.left)}`] } : { dimColor: true, children: [`○ cache cold ${minutes(-st.left)}`] }))
-    parts.push(Text({ dimColor: true, children: [` │ ctx ${tokens(S.ctx)}`] }))
-    if (st.kind === 'cold' && big) parts.push(Text({ color: 'red', children: [` │ next send rewrites it ≈ ${money(rewriteCost(S.ctx, S.model, ttl))}`] }))
-    else parts.push(Text({ dimColor: true, children: [` │ rewrite ≈ ${money(rewriteCost(S.ctx, S.model, ttl))}`] }))
-    if (S.rateLimits.length) parts.push(Text(limitTone(S.rateLimits, { children: [' │ ' + limitsText(S.rateLimits)] })))
-    parts.push(Text({ dimColor: true, children: [` │ session ${money(S.costUsd)}`] }))
-    if (S.coldRestarts.length) parts.push(Text({ dimColor: true, children: [` │ ${S.coldRestarts.length} cold restart${S.coldRestarts.length === 1 ? '' : 's'} ${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))}`] }))
-    const row = [Box({ flexDirection: 'row', children: parts })]
     if (st.kind === 'cooling' && big) {
-      row.push(Button({ key: 'keepwarm', label: 'keep warm', hotkey: '1', plain: true, onPress: async () => { now = await $.clock.now(); startKeepWarm($, settings.keepWarmHours); await heartbeat($, true); $.ui.invalidate('ui.render') } }))
+      actions.push(Button({ key: 'keepwarm', label: 'K.W.', hotkey: '1', plain: true, onPress: async () => { now = await $.clock.now(); setAutoWarm(true); startKeepWarm($, settings.keepWarmHours); await heartbeat($, true); $.ui.invalidate('ui.render') } }))
     } else if (st.kind === 'kept') {
-      row.push(Button({ key: 'keepwarm', label: 'stop warm', hotkey: '1', plain: true, onPress: async () => { now = await $.clock.now(); stopKeepWarm($, 'turned off'); await heartbeat($, true); $.ui.invalidate('ui.render') } }))
+      actions.push(Button({ key: 'keepwarm', label: 'Stop K.W.', hotkey: '1', plain: true, onPress: async () => { now = await $.clock.now(); setAutoWarm(false); stopKeepWarm($, 'turned off'); await heartbeat($, true); $.ui.invalidate('ui.render') } }))
     }
-    const left = Box({ flexDirection: 'row', columnGap: 2, children: row })
     // Right edge: one click runs /session-handoff (h while the band has the focus;
     // a letter never fires from the prompt box, unlike a digit). Once a handoff
     // is in, c clears this chat and sends it as the fresh chat's first prompt.
     const busy = handoffPending || H.armed
-    const handoff = Button({ key: 'handoff', label: handoffPending ? 'handoff queued' : H.armed ? 'handoff running' : 'handoff', hotkey: 'h', plain: true, dimColor: busy, onPress: () => runHandoff($) })
-    let right = handoff
-    if (H.text || H.continuing) {
-      const go = Button({ key: 'continue', label: H.continuing ? 'clearing' : 'clear and continue', hotkey: 'c', plain: true, onPress: () => clearAndContinue($) })
-      right = Box({ flexDirection: 'row', columnGap: 2, children: [go, handoff] })
-    }
-    const mine = Box({ flexDirection: 'row', justifyContent: 'space-between', width: '100%', columnGap: 2, children: [left, right] })
+    const handoff = Button({ key: 'handoff', label: handoffPending ? 'Handoff queued' : H.armed ? 'Handoff running' : 'Handoff', hotkey: 'h', plain: true, dimColor: busy, onPress: () => runHandoff($) })
+    if (H.text || H.continuing) actions.push(Button({ key: 'continue', label: H.continuing ? 'Clearing' : 'Clear and continue', hotkey: 'c', plain: true, onPress: () => clearAndContinue($) }))
+    actions.push(handoff)
+    const right = Box({ flexDirection: 'row', flexShrink: 0, columnGap: 2, children: actions })
+    const mine = Box({ flexDirection: 'row', flexWrap: 'wrap', justifyContent: 'space-between', width: '100%', columnGap: 2, children: [left, right] })
     return Box({ flexDirection: 'column', children: below ? [mine, below] : [mine] })
   })
 
@@ -762,11 +2579,105 @@ export function register(on) {
   })
 }
 
+// The band's segments, ccstatusline style: each names a hue, and paint() picks that hue's
+// dark or light shade by position, alternating, so neighbours always contrast
+const LIGHT = '#ffffff'
+const DARK = '#1e1e1e'
+export const HUES = {
+  red: ['#a51d2d', '#ffa3a3'],
+  yellow: ['#6b4b00', '#f6d32d'],
+  blue: ['#1a4f99', '#99c1f1'],
+  green: ['#1d5c3d', '#8ff0a4'],
+  cyan: ['#0a5960', '#7fe0e0'],
+  gray: ['#4a4950', '#c0bfbc'],
+  purple: ['#5a3d8a', '#c9a8f0'],
+  pink: ['#74305f', '#f0a8dc'],
+  salmon: ['#7f302a', '#f5a99f'],
+  orange: ['#8a3700', '#ffbe6f'],
+  teal: ['#175858', '#88d8c8'],
+}
+const WARN = 'orange'
+const HOT = 'red'
+
+// Every segment's first word capitalised, past a leading symbol (● cache → ● Cache); "5h" stays
+export function capFirst(text) {
+  if (/^\S+@\S+$/.test(text)) return text // an email stays as written
+  return String(text).replace(/^([^\p{L}\p{N}]*)(\p{Ll})/u, (_, lead, letter) => lead + letter.toUpperCase())
+}
+
+// [text, hue] -> [text, background, foreground], dark and light shades in turn
+export function paint(segs) {
+  return segs.map(([text, hue], i) => {
+    const dark = i % 2 === 0
+    return [capFirst(text), (HUES[hue] || HUES.gray)[dark ? 0 : 1], dark ? LIGHT : DARK]
+  })
+}
+
+export function modelName(id) {
+  const m = String(id || '').toLowerCase().match(/(opus|sonnet|haiku|fable)-(\d+)(?:-(\d{1,2})(?!\d))?/)
+  if (!m) return String(id || '') || 'model ?'
+  return m[1][0].toUpperCase() + m[1].slice(1) + ' ' + m[2] + (m[3] ? '.' + m[3] : '')
+}
+
+// 42m, 3h30m, 7d9h: days once past a day
+export function ago(ms) {
+  const h = Math.floor(ms / (60 * MIN))
+  return h >= 24 ? Math.floor(h / 24) + 'd' + (h % 24) + 'h' : minutes(ms)
+}
+
+// "3h30m", "6d14h"; '' when the time is unknown or past
+export function untilText(iso, at) {
+  const ms = Date.parse(iso || '') - at
+  return ms > 0 ? ago(ms) : ''
+}
+
+function limitSegment(label, limit, hue, showReset = true) {
+  const pct = limit.percentUsed || 0
+  const left = showReset ? untilText(limit.resetsAt, now) : ''
+  return [`${label} ${Math.round(pct)}%${left ? ' · ' + left : ''}`, pct >= 95 ? HOT : pct >= 80 ? WARN : hue]
+}
+
+function bandSegments() {
+  const st = cacheState(myHeartbeat())
+  const ttl = ttlMin()
+  const big = S.ctx >= settings.bigTokens
+  const out = []
+  // the app's composer already shows the model and effort
+  if (onTerminal) out.push([modelName(S.model), 'red'])
+  if (onTerminal && S.effort) out.push([S.effort, 'yellow'])
+  const rewrite = money(rewriteCost(S.ctx, S.model, ttl))
+  out.push([`Ctx ${tokens(S.ctx)} · ${st.kind === 'cold' && big ? 'Next send rewrites ≈ ' : 'Rewrite ≈ '}${rewrite}`, st.kind === 'cold' && big ? HOT : 'blue'])
+  if (st.kind === 'kept') out.push([`◆ K.W. until ${clock(S.keepWarmUntil)} · ${S.pings} ping${S.pings === 1 ? '' : 's'} ${money(S.pingUsd)}${st.left === null ? ' · waits for next message' : ''}`, 'cyan'])
+  else if (st.kind === 'warm') out.push([`● cache warm ${minutes(st.left)}`, 'green'])
+  else if (st.kind === 'cooling') out.push([`◐ cache cools in ${minutes(st.left)}`, WARN])
+  else if (st.kind === 'cold') out.push([`○ cache cold${st.left === null ? '' : ' ' + ago(-st.left)}`, big ? HOT : 'gray'])
+  else out.push(['cache –', 'gray'])
+  // what this chat has already paid to rewrite cold caches, beside the next send's estimate
+  if (S.coldRestarts.length) out.push([`Chat cold rewrites ${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))} (${S.coldRestarts.length})`, 'gray'])
+  // the engine's own reading once a request has run; before that another session's on the same account, then the shared usage reading
+  let limits = stillOpen(S.rateLimits, now) // a window that reset since is stale
+  if (!limits.length && signedIn !== false && !keyUnsure()) limits = borrowedLimits(fleet, { seat: S.seat, account: S.account, desktop: !onTerminal }, now) // not while the seat or account is unknown: the key may name the old one
+  if (!limits.length && !keyUnsure()) limits = S.planWindows // the shared reading waits for it too: it may be the old account's
+  const five = limits.find((l) => l.kind === 'five_hour')
+  const week = limits.find((l) => l.kind === 'seven_day')
+  if (five) out.push(limitSegment('5h', five, 'purple'))
+  if (week) out.push(limitSegment('Week', week, 'green'))
+  // its reset is the weekly one's, already shown; the reading waits for the seat and account like the windows
+  if (S.fable && !keyUnsure()) out.push(limitSegment('Fable', S.fable, 'pink', false))
+  for (const l of S.rateLimits) if (l.kind !== 'five_hour' && l.kind !== 'seven_day') out.push(limitSegment(LIMIT_LABEL[l.kind] || l.kind, l, 'gray'))
+  out.push([`session ${money(S.costUsd)}`, 'salmon'])
+  if (S.resumeAt) out.push([S.resumeAt <= now && putBackHeld() ? '⏸ Resume waits for your message' : `⏸ resumes ${resumeText(S.resumeAt, now)}`, WARN])
+  // who the terminal session runs as: a configured seat's label, else the signed-in account
+  const who = S.seat ? `seat ${mask(S.seat)}` : S.account ? mask(S.account) : ''
+  if (onTerminal && who) out.push([who, 'teal'])
+  return paint(out)
+}
+
 function footerLabel() {
   const parts = []
   const st = cacheState(myHeartbeat())
   const big = S.ctx >= settings.bigTokens
-  if (st.kind === 'kept') parts.push('cache kept warm')
+  if (st.kind === 'kept') parts.push(st.left === null ? 'keep warm waits for next message' : 'cache kept warm')
   else if (st.kind === 'cooling' && big) parts.push(`cache cools in ${minutes(st.left)} · /keepwarm`)
   else if (st.kind === 'cold' && big) parts.push(`cache cold · rewrite ≈ ${money(rewriteCost(S.ctx, S.model, ttlMin()))}`)
   const high = S.rateLimits.filter((l) => (l.percentUsed || 0) >= 80)
@@ -791,7 +2702,7 @@ function cacheCell(hb) {
   if (st.kind === 'kept') return ['kept warm', 'cyan']
   if (st.kind === 'warm') return ['warm ' + minutes(st.left), 'green']
   if (st.kind === 'cooling') return ['cools in ' + minutes(st.left), 'yellow']
-  if (st.kind === 'cold') return ['cold ' + minutes(-st.left), (hb.ctx || 0) >= settings.bigTokens ? 'red' : 'gray']
+  if (st.kind === 'cold') return [st.left === null ? 'cold' : 'cold ' + minutes(-st.left), (hb.ctx || 0) >= settings.bigTokens ? 'red' : 'gray']
   return ['–', 'gray']
 }
 
@@ -847,6 +2758,7 @@ function drawBoard($, e) {
           onPress: async () => {
             now = await $.clock.now()
             if (hb.self) {
+              setAutoWarm(!S.keepWarm)
               if (S.keepWarm) stopKeepWarm($, 'turned off')
               else startKeepWarm($, settings.keepWarmHours)
               await heartbeat($, true)
@@ -864,7 +2776,7 @@ function drawBoard($, e) {
     const detail = []
     if (hb.state === 'waiting' && hb.waitingFor) detail.push(`needs you: ${hb.waitingFor}`)
     else if (hb.state === 'working' && hb.tool) detail.push(`running ${hb.tool}`)
-    if (hb.coldCount) detail.push(`${hb.coldCount} cold restart${hb.coldCount === 1 ? '' : 's'} ${money(hb.coldUsd)}`)
+    if (hb.coldCount) detail.push(`${hb.coldCount} cold restart${hb.coldCount === 1 ? '' : 's'} in this chat ${money(hb.coldUsd)}`)
     if (hb.keepWarm) detail.push(`warm until ${clock(hb.keepWarmUntil)}, ${hb.pings} ping(s) ${money(hb.pingUsd)}`)
     if (detail.length === 0) return line
     return Box({ flexDirection: 'column', children: [line, Text({ dimColor: true, children: ['            └ ' + detail.join(' · ')] })] })
@@ -874,7 +2786,7 @@ function drawBoard($, e) {
   const waiting = list.filter((hb) => hb.state === 'waiting').length
   const footer = Text({
     dimColor: true,
-    children: [`${list.length} session${list.length === 1 ? '' : 's'} · ${money(totalCost)} total · ${waiting} waiting on you · cold restarts ${money(totalCold)} · keep warm reads the cache before it expires · Esc closes`],
+    children: [`${list.length} session${list.length === 1 ? '' : 's'} · ${money(totalCost)} total · ${waiting} waiting on you · cold restarts in these chats ${money(totalCold)} · keep warm reads the cache before it expires · Esc closes`],
   })
   return Box({ flexDirection: 'column', children: [header, ...rows, Text({ children: [' '] }), footer] })
 }
