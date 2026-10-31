@@ -40,6 +40,7 @@ const S = {
   pings: 0,
   pingUsd: 0,
   autoPingUsd: 0, // what auto keep warm's pings cost since the last real request
+  autoCappedStretch: false, // auto keep warm stopped on its cost cap since the last real request: nothing re-arms it until one
   keepWarmAuto: false, // the running keep warm began on its own, not by hand
   lastPingAt: 0,
   warnedFor: 0,
@@ -1716,12 +1717,14 @@ async function keepWarmStep($) {
   if (!S.keepWarm) return
   if (now >= S.keepWarmUntil) {
     // One started by hand ends at its own time, but if auto keep warm would still be covering this chat, it takes over
-    // (with its cost cap) rather than leaving the cache to go cold sooner than if nothing had been pressed
+    // (with its cost cap) rather than leaving the cache to go cold sooner than if nothing had been pressed. The pings
+    // so far stay counted (the cap is per idle stretch, not per keep warm), and once auto keep warm has stopped on that
+    // cap in this stretch nothing hands over again
     const autoEnd = S.lastTurnEnd + settings.autoWarmHours * 60 * MIN
-    if (!S.keepWarmAuto && settings.autoWarmHours > 0 && S.autoWarm && S.ctx >= settings.bigTokens && now < autoEnd) {
+    if (!S.keepWarmAuto && !S.autoCappedStretch && settings.autoWarmHours > 0 && S.autoWarm && S.ctx >= settings.bigTokens && now < autoEnd) {
       S.keepWarmAuto = true
       S.keepWarmUntil = autoEnd
-      S.autoPingUsd = 0
+      $.ui.toast(`Keep warm now runs as auto keep warm until ${clock(S.keepWarmUntil)}; it stops sooner once its pings since your last message cost as much as the rewrite.`)
     } else return stopKeepWarm($, 'time limit reached')
   }
   if (S.pr && now - S.prCheckedAt > 15 * MIN) {
@@ -1763,6 +1766,7 @@ async function keepWarmStep($) {
   await rememberLast($)
   // Auto keep warm only pays while it costs less than the rewrite it protects: on a 5-minute cache the pings catch up fast
   if (S.keepWarmAuto && S.autoPingUsd >= rewriteCost(S.ctx, S.model, ttl)) {
+    S.autoCappedStretch = true
     return stopKeepWarm($, `its pings have cost as much as rewriting the cache (${money(S.autoPingUsd)})`)
   }
 }
@@ -2269,6 +2273,7 @@ export function register(on, options = {}) {
     S.lastActivity = now
     measuredSteps++ // the chat measured itself: a seed still reading its transcript leaves these to it
     S.autoPingUsd = 0 // a real request ends the idle stretch the pings were protecting
+    S.autoCappedStretch = false
     rotatedPending = false
     await rememberLast($)
     return result
@@ -2300,7 +2305,7 @@ export function register(on, options = {}) {
     // Auto keep warm: a big chat stays warm until autoWarmHours after its last turn, or sooner once its pings cost as much as the rewrite
     if (settings.autoWarmHours > 0 && S.autoWarm && S.ctx >= settings.bigTokens) {
       if (!S.keepWarm) startKeepWarm($, settings.autoWarmHours, true)
-      // only the auto one is extended: one started by hand (/keepwarm N, the band's button, the board's) keeps its own end, and has no cost cap to stop it
+      // only the auto one is extended: one started by hand (/keepwarm N, the band's button, the board's) keeps its own end; at that end auto keep warm takes it over (see keepWarmStep), and its cap applies from then
       else if (S.keepWarmAuto) S.keepWarmUntil = Math.max(S.keepWarmUntil, now + settings.autoWarmHours * 60 * MIN)
     }
     await heartbeat($, true)

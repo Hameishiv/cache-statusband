@@ -68,11 +68,11 @@ If you also have Nate Herk's `cache-keeper` installed, turn one of them off: the
 | Command | What it does |
 |---|---|
 | `/cache` | Status and settings: `ttl 5\|60\|auto`, `guard on\|off`, `big 150k`, `alerts on\|off`, `autowarm 8\|off` |
-| `/keepwarm [hours\|off]` | Keep this chat's cache warm (default 4 hours) |
+| `/keepwarm [hours\|off]` | Keep this chat's cache warm (default 4 hours); at the end of those hours auto keep warm carries it on (with its cost cap, below) while it would still cover this chat |
 | `/board` | Every local Claude Code chat: state, context, cache, cost |
 | `/handoff [continue]` | Session handoff, then clear this chat and continue with it |
 
-Auto keep warm (the default for big chats, `/cache autowarm 8|off`) stops on its own once its pings since your last message have cost as much as the rewrite they protect. On a 5-minute cache that happens much sooner than on a 1-hour one. `/keepwarm` started by hand is not capped this way.
+Auto keep warm (the default for big chats, `/cache autowarm 8|off`) stops on its own once its pings since your last message have cost as much as the rewrite they protect. On a 5-minute cache that happens much sooner than on a 1-hour one. `/keepwarm` started by hand is not capped while its own hours run. At their end, while auto keep warm would still cover the chat, auto keep warm carries it on (a toast says so) with this cap, counting every auto ping since your last message, and stops sooner once the cap is reached; a `/keepwarm` pressed after auto keep warm already stopped on the cap does not hand over again. `/cache autowarm off` makes a hand-started keep warm stop at its own end.
 
 ## Optional settings
 

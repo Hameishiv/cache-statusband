@@ -858,6 +858,65 @@ test('a keep warm started by hand that reaches its own end hands over to auto ke
   expect(pings - atHandover).toBeLessThan(30)
 })
 
+test('after auto keep warm stopped on its cost cap, a keep warm started by hand does not hand over again at its end', async ($, on) => {
+  const { clock } = engine($, on)
+  let pings = 0
+  on('model.fork', () => {
+    pings++
+    return { value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }
+  })
+  const step = stepper($, on)
+  await start($, 300000, clock)
+  await $.command.run({ command: 'cache', args: 'ttl 5' })
+  await step(usage({ cache_read_input_tokens: 300000 }))
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  await clock.advance(2 * 3600000) // auto keep warm pings until its cap stops it
+  let r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/Keep warm is on/)
+  const capped = pings
+  expect(capped).toBeGreaterThan(3)
+  await $.command.run({ command: 'keepwarm', args: '1' }) // no message since: the same idle stretch
+  await clock.advance(30 * 60000)
+  const byHand = pings - capped
+  expect(byHand).toBeGreaterThan(3)
+  await clock.advance(4 * 3600000) // past its own hour, and past the auto hours
+  r = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/Keep warm is on/)
+  expect(pings - capped).toBeLessThanOrEqual(byHand + 8) // only the pings left in its own hour; none after it
+  expect(pings - capped).toBeLessThan(20)
+})
+
+test('a hand-over to auto keep warm says so, and the pings before it count toward the same cap', async ($, on) => {
+  const { clock, seen } = engine($, on)
+  let pings = 0
+  on('model.fork', () => {
+    pings++
+    return { value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }
+  })
+  const step = stepper($, on)
+  await start($, 300000, clock)
+  await $.command.run({ command: 'cache', args: 'ttl 5' })
+  await step(usage({ cache_read_input_tokens: 300000 }))
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  await clock.advance(20 * 60000) // auto keep warm pings for a while
+  const autoBefore = pings
+  expect(autoBefore).toBeGreaterThan(2)
+  await $.command.run({ command: 'keepwarm', args: '1' }) // by hand, taking over from the auto one
+  await clock.advance(61 * 60000) // its own hour is over
+  const handEnd = pings
+  expect(handEnd - autoBefore).toBeGreaterThan(8)
+  await clock.advance(6 * 3600000)
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/Keep warm is on/)
+  const autoAfter = pings - handEnd
+  expect(autoAfter).toBeGreaterThan(0) // auto keep warm did take over
+  // the auto-only bound: a whole auto run on this chat ends within 30 pings, those before the hand press counted
+  expect(autoBefore + autoAfter).toBeLessThan(30)
+  const hand = seen.toasts.filter((t) => /now runs as auto keep warm/.test(t))
+  expect(hand.length).toBe(1)
+  expect(hand[0]).toMatch(/until [^;]+; it stops sooner once its pings since your last message cost as much as the rewrite/)
+})
+
 test('with auto keep warm off, a keep warm started by hand stops at its own end', async ($, on) => {
   const { clock } = engine($, on)
   on('model.fork', () => ({ value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }))
