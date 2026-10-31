@@ -8,7 +8,7 @@ const SETUP = { options: { seatFileTerminal: '~/.claude-cli-accounts/.active', s
 
 // The engine beneath the mod: a terminal session on seat A, nothing on disk but the seat file
 // `disk` adds files by name (a transcript, the account file); `holdAccount` makes reading the account file wait, `holdEnv` an environment read (its name and how many times that name was read), `hold` a named file's
-function engine($: any, on: any, seat: { label: string; recording?: string } = { label: 'A' }, kept?: Map<string, unknown>, onGet?: (key: string) => Promise<void> | void, disk: { files?: Record<string, string>; holdAccount?: Promise<void>; hold?: Record<string, Promise<void>>; hangSet?: (key: string) => boolean; holdSet?: (key: string) => Promise<void> | undefined; id?: string; holdEnv?: (name: string, nth: number) => Promise<void> | void; messages?: { role: string; text: string }[] } = {}) {
+function engine($: any, on: any, seat: { label: string; recording?: string } = { label: 'A' }, kept?: Map<string, unknown>, onGet?: (key: string) => Promise<void> | void, disk: { files?: Record<string, string>; holdAccount?: Promise<void>; hold?: Record<string, Promise<void>>; hangSet?: (key: string) => boolean; hangDelete?: (key: string) => boolean; holdId?: () => Promise<void> | undefined; holdSet?: (key: string) => Promise<void> | undefined; id?: string; holdEnv?: (name: string, nth: number) => Promise<void> | void; messages?: { role: string; text: string }[] } = {}) {
   const clock = mock.clock(on)
   if (kept) {
     // a store already holding what an earlier run of this mod wrote
@@ -19,7 +19,11 @@ function engine($: any, on: any, seat: { label: string; recording?: string } = {
       kept.set(e.key, e.value)
       return { value: undefined }
     })
-    on('store.delete', (_: unknown, e: any) => (kept.delete(e.key), { value: undefined }))
+    on('store.delete', async (_: unknown, e: any) => {
+      if (disk.hangDelete?.(e.key)) await new Promise(() => {})
+      kept.delete(e.key)
+      return { value: undefined }
+    })
     on('store.keys', () => ({ value: [...kept.keys()] }))
   } else mock.store(on)
   if (disk.holdEnv) {
@@ -27,7 +31,7 @@ function engine($: any, on: any, seat: { label: string; recording?: string } = {
     on('env.get', async (_: unknown, e: any) => (await disk.holdEnv!(e.name, (reads[e.name] = (reads[e.name] || 0) + 1)), { value: e.name === 'USERPROFILE' ? 'C:/Users/T' : undefined }))
   } else mock.env(on, { USERPROFILE: 'C:/Users/T' })
   const seen = { compacts: 0, submits: [] as string[], asks: 0, toasts: [] as string[], failCompact: false, failSubmit: false, duringCompact: null as null | (() => Promise<unknown>), duringSubmit: null as null | (() => Promise<unknown>), duringClear: null as null | (() => Promise<unknown>) }
-  on('session.id', () => ({ value: disk.id ?? 'sid-test' }))
+  on('session.id', async () => (await disk.holdId?.(), { value: disk.id ?? 'sid-test' }))
   on('session.cwd', () => ({ value: '/repo' }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
   on('session.surface', () => ({ value: 'terminal' }))
@@ -6528,19 +6532,20 @@ test('a stuck record set that lands after a newer record was written is followed
   expect((kept.get('last:sid-test') as { ctx: number }).ctx).toBe(320010)
 })
 
-// Every store call a turn.start or a session.start waits on is bounded: a store that never answers does not hang them for good
-test('a store that never answers does not hang turn.start (heartbeat) or session.start (the seed\'s reads)', SETUP, async ($, on) => {
+// Every store call a turn.start, a session.start or a session.end waits on is bounded: a store that never answers (any key, get, set or delete) does not hang them for good
+test('a store that never answers any key does not hang turn.start, session.start or session.end', SETUP, async ($, on) => {
   let hang = false
   const kept = new Map<string, unknown>()
-  const disk: any = { files: {}, hangSet: (key: string) => hang && key.startsWith('hb:') }
-  const { clock, seen } = engine($, on, { label: 'A' }, kept, async (key) => { if (hang && (key.startsWith('last:') || key.startsWith('hb:'))) await new Promise(() => {}) }, disk)
+  const disk: any = { files: {}, hangSet: () => hang, hangDelete: () => hang }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, async () => { if (hang) await new Promise(() => {}) }, disk)
   answer(on, seen, 'Send anyway')
   on('turn.start', () => ({ turnId: 't1' }))
+  on('session.end', () => ({ sessionId: 'sid-test' }))
   await clock.advance(60000)
   hang = true
   let started = false
   const s = $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true }).then(() => { started = true })
-  for (let i = 0; i < 6 && !started; i++) await clock.advance(5000) // the heartbeat's set, then the seed's reads, each bounded
+  for (let i = 0; i < 12 && !started; i++) await clock.advance(5000) // the settings read, the heartbeat read and set, the seed's read: each bounded
   expect(started).toBe(true)
   await s
   await clock.advance(10000)
@@ -6549,4 +6554,156 @@ test('a store that never answers does not hang turn.start (heartbeat) or session
   for (let i = 0; i < 3 && !began; i++) await clock.advance(5000)
   expect(began).toBe(true)
   await t
+  let ended = false
+  const e = ($ as any).session.end({ sessionId: 'sid-test' }).then(() => { ended = true })
+  for (let i = 0; i < 3 && !ended; i++) await clock.advance(5000)
+  expect(ended).toBe(true)
+  await e
+})
+
+test('a store that answers everything but the settings key does not hang session.start either', SETUP, async ($, on) => {
+  let hang = false
+  const kept = new Map<string, unknown>()
+  const disk: any = { files: {}, hangSet: () => hang }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, async (k) => { if (hang && k !== 'settings') await new Promise(() => {}) }, disk)
+  answer(on, seen, 'Send anyway')
+  await clock.advance(60000)
+  hang = true
+  let started = false
+  void $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true }).then(() => { started = true })
+  for (let i = 0; i < 12 && !started; i++) await clock.advance(5000)
+  expect(started).toBe(true)
+})
+
+test('a settings read that never answers leaves the defaults, as a failed one does', SETUP, async ($, on) => {
+  let hang = false
+  const kept = new Map<string, unknown>([['settings', { bigTokens: 12345 }]])
+  const disk: any = { files: {} }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, async (k) => { if (hang && k === 'settings') await new Promise(() => {}) }, disk)
+  answer(on, seen, 'Send anyway')
+  await clock.advance(60000)
+  hang = true
+  let started = false
+  void $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true }).then(() => { started = true })
+  for (let i = 0; i < 4 && !started; i++) await clock.advance(5000)
+  expect(started).toBe(true)
+  const c: any = await $.command.run({ command: 'cache', args: '' })
+  expect(c.text).not.toContain('12k')
+})
+
+// A record set that lands late over a newer record is written again, per key: a write for another chat id in between does not hide it
+test('a stuck record set that lands late after the chat changed id is still followed by the newest record for its key', SETUP, async ($, on) => {
+  let calls = 0
+  const releases: (() => void)[] = []
+  const kept = new Map<string, unknown>()
+  const disk: any = { files: {}, holdSet: (key: string) => (key === 'last:sid-test' && ++calls === 1 ? new Promise<void>((r) => releases.push(r)) : undefined) }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  answer(on, seen, 'Send anyway')
+  const req = heldRequest($, on)
+  on('classic.SessionStart', () => ({}))
+  await start($, 300000, clock)
+  calls = 0
+  req.begin()
+  const a = req.finish(usage({ cache_read_input_tokens: 310000 })) // its set stays out until released
+  await clock.advance(6000)
+  await a
+  req.begin()
+  const a2 = req.finish(usage({ cache_read_input_tokens: 320000 }))
+  await clock.advance(100)
+  await a2
+  expect((kept.get('last:sid-test') as any).ctx).toBe(320010)
+  disk.id = 'sid-2'
+  await ($ as any).classic.SessionStart({ source: 'clear' })
+  req.begin()
+  const b = req.finish(usage({ cache_read_input_tokens: 50000 }))
+  await clock.advance(100)
+  await b
+  expect((kept.get('last:sid-2') as any).ctx).toBe(50010)
+  releases.forEach((r) => r()) // the first set lands now, over the newer record of the first id
+  await clock.advance(100)
+  expect((kept.get('last:sid-test') as any).ctx).toBe(320010)
+  expect((kept.get('last:sid-2') as any).ctx).toBe(50010)
+})
+
+// The re-write waits its turn on the chain: a record issued while it is out is written after it, not overtaken by it
+test('the re-write of a newest record does not land after a request recorded meanwhile', SETUP, async ($, on) => {
+  let calls = 0
+  let armed = false
+  const rel: Record<number, () => void> = {}
+  const kept = new Map<string, unknown>()
+  const disk: any = {
+    files: {},
+    holdSet: (key: string) => {
+      if (key !== 'last:sid-test' || !armed) return undefined
+      const n = ++calls
+      if (n === 1 || n === 3) return new Promise<void>((r) => (rel[n] = r)) // the first record's set, and the re-write of the second
+      return undefined
+    },
+  }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  answer(on, seen, 'Send anyway')
+  const req = heldRequest($, on)
+  on('classic.SessionStart', () => ({}))
+  await start($, 300000, clock)
+  armed = true
+  req.begin()
+  const a = req.finish(usage({ cache_read_input_tokens: 310000 }))
+  await clock.advance(6000)
+  await a
+  req.begin()
+  const b = req.finish(usage({ cache_read_input_tokens: 320000 }))
+  await clock.advance(100)
+  await b
+  rel[1]() // the first set lands over the second record: the second is written again (held)
+  await clock.advance(100)
+  expect(calls).toBe(3)
+  req.begin()
+  const c = req.finish(usage({ cache_read_input_tokens: 330000 })) // waits for the re-write on the chain
+  await clock.advance(100)
+  rel[3]() // the re-write lands (before the third record is written)
+  await clock.advance(100)
+  await c
+  await clock.advance(100)
+  expect((kept.get('last:sid-test') as any).ctx).toBe(330010)
+})
+
+// A chat open under an earlier version has its heartbeat: session.start's own heartbeat must not replace it before the seed reads it
+test('a reopened chat with no transcript and an earlier version\'s heartbeat is seeded from it', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const disk: any = { files: {} }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  answer(on, seen, 'Send anyway')
+  await clock.advance(60000)
+  const t0 = await clock.now()
+  kept.set('hb:sid-test', { id: 'sid-test', ctx: 400000, lastActivity: t0 - 10 * 60000, model: 'claude-opus-5-5', updatedAt: t0 - 60000 })
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await clock.advance(10)
+  const c: any = await $.command.run({ command: 'cache', args: '' })
+  expect(c.text.split('\n')[0]).toContain('400k')
+})
+
+// A request that ends while a /clear has not yet read the new id has no id of its own to be recorded under: the old chat's record keeps its cold history
+test('a request that ends between a /clear and its new id does not rewrite the old chat\'s record with an empty cold history', SETUP, async ($, on) => {
+  let hold = false
+  let release: () => void = () => {}
+  const cold = [{ at: 1000, tokens: 200000, usd: 1.5, gapMin: 70 }]
+  const kept = new Map<string, unknown>([['last:sid-test', { ctx: 250000, at: 0, keptAt: 1, cold }]])
+  const disk: any = { files: {}, holdId: () => (hold ? new Promise<void>((r) => (release = r)) : undefined) }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  answer(on, seen, 'Send anyway')
+  const req = heldRequest($, on)
+  on('classic.SessionStart', () => ({}))
+  await start($, 300000, clock)
+  req.begin()
+  hold = true
+  const cleared = ($ as any).classic.SessionStart({ source: 'clear' }) // the new id is not read yet
+  await clock.advance(10)
+  const done = req.finish(usage({ cache_read_input_tokens: 310000 })) // the old chat's request ends in the window
+  await clock.advance(100)
+  await done
+  hold = false
+  release()
+  await cleared
+  await clock.advance(100)
+  expect((kept.get('last:sid-test') as any).cold).toEqual(cold)
 })
