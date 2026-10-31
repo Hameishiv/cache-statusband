@@ -51,6 +51,7 @@ const S = {
   autoWarm: true, // false once keep warm is turned off by hand in this session, or by a merged PR (autoWarmOffByPr) for that chat
   autoWarmOffByPr: false, // autoWarm went false because the PR merged, not by hand: a new chat starts with it on again
   pr: 0, // a merge-pr session's PR: keep warm stops once it merges or closes
+  prLive: false, // pr was set by a prompt submitted in this chat, not read from its history (a history read replaces it: see adoptHistoryPr)
   prCheckedAt: 0,
   effort: '', // the main loop's effort, as its last request named it
   account: '', // the signed-in account's email, shown when no seat file is configured
@@ -201,6 +202,10 @@ function continuationPrompt() {
   return `Handoff from my previous session${where}:\n\n${H.text}`
 }
 
+// Set by clearAndContinue for the SessionStart of the /clear it runs: that SessionStart keeps the chat's PR and the keep warm state tied to it (the work carries on), once. It may land inside the clear command or after clearAndContinue has returned, so it is a token the SessionStart consumes, not a window; it lapses KEEP_PR_LAPSE after the clear returns, so a later unrelated /clear still starts from nothing
+const KEEP_PR_LAPSE = 30000
+let keepPrOnClear = null
+
 async function clearAndContinue($) {
   if (H.continuing) return
   if (!H.text) {
@@ -214,10 +219,15 @@ async function clearAndContinue($) {
   const text = continuationPrompt()
   const path = H.path
   H.continuing = true
+  const keep = (keepPrOnClear = {})
   $.ui.invalidate('ui.render')
   try {
     await $.command.run({ command: 'clear', args: '' })
+    $.clock.after(KEEP_PR_LAPSE, () => {
+      if (keepPrOnClear === keep) keepPrOnClear = null
+    })
   } catch (err) {
+    if (keepPrOnClear === keep) keepPrOnClear = null
     H.continuing = false
     $.ui.invalidate('ui.render')
     $.ui.toast('Could not run /clear: ' + clip(String((err && err.message) || err), 100) + (path ? ` The handoff is saved at ${path}.` : ''), { timeoutMs: 10000 })
@@ -1055,6 +1065,23 @@ function findPr(text) {
   return m && m[1] ? Number(m[1]) || 0 : 0
 }
 
+// A stored prompt as it was typed: a typed command is kept as <command-name>/<command-args> tags, put back into the typed form
+function promptText(text) {
+  text = String(text || '')
+  const name = /<command-name>\s*\/?([^<\s]+)\s*<\/command-name>/.exec(text)
+  if (!name) return text
+  const args = /<command-args>([\s\S]*?)<\/command-args>/.exec(text)
+  return `/${name[1]} ${args ? args[1] : ''}`
+}
+
+// A PR read from a chat's history (a resumed chat's transcript, the messages the session reports): the first prompt of the chat that names one. Settled the same whichever of the resume's SessionStart and session.start comes first, and whatever the person typed meanwhile: the first history read to land stands, and it replaces a PR that only a prompt submitted since set (that prompt is later than the history). Not in a chat since cleared or replaced by a resumed one
+function adoptHistoryPr(chat, pr) {
+  if (!pr || msgChat !== chat) return
+  if (S.pr && !S.prLive) return
+  S.pr = pr
+  S.prLive = false
+}
+
 // The first user prompt in a transcript's rows that names a PR. A typed command is stored as <command-name>/<command-args> tags, put back into the typed form first
 export function prFromTranscript(lines) {
   for (const line of lines) {
@@ -1066,13 +1093,8 @@ export function prFromTranscript(lines) {
     }
     if (!j || j.type !== 'user' || j.isSidechain || j.isMeta || !j.message) continue
     const c = j.message.content
-    let text = typeof c === 'string' ? c : Array.isArray(c) ? c.filter((b) => b && b.type === 'text').map((b) => b.text).join('\n') : ''
-    const name = /<command-name>\s*\/?([^<\s]+)\s*<\/command-name>/.exec(text)
-    if (name) {
-      const args = /<command-args>([\s\S]*?)<\/command-args>/.exec(text)
-      text = `/${name[1]} ${args ? args[1] : ''}`
-    }
-    const pr = findPr(text)
+    const text = typeof c === 'string' ? c : Array.isArray(c) ? c.filter((b) => b && b.type === 'text').map((b) => b.text).join('\n') : ''
+    const pr = findPr(promptText(text))
     if (pr) return pr
   }
   return 0
@@ -1093,8 +1115,8 @@ async function resumedPr($, path) {
     // no transcript to read here: the session's own messages
   }
   try {
-    const first = (await $.session.messages()).find((m) => m.role === 'user' && findPr(m.text))
-    return first ? findPr(first.text) : 0
+    const first = (await $.session.messages()).find((m) => m.role === 'user' && findPr(promptText(m.text)))
+    return first ? findPr(promptText(first.text)) : 0
   } catch {
     return 0
   }
@@ -1399,7 +1421,8 @@ async function rememberLast($) {
   }
 }
 
-async function seedFromTranscript($, path) {
+// chat: the msgChat the transcript belongs to (default: the chat now). Every read here can outlast a /clear or a resume of another chat, whose own seed it must not write over: nothing is written once the chat has moved on
+async function seedFromTranscript($, path, chat = msgChat) {
   let found = null
   try {
     const st = await $.fs.stat(path)
@@ -1410,18 +1433,21 @@ async function seedFromTranscript($, path) {
   } catch {
     // no transcript yet, or too big to read here (the app): fall back on what this mod kept
   }
+  if (msgChat !== chat) return
   let last = null
   try {
     last = S.id ? await $.store.get('last:' + S.id) : null
   } catch {
     last = null
   }
+  if (msgChat !== chat) return
   if (last && Array.isArray(last.cold) && !S.coldRestarts.length) S.coldRestarts = last.cold
   if (!found && S.id) {
     try {
       // before its first record, a chat open under an earlier version still has its heartbeat
       const hb = last ? null : await $.store.get('hb:' + S.id)
       const r = last || (hb && { ctx: hb.ctx, at: hb.lastActivity, model: hb.model, effort: hb.effort })
+      if (msgChat !== chat) return
       // an `at` of 0 was written between a compaction and the next request
       if (r && r.ctx) found = { ctx: r.ctx, at: r.at, model: r.model, effort: r.effort, compacted: !r.at }
     } catch {
@@ -1717,6 +1743,7 @@ export function register(on, options = {}) {
   cfg.prPattern = pattern(options.prPattern)
   cfg.autoResume = options.autoResume === true
   on('session.start', async ($, e, next) => {
+    const chat = msgChat // a /clear or a resume of another chat while this reads: what it reads is the old chat's
     now = await $.clock.now()
     home = (await $.env.get('USERPROFILE')) || (await $.env.get('HOME')) || ''
     S.id = await $.session.id()
@@ -1751,8 +1778,8 @@ export function register(on, options = {}) {
       // none yet: the first measure fills them
     }
     try {
-      const first = (await $.session.messages()).find((m) => m.role === 'user' && findPr(m.text))
-      if (first) S.pr = findPr(first.text)
+      const first = (await $.session.messages()).find((m) => m.role === 'user' && findPr(promptText(m.text)))
+      if (first) adoptHistoryPr(chat, findPr(promptText(first.text)))
     } catch {
       // no transcript yet: the first prompt that names a PR sets it
     }
@@ -1790,9 +1817,12 @@ export function register(on, options = {}) {
       S.floor = 0
       S.ctx = 0 // the last chat's size; a resumed chat's own is seeded below (a cleared one starts at 0)
       pendingSeed = null // a transcript still waiting for session.start belongs to the chat this one replaces
-      // the last chat's merge-pr PR says nothing about this one: its keep warm must not stop when that PR merges, and an auto keep warm that merge switched off starts on again. The new chat's own PR is read from its first prompt that names one (prompt.submit); a resumed chat's from its transcript (below). A fork is the same conversation and keeps both, and so does this mod's own clear and continue, which carries the same work into the cleared chat
-      if (!H.continuing) {
+      // the last chat's merge-pr PR says nothing about this one: its keep warm must not stop when that PR merges, and an auto keep warm that merge switched off starts on again. The new chat's own PR is read from its first prompt that names one (prompt.submit); a resumed chat's from its transcript (below). A fork is the same conversation and keeps both, and so does this mod's own clear and continue (keepPrOnClear), which carries the same work into the cleared chat
+      const keepPr = e.source === 'clear' && keepPrOnClear
+      keepPrOnClear = null // one SessionStart (a clear's) takes it
+      if (!keepPr) {
         S.pr = 0
+        S.prLive = false
         S.prCheckedAt = 0
         if (S.autoWarmOffByPr) setAutoWarm(true)
       }
@@ -1818,6 +1848,7 @@ export function register(on, options = {}) {
       submitsSeen++ // the chat is replaced: an unattended send still compacting (our Resume, a wake-up) must not go into the new one
     }
     $.ui.invalidate('ui.render')
+    const chat = msgChat // this SessionStart's chat: a fork's is the one it carries on
     try {
       S.id = (await $.session.id()) || S.id
     } catch {
@@ -1825,12 +1856,12 @@ export function register(on, options = {}) {
     }
     S.label = basename(S.cwd)
     // a fork keeps its parent's cache, so only a resume seeds; before session.start has read the seat and account it waits for there
-    if (e.source === 'resume') {
-      if (identityRead) await seedFromTranscript($, e.transcript_path)
+    if (e.source === 'resume' && msgChat === chat) {
+      // a /clear or another resume while the transcript is read makes it the old chat's: nothing of it is written (seedFromTranscript checks, and so does the PR)
+      if (identityRead) await seedFromTranscript($, e.transcript_path, chat)
       else pendingSeed = e.transcript_path
       // either order with session.start ends with the resumed chat's PR: read here from its transcript, not left for its next prompt
-      const pr = await resumedPr($, e.transcript_path)
-      if (pr) S.pr = pr
+      adoptHistoryPr(chat, await resumedPr($, e.transcript_path))
     }
     return next(e)
   })
@@ -1860,7 +1891,10 @@ export function register(on, options = {}) {
       H.path = ''
       $.ui.invalidate('ui.render')
     }
-    if (!S.pr) S.pr = findPr(e.command ? `/${e.command.name} ${e.command.args}` : e.text)
+    if (!S.pr) {
+      S.pr = findPr(e.command ? `/${e.command.name} ${e.command.args}` : e.text)
+      S.prLive = !!S.pr
+    }
     const fromUser = e.origin && (e.origin.kind === 'composer' || e.origin.kind === 'bridge')
     // Whatever the person submits from the composer (a command or a plain message, whatever becomes of it: a dialog's Cancel or a lower hook may drop it) takes the box text: what a put-back left there is gone. The Resume hold ends with it only when the put-back was filled into the box (a due Resume no longer waits for a message that is not there); a message that was only quoted in a toast was never in the box, so typing does not send it and does not end its hold. This mod's own put-back of a command is a plugin-origin submit, not this, and neither is another plugin's. A fork that did not come from such a submit keeps both. A fill still unsure (see placeBack) that lands after this submit starts the hold again when a read of the box shows its text, or when there is no read or it fails (not when a read that succeeds does not show it)
     if (e.origin && e.origin.kind === 'composer') composerTakesBox()

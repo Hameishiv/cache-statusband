@@ -7,8 +7,8 @@ const SETUP = { options: { seatFileTerminal: '~/.claude-cli-accounts/.active', s
 
 
 // The engine beneath the mod: a terminal session on seat A, nothing on disk but the seat file
-// `disk` adds files by name (a transcript, the account file); `holdAccount` makes reading the account file wait
-function engine($: any, on: any, seat: { label: string; recording?: string } = { label: 'A' }, kept?: Map<string, unknown>, onGet?: (key: string) => Promise<void> | void, disk: { files?: Record<string, string>; holdAccount?: Promise<void> } = {}) {
+// `disk` adds files by name (a transcript, the account file); `holdAccount` makes reading the account file wait, `hold` a named file's
+function engine($: any, on: any, seat: { label: string; recording?: string } = { label: 'A' }, kept?: Map<string, unknown>, onGet?: (key: string) => Promise<void> | void, disk: { files?: Record<string, string>; holdAccount?: Promise<void>; hold?: Record<string, Promise<void>>; messages?: { role: string; text: string }[] } = {}) {
   const clock = mock.clock(on)
   if (kept) {
     // a store already holding what an earlier run of this mod wrote
@@ -23,7 +23,7 @@ function engine($: any, on: any, seat: { label: string; recording?: string } = {
   on('session.cwd', () => ({ value: '/repo' }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
   on('session.surface', () => ({ value: 'terminal' }))
-  on('session.messages', () => ({ value: [] }))
+  on('session.messages', () => ({ value: disk.messages ?? [] }))
   on('command.register', (_: unknown, e: any) => ({ value: { command: e.name } }))
   on('agent.list', () => ({ value: [] }))
   const isRecording = (e: any) => !!seat.recording && String(e.path ?? e).includes('recording')
@@ -31,6 +31,7 @@ function engine($: any, on: any, seat: { label: string; recording?: string } = {
   const named = (e: any) => String(e.path ?? e).split('/').pop()!
   on('fs.read', async (_: unknown, e: any) => {
     if (named(e) === '.claude.json') await disk.holdAccount
+    await disk.hold?.[named(e)] // a transcript read that waits, by file name
     const file = disk.files?.[named(e)]
     return { value: file ?? (isRecording(e) ? seat.recording : seat.label) }
   })
@@ -5873,4 +5874,168 @@ test('on an engine with no read, a late "filled" answer of a fill that a later f
   for (let i = 0; i < 10 && fills.length < 4; i++) await clock.advance(1000)
   await clock.advance(2500)
   expect(fills[3]).toBe(WAKE_TEXT.replace('Go on.', 'three') + '\n\n' + WAKE_TEXT.replace('Go on.', 'four')) // only F2's text is the box's: F1's "filled" answer (seq !== fillSeq) tracked nothing and F2's answer tracks its own text
+})
+
+// NEW-TESTS-BEGIN (batch 42)
+// A resumed chat's transcript read is still out when the chat is cleared or another resumed: its PR and context must not land in the new chat
+for (const later of ['clear', 'resume of Y']) {
+  test(`a resumed chat's slow transcript read that lands after a later ${later} writes nothing into the new chat`, SETUP, async ($, on) => {
+    let release: () => void = () => {}
+    const disk: any = { files: {}, hold: { 'x.jsonl': new Promise<void>((r) => (release = r)) } }
+    const { clock } = engine($, on, { label: 'A' }, undefined, undefined, disk)
+    const asked: string[] = []
+    on('process.run', (_: unknown, e: any) => (asked.push(String(e.command?.[3] ?? e.argv?.[3] ?? '')), { value: { exitCode: 0, stdout: 'OPEN\n', stderr: '' } }))
+    on('session.usage', () => ({ value: { context: { tokens: 300000, window: 1000000 } } }))
+    on('turn.complete', () => ({ text: '' }))
+    on('model.fork', () => ({ value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }))
+    on('classic.SessionStart', () => ({}))
+    disk.files['x.jsonl'] = prompt('hello') + typedCommand('merge-pr', '456') + reply(60000, 500000)
+    disk.files['y.jsonl'] = prompt('hi') + typedCommand('merge-pr', '789') + reply(60000, 200000)
+    await start($, 300000, clock)
+    const p = ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/x.jsonl' })
+    await clock.advance(10)
+    if (later === 'clear') await ($ as any).classic.SessionStart({ source: 'clear' })
+    else await ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/y.jsonl' })
+    release()
+    await p
+    const c: any = await $.command.run({ command: 'cache', args: '' })
+    expect(c.text).not.toMatch(/500k|500,000|500000/) // X's context, not the new chat's
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+    await clock.advance(16 * 60000)
+    expect(asked.includes('456')).toBe(false) // X's PR is never asked about
+    if (later === 'resume of Y') {
+      expect(asked.length).toBeGreaterThan(0)
+      expect(asked.every((n) => n === '789')).toBe(true) // the new chat's own PR
+    }
+  })
+}
+
+// This mod's clear and continue keeps the chat's PR whether the clear's SessionStart lands inside the /clear command or after clearAndContinue has returned
+for (const order of ['inside the clear', 'after clear and continue returned']) {
+  test(`this mod's clear and continue keeps the PR when the clear's SessionStart lands ${order}`, SETUP, async ($, on) => {
+    const { clock, seen } = engine($, on)
+    let state = 'OPEN'
+    on('process.run', () => ({ value: { exitCode: 0, stdout: state + '\n', stderr: '' } }))
+    on('session.usage', () => ({ value: { context: { tokens: 300000, window: 1000000 } } }))
+    on('turn.complete', () => ({ text: '' }))
+    on('model.fork', () => ({ value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }))
+    on('classic.SessionStart', () => ({}))
+    await start($, 300000, clock)
+    await $.prompt.submit({ text: '/merge-pr 123', command: { name: 'merge-pr', args: '123' }, origin: COMPOSER, wait: false } as never)
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+    await $.command.run({ command: 'session-handoff', args: '' })
+    await $.turn.complete({ answer: '# Session Handoff\n' + 'work on PR 123 continues. '.repeat(20), durationMs: 1, isAborted: false, turnId: 't2', reason: 'answer' } as never)
+    if (order === 'inside the clear') seen.duringClear = async () => { await ($ as any).classic.SessionStart({ source: 'clear' }) }
+    await $.command.run({ command: 'handoff', args: 'continue' })
+    await clock.advance(100)
+    expect(seen.submits.length).toBe(1)
+    if (order !== 'inside the clear') await clock.advance(5000), await ($ as any).classic.SessionStart({ source: 'clear' }) // the clear's SessionStart, well after everything returned
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't3', reason: 'end_turn' } as never)
+    state = 'MERGED'
+    await clock.advance(16 * 60000)
+    const r: any = await $.command.run({ command: 'cache', args: '' })
+    expect(r.text).not.toMatch(/Keep warm is on/)
+    expect(r.text).toMatch(/off in this session/)
+  })
+}
+
+test('the keep-the-PR token of clear and continue lapses: a later unrelated /clear starts from no PR', SETUP, async ($, on) => {
+  const { clock, seen } = engine($, on)
+  const asked: string[] = []
+  on('process.run', (_: unknown, e: any) => (asked.push(String(e.command?.[3] ?? e.argv?.[3] ?? '')), { value: { exitCode: 0, stdout: 'MERGED\n', stderr: '' } }))
+  on('session.usage', () => ({ value: { context: { tokens: 300000, window: 1000000 } } }))
+  on('turn.complete', () => ({ text: '' }))
+  on('model.fork', () => ({ value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }))
+  on('classic.SessionStart', () => ({}))
+  await start($, 300000, clock)
+  await $.prompt.submit({ text: '/merge-pr 123', command: { name: 'merge-pr', args: '123' }, origin: COMPOSER, wait: false } as never)
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  await $.command.run({ command: 'session-handoff', args: '' })
+  await $.turn.complete({ answer: '# Session Handoff\n' + 'work on PR 123 continues. '.repeat(20), durationMs: 1, isAborted: false, turnId: 't2', reason: 'answer' } as never)
+  await $.command.run({ command: 'handoff', args: 'continue' }) // its /clear never produced a SessionStart
+  await clock.advance(60000)
+  await ($ as any).classic.SessionStart({ source: 'clear' }) // the person's own /clear, a minute on
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't3', reason: 'end_turn' } as never)
+  await clock.advance(16 * 60000)
+  expect(asked).toEqual([]) // PR 123 is not this chat's
+  expect(seen.submits.length).toBe(1)
+})
+
+// A resumed chat's PR is read from its transcript or, failing that, the session's messages, with a typed command's tags put back into the typed form; the first PR-naming prompt of the chat wins whichever event order
+const tagged = (name: string, args: string) => ({ role: 'user', text: `<command-message>${name}</command-message>\n<command-name>/${name}</command-name>\n<command-args>${args}</command-args>` })
+
+test('a resumed chat with no readable transcript reads its PR from the session messages, typed command tags included', SETUP, async ($, on) => {
+  const disk: any = { files: {}, messages: [{ role: 'user', text: 'hello' }, tagged('merge-pr', '456')] }
+  const { clock } = engine($, on, { label: 'A' }, undefined, undefined, disk)
+  const asked: string[] = []
+  on('process.run', (_: unknown, e: any) => (asked.push(String(e.command?.[3] ?? e.argv?.[3] ?? '')), { value: { exitCode: 0, stdout: 'OPEN\n', stderr: '' } }))
+  on('session.usage', () => ({ value: { context: { tokens: 300000, window: 1000000 } } }))
+  on('turn.complete', () => ({ text: '' }))
+  on('model.fork', () => ({ value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }))
+  on('classic.SessionStart', () => ({}))
+  await start($, 300000, clock)
+  await ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/gone.jsonl' })
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  await clock.advance(16 * 60000)
+  expect(asked.length).toBeGreaterThan(0)
+  expect(asked.every((n) => n === '456')).toBe(true)
+})
+
+test('session.start reads the PR of a reopened chat from its messages, typed command tags included', SETUP, async ($, on) => {
+  const disk: any = { files: {}, messages: [tagged('merge-pr', '456')] }
+  const { clock } = engine($, on, { label: 'A' }, undefined, undefined, disk)
+  const asked: string[] = []
+  on('process.run', (_: unknown, e: any) => (asked.push(String(e.command?.[3] ?? e.argv?.[3] ?? '')), { value: { exitCode: 0, stdout: 'OPEN\n', stderr: '' } }))
+  on('session.usage', () => ({ value: { context: { tokens: 300000, window: 1000000 } } }))
+  on('turn.complete', () => ({ text: '' }))
+  on('model.fork', () => ({ value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }))
+  await start($, 300000, clock)
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  await clock.advance(16 * 60000)
+  expect(asked.length).toBeGreaterThan(0)
+  expect(asked.every((n) => n === '456')).toBe(true)
+})
+
+test('session.start does not overwrite the PR a resume already read for the same chat', SETUP, async ($, on) => {
+  // the messages name another PR than the transcript: the resume's read (first to land) stands whichever comes second
+  const disk: any = { files: {}, messages: [{ role: 'user', text: '/merge-pr 789' }] }
+  const { clock } = engine($, on, { label: 'A' }, undefined, undefined, disk)
+  const asked: string[] = []
+  on('process.run', (_: unknown, e: any) => (asked.push(String(e.command?.[3] ?? e.argv?.[3] ?? '')), { value: { exitCode: 0, stdout: 'OPEN\n', stderr: '' } }))
+  on('session.usage', () => ({ value: { context: { tokens: 300000, window: 1000000 } } }))
+  on('turn.complete', () => ({ text: '' }))
+  on('model.fork', () => ({ value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }))
+  on('classic.SessionStart', () => ({}))
+  disk.files['sid-test.jsonl'] = prompt('hello') + typedCommand('merge-pr', '456') + reply(60000, 300000)
+  await clock.advance(60000)
+  await ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/sid-test.jsonl' })
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [], changed: [] })
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  await clock.advance(16 * 60000)
+  expect(asked.length).toBeGreaterThan(0)
+  expect(asked.every((n) => n === '456')).toBe(true)
+})
+
+test('a resumed chat\'s history PR replaces one only a prompt typed during the read set (that prompt is later than the history)', SETUP, async ($, on) => {
+  let release: () => void = () => {}
+  const disk: any = { files: {}, hold: { 'x.jsonl': new Promise<void>((r) => (release = r)) } }
+  const { clock } = engine($, on, { label: 'A' }, undefined, undefined, disk)
+  const asked: string[] = []
+  on('process.run', (_: unknown, e: any) => (asked.push(String(e.command?.[3] ?? e.argv?.[3] ?? '')), { value: { exitCode: 0, stdout: 'OPEN\n', stderr: '' } }))
+  on('session.usage', () => ({ value: { context: { tokens: 300000, window: 1000000 } } }))
+  on('turn.complete', () => ({ text: '' }))
+  on('model.fork', () => ({ value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }))
+  on('classic.SessionStart', () => ({}))
+  disk.files['x.jsonl'] = prompt('hello') + typedCommand('merge-pr', '456') + reply(60000, 300000)
+  await start($, 300000, clock)
+  const p = ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/x.jsonl' })
+  await clock.advance(10)
+  await $.prompt.submit({ text: '/merge-pr 999', command: { name: 'merge-pr', args: '999' }, origin: COMPOSER, wait: false } as never)
+  release()
+  await p
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  await clock.advance(16 * 60000)
+  expect(asked.length).toBeGreaterThan(0)
+  expect(asked.every((n) => n === '456')).toBe(true)
 })
