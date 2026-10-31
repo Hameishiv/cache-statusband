@@ -5374,7 +5374,7 @@ for (const answerLate of ['not filled', 'filled'] as const) {
   })
 }
 
-// A put-back that holds nothing (a local command such as /btw never reaches the chat): no hold, but what its fill puts in is still tracked when it answers late "filled". (A joined hold-less fill, behind earlier text after a finished compaction, cannot be built here: the chat counts as compacted until a request starts, and a request ends the tracking of the earlier text, while a composer submit takes it)
+// A put-back that holds nothing (a local command such as /btw never reaches the chat): no hold, but what its fill puts in is still tracked when it answers late "filled"
 test('on an engine with no read, a /btw question whose fill answers late "filled" is tracked though it holds nothing: the next put-back quotes it instead of overwriting it', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
   const box = { text: '' }
   const { clock, seen, fills, late } = await lateJoinSetup($, on, box, true)
@@ -5393,6 +5393,39 @@ test('on an engine with no read, a /btw question whose fill answers late "filled
   expect(fills).toEqual(['/btw what is X?', 'three'])
   expect(seen.toasts.filter((t: string) => t.includes('Also not sent: /btw what is X?'))).toHaveLength(1)
 })
+
+// A joined fill that holds nothing, behind earlier text: compaction #1 is abandoned (its fill puts the text in the box), #1 fails late, 16 minutes pass (the hold has lapsed), a bridge wake-up compacts (#2, which fails, so the send is not stuck) and its submit is refused, so it is put back with no hold, joined behind the earlier text. Its fill does not answer in time; compaction #3 fails too, so a third put-back can be observed. No read on the engine: only the late answer says what the box holds
+for (const answerLate of ['not filled', 'filled'] as const) {
+  test(`on an engine with no read, a joined fill that holds nothing (a wake-up whose compaction failed and whose submit was refused) and answers late "${answerLate}": the next put-back goes in behind ${answerLate === 'filled' ? 'the joined text' : 'the earlier put-back'}`, SETUP, async ($, on) => {
+    const box = { text: '' }
+    const { clock, seen, fills, late } = await lateJoinSetup($, on, box, true)
+    let fail: (e: Error) => void = () => {}
+    let n = 0
+    seen.duringCompact = () => (++n === 1 ? new Promise<void>((_, rej) => { fail = rej }) : Promise.reject(new Error('no room'))) // #1 hangs until it fails late; #2 and #3 fail at once
+    await $.prompt.submit({ text: 'stop, do X instead', origin: COMPOSER, wait: false } as never)
+    await clock.advance(60000)
+    for (let i = 0; i < 20 && !fills.length; i++) await clock.advance(60000)
+    expect(fills).toEqual(['stop, do X instead'])
+    fail(new Error('late boom'))
+    await clock.advance(16 * 60000)
+    late.armed = true
+    seen.failSubmit = true
+    await sendBridge($, WAKE_TEXT)
+    for (let i = 0; i < 10 && fills.length < 2; i++) await clock.advance(1000)
+    await clock.advance(2500)
+    await clock.advance(2500)
+    expect(fills).toEqual(['stop, do X instead', 'stop, do X instead\n\n' + WAKE_TEXT])
+    late.resolve({ isFilled: answerLate === 'filled' })
+    await realMs(50)
+    late.armed = false
+    void sendBridge($, WAKE_TEXT.replace('Go on.', 'three'))
+    for (let i = 0; i < 10 && fills.length < 3; i++) await clock.advance(1000)
+    await clock.advance(1000)
+    await clock.advance(2500)
+    expect(fills).toEqual(['stop, do X instead', 'stop, do X instead\n\n' + WAKE_TEXT, answerLate === 'filled' ? 'stop, do X instead\n\n' + WAKE_TEXT + '\n\n' + WAKE_TEXT.replace('Go on.', 'three') : 'stop, do X instead\n\n' + WAKE_TEXT.replace('Go on.', 'three')])
+    expect(seen.toasts.filter((t) => t.includes('Also not sent'))).toEqual([])
+  })
+}
 
 // A single fill (nothing earlier in the box) that answers late "filled": the text it filled is the remembered one, joined or not
 test('on an engine with no read, a single fill that answers late "filled" is tracked: the next put-back goes in behind it', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
