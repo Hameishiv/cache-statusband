@@ -2265,6 +2265,7 @@ test('a resume due while the person\'s "Compact first, then send" compaction run
   }
   await $.prompt.submit({ text: 'are we back?', origin: COMPOSER, wait: false } as never)
   await clock.advance(100) // the compaction, then the send
+  for (let i = 0; i < 100 && !seen.submits.length; i++) await clock.advance(10) // the send has been handed on before its request starts: how many hops that takes varies with load
   await mainStep($) // the message's own request starts: that settles the resume
   await clock.advance(5 * 60000)
   expect(seen.asks).toBe(1)
