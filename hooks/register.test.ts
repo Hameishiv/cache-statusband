@@ -8541,6 +8541,14 @@ test('a 429 on every ping of a 1-hour cache: retried every second tick from the 
   expect(offs[0]).toMatch(/the ping failed \(429\)/)
 })
 
+test('a 429 on every ping of a 5-minute cache: exactly 3 forks (the last tick before the limit is not skipped) and one stop toast', async ($, on) => {
+  const { seen, hold } = await failingFork($, on, () => apiError()) // pings at 3:30, 4:00, 4:30; the limit (90 s) is 5:00
+  expect(hold.pings).toBe(3)
+  const offs = seen.toasts.filter((t) => /Keep warm off/.test(t))
+  expect(offs.length).toBe(1)
+  expect(offs[0]).toMatch(/the ping failed \(429\)/)
+})
+
 test('a 429 that is billed (usage) stops at once, counted', async ($, on) => {
   const { seen, hold } = await failingFork($, on, () => apiError({ usage: usage({ input_tokens: 40, output_tokens: 0 }) }))
   expect(hold.pings).toBe(1)

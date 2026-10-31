@@ -1767,11 +1767,11 @@ function stopKeepWarm($, why) {
 
 // A keep-warm ping (a fork) is out: no second one goes while it is, however many ticks come (a tick does not wait for the step before it).
 // Its settling is the real signal, as for fillOut: a ping that is slow is waited for (a tick waits PING_LIMIT for it, then goes on, and what the ping finds is applied when it does settle). The backstop is the time the cache had left when the ping went (at least PING_FLOOR, so that a ping that went with the cache already gone is not given up on before it can answer): a ping still out then has not saved the cache that the chat can count on, so it counts as no answer (keep warm stops, the slot is free), and an answer after that is counted (it was billed) and does nothing else.
-// A ping that comes back failed (the engine returns it, it does not throw) is no answer either, and stops keep warm at once: nothing to fork, an abort, an empty reply, a throw, an api-error with another status than 429 or a 5xx, or one with something billed (counted). A rate limit or a server error that billed nothing is the exception: its slot is freed, nothing is dated, and the next tick pings again until the time the first such ping's cache would have run out (pingFailing), when keep warm stops as above; a read that worked clears that. From the second failure in a row the retries go on every second tick instead of every tick (pingFailing.skip).
+// A ping that comes back failed (the engine returns it, it does not throw) is no answer either, and stops keep warm at once: nothing to fork, an abort, an empty reply, a throw, an api-error with another status than 429 or a 5xx, or one with something billed (counted). A rate limit, a server error or an API error with no status that billed nothing is the exception: its slot is freed, nothing is dated, and a later tick (see skip) pings again until the time the first such ping's cache would have run out (pingFailing), when keep warm stops as above; a read that worked clears that. From the second failure in a row the retries go on every second tick instead of every tick (pingFailing.skip).
 // A ping whose chat, account, keep warm or cache has changed since it went (moved: a /clear, a resume, a compaction, an off (not a start while it is on), a rotation (an account or seat change, or a wake-up that showed neither), or a real request, which warmed the cache for a whole window from its own start) is let go of: nothing stops, and its answer, whenever it comes, is counted and does nothing else. Its slot is free at once, except when only keep warm went off (changed() false: an off, and perhaps on again): the fork is still out and billed, and a new keep warm must not stack a second ping on it, so the slot stays held until it settles or its limit passes (no stop either: the new keep warm is not this ping's to end).
 // { at, limit, moved, changed, lost }: when it went, its backstop, whether the chat/account/keep warm/cache changed since it went, whether anything but keep warm changed, and whether it has been let go of
 let pingOut = null
-// Pings that came back as a rate limit or a server error since the last read that worked, none of them billed: { until, status, moved, fails, skip } (until: the first failed ping's at + limit, the time its cache would have run out; status: of the latest failure; moved: that ping's own check, so a /clear, a compaction, a rotation, a real request or an off ends it; fails: how many in a row; skip: ticks still to leave out before the next try, 1 once there have been two). Each failure frees the slot and the next tick tries again; keep warm stops once `until` has passed with no read that worked (a read that worked clears it)
+// Pings that came back as a rate limit, a server error or an API error with no status since the last read that worked, none of them billed: { until, status, moved, fails, skip } (until: the first failed ping's at + limit, the time its cache would have run out; status: of the latest failure; moved: that ping's own check, so a /clear, a compaction, a rotation, a real request or an off ends it; fails: how many in a row; skip: ticks still to leave out before the next try, 1 once there have been two). Each failure frees the slot and a later tick (see skip) tries again; keep warm stops once `until` has passed with no read that worked (a read that worked clears it)
 let pingFailing = null
 const PING_LIMIT = 60000
 const pingFailedWhy = (status) => (status ? `the ping failed (${status}), so the cache may already be cold` : 'the ping got no answer, so the cache may already be cold')
@@ -1856,8 +1856,8 @@ async function keepWarmStep($) {
   const ttl = ttlMin()
   const margin = ttl >= 60 ? 8 * MIN : 90000
   if (now - S.lastActivity < ttl * MIN - margin) return
-  // A busy API that has turned two pings away is not asked every tick: every second one
-  if (pingFailing && pingFailing.skip > 0) {
+  // A busy API that has turned two pings away is not asked every tick: every second one, except a tick after which no other would come before the limit (the last one is never left out)
+  if (pingFailing && pingFailing.skip > 0 && now + HEARTBEAT_EVERY < pingFailing.until) {
     pingFailing.skip--
     return
   }
@@ -1884,7 +1884,7 @@ async function keepWarmStep($) {
       return stopKeepWarm($, pingFailedWhy(reply && reply.status))
     }
     if (failed && !billed) {
-      // A busy API (rate limit, server error) that billed nothing: the slot is free (above), nothing is dated or stopped, and the next tick pings again, until the time the first failed ping's cache would have run out
+      // A busy API (rate limit, server error, or an API error with no status) that billed nothing: the slot is free (above), nothing is dated or stopped, and a later tick (see skip) pings again, until the time the first failed ping's cache would have run out
       if (retryable(reply, billed) && !ping.lost && !moved()) {
         if (!pingFailing) pingFailing = { until: ping.at + ping.limit, status: null, moved, fails: 0, skip: 0 }
         pingFailing.status = reply.status || null
