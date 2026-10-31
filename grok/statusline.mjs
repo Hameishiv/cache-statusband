@@ -317,34 +317,50 @@ function storedRecord(cached) {
   return { percent, periodType, periodEnd, fetchedAt: text(record.fetchedAt) };
 }
 
+const MAX_CACHED_LOGS = 8;
+
+// The cache file holds { logs: { [logPath]: entry } }. A file from an earlier version (one bare record) has no `logs`: a miss.
 function readCache(cachePath) {
-  if (!cachePath) return null;
+  if (!cachePath) return {};
   try {
-    return JSON.parse(readFileSync(cachePath, "utf8"));
+    const logs = JSON.parse(readFileSync(cachePath, "utf8")).logs;
+    if (!logs || typeof logs !== "object" || Array.isArray(logs)) return {};
+    return logs;
   } catch {
-    return null;
+    return {};
   }
 }
 
-function writeCache(cachePath, body) {
-  if (!cachePath) return;
+function cachedEntry(logs, logPath) {
+  if (!logPath || !Object.hasOwn(logs, logPath)) return null;
+  const entry = logs[logPath];
+  return entry && typeof entry === "object" ? entry : null;
+}
+
+function writeCache(cachePath, logPath, entry) {
+  if (!cachePath || !logPath) return;
   try {
+    // Merge into what is stored now, so another home's entry stays; the eight newest scans are kept.
+    const logs = readCache(cachePath);
+    const kept = Object.entries(logs).filter(([key, value]) => key !== logPath && value && typeof value === "object");
+    kept.sort((a, b) => (finite(b[1].scannedAt) ?? 0) - (finite(a[1].scannedAt) ?? 0));
+    const next = Object.fromEntries([...kept.slice(0, MAX_CACHED_LOGS - 1), [logPath, entry]]);
     mkdirSync(dirname(cachePath), { recursive: true });
-    writeFileSync(cachePath, JSON.stringify(body));
+    writeFileSync(cachePath, JSON.stringify({ logs: next }));
   } catch {
     // This run can still show the reading it already has.
   }
 }
 
 /**
- * Last weekly reading. Re-reads the log at most once per five minutes.
+ * Last weekly reading. Re-reads each log at most once per five minutes: the wait is kept per log, so two Grok homes
+ * (GROK_HOME or CSB_BILLING_LOG) that share one cache file each keep their own, and neither forces the other to rescan.
  * A failed re-read keeps the last good record and only moves the next check.
- * The cache stores the percent, period type, period end, and fetch time, with the log it was read from (a reading from another log is a miss).
+ * The cache stores, per log, the percent, period type, period end, and fetch time, with when the log was last scanned.
+ * It keeps the eight most recently scanned logs. A cache file in the earlier single-record shape is a miss.
  */
 export function loadWeekly(logPath, cachePath, nowMs = Date.now()) {
-  const stored = readCache(cachePath);
-  // A reading taken from another log (another GROK_HOME or CSB_BILLING_LOG) is another account's: a miss.
-  const cached = stored && stored.logPath === logPath ? stored : null;
+  const cached = cachedEntry(readCache(cachePath), logPath);
   const prior = storedRecord(cached);
   const freshScan = cached && finite(cached.scannedAt) !== null && nowMs - cached.scannedAt < RESCAN_MS;
   if (freshScan) return prior;
@@ -363,8 +379,7 @@ export function loadWeekly(logPath, cachePath, nowMs = Date.now()) {
   const found = st ? readLastBilling(logPath) : null;
   if (!found) {
     // A miss is cached too, so a log with no billing line is not rescanned on every run.
-    writeCache(cachePath, {
-      logPath,
+    writeCache(cachePath, logPath, {
       sourceMtimeMs: prior ? cached.sourceMtimeMs : st ? st.mtimeMs : null,
       sourceSize: prior ? cached.sourceSize : st ? st.size : null,
       scannedAt: nowMs,
@@ -378,8 +393,7 @@ export function loadWeekly(logPath, cachePath, nowMs = Date.now()) {
     periodEnd: found.periodEnd,
     fetchedAt: found.fetchedAt,
   };
-  writeCache(cachePath, {
-    logPath,
+  writeCache(cachePath, logPath, {
     sourceMtimeMs: found.sourceMtimeMs,
     sourceSize: found.sourceSize,
     scannedAt: nowMs,

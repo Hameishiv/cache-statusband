@@ -22,7 +22,7 @@ Grok Build 1.0.70 can run a script as the bottom row (`[ui.status_line]` `type =
 | Context measured from a reopened transcript | Not ported. The line uses `context_window.context_tokens` when Grok sends it. It does not parse the transcript. |
 | `/board` of every local session | Not ported. Grok already lists sessions with `grok sessions list` and `/dashboard`. |
 
-The script never reads, prints, or stores an auth token. It does not call a usage endpoint. A re-read of the local log waits at least five minutes, shared through `%LOCALAPPDATA%\cache-statusband-grok\usage.json` (`$XDG_CACHE_HOME/cache-statusband-grok/usage.json`, or `~/.cache/...`, off Windows). A log with no credits line is remembered too, so it is not rescanned on every run. A reset that has already passed, or a reading fetched more than a day ago, drops the weekly segment until Grok logs a new one.
+The script never reads, prints, or stores an auth token. It does not call a usage endpoint. A re-read of a local log waits at least five minutes, counted for each log on its own, so two Grok homes sharing one cache file never make each other rescan. The waits are kept in `%LOCALAPPDATA%\cache-statusband-grok\usage.json` (`$XDG_CACHE_HOME/cache-statusband-grok/usage.json`, or `~/.cache/...`, off Windows), for the eight logs read most recently. A log with no credits line is remembered too, so it is not rescanned on every run. A reset that has already passed, or a reading fetched more than a day ago, drops the weekly segment until Grok logs a new one.
 
 ## Credits
 

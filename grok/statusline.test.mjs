@@ -111,9 +111,9 @@ describe("weekly usage", () => {
     const cachePath = join(dir, "usage.json");
     writeFileSync(logPath, "no credits line\n");
     assert.equal(loadWeekly(logPath, cachePath, now), null);
-    const cached = JSON.parse(readFileSync(cachePath, "utf8"));
-    assert.equal(cached.record, null);
-    assert.equal(cached.scannedAt, now);
+    const entry = JSON.parse(readFileSync(cachePath, "utf8")).logs[logPath];
+    assert.equal(entry.record, null);
+    assert.equal(entry.scannedAt, now);
     // A credits line appended within five minutes is not seen until the next rescan.
     writeFileSync(logPath, `no credits line\n${JSON.stringify({
       ts: "2026-10-29T11:40:00Z",
@@ -124,7 +124,7 @@ describe("weekly usage", () => {
     assert.equal(loadWeekly(logPath, cachePath, now + 6 * 60 * 1000).percent, 5);
   });
 
-  it("does not show one Grok home's weekly reading for another home that shares the cache", () => {
+  it("keeps the five-minute wait per log: two homes sharing the cache each show their own reading and do not rescan each other", () => {
     const dir = mkdtempSync(join(tmpdir(), "csb-homes-"));
     const cachePath = join(dir, "usage.json");
     const credits = (percent) => `${JSON.stringify({
@@ -139,9 +139,48 @@ describe("weekly usage", () => {
       return logPath;
     });
     assert.equal(loadWeekly(logs[0], cachePath, now).percent, 10);
-    assert.equal(loadWeekly(logs[1], cachePath, now + 60 * 1000).percent, 90); // inside the five-minute window
+    assert.equal(loadWeekly(logs[1], cachePath, now + 1000).percent, 90);
+    // Both logs gain a newer line (of a different size). A rescan would show it; inside five minutes none happens.
+    writeFileSync(logs[0], credits(7));
+    writeFileSync(logs[1], credits(100));
+    assert.equal(loadWeekly(logs[0], cachePath, now + 60 * 1000).percent, 10);
     assert.equal(loadWeekly(logs[1], cachePath, now + 120 * 1000).percent, 90);
     assert.equal(loadWeekly(logs[0], cachePath, now + 180 * 1000).percent, 10);
+    assert.equal(loadWeekly(logs[1], cachePath, now + 240 * 1000).percent, 90);
+    // Past the wait each log rescans on its own.
+    assert.equal(loadWeekly(logs[0], cachePath, now + 6 * 60 * 1000).percent, 7);
+    assert.equal(loadWeekly(logs[1], cachePath, now + 6 * 60 * 1000 + 2000).percent, 100);
+    assert.deepEqual(Object.keys(JSON.parse(readFileSync(cachePath, "utf8")).logs).sort(), [...logs].sort());
+  });
+
+  it("treats an earlier version's single-record cache file as a miss, and keeps only the eight newest logs", () => {
+    const dir = mkdtempSync(join(tmpdir(), "csb-old-"));
+    const cachePath = join(dir, "usage.json");
+    const credits = (percent) => `${JSON.stringify({
+      ts: "2026-10-29T11:37:35.772Z",
+      msg: "billing: fetched credits config",
+      ctx: { config: { creditUsagePercent: percent, currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", end: "2026-11-02T22:57:09.651+00:00" } } },
+    })}\n`;
+    const logPath = join(dir, "unified.jsonl");
+    writeFileSync(logPath, credits(33));
+    writeFileSync(cachePath, JSON.stringify({
+      logPath,
+      sourceMtimeMs: 1,
+      sourceSize: 1,
+      scannedAt: now,
+      record: { percent: 99, periodType: "USAGE_PERIOD_TYPE_WEEKLY", periodEnd: "2026-11-02T22:57:09.651+00:00", fetchedAt: "2026-10-29T11:37:35.772Z" },
+    }));
+    assert.equal(loadWeekly(logPath, cachePath, now + 1000).percent, 33);
+    const many = [];
+    for (let i = 0; i < 10; i++) {
+      const other = join(dir, `h${i}.jsonl`);
+      writeFileSync(other, credits(i + 1));
+      many.push(other);
+      loadWeekly(other, cachePath, now + 2000 + i * 1000);
+    }
+    const kept = Object.keys(JSON.parse(readFileSync(cachePath, "utf8")).logs);
+    assert.equal(kept.length, 8);
+    assert.deepEqual(kept.sort(), many.slice(2).sort());
   });
 
   it("reads the last credits line and keeps every other field out of the cache", () => {
@@ -167,8 +206,11 @@ describe("weekly usage", () => {
     const first = loadWeekly(logPath, cachePath, now);
     assert.equal(weeklyLabel(first, now), "week 23% · 4d11h");
     const cached = JSON.parse(readFileSync(cachePath, "utf8"));
-    assert.deepEqual(Object.keys(cached).sort(), ["logPath", "record", "scannedAt", "sourceMtimeMs", "sourceSize"]);
-    assert.deepEqual(Object.keys(cached.record).sort(), ["fetchedAt", "percent", "periodEnd", "periodType"]);
+    assert.deepEqual(Object.keys(cached).sort(), ["logs"]);
+    assert.deepEqual(Object.keys(cached.logs), [logPath]);
+    const entry = cached.logs[logPath];
+    assert.deepEqual(Object.keys(entry).sort(), ["record", "scannedAt", "sourceMtimeMs", "sourceSize"]);
+    assert.deepEqual(Object.keys(entry.record).sort(), ["fetchedAt", "percent", "periodEnd", "periodType"]);
     assert.equal(JSON.stringify(cached).includes("super-secret-tier"), false);
     assert.equal(JSON.stringify(cached).includes("user@example.com"), false);
 
@@ -186,12 +228,12 @@ describe("weekly usage", () => {
       })}\n`,
     );
     assert.equal(loadWeekly(logPath, cachePath, now + 1000).percent, 23);
-    cached.scannedAt = now - 6 * 60 * 1000;
+    entry.scannedAt = now - 6 * 60 * 1000;
     writeFileSync(cachePath, JSON.stringify(cached));
     assert.equal(loadWeekly(logPath, cachePath, now + 1000).percent, 40);
     writeFileSync(logPath, "no credits line\n");
     const aged = JSON.parse(readFileSync(cachePath, "utf8"));
-    aged.scannedAt = now - 6 * 60 * 1000;
+    aged.logs[logPath].scannedAt = now - 6 * 60 * 1000;
     writeFileSync(cachePath, JSON.stringify(aged));
     assert.equal(loadWeekly(logPath, cachePath, now + 2000).percent, 40);
   });
