@@ -804,6 +804,22 @@ test('auto keep warm stops once its pings cost as much as the rewrite; one start
   expect(r.text).toMatch(/Keep warm is on/)
 })
 
+test('a keep warm started by hand keeps its own end: a turn ending after it does not stretch it to the auto keep warm\'s hours', async ($, on) => {
+  const { clock } = engine($, on)
+  on('model.fork', () => ({ value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }))
+  const step = stepper($, on)
+  await start($, 300000, clock)
+  await $.command.run({ command: 'cache', args: 'ttl 5' })
+  await $.command.run({ command: 'keepwarm', args: '1' })
+  await step(usage({ cache_read_input_tokens: 300000 }))
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  let r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/Keep warm is on/)
+  await clock.advance(5 * 3600000)
+  r = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/Keep warm is on/)
+})
+
 test('a failed plan check does not overwrite a newer reading another session took', async ($, on) => {
   const kept = new Map<string, unknown>()
   const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } } // an account to key the reading by: a session with none shares nothing

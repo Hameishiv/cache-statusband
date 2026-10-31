@@ -2288,7 +2288,8 @@ export function register(on, options = {}) {
     // Auto keep warm: a big chat stays warm until autoWarmHours after its last turn, or sooner once its pings cost as much as the rewrite
     if (settings.autoWarmHours > 0 && S.autoWarm && S.ctx >= settings.bigTokens) {
       if (!S.keepWarm) startKeepWarm($, settings.autoWarmHours, true)
-      S.keepWarmUntil = Math.max(S.keepWarmUntil, now + settings.autoWarmHours * 60 * MIN)
+      // only the auto one is extended: one started by hand (/keepwarm N, the band's button, the board's) keeps its own end, and has no cost cap to stop it
+      else if (S.keepWarmAuto) S.keepWarmUntil = Math.max(S.keepWarmUntil, now + settings.autoWarmHours * 60 * MIN)
     }
     await heartbeat($, true)
     $.ui.invalidate('ui.render')
