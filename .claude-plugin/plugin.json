@@ -23,7 +23,7 @@
     "rotatorWakePattern": {
       "type": "string",
       "title": "Rotator wake-up pattern",
-      "description": "A regular expression matching the prompt an unattended account rotator types after rotating. Such a prompt is compacted first without asking, since nobody is there to answer, unless the cold-send guard is off (/cache guard off): then it is sent as it is, uncompacted. For 3 minutes after it, a late rewrite of the seat file or the account is still taken as that rotation. Leave empty to turn off.",
+      "description": "A regular expression matching the prompt an unattended account rotator types after rotating. Such a prompt is compacted first without asking, since nobody is there to answer, whenever the cold-send guard would apply: the guard is on (/cache guard off turns it off), the context is at least the big size (/cache big) and at least 100k tokens above what the last compaction left, the prompt has no attachment, the chat was not just compacted, and it is not typed inside a running turn. Otherwise it is sent as it is, uncompacted. For 3 minutes after it, a late rewrite of the seat file or the account is still taken as that rotation. Leave empty to turn off.",
       "default": ""
     },
     "prPattern": {
