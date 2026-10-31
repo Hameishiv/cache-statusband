@@ -5291,7 +5291,7 @@ test('a late "not filled" answer for a message put back over one held only quote
 })
 
 // The earlier put-back is still in the box, unsent, when a later one is joined behind it (the fill replaces the box, so its text is both)
-async function joinedLateFill($: any, on: any, second: string, answer: 'none' | 'not filled' | 'filled', boxAfter?: string, noRead = false) {
+async function joinedLateFill($: any, on: any, second: string, answer: 'none' | 'not filled' | 'filled', boxAfter?: string, noRead = false, during?: (clock: any) => Promise<void>) {
   const box = { text: '' }
   const { clock, seen, fills, late, finish } = await lateJoinSetup($, on, box, noRead)
   await $.prompt.submit({ text: 'stop, do X instead', origin: COMPOSER, wait: false } as never)
@@ -5304,6 +5304,7 @@ async function joinedLateFill($: any, on: any, second: string, answer: 'none' | 
   await clock.advance(1000)
   await clock.advance(2500)
   expect(fills).toEqual(['stop, do X instead', 'stop, do X instead\n\n' + second])
+  if (during) await during(clock) // something happens while the fill is still out
   if (boxAfter !== undefined) box.text = boxAfter
   if (answer === 'not filled') late.resolve({ isFilled: false })
   if (answer === 'filled') late.resolve({ isFilled: true })
@@ -5355,6 +5356,84 @@ test('on an engine with no read, after the joined fill answers late "filled", a 
   void sendBridge($, 'three')
   await r.clock.advance(1000)
   expect(r.fills).toEqual(['stop, do X instead', 'stop, do X instead\n\n' + WAKE_TEXT, 'stop, do X instead\n\n' + WAKE_TEXT + '\n\nthree'])
+})
+
+// The late answer is tracked whatever became of the hold meanwhile: a put-back quoted while the fill is out replaces the hold without touching the box
+for (const answerLate of ['not filled', 'filled'] as const) {
+  test(`on an engine with no read, a put-back quoted while the joined fill is out does not stop the late "${answerLate}" answer from being tracked: the next put-back goes in behind ${answerLate === 'filled' ? 'the joined text' : 'the earlier put-back'}`, { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+    const r = await joinedLateFill($, on, WAKE_TEXT, answerLate, undefined, true, async (clock) => {
+      void sendBridge($, 'mid') // the fill is still out: quoted in a toast, the box is left alone
+      await clock.advance(1000)
+      await clock.advance(2500)
+    })
+    void sendBridge($, 'three')
+    await r.clock.advance(1000)
+    await r.clock.advance(2500)
+    expect(r.seen.toasts.filter((t: string) => t.includes('Also not sent: mid'))).toHaveLength(1)
+    expect(r.fills).toEqual(['stop, do X instead', 'stop, do X instead\n\n' + WAKE_TEXT, answerLate === 'filled' ? 'stop, do X instead\n\n' + WAKE_TEXT + '\n\nthree' : 'stop, do X instead\n\nthree'])
+  })
+}
+
+// A put-back that holds nothing (a send refused after a compaction that finished): no hold, but the text it joins behind is still tracked, and its late answer gives that tracking back
+test('on an engine with no read, a late "not filled" answer for a fill that holds nothing (a refused send after a finished compaction) gives the earlier text back: the next put-back goes in behind it', SETUP, async ($, on) => {
+  heldAsk(on, 99)
+  const late: { resolve: (v: any) => void; armed: boolean } = { resolve: () => {}, armed: false }
+  const { clock, seen, fills } = await coldChat($, on, () => {}, (e) => (late.armed ? new Promise((r) => { late.resolve = r }) : { isFilled: true })) // no prompt.read
+  seen.failSubmit = true // after "Compact first" the message is refused, and put back
+  await send($, 'one')
+  await clock.advance(1000)
+  expect(fills).toEqual(['one'])
+  await clock.advance(77 * 60000) // cold again, the text of 'one' still unsent in the box
+  late.armed = true
+  void sendBridge($, 'two') // refused after compacting, put back behind 'one', and the fill does not answer in time
+  await clock.advance(1000)
+  await clock.advance(2500)
+  expect(fills).toEqual(['one', 'one\n\ntwo'])
+  late.resolve({ isFilled: false })
+  await realMs(50)
+  late.armed = false
+  await clock.advance(77 * 60000)
+  void sendBridge($, 'three')
+  await clock.advance(1000)
+  await clock.advance(2500)
+  expect(fills).toEqual(['one', 'one\n\ntwo', 'one\n\nthree'])
+  expect(seen.toasts.filter((t) => t.includes('Also not sent'))).toEqual([])
+})
+
+// A single fill (nothing earlier in the box) that answers late "filled": the text it filled is the remembered one, joined or not
+test('on an engine with no read, a single fill that answers late "filled" is tracked: the next put-back goes in behind it', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+  const box = { text: '' }
+  const { clock, seen, fills, late } = await lateJoinSetup($, on, box, true)
+  late.armed = true
+  await $.prompt.submit({ text: 'stop, do X instead', origin: COMPOSER, wait: false } as never)
+  await clock.advance(60000)
+  for (let i = 0; i < 20 && !fills.length; i++) await clock.advance(60000)
+  await clock.advance(1000)
+  await clock.advance(2500)
+  expect(fills).toEqual(['stop, do X instead'])
+  late.resolve({ isFilled: true })
+  await realMs(50)
+  late.armed = false
+  void sendBridge($, 'three')
+  await clock.advance(1000)
+  await clock.advance(2500)
+  expect(fills).toEqual(['stop, do X instead', 'stop, do X instead\n\nthree'])
+  expect(seen.toasts.filter((t: string) => t.includes('Also not sent'))).toEqual([])
+})
+
+// A request that starts while the fill is out may be the very message that was put back and sent: the late "filled" answer then tracks nothing, so a later put-back does not bring the sent text back
+test('on an engine with no read, a late "filled" answer after a request started while the fill was out is not tracked: a later put-back does not bring the text back', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+  const step = stepper($, on)
+  const r = await joinedLateFill($, on, WAKE_TEXT, 'filled', undefined, true, async () => { await step({}) })
+  r.finish()
+  await r.clock.advance(1000)
+  await r.clock.advance(77 * 60000) // cold again
+  ;(r.seen as any).failSubmit = true // the message is refused after compacting, and put back
+  void sendBridge($, 'three')
+  await r.clock.advance(1000)
+  await r.clock.advance(2500)
+  expect(r.fills[r.fills.length - 1]).toBe('three')
+  expect(r.fills.length).toBe(3)
 })
 
 // The earlier put-back's own hold (15 minutes) has run out before the later one is joined behind it: its compaction failed late, which freed the next send to compact, and that compaction was abandoned in turn. The text of the earlier put-back is still in the box, and the tracking of it does not lapse with time
