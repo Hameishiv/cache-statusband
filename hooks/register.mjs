@@ -1051,6 +1051,51 @@ function findPr(text) {
   return m && m[1] ? Number(m[1]) || 0 : 0
 }
 
+// The first user prompt in a transcript's rows that names a PR. A typed command is stored as <command-name>/<command-args> tags, put back into the typed form first
+export function prFromTranscript(lines) {
+  for (const line of lines) {
+    let j
+    try {
+      j = JSON.parse(line)
+    } catch {
+      continue // the head's last line may be cut
+    }
+    if (!j || j.type !== 'user' || j.isSidechain || j.isMeta || !j.message) continue
+    const c = j.message.content
+    let text = typeof c === 'string' ? c : Array.isArray(c) ? c.filter((b) => b && b.type === 'text').map((b) => b.text).join('\n') : ''
+    const name = /<command-name>\s*\/?([^<\s]+)\s*<\/command-name>/.exec(text)
+    if (name) {
+      const args = /<command-args>([\s\S]*?)<\/command-args>/.exec(text)
+      text = `/${name[1]} ${args ? args[1] : ''}`
+    }
+    const pr = findPr(text)
+    if (pr) return pr
+  }
+  return 0
+}
+
+const HEAD_JS = "const fs=require('fs'),p=process.argv[1],n=Math.min(fs.statSync(p).size," + 1024 * 1024 + "),b=Buffer.alloc(n),fd=fs.openSync(p,'r');fs.readSync(fd,b,0,n,0);process.stdout.write(b)"
+
+// The PR a resumed chat's first merge-pr prompt names: from its transcript, else the messages the session reports
+async function resumedPr($, path) {
+  try {
+    const st = await $.fs.stat(path)
+    if (st.kind === 'file' && st.size) {
+      const text = st.size <= 4 * 1024 * 1024 ? String(await $.fs.read(path)) : (await $.process.run(['node', '-e', HEAD_JS, path], { timeoutMs: 15000 })).stdout
+      const pr = prFromTranscript(String(text).split('\n'))
+      if (pr) return pr
+    }
+  } catch {
+    // no transcript to read here: the session's own messages
+  }
+  try {
+    const first = (await $.session.messages()).find((m) => m.role === 'user' && findPr(m.text))
+    return first ? findPr(first.text) : 0
+  } catch {
+    return 0
+  }
+}
+
 async function prState($) {
   try {
     const r = await $.process.run(['gh', 'pr', 'view', String(S.pr), '--json', 'state', '-q', '.state'], { cwd: S.cwd, timeoutMs: 20000 })
@@ -1741,10 +1786,12 @@ export function register(on, options = {}) {
       S.floor = 0
       S.ctx = 0 // the last chat's size; a resumed chat's own is seeded below (a cleared one starts at 0)
       pendingSeed = null // a transcript still waiting for session.start belongs to the chat this one replaces
-      // the last chat's merge-pr PR says nothing about this one: its keep warm must not stop when that PR merges, and an auto keep warm that merge switched off starts on again. The new chat's own PR is read from its first prompt that names one (prompt.submit); a resumed chat's earlier prompts are not read here, so a resumed merge-pr chat is tracked from its next prompt that names the PR. A fork is the same conversation and keeps both
-      S.pr = 0
-      S.prCheckedAt = 0
-      if (S.autoWarmOffByPr) setAutoWarm(true)
+      // the last chat's merge-pr PR says nothing about this one: its keep warm must not stop when that PR merges, and an auto keep warm that merge switched off starts on again. The new chat's own PR is read from its first prompt that names one (prompt.submit); a resumed chat's from its transcript (below). A fork is the same conversation and keeps both, and so does this mod's own clear and continue, which carries the same work into the cleared chat
+      if (!H.continuing) {
+        S.pr = 0
+        S.prCheckedAt = 0
+        if (S.autoWarmOffByPr) setAutoWarm(true)
+      }
     }
     S.keepWarm = false
     H.armed = false
@@ -1777,6 +1824,9 @@ export function register(on, options = {}) {
     if (e.source === 'resume') {
       if (identityRead) await seedFromTranscript($, e.transcript_path)
       else pendingSeed = e.transcript_path
+      // either order with session.start ends with the resumed chat's PR: read here from its transcript, not left for its next prompt
+      const pr = await resumedPr($, e.transcript_path)
+      if (pr) S.pr = pr
     }
     return next(e)
   })

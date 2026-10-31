@@ -18,7 +18,7 @@ function engine($: any, on: any, seat: { label: string; recording?: string } = {
     on('store.keys', () => ({ value: [...kept.keys()] }))
   } else mock.store(on)
   mock.env(on, { USERPROFILE: 'C:/Users/T' })
-  const seen = { compacts: 0, submits: [] as string[], asks: 0, toasts: [] as string[], failCompact: false, failSubmit: false, duringCompact: null as null | (() => Promise<unknown>), duringSubmit: null as null | (() => Promise<unknown>) }
+  const seen = { compacts: 0, submits: [] as string[], asks: 0, toasts: [] as string[], failCompact: false, failSubmit: false, duringCompact: null as null | (() => Promise<unknown>), duringSubmit: null as null | (() => Promise<unknown>), duringClear: null as null | (() => Promise<unknown>) }
   on('session.id', () => ({ value: 'sid-test' }))
   on('session.cwd', () => ({ value: '/repo' }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
@@ -46,6 +46,7 @@ function engine($: any, on: any, seat: { label: string; recording?: string } = {
       await seen.duringCompact?.()
       if (seen.failCompact) throw new Error('no room')
     }
+    if (e.command === 'clear') await seen.duringClear?.()
     return { text: '' }
   })
   on('prompt.submit', (_: unknown, e: any) => {
@@ -210,6 +211,72 @@ test('a chat resumed after the old chat\'s PR merged keeps warm: the PR and the 
   r = await $.command.run({ command: 'cache', args: '' })
   expect(r.text).toMatch(/Keep warm is on/)
 })
+
+test('this mod\'s clear and continue keeps the chat\'s PR: keep warm still stops when that PR merges', SETUP, async ($, on) => {
+  const { clock, seen } = engine($, on)
+  let state = 'OPEN'
+  on('process.run', () => ({ value: { exitCode: 0, stdout: state + '\n', stderr: '' } }))
+  on('session.usage', () => ({ value: { context: { tokens: 300000, window: 1000000 } } }))
+  on('turn.complete', () => ({ text: '' }))
+  on('model.fork', () => ({ value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }))
+  on('classic.SessionStart', () => ({}))
+  await start($, 300000, clock)
+  await $.prompt.submit({ text: '/merge-pr 123', command: { name: 'merge-pr', args: '123' }, origin: COMPOSER, wait: false } as never)
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  // a handoff is captured, then /handoff continue runs /clear, whose SessionStart fires inside it
+  await $.command.run({ command: 'session-handoff', args: '' })
+  await $.turn.complete({ answer: '# Session Handoff\n' + 'work on PR 123 continues. '.repeat(20), durationMs: 1, isAborted: false, turnId: 't2', reason: 'answer' } as never)
+  seen.duringClear = async () => { await ($ as any).classic.SessionStart({ source: 'clear' }) }
+  await $.command.run({ command: 'handoff', args: 'continue' })
+  await clock.advance(100)
+  expect(seen.submits.length).toBe(1) // the handoff went into the cleared chat
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't3', reason: 'end_turn' } as never)
+  let r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/Keep warm is on/)
+  state = 'MERGED'
+  await clock.advance(16 * 60000)
+  r = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/Keep warm is on/)
+  expect(r.text).toMatch(/off in this session/)
+})
+
+const prompt = (text: string) => JSON.stringify({ type: 'user', message: { role: 'user', content: text } }) + '\n'
+const typedCommand = (name: string, args: string) => prompt(`<command-message>${name}</command-message>\n<command-name>/${name}</command-name>\n<command-args>${args}</command-args>`)
+
+// the resumed chat's PR, in either order of the resume's SessionStart and session.start
+for (const order of ['session.start first', 'SessionStart first']) {
+  test(`a resumed chat whose transcript names a PR tracks it (${order}): keep warm stops when it merges`, SETUP, async ($, on) => {
+    const disk: { files: Record<string, string> } = { files: {} }
+    const { clock } = engine($, on, { label: 'A' }, undefined, undefined, disk)
+    let state = 'OPEN'
+    const asked: string[] = []
+    on('process.run', (_: unknown, e: any) => (asked.push(String(e.command?.[3] ?? e.argv?.[3] ?? '')), { value: { exitCode: 0, stdout: state + '\n', stderr: '' } }))
+    on('session.usage', () => ({ value: { context: { tokens: 300000, window: 1000000 } } }))
+    on('turn.complete', () => ({ text: '' }))
+    on('model.fork', () => ({ value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }))
+    on('classic.SessionStart', () => ({}))
+    disk.files['sid-test.jsonl'] = prompt('hello') + typedCommand('merge-pr', '456') + reply(60000, 300000)
+    if (order === 'session.start first') {
+      await start($, 300000, clock)
+      await $.prompt.submit({ text: '/merge-pr 123', command: { name: 'merge-pr', args: '123' }, origin: COMPOSER, wait: false } as never)
+      await ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/sid-test.jsonl' })
+    } else {
+      await clock.advance(60000)
+      await ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/sid-test.jsonl' })
+      await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+      await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: [], changed: [] })
+    }
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+    await clock.advance(16 * 60000)
+    expect(asked.length).toBeGreaterThan(0)
+    expect(asked.every((n) => n === '456')).toBe(true) // the resumed chat's PR, never the old chat's 123
+    state = 'MERGED'
+    await clock.advance(16 * 60000)
+    const r: any = await $.command.run({ command: 'cache', args: '' })
+    expect(r.text).not.toMatch(/Keep warm is on/)
+    expect(r.text).toMatch(/off in this session/)
+  })
+}
 
 test('an auto keep warm turned off by hand stays off in a cleared chat', SETUP, async ($, on) => {
   const { clock } = engine($, on)
