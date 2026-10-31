@@ -5687,3 +5687,40 @@ test('on an engine with no read, a late "not filled" answer of a fill that a lat
   await clock.advance(2500)
   expect(fills[3]).toBe(WAKE_TEXT.replace('Go on.', 'four')) // not 'stop, do X instead\n\n' + ...: that text is not known to be in the box
 })
+
+// Same set-up, but both late answers are "filled". F1's (joined: 'stop, do X instead' + the wake-up) is stale, F2 followed it, so it tracks nothing (the `seq === fillSeq` check in stillUntouched); F2's own answer tracks its text, and the put-back after both goes in behind F2's text only, not behind F1's joined text. No read on the engine
+test('on an engine with no read, a late "filled" answer of a fill that a later fill has followed tracks nothing: a put-back after both goes in behind the later fill's text only', SETUP, async ($, on) => {
+  const box = { text: '' }
+  const { clock, seen, fills, late } = await lateJoinSetup($, on, box, true)
+  let fail: (e: Error) => void = () => {}
+  let n = 0
+  seen.duringCompact = () => (++n === 1 ? new Promise<void>((_, rej) => { fail = rej }) : Promise.reject(new Error('no room')))
+  await $.prompt.submit({ text: 'stop, do X instead', origin: COMPOSER, wait: false } as never)
+  await clock.advance(60000)
+  for (let i = 0; i < 20 && !fills.length; i++) await clock.advance(60000)
+  fail(new Error('late boom'))
+  await clock.advance(16 * 60000)
+  seen.failSubmit = true
+  late.armed = true
+  await sendBridge($, WAKE_TEXT)
+  for (let i = 0; i < 10 && fills.length < 2; i++) await clock.advance(1000)
+  await clock.advance(2500)
+  await clock.advance(2500)
+  const answerF1 = late.resolve
+  await clock.advance(16 * 60000)
+  await sendBridge($, WAKE_TEXT.replace('Go on.', 'three'))
+  for (let i = 0; i < 10 && fills.length < 3; i++) await clock.advance(1000)
+  await clock.advance(2500)
+  await clock.advance(2500)
+  const answerF2 = late.resolve
+  expect(fills).toEqual(['stop, do X instead', 'stop, do X instead\n\n' + WAKE_TEXT, WAKE_TEXT.replace('Go on.', 'three')])
+  answerF1({ isFilled: true })
+  await realMs(50)
+  answerF2({ isFilled: true })
+  await realMs(50)
+  late.armed = false
+  void sendBridge($, WAKE_TEXT.replace('Go on.', 'four'))
+  for (let i = 0; i < 10 && fills.length < 4; i++) await clock.advance(1000)
+  await clock.advance(2500)
+  expect(fills[3]).toBe(WAKE_TEXT.replace('Go on.', 'three') + '\n\n' + WAKE_TEXT.replace('Go on.', 'four')) // only F2's text is the box's: F1's "filled" answer (seq !== fillSeq) tracked nothing and F2's answer tracks its own text
+})
