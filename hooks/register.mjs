@@ -23,6 +23,7 @@ const S = {
   label: '',
   model: '',
   lastActivity: 0, // last main-loop request or keep-warm ping that touched the cache
+  compactedAt: 0, // when the chat was last compacted with no request since (markCompacted zeroed lastActivity): an auto keep warm waiting for that request gives up one TTL on
   ctx: 0,
   window: 0,
   costUsd: 0,
@@ -314,6 +315,7 @@ function markCompacted($, seq = 0) {
   if (abandoned && !(seq ? abandoned.seq > seq : olderRunOut(abandoned.seq))) abandoned = null // a compaction that succeeded, ours or the person's, makes an earlier hung one moot, not one that started after it (seq: the succeeding run's number; 0 for an engine mark, which can't say whose end it is: while an older run of ours is still out and started less than two COMPACT_LIMITs ago it is probably that one's)
   rotatedPending = false // the rotation is now part of compactedCold
   S.lastActivity = 0
+  S.compactedAt = now
   rememberCompacted($)
 }
 
@@ -1155,7 +1157,8 @@ function msLeft(lastActivity, ttl) {
 function cacheState(hb) {
   if (hb.rotated) return { kind: 'cold', left: hb.seatChangedAt ? hb.seatChangedAt - now : null }
   const left = msLeft(hb.lastActivity, hb.ttlMin)
-  if (left === null) return { kind: 'unknown', left: 0 }
+  // keep warm on with no activity time (a compaction zeroed it, or a chat with no request yet): it is on and waits for the next request, so the band, /cache and the board all say so
+  if (left === null) return hb.keepWarm ? { kind: 'kept', left: null } : { kind: 'unknown', left: 0 }
   if (hb.keepWarm) return { kind: 'kept', left }
   if (left <= 0) return { kind: 'cold', left }
   if (left <= 5 * MIN) return { kind: 'cooling', left }
@@ -1353,8 +1356,8 @@ async function refreshPlan($) {
       fetched = true
     } else why = 'HTTP ' + r.status
     // a 429 names how long to stay away; every session on this key waits it out, an hour at most
-    const wait = Number(r.headers && r.headers['retry-after'])
-    if (!r.ok && wait > 0) next = now + Math.min(60 * MIN, Math.max(PLAN_EVERY, wait * 1000))
+    const wait = retryAfterMs(r.headers, now)
+    if (!r.ok && wait > 0) next = now + Math.min(60 * MIN, Math.max(PLAN_EVERY, wait))
   } catch (err) {
     why = clip(String((err && err.message) || err), 120) // offline or refused: keep the last reading
   }
@@ -1378,6 +1381,16 @@ async function refreshPlan($) {
   } catch {
     // lock held: another session is writing the same reading
   }
+}
+
+// A Retry-After header, found whatever its capitals, as milliseconds from `at`: seconds, or an HTTP date. 0 when absent, unreadable, or already past
+function retryAfterMs(headers, at) {
+  if (!headers || typeof headers !== 'object') return 0
+  const key = Object.keys(headers).find((k) => k.toLowerCase() === 'retry-after')
+  const v = key === undefined ? '' : String(headers[key]).trim()
+  if (!v) return 0
+  const ms = /^\d+(\.\d+)?$/.test(v) ? Number(v) * 1000 : Date.parse(v) - at
+  return ms > 0 ? ms : 0 // NaN and a past date are not waits
 }
 
 // Nothing to read or write: the shared plan reading would be another account's
@@ -1702,9 +1715,10 @@ function setAutoWarm(on) {
 }
 
 // Why auto keep warm may not run in this chat now, by what is set (on, big chat) and what it has spent (the cap on its pings in this idle stretch); '' when it may. Checked by every start and hand-over (autoMayRun) and, each step, by an auto keep warm that is running, so a setting changed meanwhile (here or in another session) applies to it
-function autoStopReason() {
+function autoStopReason(settingsOnly = false) {
   if (!(settings.autoWarmHours > 0) || !S.autoWarm) return 'auto keep warm was turned off'
   if (S.ctx < settings.bigTokens) return 'this chat is now under the big size'
+  if (settingsOnly) return '' // the cap is for the idle path: while a request runs, S.model may already be the next request's and the cost of the pings was counted at the old one's price
   if (S.autoCappedStretch || S.autoPingUsd >= rewriteCost(S.ctx, S.model, ttlMin())) return `its pings have cost as much as rewriting the cache (${money(S.autoPingUsd)})`
   return ''
 }
@@ -1733,7 +1747,8 @@ async function keepWarmStep($) {
   if (!S.keepWarm) return
   if (S.keepWarmAuto) {
     // a setting changed while it ran (autowarm off, big 400k, in this session or another): it stops, even while the chat works
-    const why = autoStopReason()
+    // while the chat works only the settings count: the cap is judged when it is idle (and by a ping that has just been paid)
+    const why = autoStopReason(S.working)
     if (why) return stopKeepWarm($, why)
     // fewer auto hours than it started with: it ends that long after the last turn
     if (S.lastTurnEnd) S.keepWarmUntil = Math.min(S.keepWarmUntil, S.lastTurnEnd + settings.autoWarmHours * 60 * MIN)
@@ -1767,7 +1782,11 @@ async function keepWarmStep($) {
   // Auto keep warm never pings a cache that has already gone cold (a long idle with the chat working, or a turn that ended with no request of its own, long after the last one): the ping would pay the whole rewrite. One started by hand goes on as it was
   // A cache with no activity time at all is not one that went cold: a compaction (typed, automatic or a wake-up's) zeroed it, and the next request writes the shorter context; it waits for that, below
   if (S.keepWarmAuto && S.lastActivity && msLeft(S.lastActivity, ttlMin()) <= 0) return stopKeepWarm($, 'the cache had already gone cold')
-  if (!S.lastActivity) return
+  if (!S.lastActivity) {
+    // waiting for the request a compaction made room for: if none lands within a TTL of it, the chat is not being used and auto keep warm has nothing to protect
+    if (S.keepWarmAuto && S.compactedAt && now - S.compactedAt >= ttlMin() * MIN) return stopKeepWarm($, 'the chat was compacted and no message followed')
+    return
+  }
   const ttl = ttlMin()
   const margin = ttl >= 60 ? 8 * MIN : 90000
   if (now - S.lastActivity < ttl * MIN - margin) return
@@ -1927,7 +1946,7 @@ function statusText() {
   if (st.kind === 'warm' || st.kind === 'cooling') lines.push(`Cache is warm for about ${minutes(st.left)} more.`)
   if (st.kind === 'cold') lines.push(`Cache ${st.left === null ? 'is cold' : `went cold ${minutes(-st.left)} ago`}. The next message rewrites it for about ${money(rewriteCost(S.ctx, S.model, ttl))}.`)
   if (rotatedCold()) lines.push(`The account rotated${rotatedAgo()} (now ${mask(S.seat || S.account)}), so the cache is cold.`)
-  if (S.keepWarm) lines.push(`Keep warm is on until ${clock(S.keepWarmUntil)}: ${S.pings} ping(s), ${money(S.pingUsd)} so far.`)
+  if (S.keepWarm) lines.push(`Keep warm is on until ${clock(S.keepWarmUntil)}: ${S.pings} ping(s), ${money(S.pingUsd)} so far.${st.left === null ? ' It waits for the next message before it pings.' : ''}`)
   if (S.rateLimits.length) lines.push(`Plan limits used: ${limitsText(S.rateLimits)}.`)
   if (keyUnsure()) lines.push('Fable weekly: waiting for the rotator to name the new seat or account.')
   else lines.push(S.fable ? `Fable weekly: ${Math.round(S.fable.percentUsed)}% used.` : `Fable weekly: no reading yet${planWhy && planWhy !== 'ok' ? ` (last check: ${planWhy})` : ''}.`)
@@ -2042,6 +2061,7 @@ export function register(on, options = {}) {
       S.seatChangedAt = 0
       rotatedPending = false
       S.lastActivity = 0
+      S.compactedAt = 0
       // the last chat's compaction says nothing about this one, and would mute its cold-send guard
       justCompacted = false
       abandoned = null // the last chat's compaction, if it ever ends, is not this one's
@@ -2312,6 +2332,7 @@ export function register(on, options = {}) {
     }
     S.ctx = total
     S.lastActivity = now
+    S.compactedAt = 0 // the request a compaction waited for has landed
     measuredSteps++ // the chat measured itself: a seed still reading its transcript leaves these to it
     S.autoPingUsd = 0 // a real request ends the idle stretch the pings were protecting
     S.autoCappedStretch = false
@@ -2626,7 +2647,7 @@ function bandSegments() {
   if (onTerminal && S.effort) out.push([S.effort, 'yellow'])
   const rewrite = money(rewriteCost(S.ctx, S.model, ttl))
   out.push([`Ctx ${tokens(S.ctx)} · ${st.kind === 'cold' && big ? 'Next send rewrites ≈ ' : 'Rewrite ≈ '}${rewrite}`, st.kind === 'cold' && big ? HOT : 'blue'])
-  if (st.kind === 'kept') out.push([`◆ K.W. until ${clock(S.keepWarmUntil)} · ${S.pings} ping${S.pings === 1 ? '' : 's'} ${money(S.pingUsd)}`, 'cyan'])
+  if (st.kind === 'kept') out.push([`◆ K.W. until ${clock(S.keepWarmUntil)} · ${S.pings} ping${S.pings === 1 ? '' : 's'} ${money(S.pingUsd)}${st.left === null ? ' · waits for next message' : ''}`, 'cyan'])
   else if (st.kind === 'warm') out.push([`● cache warm ${minutes(st.left)}`, 'green'])
   else if (st.kind === 'cooling') out.push([`◐ cache cools in ${minutes(st.left)}`, WARN])
   else if (st.kind === 'cold') out.push([`○ cache cold${st.left === null ? '' : ' ' + ago(-st.left)}`, big ? HOT : 'gray'])
@@ -2656,7 +2677,7 @@ function footerLabel() {
   const parts = []
   const st = cacheState(myHeartbeat())
   const big = S.ctx >= settings.bigTokens
-  if (st.kind === 'kept') parts.push('cache kept warm')
+  if (st.kind === 'kept') parts.push(st.left === null ? 'keep warm waits for next message' : 'cache kept warm')
   else if (st.kind === 'cooling' && big) parts.push(`cache cools in ${minutes(st.left)} · /keepwarm`)
   else if (st.kind === 'cold' && big) parts.push(`cache cold · rewrite ≈ ${money(rewriteCost(S.ctx, S.model, ttlMin()))}`)
   const high = S.rateLimits.filter((l) => (l.percentUsed || 0) >= 80)

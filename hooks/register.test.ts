@@ -7489,8 +7489,9 @@ test('a resume whose id read answers nothing keeps heartbeating under the id it 
 })
 
 // A big chat's auto keep warm running on a warm 1-hour cache (300k, the default), five minutes after its turn ended
-async function autoRunning($: any, on: any) {
+async function autoRunning($: any, on: any, draws = false) {
   const { clock, seen } = engine($, on)
+  if (draws) on('ui.render', engineDraws) // the band, for a test that reads it
   const count = { pings: 0 }
   on('model.fork', () => {
     count.pings++
@@ -7592,4 +7593,161 @@ test('a typed /compact while auto keep warm runs on a warm cache is not "the cac
   const r: any = await $.command.run({ command: 'cache', args: '' })
   expect(r.text).toMatch(/Keep warm is on/) // still running, with no stop and start between
   expect(count.pings).toBe(0) // a ping on the compacted chat would write, not read
+})
+
+// ===== review round 57: compaction while keep warm runs, a mid-request model switch, Retry-After forms =====
+// auto keep warm running, then a typed /compact and no request after it
+async function compactedWhileAuto($: any, on: any) {
+  const e = await autoRunning($, on, true)
+  await $.command.run({ command: 'compact', args: '' })
+  return e
+}
+
+test('/compact during auto keep warm with no request after it stops within one TTL, saying why', async ($, on) => {
+  const { clock, seen, count } = await compactedWhileAuto($, on)
+  await clock.advance(55 * 60000)
+  expect(seen.toasts.filter((t) => /Keep warm off/.test(t)).length).toBe(0) // inside the TTL: it still waits
+  await clock.advance(10 * 60000) // 65 minutes after the compaction: past the 1-hour TTL
+  const off = seen.toasts.filter((t) => /Keep warm off/.test(t))
+  expect(off.length).toBe(1)
+  expect(off[0]).toContain('Keep warm off (the chat was compacted and no message followed). 0 ping(s)')
+  expect(count.pings).toBe(0)
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/Keep warm is on/)
+})
+
+test('a request landing after the /compact ends the wait: auto keep warm goes on past one TTL', async ($, on) => {
+  const { clock, seen } = await compactedWhileAuto($, on)
+  await clock.advance(30 * 60000)
+  await mainStep($) // the first request after the compaction (usage comes from the stepper's last answer)
+  await clock.advance(40 * 60000)
+  expect(seen.toasts.filter((t) => /was compacted and no message followed/.test(t)).length).toBe(0)
+})
+
+// Whether the band draws a button matching re
+async function bandButton($: any, re: RegExp) {
+  const ui = await $.ui.mount({ plugin: 'test', component: 'AbovePrompt', surface: 'terminal', viewport: { columns: 200, rows: 30 }, props: {} } as never)
+  return !!(await ui.find({ type: 'Button', text: re }))
+}
+
+test('the band shows keep warm while a compacted chat waits for its next message, and a bare /keepwarm then does what the band says: turns it off', async ($, on) => {
+  const { clock, seen } = await compactedWhileAuto($, on)
+  await clock.advance(5 * 60000)
+  const kw = await bandText($, /K\.W\. until/)
+  expect(kw).not.toBeNull()
+  expect(kw).toContain('waits for next message')
+  expect(await bandButton($, /Stop K\.W\./)).toBe(true) // the button that the bare /keepwarm matches
+  expect(await bandText($, /cache –/)).toBeNull() // the band no longer says "cache unknown" while /cache says keep warm is on
+  let r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/Keep warm is on/)
+  await $.command.run({ command: 'keepwarm', args: '' })
+  expect(seen.toasts.filter((t) => /Keep warm off \(turned off\)/.test(t)).length).toBe(1)
+  r = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/Keep warm is on/)
+  expect(await bandText($, /K\.W\. until/)).toBeNull()
+})
+
+test('a bare /keepwarm with keep warm off turns it on, even on an unmeasured chat', async ($, on) => {
+  const { clock, seen } = engine($, on)
+  await start($, 300000, clock)
+  await $.command.run({ command: 'keepwarm', args: '' })
+  expect(seen.toasts.filter((t) => /Keeping this cache warm/.test(t)).length).toBe(1)
+  expect(seen.toasts.filter((t) => /Keep warm off/.test(t)).length).toBe(0)
+})
+
+test('PROBE3: a request that switches to a cheaper model does not stop auto keep warm mid-request on its cap, and the turn end does not restart it', async ($, on) => {
+  const { clock, seen } = engine($, on)
+  let pings = 0
+  on('model.fork', () => {
+    pings++
+    return { value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }
+  })
+  let release = () => {}
+  const gate = new Promise<void>((r) => (release = r))
+  let held = false
+  on('turn.step', async function* (_: unknown, e: any) {
+    if (e.model === 'claude-haiku-4-5') {
+      held = true
+      await gate
+    }
+    return { answer: '', toolUses: [], usage: usage({ cache_read_input_tokens: 300000 }) }
+  })
+  on('turn.start', () => ({ turnId: 't' }))
+  on('turn.complete', () => ({ text: '' }))
+  on('session.usage', () => ({ value: {} }))
+  await start($, 300000, clock)
+  await $.command.run({ command: 'cache', args: 'ttl 5' })
+  await mainStep($)
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  await clock.advance(26 * 60000)
+  expect(pings).toBeGreaterThanOrEqual(6) // Opus pings, which the cap has not yet reached
+  expect(seen.toasts.filter((t) => /Keep warm off/.test(t)).length).toBe(0)
+  const restarts = seen.toasts.filter((t) => /Keeping this cache warm/.test(t)).length
+  await $.turn.start({ turnId: 't2' } as never)
+  const step = ($ as any).turn.step({ model: 'claude-haiku-4-5', messages: [] })
+  const stepping = (async () => {
+    if (step && typeof step[Symbol.asyncIterator] === 'function') for await (const _ of step) void _
+    else await step
+  })()
+  await clock.advance(60000) // the request is out, on Haiku: ticks run
+  expect(held).toBe(true)
+  expect(seen.toasts.filter((t) => /cost as much/.test(t)).length).toBe(0)
+  release()
+  await stepping
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't2', reason: 'end_turn' } as never)
+  expect(seen.toasts.filter((t) => /cost as much/.test(t)).length).toBe(0)
+  expect(seen.toasts.filter((t) => /Keeping this cache warm/.test(t)).length).toBe(restarts) // no stop, so no restart
+})
+
+// Retry-After on a refused plan check: the next check waits that long, an hour at most
+async function planRetry(headers: Record<string, string>, $: any, on: any) {
+  const kept = new Map<string, unknown>()
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  on('session.authorize', () => ({ value: { handle: 'h' } }))
+  let at = 0
+  on('http.fetch', async () => {
+    at = await clock.now()
+    return { value: { ok: false, status: 429, text: '', headers } }
+  })
+  kept.set('plan:account:a@x', { at: 1, next: 2, fable: { percentUsed: 1 }, windows: [], why: 'ok' })
+  await start($, 50000, clock)
+  await clock.advance(70000)
+  expect(at).toBeGreaterThan(0)
+  return { at, next: (kept.get('plan:account:a@x') as any).next as number }
+}
+
+test('Retry-After in seconds, named with a capital letter, sets the next plan check', async ($, on) => {
+  const { at, next } = await planRetry({ 'Retry-After': '900' }, $, on)
+  expect(next).toBe(at + 900000)
+})
+
+// the test clock reads close to 1970, so a date is built from that epoch
+const httpDate = (afterMs: number) => new Date(afterMs).toUTCString()
+
+test('Retry-After as an HTTP date sets the next plan check', async ($, on) => {
+  const date = httpDate(15 * 60000 + 130000)
+  const { at, next } = await planRetry({ 'retry-after': date }, $, on)
+  expect(next).toBe(Date.parse(date)) // a date later than the five-minute floor is taken as it is
+  expect(next).toBeGreaterThan(at + 5 * 60000)
+})
+
+test('Retry-After longer than an hour, in seconds, is cut to an hour', async ($, on) => {
+  const { at, next } = await planRetry({ 'Retry-After': '999999' }, $, on)
+  expect(next).toBe(at + 3600000)
+})
+
+test('Retry-After as a date more than an hour away is cut to an hour', async ($, on) => {
+  const { at, next } = await planRetry({ 'Retry-After': httpDate(5 * 3600000) }, $, on)
+  expect(next).toBe(at + 3600000)
+})
+
+test('Retry-After as a date that has passed is ignored: the usual five minutes', async ($, on) => {
+  const { at, next } = await planRetry({ 'Retry-After': httpDate(0) }, $, on)
+  expect(next).toBe(at + 300000)
+})
+
+test('Retry-After that is neither seconds nor a date is ignored: the usual five minutes', async ($, on) => {
+  const { at, next } = await planRetry({ 'retry-after': 'soon' }, $, on)
+  expect(next).toBe(at + 300000)
 })
