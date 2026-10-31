@@ -184,12 +184,15 @@ function commandDefs() {
     }
     const type = topLevelType(s)
     if (!type) continue
-    if (m[1]) defs.push({ names: [m[1]], type })
-    else if (type === 'local' || type === 'local-jsx') {
+    const local = type === 'local' || type === 'local-jsx'
+    // userFacingName (a method or a getter) at the top level of the command's object
+    const ufn = local && /[,{](?:get\s+)?userFacingName\b/.test(objectAt(s))
+    if (m[1]) defs.push({ names: [m[1]], type, ufn })
+    else if (local) {
       const expr = m[2] || m[3]
       if (m[2] && /\.name$/.test(m[2]) && PLUGIN_FACTORY.test(objectAt(s))) continue // the plugin-registration factory: names given at run time
       const names = m[2] && !m[2].includes('.') ? resolveIdent(m[2], s) : m[2] ? resolveMember(m[2], s) : []
-      if (names.length) defs.push({ names, type })
+      if (names.length) defs.push({ names, type, ufn })
       else unresolved.add(expr.trim())
     }
   }
@@ -209,8 +212,8 @@ test('every LOCAL_BUILTINS entry is a local or local-jsx command in the installe
   assert.deepEqual(wrong, [])
 })
 
-// `/branch` is the typed command that creates a fork; LOCAL_BUILTINS must name every spelling of it. The engine defines no alias for it (`/fork` is another command: a background agent), so `branch` alone is listed.
-test('/branch is in LOCAL_BUILTINS, and the engine gives it no alias that would also have to be listed', { skip: skipWhy || (objectsOf('branch').length === 0 ? 'the engine\'s command definitions are not readable here' : false) }, () => {
+// `/branch` is the typed command that creates a fork. prompt.submit's `command.name` is the command's canonical name, never the alias that was typed: the engine resolves the typed name to the command object (`Zs(typed, commands)`: name, userFacingName or alias) and builds `command:{name: userFacingName?.() ?? name, ...}` from that object (engine 2.1.316, read), so LOCAL_BUILTINS lists canonical names only. The engine defines no alias for `branch` anyway (`/fork` is another command: a background agent); the alias assertions below only make a later change show.
+test('/branch is in LOCAL_BUILTINS, and the engine gives it no alias', { skip: skipWhy || (objectsOf('branch').length === 0 ? 'the engine\'s command definitions are not readable here' : false) }, () => {
   assert.ok(LOCAL_BUILTINS.has('branch'))
   const defs = objectsOf('branch').filter((o) => o.includes('type:"local-jsx"'))
   assert.equal(defs.length, 1)
@@ -218,6 +221,13 @@ test('/branch is in LOCAL_BUILTINS, and the engine gives it no alias that would 
   assert.doesNotMatch(src, /aliases:\[[^\]]*"branch"/) // no other command takes the name as an alias
   assert.doesNotMatch(src, /aliases:\[[^\]]*"fork"/) // and `fork` is not an alias of anything, so not of /branch
   assert.equal(LOCAL_BUILTINS.has('fork'), false)
+})
+
+// What prompt.submit's `command.name` carries is `userFacingName?.() ?? name`: a listed command that defines userFacingName could carry a name LOCAL_BUILTINS does not hold
+test('no LOCAL_BUILTINS command defines userFacingName, so prompt.submit carries its listed name', { skip: skipWhy || (typesOf('compact').length === 0 ? 'the engine\'s command definitions are not readable here' : false) }, () => {
+  const renamed = [...LOCAL_BUILTINS].filter((n) => commandDefs().defs.some((x) => x.ufn && x.names.includes(n)))
+  assert.deepEqual(renamed, [])
+  assert.ok(commandDefs().defs.some((x) => x.ufn), 'the scan found no userFacingName at all: it cannot be trusted') // autocompact, pause-memory and autofix-pr have one
 })
 
 // Every `local` / `local-jsx` command in the engine, as a name
