@@ -41,7 +41,7 @@ const S = {
   pings: 0,
   pingUsd: 0,
   autoPingUsd: 0, // what auto keep warm's pings cost since the last real request
-  autoCappedStretch: false, // auto keep warm stopped on its cost cap since the last real request. autoMayRun() is the single gate for starting auto keep warm or handing over to it (turn.complete, keepWarmStep): it needs auto keep warm on, a big chat, this cap unspent (autoStopReason(), whose settings a running one also meets each step: only the settings while a request runs), a turn of this chat within the auto hours, and a cache still warm; so neither a turn that ends without a request, nor a hand-over, re-arms it after the cap stop until a real request
+  autoCappedStretch: false, // auto keep warm stopped on its cost cap since the last real request. autoMayRun() is the single gate for starting auto keep warm or handing over to it (turn.complete, keepWarmStep): it needs auto keep warm on, a big chat, this cap unspent (autoStopReason(), whose settings a running one also meets each step: only the settings while a request runs), a turn of this chat within the auto hours, a cache still warm, and no rotation that no request has landed on; so neither a turn that ends without a request, nor a hand-over, re-arms it after the cap stop until a real request
   capId: '', // the chat (session id) autoPingUsd, autoCappedStretch and lastTurnEnd describe: a /clear or resume into another id starts them clean, one into the same id (or one whose id could not be read: only lastTurnEnd, which dates the chat it replaces) does not; a fork takes its own id
   keepWarmAuto: false, // the running keep warm began on its own, not by hand
   lastPingAt: 0,
@@ -1726,6 +1726,7 @@ function autoStopReason(settingsOnly = false) {
 // May auto keep warm run now? The one decision behind every place that starts it or hands over to it
 function autoMayRun(t) {
   if (autoStopReason()) return false
+  if (rotatedCold()) return false // the account rotated: its cache is empty, so there is nothing for auto keep warm to be covering until a request lands on it
   if (!S.lastTurnEnd || t >= S.lastTurnEnd + settings.autoWarmHours * 60 * MIN) return false // no turn of this chat yet, or past the auto hours
   return !!S.lastActivity && S.lastActivity + ttlMin() * MIN > t // a cache that went cold is not one to keep warm: a ping would pay the whole rewrite
 }
@@ -1787,8 +1788,12 @@ async function keepWarmStep($) {
       return stopKeepWarm($, `PR #${S.pr} is ${state.toLowerCase()}`)
     }
   }
-  // After a rotation a ping would pay the whole rewrite: leave that to the next real turn
-  if (S.working || rotatedCold()) return
+  if (S.working) return
+  // After a rotation a ping would pay the whole rewrite: leave that to the next real turn. Auto keep warm waits for it one TTL, from when the rotation was seen (seatChangedAt; 0 for one only found on a reopened chat's record, which is no wait at all, though auto keep warm never starts on such a chat: autoMayRun), then it has nothing to protect and stops, as after a compaction. One started by hand waits on, to its own end
+  if (rotatedCold()) {
+    if (S.keepWarmAuto && now - S.seatChangedAt >= ttlMin() * MIN) return stopKeepWarm($, 'the account rotated and no message followed')
+    return
+  }
   // Auto keep warm never pings a cache that has already gone cold (a long idle with the chat working, or a turn that ended with no request of its own, long after the last one): the ping would pay the whole rewrite. One started by hand goes on as it was
   // A cache with no activity time at all is not one that went cold: a compaction (typed, automatic or a wake-up's) zeroed it, and the next request writes the shorter context; it waits for that, below
   if (S.keepWarmAuto && S.lastActivity && msLeft(S.lastActivity, ttlMin()) <= 0) return stopKeepWarm($, 'the cache had already gone cold')
@@ -2590,8 +2595,8 @@ export function register(on, options = {}) {
     return drawBoard($, e)
   })
 
-  // The band is terminal-only. The footer also draws in the Desktop app, so it
-  // carries a short label, only when there's something to act on.
+  // The band draws on both surfaces (README), though its model, effort and account segments are the terminal's only (onTerminal: the app's composer shows them).
+  // The footer's mode list is another place, on either surface, so it carries a short label, only when there's something to act on.
   on('ui.render', { component: 'SessionMode' }, async ($, e, next) => {
     const label = footerLabel()
     if (!label) return next(e)
@@ -2702,6 +2707,8 @@ function footerLabel() {
   if (st.kind === 'kept') parts.push(st.left === null ? 'keep warm waits for next message' : 'cache kept warm')
   else if (st.kind === 'cooling' && big) parts.push(`cache cools in ${minutes(st.left)} · /keepwarm`)
   else if (st.kind === 'cold' && big) parts.push(`cache cold · rewrite ≈ ${money(rewriteCost(S.ctx, S.model, ttlMin()))}`)
+  // a rotated chat reads cold whatever keep warm is doing (cacheState), so keep warm being on, and that it waits, is said beside it, as the band's K.W. segment does
+  if (S.keepWarm && rotatedCold()) parts.push('keep warm waits for next message')
   const high = S.rateLimits.filter((l) => (l.percentUsed || 0) >= 80)
   if (high.length) parts.push(limitsText(high))
   if (H.text) parts.push(`handoff ready · /${names.handoff} continue`)

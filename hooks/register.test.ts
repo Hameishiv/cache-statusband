@@ -7984,3 +7984,63 @@ test('a rotation while a ping is out: the ping is counted, but nothing of it dat
   await $.command.run({ command: 'keepwarm', args: '1' })
   expect(await keepWarmLine($)).toMatch(PAID)
 })
+
+// The footer's mode list as the mod leaves it (what the app would draw beside the permission mode): call before the engine starts, then read through `modes()`
+function footerModes($: any, on: any) {
+  let got: string[] = []
+  on('ui.render', { component: 'SessionMode' }, (_: unknown, e: any) => {
+    got = e.props.modes
+    return { type: 'Text', props: {}, children: ['mode'] } as never
+  })
+  return async () => {
+    await $.ui.mount({ plugin: 'test', component: 'SessionMode', surface: 'terminal', viewport: { columns: 200, rows: 30 }, props: { modes: ['plan'] } } as never)
+    return got
+  }
+}
+
+test('on a rotated chat with keep warm on the footer label says keep warm waits for the next message, beside the cold text', SETUP, async ($, on) => {
+  const modes = footerModes($, on)
+  await rotatedWithKeepWarm($, on)
+  const label = (await modes())[1]
+  expect(label).toMatch(/^cache cold · rewrite ≈ \$[\d.]+ · keep warm waits for next message$/)
+})
+
+// Auto keep warm running on a 300k chat that has had its turn; then the account rotates (the cache is cold and no request has landed on it)
+async function autoThenRotated($: any, on: any, handMinutes = 0) {
+  const seat = { label: 'A' }
+  const { clock, seen } = engine($, on, seat)
+  const hold = { pings: 0 }
+  on('session.usage', () => ({ value: { context: { tokens: 300000, window: 1000000 } } }))
+  on('turn.complete', () => ({ text: '' }))
+  on('model.fork', () => (hold.pings++, { value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }))
+  on('classic.SessionStart', () => ({}))
+  const req = bigRequest($, on)
+  await start($, 300000, clock)
+  await req()
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never) // auto keep warm starts
+  expect(await keepWarmLine($)).toBeDefined()
+  if (handMinutes) await $.command.run({ command: 'keepwarm', args: String(handMinutes / 60) }) // by hand instead, for this long
+  await $.command.run({ command: 'cache', args: 'guard off' }) // the wake-up goes in as it is
+  seat.label = 'B'
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never)
+  await clock.advance(1000)
+  return { clock, seen, hold }
+}
+
+test('auto keep warm on a rotated chat stops after one window with no message, without a ping, and says why', SETUP, async ($, on) => {
+  const { clock, seen, hold } = await autoThenRotated($, on)
+  await clock.advance(57 * 60000)
+  expect(await keepWarmLine($)).toBeDefined() // still inside the window
+  await clock.advance(5 * 60000)
+  expect(await keepWarmLine($)).toBeUndefined()
+  expect(seen.toasts.filter((t) => /Keep warm off \(the account rotated and no message followed\)/.test(t)).length).toBe(1)
+  expect(hold.pings).toBe(0) // a rotated chat is never pinged
+})
+
+test('a keep warm started by hand that reaches its end on a rotated chat does not hand over to auto keep warm', SETUP, async ($, on) => {
+  const { clock, seen } = await autoThenRotated($, on, 15)
+  await clock.advance(16 * 60000)
+  expect(seen.toasts.filter((t) => /Keep warm off \(time limit reached\)/.test(t)).length).toBe(1)
+  expect(seen.toasts.filter((t) => /now runs as auto keep warm/.test(t)).length).toBe(0)
+  expect(await keepWarmLine($)).toBeUndefined()
+})
