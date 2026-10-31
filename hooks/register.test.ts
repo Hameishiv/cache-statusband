@@ -4627,8 +4627,8 @@ test('a fill that is rejected late keeps the Resume hold when the box cannot be 
   expect(await bandText($, /⏸ Resumes? /)).toBe('⏸ Resume waits for your message')
 })
 
-// The fill's answer comes just after the bound, before the hold is set: the hold is then set over an answer that is already in
-test('a fill answered "not filled" just after the bound, before the hold is set, starts no hold that outlives it: the Resume goes', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+// The fill answers "not filled" at the bound (2 s after it started). In this harness the answer always lands after the hold is set (the order seen: bound reached, clock read, hold set, answer), so this exercises the late answer ending a hold that is already there, quickly. The path where the answer is in before the hold is set (the lateEnds() call right after the hold is set in placeBack) is covered by no test: the harness cannot interleave the answer with the `await $.clock.now()` between the bound and the hold
+test('a fill answered "not filled" right at the bound ends the hold it started at once: the Resume goes', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
   const { clock, seen } = await resumeLateFill($, on, { held: false, fillHook: async (_e: any, clk: any) => { await clk.sleep(2000); return { isFilled: false } } })
   await clock.advance(10 * 60000)
   expect(seen.submits).toEqual(['Resume'])
@@ -5064,14 +5064,14 @@ test('a message put back in the box while another is held only quoted in a toast
     if (seen.toasts.some((t) => t.includes('Also not sent: stop, do X instead'))) quotedAt = await clock.now()
   }
   expect(quotedAt).toBeGreaterThan(0)
-  draft = '' // the person sent their draft away: the box is empty
+  draft = '' // the person deleted their draft: the box is empty
   await clock.advance(5 * 60000)
-  await sendBridge($, 'two') // the earlier compaction is still out: it goes back in the box, filled
+  await sendBridge($, WAKE_TEXT) // a wake-up delivered remotely while the earlier compaction is still out: it goes back in the box, filled (a bridge message would be offered no "Compact first" while a compaction is out)
   await clock.advance(1000)
-  expect(fills).toEqual(['two'])
+  expect(fills).toEqual([WAKE_TEXT])
   finish()
   await clock.advance(1000)
-  await send($, '/usage', { name: 'usage', args: '' }) // takes the box text: 'two' is gone from it
+  await send($, '/usage', { name: 'usage', args: '' }) // takes the box text: the wake-up text is gone from it
   await clock.advance(2000)
   expect(seen.submits).toEqual([])
   expect(await bandText($, /⏸ Resumes? /)).toBe('⏸ Resume waits for your message') // the quoted message is still to be sent
