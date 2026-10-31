@@ -4480,8 +4480,8 @@ test('a fill that did not answer in time may still land: the toast says the mess
 
 // The box is empty when the fill of the first put-back times out: a read while that fill is still out shows an empty box, which must not be taken as free to write
 function lateFill(on: any, box: { text: string }) {
-  const ctl: { land: (isFilled?: boolean) => void } = { land: () => {} }
-  const fill = (e: any) => new Promise((resolve) => { ctl.land = (isFilled = true) => { if (isFilled) box.text = e.text; resolve({ isFilled }) } })
+  const ctl: { land: (isFilled?: boolean) => void; fail: () => void } = { land: () => {}, fail: () => {} }
+  const fill = (e: any) => new Promise((resolve, reject) => { ctl.land = (isFilled = true) => { if (isFilled) box.text = e.text; resolve({ isFilled }) }; ctl.fail = () => reject(new Error('the engine gave up on the fill')) }) // a hook that throws is skipped, so the call rejects
   return { ctl, fill }
 }
 
@@ -4532,14 +4532,17 @@ test('once the fill that did not answer in time has settled without landing, the
   expect(seen.toasts.filter((t) => t.includes('Also not sent: two'))).toEqual([])
 })
 
-// A put-back whose fill did not answer in time starts the Resume hold (the message may be in the box); the engine's late answer then says which
-async function resumeLateFill($: any, on: any) {
+// A put-back whose fill did not answer in time starts the Resume hold (the message may be in the box); the engine's late answer then says which, and a read of the box says whether it is there.
+// read: what the engine's prompt.read does: 'box' reads `box`, 'deny' fails, 'none' is no read method at all. fillHook: another answer for the fill (given the clock), instead of one that stays out until `ctl` settles it. held: whether the hold is expected to be standing when the helper returns
+async function resumeLateFill($: any, on: any, o: { read?: 'box' | 'deny' | 'none'; fillHook?: (e: any, clock: any) => unknown; held?: boolean } = {}) {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)
   on('ui.render', engineDraws)
   const box = { text: '' }
   const { ctl, fill } = lateFill(on, box)
-  on('prompt.fill', (_: unknown, e: any) => fill(e))
+  on('prompt.fill', (_: unknown, e: any) => (o.fillHook ? o.fillHook(e, clock) : fill(e)))
+  let broken = false // 'deny': the read works until the fill has been tried (a read that failed before it would quote the message instead)
+  if (o.read !== 'none') on('prompt.read', () => (broken ? { deny: 'the box could not be read' } : { value: { text: box.text, cursor: box.text.length } }))
   answer(on, seen, 'Compact first, then send')
   on('classic.StopFailure', () => ({}))
   await clock.advance(60000)
@@ -4557,10 +4560,12 @@ async function resumeLateFill($: any, on: any) {
   finish() // the compaction ends late, successfully: nothing else keeps the Resume back
   await clock.advance(1000)
   expect(seen.toasts.filter((t) => t.includes('the message may not have been put back: stop, do X instead'))).toHaveLength(1)
-  expect(await bandText($, /⏸ Resumes? /)).toBe('⏸ Resume waits for your message')
+  if (o.held !== false) expect(await bandText($, /⏸ Resumes? /)).toBe('⏸ Resume waits for your message')
+  broken = o.read === 'deny'
   return { clock, seen, ctl, box }
 }
 
+// A late answer that is not a fill ends the hold only when a read of the box shows the text is not there: it may be the engine giving up on the client (its fill timeout is 5 s per client) while the client still writes it
 test('a fill that did not answer in time and then answers that it did not fill ends the Resume hold it started: the message is not in the box, so the Resume goes', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
   const { clock, seen, ctl } = await resumeLateFill($, on)
   ctl.land(false)
@@ -4578,6 +4583,54 @@ test('a fill that did not answer in time and then lands keeps the Resume hold: t
   expect(seen.submits).toEqual([]) // the message is in the box and unsent
   expect(await bandText($, /⏸ Resumes? /)).toBe('⏸ Resume waits for your message')
   await clock.advance(6 * 60000) // 15 minutes after the put-back
+  expect(seen.submits).toEqual(['Resume'])
+})
+
+test('a fill that answers late without filling, while a read of the box shows the text there, keeps the Resume hold: the client wrote it', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+  const { clock, seen, ctl, box } = await resumeLateFill($, on)
+  box.text = 'stop, do X instead' // the client wrote it although the engine gave up on it
+  ctl.land(false)
+  await realMs(50)
+  await clock.advance(10 * 60000)
+  expect(seen.submits).toEqual([])
+  expect(await bandText($, /⏸ Resumes? /)).toBe('⏸ Resume waits for your message')
+})
+
+for (const read of ['none', 'deny'] as const) {
+  test(`a fill that answers late without filling keeps the Resume hold when the box cannot be read (${read === 'none' ? 'the engine has no read' : 'the read fails'}): it may still be written, and the hold lapses at 15 minutes`, { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+    const { clock, seen, ctl } = await resumeLateFill($, on, { read })
+    ctl.land(false)
+    await realMs(50)
+    await clock.advance(10 * 60000)
+    expect(seen.submits).toEqual([])
+    expect(await bandText($, /⏸ Resumes? /)).toBe('⏸ Resume waits for your message')
+    await clock.advance(6 * 60000) // 15 minutes after the put-back
+    expect(seen.submits).toEqual(['Resume'])
+  })
+}
+
+// The engine rejects the fill (its own timeout, say): the same as an answer that it did not fill
+test('a fill that is rejected late ends the Resume hold when the box, read afterwards, does not hold the text', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+  const { clock, seen, ctl } = await resumeLateFill($, on)
+  ctl.fail()
+  await realMs(50)
+  await clock.advance(10 * 60000)
+  expect(seen.submits).toEqual(['Resume'])
+})
+
+test('a fill that is rejected late keeps the Resume hold when the box cannot be read', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+  const { clock, seen, ctl } = await resumeLateFill($, on, { read: 'none' })
+  ctl.fail()
+  await realMs(50)
+  await clock.advance(10 * 60000)
+  expect(seen.submits).toEqual([])
+  expect(await bandText($, /⏸ Resumes? /)).toBe('⏸ Resume waits for your message')
+})
+
+// The fill's answer comes just after the bound, before the hold is set: the hold is then set over an answer that is already in
+test('a fill answered "not filled" just after the bound, before the hold is set, starts no hold that outlives it: the Resume goes', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
+  const { clock, seen } = await resumeLateFill($, on, { held: false, fillHook: async (_e: any, clk: any) => { await clk.advance(2000); return { isFilled: false } } })
+  await clock.advance(10 * 60000)
   expect(seen.submits).toEqual(['Resume'])
 })
 
@@ -4718,8 +4771,8 @@ test('a prompt.fill that never answers is not waited for: the message is reporte
   expect(seen.toasts.filter((t) => t.includes('may not have been put back: two')).length).toBe(1)
 })
 
-// The bound: an earlier fill that never settles blocks put-backs for FILL_LAND_LIMIT (7 s) from its start, and not after
-test('a fill that never settles blocks put-backs for 7 s from its start and no longer: a put-back inside the bound is quoted, one after it reads the box and is filled', SETUP, async ($, on) => {
+// A fill still out blocks put-backs until it settles: the engine's own fill timeout is 5 s per client (the clients are tried in turn), so no short bound says it is over. Only one that never settles is let go, after 15 minutes
+test('a fill that never settles keeps blocking put-backs for 14 minutes and more, and is let go after 15: put-backs inside are quoted, one after reads the box and is filled', SETUP, async ($, on) => {
   const dialogs = heldAsk(on, 1)
   const box = { text: '' }
   const { fill } = lateFill(on, box)
@@ -4729,25 +4782,76 @@ test('a fill that never settles blocks put-backs for 7 s from its start and no l
     box.text = e.text
     return { isFilled: true }
   })
-  hang(seen)
+  let n = 0
+  seen.duringCompact = () => (++n <= 2 ? new Promise(() => {}) : Promise.resolve()) // the first two compactions hang
   await send($, 'one')
   await clock.advance(15 * 60000 + 1000)
   await clock.advance(2500) // 'one' has not answered within the 2 s bound: it is out
   expect(fills).toEqual(['one'])
   void sendBridge($, 'two')
   await clock.advance(100)
-  dialogs.release('Compact first, then send') // 3 s after the fill started
+  dialogs.release('Compact first, then send')
   await clock.advance(1000)
-  expect(fills).toEqual(['one']) // inside the bound: not written over a fill that may still land
-  expect(seen.toasts.filter((t) => t.includes('Also not sent: two — send it again when ready.'))).toHaveLength(1)
-  await clock.advance(8000) // 7 s have passed since the fill started
+  await clock.advance(14 * 60000) // 14 minutes after the fill started, the earlier compaction still out
   void sendBridge($, 'three')
   await clock.advance(100)
   dialogs.release('Compact first, then send')
   await clock.advance(1000)
-  expect(fills).toEqual(['one', 'three']) // the read shows an empty box: filled
-  expect(seen.toasts.filter((t) => t.includes('Also not sent: three'))).toEqual([])
+  expect(fills).toEqual(['one']) // not written over a fill that may still land
+  expect(seen.toasts.filter((t) => t.includes('Also not sent: two — send it again when ready.'))).toHaveLength(1)
+  expect(seen.toasts.filter((t) => t.includes('Also not sent: three — send it again when ready.'))).toHaveLength(1)
+  await clock.advance(2 * 60000) // past 15 minutes: the earlier compaction is let go too, so this one compacts (and hangs) and is put back 15 minutes on
+  void sendBridge($, 'four')
+  await clock.advance(100)
+  dialogs.release('Compact first, then send')
+  await clock.advance(15 * 60000 + 1000)
+  await clock.advance(3000)
+  expect(fills).toEqual(['one', 'four']) // the read shows an empty box: filled
+  expect(seen.toasts.filter((t) => t.includes('Also not sent: four'))).toEqual([])
 })
+
+// The fill settles 12 s after it started (a second client's 5 s timeout after the first's): a put-back at 8 s must not be written over it
+for (const landed of [false, true]) {
+  test(`a fill that settles 12 s after it started (${landed ? 'and landed' : 'without landing'}): a put-back at 8 s is quoted, one after it settled reads the box${landed ? ' and finds the text there, so it is quoted too' : ' and fills it'}`, SETUP, async ($, on) => {
+    const dialogs = heldAsk(on, 1)
+    const box = { text: '' }
+    const { ctl, fill } = lateFill(on, box)
+    let first = true
+    const { clock, seen, fills } = await coldChat($, on, () => on('prompt.read', () => ({ value: { text: box.text, cursor: box.text.length } })), (e: any) => {
+      if (first) { first = false; return fill(e) }
+      box.text = e.text
+      return { isFilled: true }
+    })
+    hang(seen)
+    await send($, 'one')
+    await clock.advance(15 * 60000 + 1000)
+    await clock.advance(2500) // 2.5 s after the fill started
+    expect(fills).toEqual(['one'])
+    await clock.advance(5500) // 8 s
+    void sendBridge($, 'two')
+    await clock.advance(100)
+    dialogs.release('Compact first, then send')
+    await clock.advance(1000)
+    expect(fills).toEqual(['one']) // not filled over a fill that may still land
+    expect(seen.toasts.filter((t) => t.includes('Also not sent: two — send it again when ready.'))).toHaveLength(1)
+    await clock.advance(2900) // 12 s
+    ctl.land(landed)
+    await realMs(50)
+    await clock.advance(1000)
+    expect(box.text).toBe(landed ? 'one' : '') // 'two' did not overwrite it, and nothing else wrote
+    void sendBridge($, 'three')
+    await clock.advance(100)
+    dialogs.release('Compact first, then send')
+    await clock.advance(1000)
+    if (landed) {
+      expect(fills).toEqual(['one'])
+      expect(seen.toasts.filter((t) => t.includes('Also not sent: three — send it again when ready.'))).toHaveLength(1)
+    } else {
+      expect(fills).toEqual(['one', 'three'])
+      expect(seen.toasts.filter((t) => t.includes('Also not sent: three'))).toEqual([])
+    }
+  })
+}
 
 test('a prompt.fill that never answers holds a due Resume as a put-back does (the message may be in the box), for 15 minutes and not for good', { options: { ...SETUP.options, autoResume: true } }, async ($, on) => {
   const kept = new Map<string, unknown>()
