@@ -8161,8 +8161,8 @@ test('a ping hung past its margin after a real request does not stop keep warm: 
   expect(recordedAt(kept)).toBe(reqAt)
 })
 
-// The wake-up's own request is out when the seat, or the account, is adopted a tick later
-async function staggeredAdoption($: any, on: any, variant: 'seat-late' | 'account-late' | 'both-at-wake') {
+// The wake-up's own request is out (landFirst false) or has landed (true) when the seat, or the account, is adopted a tick later
+async function staggeredAdoption($: any, on: any, variant: 'seat-late' | 'account-late' | 'both-at-wake', landFirst = false) {
   const seat = { label: variant === 'both-at-wake' ? 'B' : 'A' }
   const disk: { files: Record<string, string> } = { files: { '.claude.json': account(variant === 'both-at-wake' ? 'b@x' : 'a@x') } }
   const { clock, seen } = engine($, on, seat, undefined, undefined, disk)
@@ -8180,9 +8180,13 @@ async function staggeredAdoption($: any, on: any, variant: 'seat-late' | 'accoun
   await clock.advance(1000)
   const request = mainStep($) // the wake-up's own request: begins after the wake-up, on the new account
   await clock.advance(10)
+  if (landFirst) {
+    release()
+    await request
+  }
   if (variant === 'seat-late') seat.label = 'B'
   if (variant === 'account-late') disk.files['.claude.json'] = account('b@x')
-  await clock.advance(31000) // a tick adopts what was late, while the request is out
+  await clock.advance(31000) // a tick adopts what was late, while the request is out (or after it landed)
   release()
   await request
   await $.command.run({ command: 'cache', args: 'guard on' })
@@ -8192,12 +8196,15 @@ async function staggeredAdoption($: any, on: any, variant: 'seat-late' | 'accoun
   return { text: r.text as string, asks: seen.asks - asked }
 }
 
+// Round 62: the wake-up's own request, when the staggered half is adopted after it started, may have run on the old account: cold, whether it was still out at the adoption or had landed before it (the order does not matter)
 for (const variant of ['seat-late', 'account-late'] as const) {
-  test(`${variant}: the wake-up's own request that is out when the ${variant === 'seat-late' ? 'seat' : 'account'} is adopted ends the rotation: warm, and the next send is not guarded`, SETUP, async ($, on) => {
-    const { text, asks } = await staggeredAdoption($, on, variant)
-    expect(text).not.toMatch(/account rotated|went cold|Cache is cold/)
-    expect(asks).toBe(0)
-  })
+  for (const landFirst of [false, true]) {
+    test(`${variant}: the wake-up's own request ${landFirst ? 'landed before' : 'out when'} the ${variant === 'seat-late' ? 'seat' : 'account'} is adopted: the cache is cold, and the next send is guarded`, SETUP, async ($, on) => {
+      const { text, asks } = await staggeredAdoption($, on, variant, landFirst)
+      expect(text).toMatch(/account rotated|went cold|Cache is cold/)
+      expect(asks).toBe(1)
+    })
+  }
 }
 
 test('control: seat and account both shown at the wake-up, the wake-up\'s own request ends the rotation', SETUP, async ($, on) => {

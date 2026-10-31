@@ -80,6 +80,11 @@ let compactedCold = false
 let identityRead = false // session.start has read the seat and account: a chat's record can be compared with them
 let pendingSeed = null // { path, chat, measured, steps, compact, sized }: a startup or resume SessionStart's transcript that came before that, seeded once it has, with the chat (msgChat) and the counts (measuredSteps, stepsSeen, compactGen, sizeUpdates) it was queued at (seedMark)
 let rotationSeenAt = 0 // when this process last saw a rotation: a process fact, kept across /clear, resume and fork
+let rotationSeenSteps = 0 // stepsSeen as it was then (seeRotation): a main-loop request that started since may have run on the old account, landed or not
+function seeRotation() {
+  rotationSeenAt = now
+  rotationSeenSteps = stepsSeen
+}
 const WAKE_WINDOW = 3 * MIN // how long after a wake-up a late rewrite of the seat file or .claude.json is still taken as that rotation
 let seatUnknown = false // after a wake-up, until the seat file names a new seat: the rotator may not have written it yet, so S.seat may be the old one: its plan fetch, borrowing and lending of usage windows, and the shared windows and Fable reading it shows wait for it
 let accountUnknown = false // likewise for the account in .claude.json, which may not have switched though the seat label did: it holds back the same things (keyUnsure); a read with no account is not a change
@@ -411,7 +416,7 @@ async function readSeat($, adopt = false) {
   // at a wake-up a seat appearing where there was none is a change too
   if (seat && seat !== S.seat && (S.seat || adopt)) {
     S.seatChangedAt = now
-    rotationSeenAt = now
+    seeRotation()
     rotatedPending = true
     rotationGen++
     dropReadings(!adopt) // at a wake-up the wake-up is itself the resume: a pending one is not re-armed
@@ -425,7 +430,7 @@ async function readSeat($, adopt = false) {
 // A resume still pending that was armed from them is not cancelled: it moves to a minute from now, when the new account presumably has usage, keeping its tries. One already settled, sent or cleared is not revived. While a wake-up is on its way (wakePendingId) nor does a late adoption re-arm one: the wake-up is itself the resume, and its request settles it.
 // A request that started before the drop reports the old account's windows: identityGen lets its readings be told apart.
 let identityGen = 0
-let rotationGen = 0 // bumped only where a rotation is marked (rotatedPending set), by a seat change, a wake-up or a late adoption that re-marks it; not by an adoption that only names the account or seat a request already ran on (dropReadings, identityGen)
+let rotationGen = 0 // bumped only where a rotation is marked (rotatedPending set), by a seat change, a wake-up or a late adoption that re-marks it; not by an adoption that re-marks nothing: the seat after the account was known, or one with no main-loop request landed or started since the wake-up, so nothing ran on the old account (dropReadings moves identityGen only)
 let requestRot = 0 // rotationGen as the latest main-loop request started: a request that began before the latest mark ran before the rotation, and does not end it
 let requestGen = 0 // identityGen as the latest main-loop request started: session.measure names no request, so the latest start stands for the one that reports (a subagent's reading carries the same account)
 function dropReadings(rearm = true) {
@@ -1901,7 +1906,7 @@ function warnStep($) {
 // The rotator writes .claude.json and the seat file separately, at times we don't know. So for WAKE_WINDOW after a
 // wake-up, a field still unchanged (or an account that reads empty) is unknown and the ticks look again, each file on its own; once the window is over
 // the session keeps the seat and account it has. Outside a window a change is never taken: only a wake-up carries one.
-// A request that landed since the wake-up may have run on the old account: adopting then marks the cache cold.
+// A request that has landed, or started and is still out, since the wake-up may have run on the old account (the wake-up's own request included: the credential may not have switched when it began): adopting then marks the cache cold.
 // The account is what switches the credential, and the seat label can be written before it, so an account adopted late re-marks
 // whatever the seat did, unless the wake-up already showed the seat change. A seat adopted after the account was already known
 // never re-marks: that request ran on the new account.
@@ -1939,11 +1944,12 @@ async function refreshIdentity($) {
     // unreadable now: the next tick looks again
   }
   if (adopted) {
-    if ((accountAdopted ? !seatMoved : !accountMoved) && S.lastActivity > rotationSeenAt) {
+    // a request that has run since the wake-up (landed: S.lastActivity) or is running (started, not landed: stepsSeen) may be on the old account, the wake-up's own request included: re-marked, so it, if still out, does not end the rotation (turn.step's onCurrent) and is as cold as one that had landed
+    if ((accountAdopted ? !seatMoved : !accountMoved) && (S.lastActivity > rotationSeenAt || stepsSeen !== rotationSeenSteps)) {
       rotatedPending = true
       rotationGen++
       S.seatChangedAt = now
-      rotationSeenAt = now
+      seeRotation()
     }
     if (accountAdopted) accountMoved = true
   }
@@ -2232,7 +2238,7 @@ export function register(on, options = {}) {
       wakeAccount = S.account
       wakeWindowEnd = now + WAKE_WINDOW
       await readSeat($, true)
-      rotationSeenAt = now
+      seeRotation()
       // the seat file may be absent or unchanged: the account is what moved
       await readAccount($, true)
       // a field still as it was, or an account that read empty, is unknown: the rotator may not have written it yet, the ticks look again for the window
@@ -2386,7 +2392,7 @@ export function register(on, options = {}) {
       }
     }
     S.ctx = total
-    // A request that began before a rotation was marked (a wake-up typed mid-turn) ran on the old account: it dates and warms nothing on the new one, which is still empty (rotatedPending stays, and so the cold-send guard and keep warm's wait), and its record is not written, as it would name the new account for a request that ran on the old. The wake-up's own request, which began after the mark, does all of it, even when the seat or the account is adopted while it is out (that only names the account it ran on: dropReadings moves identityGen, not rotationGen; its windows are still told apart by identityGen, below)
+    // A request that began before a rotation was marked (a wake-up typed mid-turn) ran on the old account: it dates and warms nothing on the new one, which is still empty (rotatedPending stays, and so the cold-send guard and keep warm's wait), and its record is not written, as it would name the new account for a request that ran on the old. The wake-up's own request, which began after the mark, does all of it when both the seat and the account were taken at the wake-up (or nothing late was adopted); when the staggered half is adopted after it began, whether it has landed or is still out, that adoption re-marks (refreshIdentity: it may have run on the old account), rotationGen moves past requestRot, and it is as cold as one that had landed first. Its windows are told apart by identityGen, below
     const onCurrent = requestRot === rotationGen
     if (onCurrent) S.lastActivity = now
     S.compactedAt = 0 // the request a compaction waited for has landed
