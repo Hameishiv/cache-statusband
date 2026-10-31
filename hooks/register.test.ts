@@ -8115,3 +8115,147 @@ test('a wake-up rotation while a request is out: when that old request ends the 
   const after: any = await $.command.run({ command: 'cache', args: '' })
   expect(after.text).not.toMatch(/Cache is cold|went cold/)
 })
+
+// ===== review round 61: a real request while a ping is out; staggered adoption during the wake-up's request; a hung ping from another chat; the backstop's reference =====
+// A real request that lands while a keep-warm ping is out (the request itself read the cache: it is warm for an hour from now)
+async function requestWhilePingOut($: any, on: any, pingUsage?: Record<string, unknown>) {
+  const held = await heldPing($, on, pingUsage)
+  await held.clock.advance(30000)
+  await mainStep($)
+  const reqAt = await held.clock.now()
+  return { ...held, reqAt }
+}
+
+test('a ping that settles after a real request does not move the chat\'s date back to when the ping went', async ($, on) => {
+  const { clock, kept, hold, reqAt } = await requestWhilePingOut($, on)
+  expect(recordedAt(kept)).toBe(reqAt)
+  hold.release()
+  await clock.advance(1000)
+  expect(recordedAt(kept)).toBe(reqAt) // not the ping's earlier time
+  await $.command.run({ command: 'keepwarm', args: '1' })
+  expect(await keepWarmLine($)).toMatch(PAID) // but it was billed: counted
+})
+
+test('a ping that settles after a real request charges nothing to the new idle stretch\'s cap: auto keep warm goes on', async ($, on) => {
+  const { clock, seen, hold } = await requestWhilePingOut($, on, { cache_read_input_tokens: 300000, input_tokens: 3000000 }) // a ping that alone costs more than the rewrite
+  hold.release()
+  await clock.advance(1000)
+  expect(seen.toasts.filter((t) => /Keep warm off/.test(t)).length).toBe(0)
+  expect(await keepWarmLine($)).toBeDefined()
+  expect(await keepWarmLine($)).toMatch(PAID)
+})
+
+test('a ping that wrote instead of read, settling after a real request, does not stop keep warm: the request is what the cache holds', async ($, on) => {
+  const { clock, seen, hold } = await requestWhilePingOut($, on, { cache_creation_input_tokens: 300000 })
+  hold.release()
+  await clock.advance(1000)
+  expect(seen.toasts.filter((t) => /Keep warm off/.test(t)).length).toBe(0)
+  expect(await keepWarmLine($)).toBeDefined()
+})
+
+test('a ping hung past its margin after a real request does not stop keep warm: the cache is warm from that request', async ($, on) => {
+  const { clock, seen } = await requestWhilePingOut($, on)
+  await clock.advance(8 * 60000)
+  expect(seen.toasts.filter((t) => /Keep warm off/.test(t)).length).toBe(0)
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/Cache is warm for about 5\dm more/)
+  expect(await keepWarmLine($)).toBeDefined()
+})
+
+// The wake-up's own request is out when the seat, or the account, is adopted a tick later
+async function staggeredAdoption($: any, on: any, variant: 'seat-late' | 'account-late' | 'both-at-wake') {
+  const seat = { label: variant === 'both-at-wake' ? 'B' : 'A' }
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account(variant === 'both-at-wake' ? 'b@x' : 'a@x') } }
+  const { clock, seen } = engine($, on, seat, undefined, undefined, disk)
+  answer(on, seen, 'Send anyway')
+  let release: () => void = () => {}
+  const gate = new Promise<void>((r) => (release = r))
+  on('turn.step', async function* () {
+    await gate
+    return { answer: '', toolUses: [], usage: usage({ cache_read_input_tokens: 300000 }) }
+  })
+  on('turn.complete', () => ({ text: '' }))
+  await start($, 300000, clock)
+  await $.command.run({ command: 'cache', args: 'guard off' }) // the wake-up goes in as it is
+  await $.prompt.submit({ text: ROTATE, origin: COMPOSER, wait: false } as never) // nothing, or only half, written yet
+  await clock.advance(1000)
+  const request = mainStep($) // the wake-up's own request: begins after the wake-up, on the new account
+  await clock.advance(10)
+  if (variant === 'seat-late') seat.label = 'B'
+  if (variant === 'account-late') disk.files['.claude.json'] = account('b@x')
+  await clock.advance(31000) // a tick adopts what was late, while the request is out
+  release()
+  await request
+  await $.command.run({ command: 'cache', args: 'guard on' })
+  const asked = seen.asks
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  await $.prompt.submit({ text: 'carry on', origin: COMPOSER, wait: false } as never)
+  return { text: r.text as string, asks: seen.asks - asked }
+}
+
+for (const variant of ['seat-late', 'account-late'] as const) {
+  test(`${variant}: the wake-up's own request that is out when the ${variant === 'seat-late' ? 'seat' : 'account'} is adopted ends the rotation: warm, and the next send is not guarded`, SETUP, async ($, on) => {
+    const { text, asks } = await staggeredAdoption($, on, variant)
+    expect(text).not.toMatch(/account rotated|went cold|Cache is cold/)
+    expect(asks).toBe(0)
+  })
+}
+
+test('control: seat and account both shown at the wake-up, the wake-up\'s own request ends the rotation', SETUP, async ($, on) => {
+  const { text, asks } = await staggeredAdoption($, on, 'both-at-wake')
+  expect(text).not.toMatch(/account rotated|went cold|Cache is cold/)
+  expect(asks).toBe(0)
+})
+
+test('a ping hung in one chat does not hold up keep warm started in the chat resumed meanwhile', async ($, on) => {
+  const { clock, hold, disk } = await heldPing($, on)
+  disk.id = 'sid-B'
+  disk.files['sid-B.jsonl'] = reply((await clock.now()) - 50 * 60000, 300000) // chat B's cache has about 10 minutes left: its ping is due in 2
+  await ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/sid-B.jsonl' })
+  await $.command.run({ command: 'keepwarm', args: '1' })
+  expect(hold.pings).toBe(1)
+  await clock.advance(3 * 60000) // well inside A's ping's margin, which has not passed
+  expect(hold.pings).toBe(2) // B pings on schedule
+  hold.release()
+  await clock.advance(1000)
+  expect(await keepWarmLine($)).toBeDefined() // A's late answer changes nothing in B
+})
+
+// A chat whose last request was `ageMin` minutes ago, keep warm started by hand now, and a ping that never answers
+async function hungPingOnAge($: any, on: any, ageMin: number) {
+  const { clock, seen } = engine($, on, { label: 'A' })
+  const hold = { pings: 0 }
+  on('model.fork', async () => {
+    hold.pings++
+    await new Promise(() => {}) // never answers
+    return { value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }
+  })
+  const step = stepper($, on)
+  await start($, 300000, clock)
+  await step(usage({ cache_read_input_tokens: 300000 }))
+  await $.command.run({ command: 'keepwarm', args: 'off' })
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  await $.command.run({ command: 'keepwarm', args: 'off' }) // auto keep warm started at the turn's end: this is by hand
+  await clock.advance(ageMin * 60000)
+  await $.command.run({ command: 'keepwarm', args: '1' })
+  await clock.advance(31000) // a tick: the ping goes
+  expect(hold.pings).toBe(1)
+  return { clock, seen }
+}
+const keepWarmOffs = (seen: { toasts: string[] }) => seen.toasts.filter((t) => /Keep warm off \(the ping got no answer/.test(t)).length
+
+test('a ping that goes with 2 minutes of the cache left is given up on when those run out, not at the usual 8-minute margin', async ($, on) => {
+  const { clock, seen } = await hungPingOnAge($, on, 58)
+  await clock.advance(60000)
+  expect(keepWarmOffs(seen)).toBe(0) // the cache has about a minute left
+  await clock.advance(70000)
+  expect(keepWarmOffs(seen)).toBe(1) // it has run out
+})
+
+test('a ping that goes on a cache already gone is given up on after the floor (30 seconds), not at 8 minutes', async ($, on) => {
+  const { clock, seen } = await hungPingOnAge($, on, 120)
+  await clock.advance(20000)
+  expect(keepWarmOffs(seen)).toBe(0)
+  await clock.advance(31000)
+  expect(keepWarmOffs(seen)).toBe(1)
+})

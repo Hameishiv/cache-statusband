@@ -413,6 +413,7 @@ async function readSeat($, adopt = false) {
     S.seatChangedAt = now
     rotationSeenAt = now
     rotatedPending = true
+    rotationGen++
     dropReadings(!adopt) // at a wake-up the wake-up is itself the resume: a pending one is not re-armed
     S.seat = seat // before the await: planKey must name the new account while it runs
     await readAccount($, true)
@@ -424,6 +425,8 @@ async function readSeat($, adopt = false) {
 // A resume still pending that was armed from them is not cancelled: it moves to a minute from now, when the new account presumably has usage, keeping its tries. One already settled, sent or cleared is not revived. While a wake-up is on its way (wakePendingId) nor does a late adoption re-arm one: the wake-up is itself the resume, and its request settles it.
 // A request that started before the drop reports the old account's windows: identityGen lets its readings be told apart.
 let identityGen = 0
+let rotationGen = 0 // bumped only where a rotation is marked (rotatedPending set), by a seat change, a wake-up or a late adoption that re-marks it; not by an adoption that only names the account or seat a request already ran on (dropReadings, identityGen)
+let requestRot = 0 // rotationGen as the latest main-loop request started: a request that began before the latest mark ran before the rotation, and does not end it
 let requestGen = 0 // identityGen as the latest main-loop request started: session.measure names no request, so the latest start stands for the one that reports (a subagent's reading carries the same account)
 function dropReadings(rearm = true) {
   identityGen++
@@ -1745,24 +1748,34 @@ function stopKeepWarm($, why) {
 }
 
 // A keep-warm ping (a fork) is out: no second one goes while it is, however many ticks come (a tick does not wait for the step before it).
-// Its settling is the real signal, as for fillOut: a ping that is slow is waited for (a tick waits PING_LIMIT for it, then goes on, and what the ping finds is applied when it does settle). The backstop is the ping's own margin, the time the cache had left when it went: a ping still out then has not saved the cache that the chat can count on, so it counts as no answer (keep warm stops, the slot is free), and an answer after that is counted (it was billed) and does nothing else.
-// { at, limit, moved, lost }: when it went, its backstop, whether the chat/account/keep warm changed since it went, and whether the backstop has passed
+// Its settling is the real signal, as for fillOut: a ping that is slow is waited for (a tick waits PING_LIMIT for it, then goes on, and what the ping finds is applied when it does settle). The backstop is the time the cache had left when the ping went (at least PING_FLOOR, so that a ping that went with the cache already gone is not given up on before it can answer): a ping still out then has not saved the cache that the chat can count on, so it counts as no answer (keep warm stops, the slot is free), and an answer after that is counted (it was billed) and does nothing else.
+// A ping whose chat, account, keep warm or cache has changed since it went (moved: a /clear, a resume, a compaction, an off, a rotation, or a real request, which warmed the cache for a whole window from its own start) is let go of at once: its slot is free, nothing stops, and its answer, whenever it comes, is counted and does nothing else.
+// { at, limit, moved, lost }: when it went, its backstop, whether the chat/account/keep warm/cache changed since it went, and whether it has been let go of
 let pingOut = null
 const PING_LIMIT = 60000
+const PING_FLOOR = 30000 // the least a ping is waited for: one that goes with the cache nearly or already gone (a hand keep warm on a cold chat, a tick that came late) still needs the seconds a healthy ping takes to answer
 
 async function keepWarmStep($) {
-  if (pingOut && now - pingOut.at >= pingOut.limit) {
+  if (pingOut) {
     const lost = pingOut
-    lost.lost = true
-    pingOut = null
-    if (!lost.moved()) stopKeepWarm($, 'the ping got no answer, so the cache may already be cold')
+    if (lost.moved()) {
+      // its chat, account or keep warm has changed, or a real request has warmed the cache since: it is no longer this step's to wait for, and not a failure either
+      lost.lost = true
+      pingOut = null
+    } else if (now - lost.at >= lost.limit) {
+      lost.lost = true
+      pingOut = null
+      stopKeepWarm($, 'the ping got no answer, so the cache may already be cold')
+    }
   }
   if (!S.keepWarm || pingOut) return
   // The chat, compaction and account counts this step began with. A /clear, a resume of another chat, a compaction, a rotation or an off that lands while a read or the ping is out makes what comes back the old chat's or the old account's: its date and record are not written (a fork shares the cache and does not move msgChat). A ping that came back was billed whatever happened meanwhile, and is counted all the same (below)
   const chat = msgChat
   const gen = compactGen
   const idGen = identityGen
-  const moved = () => !S.keepWarm || msgChat !== chat || compactGen !== gen || identityGen !== idGen
+  const steps = measuredSteps // a main-loop request that measures the chat while a read or the ping is out has dated the cache itself, and warmed it for a whole window from its own start
+  const requested = () => measuredSteps !== steps
+  const moved = () => !S.keepWarm || msgChat !== chat || compactGen !== gen || identityGen !== idGen || requested()
   if (S.keepWarmAuto) {
     // a setting changed while it ran (autowarm off, big 400k, in this session or another): it stops, even while the chat works
     // while the chat works only the settings count: the cap is judged when it is idle (and by a ping that has just been paid)
@@ -1816,7 +1829,7 @@ async function keepWarmStep($) {
   // What this ping is for, taken before it goes: whether it is auto keep warm's, and the idle stretch (chat) its cost is counted in. A resume, a /clear or an off while it is out changes S, not this
   const auto = S.keepWarmAuto
   const capFor = S.capId || S.id
-  const ping = { at: now, limit: margin, moved, lost: false }
+  const ping = { at: now, limit: Math.max(PING_FLOOR, ttl * MIN - (now - S.lastActivity)), moved, lost: false } // the time the cache had left as the ping went, which is the margin when the tick was on time and less when it came late
   pingOut = ping
   // What comes back, whenever it does: a tick waits for it for PING_LIMIT at most, the rest happens when it settles
   const settled = (async () => {
@@ -1837,7 +1850,7 @@ async function keepWarmStep($) {
     S.lastPingAt = now
     const pingCost = requestCost(u, S.model, ttl)
     S.pingUsd += pingCost
-    if (auto && (S.capId || S.id) === capFor) {
+    if (auto && !requested() && (S.capId || S.id) === capFor) { // a real request since ended the idle stretch this ping was protecting: its cost is not charged to the one that began
       S.autoPingUsd += pingCost
       S.capId = capFor
     }
@@ -1848,7 +1861,7 @@ async function keepWarmStep($) {
     if ((u.cache_creation_input_tokens || 0) > 0.1 * Math.max(1, u.cache_read_input_tokens || 0)) {
       return stopKeepWarm($, `the ping wrote ${tokens(u.cache_creation_input_tokens)} tokens instead of reading the cache`)
     }
-    S.lastActivity = ping.at // when the request went, not when the answer came: the cache is dated from the one, and a slow answer must not make it look fresher than it is
+    S.lastActivity = Math.max(S.lastActivity, ping.at) // when the request went, not when the answer came: the cache is dated from the one, and a slow answer must not make it look fresher than it is (nor older than a request that has landed since)
     await rememberLast($)
     if (ping.lost || moved()) return
     // Auto keep warm only pays while it costs less than the rewrite it protects: on a 5-minute cache the pings catch up fast
@@ -1928,6 +1941,7 @@ async function refreshIdentity($) {
   if (adopted) {
     if ((accountAdopted ? !seatMoved : !accountMoved) && S.lastActivity > rotationSeenAt) {
       rotatedPending = true
+      rotationGen++
       S.seatChangedAt = now
       rotationSeenAt = now
     }
@@ -2229,6 +2243,7 @@ export function register(on, options = {}) {
       if (accountMoved) dropReadings(false) // the account is known to have moved: the readings are the old account's, as on a seat change; the wake-up is itself the resume (wakePendingId), so a pending one is not re-armed
       S.seatChangedAt = now // a second wake-up of an already rotated chat dates it anew
       rotatedPending = true
+      rotationGen++
     }
     const ttl = ttlMin()
     const left = msLeft(S.lastActivity, ttl)
@@ -2313,6 +2328,7 @@ export function register(on, options = {}) {
   on('turn.step', async function* ($, e, next) {
     if (!e.agentId) {
       requestGen = identityGen
+      requestRot = rotationGen
       // a main-loop request started: what was sent reached the chat, so a pending resume is settled (our own "Resume" zeroes it before it sends), and a wake-up's own request has arrived. Nothing else settles it: a prompt passing through, even the guard's Send anyway, may still be dropped or fail to start
       wakePendingId = 0
       sendPending.clear()
@@ -2370,8 +2386,8 @@ export function register(on, options = {}) {
       }
     }
     S.ctx = total
-    // A request that began before an account change (a wake-up typed mid-turn) ran on the old account: it dates and warms nothing on the new one, which is still empty (rotatedPending stays, and so the cold-send guard and keep warm's wait), and its record is not written, as it would name the new account for a request that ran on the old. The wake-up's own request, which began after the change, does all of it
-    const onCurrent = requestGen === identityGen
+    // A request that began before a rotation was marked (a wake-up typed mid-turn) ran on the old account: it dates and warms nothing on the new one, which is still empty (rotatedPending stays, and so the cold-send guard and keep warm's wait), and its record is not written, as it would name the new account for a request that ran on the old. The wake-up's own request, which began after the mark, does all of it, even when the seat or the account is adopted while it is out (that only names the account it ran on: dropReadings moves identityGen, not rotationGen; its windows are still told apart by identityGen, below)
+    const onCurrent = requestRot === rotationGen
     if (onCurrent) S.lastActivity = now
     S.compactedAt = 0 // the request a compaction waited for has landed
     measuredSteps++ // the chat measured itself: a seed still reading its transcript leaves these to it
