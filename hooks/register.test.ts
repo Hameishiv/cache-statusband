@@ -1112,7 +1112,7 @@ for (const failure of ['throws', 'returns api-error']) test(`an aborted turn end
   on('model.fork', () => {
     pings++
     if (pings === 1 && failure === 'throws') throw new Error('overloaded') // the first ping fails: auto keep warm stops, not on its cap
-    if (pings === 1) return { value: { isAnswered: false, reason: 'api-error', status: 529, error: 'overloaded', usage: usage({ input_tokens: 0, output_tokens: 0 }) } }
+    if (pings === 1) return { value: { isAnswered: false, reason: 'api-error', status: 400, error: 'invalid_request', usage: usage({ input_tokens: 0, output_tokens: 0 }) } } // a refused request: no retry
     if (cold) afterCold++
     return { value: { text: 'ok', usage: usage(cold ? { cache_creation_input_tokens: 300000 } : { cache_read_input_tokens: 300000 }) } }
   })
@@ -7763,10 +7763,11 @@ async function heldPing($: any, on: any, pingUsage: Record<string, unknown> = { 
   const disk: { id: string; files: Record<string, string> } = { id: 'sid-A', files: {} }
   const seat = { label: 'A' }
   const { clock, seen } = engine($, on, seat, kept, undefined, disk)
-  const hold = { releases: [] as (() => void)[], release: () => hold.releases.splice(0).forEach((r) => r()), held: false, pings: 0 }
+  const hold = { releases: [] as (() => void)[], release: () => hold.releases.splice(0).forEach((r) => r()), held: false, pings: 0, at: 0 }
   on('model.fork', async () => {
     hold.held = true
     hold.pings++
+    hold.at = await clock.now()
     await new Promise<void>((r) => hold.releases.push(r))
     return { value: { text: 'ok', usage: usage(pingUsage) } }
   })
@@ -8333,16 +8334,16 @@ async function failingFork($: any, on: any, answerOf: (n: number) => unknown, mi
 }
 const apiError = (extra: Record<string, unknown> = {}) => ({ isAnswered: false, reason: 'api-error', status: 429, error: 'rate_limit', usage: usage({ input_tokens: 0, output_tokens: 0 }), ...extra })
 
-test('a fork that returns api-error with zero usage, on a 5-minute cache: keep warm stops on the first ping, the cache is not dated, the record is not written', async ($, on) => {
-  const { seen, hold, kept, record } = await failingFork($, on, () => apiError())
+test('a fork that returns api-error 400 with zero usage, on a 5-minute cache: keep warm stops on the first ping, the cache is not dated, the record is not written', async ($, on) => {
+  const { seen, hold, kept, record } = await failingFork($, on, () => apiError({ status: 400 }))
   expect(hold.pings).toBe(1) // not one ping every few minutes for half an hour
   expect(seen.toasts.filter((t) => /Keep warm off/.test(t)).length).toBe(1)
-  expect(seen.toasts.some((t) => /Keep warm off \(the ping failed \(429\), so the cache may already be cold\)\. 0 ping\(s\), \$/.test(t))).toBe(true) // nothing was billed: nothing counted
+  expect(seen.toasts.some((t) => /Keep warm off \(the ping failed \(400\), so the cache may already be cold\)\. 0 ping\(s\), \$/.test(t))).toBe(true) // nothing was billed: nothing counted
   expect(JSON.stringify(kept.get('last:sid-test'))).toBe(record) // no record written of a read that never happened
 })
 
 test('a fork that returns api-error does not date the cache: keep warm started again by hand is still due and pings at once', async ($, on) => {
-  const { clock, seen, hold } = await failingFork($, on, () => apiError())
+  const { clock, seen, hold } = await failingFork($, on, () => apiError({ status: 400 }))
   expect(hold.pings).toBe(1)
   expect(seen.toasts.filter((t) => /Keep warm off/.test(t)).length).toBe(1)
   await $.command.run({ command: 'keepwarm', args: '1' })
@@ -8454,4 +8455,89 @@ test('the person\'s message dropped by the host after "Compact first" is put bac
   expect(seen.submits).toEqual([])
   expect(fills).toEqual(['approve, B'])
   expect(toastTexts(seen)).toContain('Compacted. Your message is back in the prompt box: press Enter to send it.')
+})
+
+// ===== review round 64: a start while keep warm is on is the same keep warm; a busy API (429, 5xx) is retried until the ping's own limit =====
+test('/keepwarm 2 while on, with a ping in flight: the ping is still this keep warm\'s: it dates the cache at when it went, and no second ping goes', async ($, on) => {
+  const { clock, kept, hold } = await heldPing($, on)
+  const before = recordedAt(kept)
+  await $.command.run({ command: 'keepwarm', args: '2' }) // on already: new hours, the same keep warm
+  hold.release()
+  await clock.advance(2 * 60000)
+  expect(hold.pings).toBe(1) // no second paid ping at the next tick
+  expect(recordedAt(kept)).toBeGreaterThan(before)
+  expect(recordedAt(kept)).toBe(hold.at) // dated at when the ping went, not when it answered
+  expect(await keepWarmLine($)).toMatch(PAID)
+})
+
+test('/keepwarm 2 while on, with a ping that never answers: it still stops keep warm at its limit', async ($, on) => {
+  const { clock, seen, hold } = await heldPing($, on)
+  await $.command.run({ command: 'keepwarm', args: '2' })
+  await clock.advance(9 * 60000) // past the margin (8 minutes on a 1-hour cache)
+  expect(seen.toasts.filter((t) => /Keep warm off \(the ping got no answer/.test(t)).length).toBe(1)
+  expect(await keepWarmLine($)).toBeUndefined()
+  expect(hold.pings).toBe(1)
+})
+
+const answered = () => ({ isAnswered: true, text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) })
+
+test('a 429 then a read that works on the retry: keep warm stays on, and the cache is dated by the read that worked', async ($, on) => {
+  const { seen, hold, kept, record } = await failingFork($, on, (n) => (n === 1 ? apiError() : answered()), 5)
+  expect(hold.pings).toBe(2) // the retry came on the next tick
+  expect(seen.toasts.filter((t) => /Keep warm off/.test(t)).length).toBe(0)
+  expect(JSON.stringify(kept.get('last:sid-test'))).not.toBe(record) // dated by the second ping
+})
+
+test('a 503 then a read that works: counted once (only the billed ping), and the retry limit is forgotten', async ($, on) => {
+  const { seen, hold, cache } = await failingFork($, on, (n) => (n === 1 ? apiError({ status: 503 }) : answered()), 5)
+  expect(hold.pings).toBe(2)
+  expect(seen.toasts.filter((t) => /Keep warm off/.test(t)).length).toBe(0)
+  expect(await cache()).toMatch(/Keep warm is on[^\n]*: 1 ping\(s\)/)
+})
+
+test('a 429 on every ping: keep warm stops once the first ping\'s limit has passed, with the toast once, and nothing counted or dated', async ($, on) => {
+  const { seen, hold, kept, record } = await failingFork($, on, () => apiError())
+  expect(hold.pings).toBeGreaterThan(1) // retried
+  expect(hold.pings).toBeLessThan(5) // but not for long: a 5-minute cache's ping has about 90 seconds
+  const offs = seen.toasts.filter((t) => /Keep warm off/.test(t))
+  expect(offs.length).toBe(1)
+  expect(offs[0]).toMatch(/Keep warm off \(the ping failed \(429\), so the cache may already be cold\)\. 0 ping\(s\), \$/)
+  expect(JSON.stringify(kept.get('last:sid-test'))).toBe(record)
+})
+
+test('a 429 that is billed (usage) stops at once, counted', async ($, on) => {
+  const { seen, hold } = await failingFork($, on, () => apiError({ usage: usage({ input_tokens: 40, output_tokens: 0 }) }))
+  expect(hold.pings).toBe(1)
+  expect(seen.toasts.some((t) => /Keep warm off \(the ping failed \(429\), so the cache may already be cold\)\. 1 ping\(s\)/.test(t))).toBe(true)
+})
+
+test('a 400 stops at once, not retried', async ($, on) => {
+  const { seen, hold } = await failingFork($, on, () => apiError({ status: 400 }))
+  expect(hold.pings).toBe(1)
+  expect(seen.toasts.filter((t) => /Keep warm off \(the ping failed \(400\)/.test(t)).length).toBe(1)
+})
+
+test('a retried ping goes one at a time: a 429 that comes back slowly is not stacked on', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  const hold = { releases: [] as (() => void)[], pings: 0 }
+  on('model.fork', async () => {
+    hold.pings++
+    await new Promise<void>((r) => hold.releases.push(r))
+    return { value: apiError() }
+  })
+  const step = stepper($, on)
+  await start($, 300000, clock)
+  await $.command.run({ command: 'cache', args: 'ttl 5' })
+  await step(usage({ cache_read_input_tokens: 300000 }))
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  await clock.advance(4 * 60000) // the first ping is out
+  expect(hold.pings).toBe(1)
+  await clock.advance(20000)
+  expect(hold.pings).toBe(1) // still out: no second
+  hold.releases.splice(0).forEach((r) => r()) // it fails, inside its limit
+  await clock.advance(1000)
+  expect(seen.toasts.filter((t) => /Keep warm off/.test(t)).length).toBe(0)
+  await clock.advance(30000)
+  expect(hold.pings).toBe(2) // the retry
 })

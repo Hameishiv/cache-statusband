@@ -1743,11 +1743,14 @@ function autoMayRun(t) {
   return !!S.lastActivity && S.lastActivity + ttlMin() * MIN > t // a cache that went cold is not one to keep warm: a ping would pay the whole rewrite
 }
 
-// Bumped whenever keep warm is started or stopped: a ping that went under one keep warm is not the next one's, even when an off and an on both land within one tick (S.keepWarm reads on again by then)
+// Bumped whenever keep warm is started from off or stopped: a ping that went under one keep warm is not the next one's, even when an off and an on both land within one tick (S.keepWarm reads on again by then). A start while it is already on (/keepwarm 2, the board's button) is the same keep warm with new hours: it bumps nothing, so a ping in flight is still this keep warm's
 let keepWarmGen = 0
 
 function startKeepWarm($, hours, auto = false) {
-  keepWarmGen++
+  if (!S.keepWarm) {
+    keepWarmGen++
+    pingFailing = null
+  }
   S.keepWarm = true
   S.keepWarmAuto = auto
   S.keepWarmUntil = now + hours * 60 * MIN
@@ -1756,6 +1759,7 @@ function startKeepWarm($, hours, auto = false) {
 
 function stopKeepWarm($, why) {
   keepWarmGen++
+  pingFailing = null
   if (!S.keepWarm) return
   S.keepWarm = false
   $.ui.toast(`Keep warm off (${why}). ${S.pings} ping(s), ${money(S.pingUsd)}.`, { timeoutMs: 8000 })
@@ -1763,10 +1767,16 @@ function stopKeepWarm($, why) {
 
 // A keep-warm ping (a fork) is out: no second one goes while it is, however many ticks come (a tick does not wait for the step before it).
 // Its settling is the real signal, as for fillOut: a ping that is slow is waited for (a tick waits PING_LIMIT for it, then goes on, and what the ping finds is applied when it does settle). The backstop is the time the cache had left when the ping went (at least PING_FLOOR, so that a ping that went with the cache already gone is not given up on before it can answer): a ping still out then has not saved the cache that the chat can count on, so it counts as no answer (keep warm stops, the slot is free), and an answer after that is counted (it was billed) and does nothing else.
-// A ping whose chat, account, keep warm or cache has changed since it went (moved: a /clear, a resume, a compaction, an off, a rotation (an account or seat change, or a wake-up that showed neither), or a real request, which warmed the cache for a whole window from its own start) is let go of: nothing stops, and its answer, whenever it comes, is counted and does nothing else. Its slot is free at once, except when only keep warm went off (changed() false: an off, and perhaps on again): the fork is still out and billed, and a new keep warm must not stack a second ping on it, so the slot stays held until it settles or its limit passes (no stop either: the new keep warm is not this ping's to end).
+// A ping that comes back failed (the engine returns it, it does not throw) is no answer either, and stops keep warm at once: nothing to fork, an abort, an empty reply, a throw, an api-error with another status than 429 or a 5xx, or one with something billed (counted). A rate limit or a server error that billed nothing is the exception: its slot is freed, nothing is dated, and the next tick pings again until the time the first such ping's cache would have run out (pingFailing), when keep warm stops as above; a read that worked clears that.
+// A ping whose chat, account, keep warm or cache has changed since it went (moved: a /clear, a resume, a compaction, an off (not a start while it is on), a rotation (an account or seat change, or a wake-up that showed neither), or a real request, which warmed the cache for a whole window from its own start) is let go of: nothing stops, and its answer, whenever it comes, is counted and does nothing else. Its slot is free at once, except when only keep warm went off (changed() false: an off, and perhaps on again): the fork is still out and billed, and a new keep warm must not stack a second ping on it, so the slot stays held until it settles or its limit passes (no stop either: the new keep warm is not this ping's to end).
 // { at, limit, moved, changed, lost }: when it went, its backstop, whether the chat/account/keep warm/cache changed since it went, whether anything but keep warm changed, and whether it has been let go of
 let pingOut = null
+// Pings that came back as a rate limit or a server error since the last read that worked, none of them billed: { until, status, moved } (until: the first failed ping's at + limit, the time its cache would have run out; status: of the latest failure; moved: that ping's own check, so a /clear, a compaction, a rotation, a real request or an off ends it). Each failure frees the slot and the next tick tries again; keep warm stops once `until` has passed with no read that worked (a read that worked clears it)
+let pingFailing = null
 const PING_LIMIT = 60000
+const pingFailedWhy = (status) => (status ? `the ping failed (${status}), so the cache may already be cold` : 'the ping got no answer, so the cache may already be cold')
+// A failure worth another try: the API was busy or down (a rate limit, a 5xx, or no status at all), and the ping was not billed. Any other status (a request the API refused), an abort, an empty reply, nothing to fork and a throw are not
+const retryable = (reply, billed) => !billed && !!reply && reply.isAnswered === false && reply.reason === 'api-error' && (!reply.status || reply.status === 429 || reply.status >= 500)
 const PING_FLOOR = 30000 // the least a ping is waited for: one that goes with the cache nearly or already gone (a hand keep warm on a cold chat, a tick that came late) still needs the seconds a healthy ping takes to answer
 
 async function keepWarmStep($) {
@@ -1782,6 +1792,7 @@ async function keepWarmStep($) {
       stopKeepWarm($, 'the ping got no answer, so the cache may already be cold')
     }
   }
+  if (pingFailing && pingFailing.moved()) pingFailing = null
   if (!S.keepWarm || pingOut) return
   // The chat, compaction and account counts this step began with. A /clear, a resume of another chat, a compaction, a rotation or an off that lands while a read or the ping is out makes what comes back the old chat's or the old account's: its date and record are not written (a fork shares the cache and does not move msgChat). A ping that came back was billed whatever happened meanwhile, and is counted all the same (below)
   const chat = msgChat
@@ -1827,6 +1838,8 @@ async function keepWarmStep($) {
     }
   }
   if (S.working) return
+  // The pings since the last read that worked were all turned away by a busy API, and the time the first one's cache had left has passed: the cache may be gone, and a ping now could pay the whole rewrite
+  if (pingFailing && now >= pingFailing.until) return stopKeepWarm($, pingFailedWhy(pingFailing.status))
   // After a rotation a ping would pay the whole rewrite: leave that to the next real turn. Auto keep warm waits for it one TTL, from when the rotation was seen (seatChangedAt; 0 for one only found on a reopened chat's record, which is no wait at all, though auto keep warm never starts on such a chat: autoMayRun), then it has nothing to protect and stops, as after a compaction. One started by hand waits on, to its own end
   if (rotatedCold()) {
     if (S.keepWarmAuto && now - S.seatChangedAt >= ttlMin() * MIN) return stopKeepWarm($, 'the account rotated and no message followed')
@@ -1863,10 +1876,17 @@ async function keepWarmStep($) {
     const noAnswer = () => {
       if (ping.lost || moved()) return
       if (reply && reply.reason === 'nothing-to-fork') return stopKeepWarm($, 'there was nothing to ping yet')
-      const status = reply && reply.status
-      return stopKeepWarm($, status ? `the ping failed (${status}), so the cache may already be cold` : 'the ping got no answer, so the cache may already be cold')
+      return stopKeepWarm($, pingFailedWhy(reply && reply.status))
     }
-    if (failed && !billed) return noAnswer()
+    if (failed && !billed) {
+      // A busy API (rate limit, server error) that billed nothing: the slot is free (above), nothing is dated or stopped, and the next tick pings again, until the time the first failed ping's cache would have run out
+      if (retryable(reply, billed) && !ping.lost && !moved()) {
+        if (!pingFailing) pingFailing = { until: ping.at + ping.limit, status: null, moved }
+        pingFailing.status = reply.status || null
+        if (now < pingFailing.until) return
+      }
+      return noAnswer()
+    }
     const u = reply.usage
     // The ping was billed: it is counted whether or not the chat, the account or keep warm itself changed while it was out, and however late it came. The cap counts it only while the chat is still the one it was sent in (the same id again is the same idle stretch; another id began a new one)
     S.pings += 1
@@ -1881,6 +1901,7 @@ async function keepWarmStep($) {
     // One that came after its backstop has already stopped keep warm (or a new one has started since): it dates and restarts nothing
     if (ping.lost || moved()) return
     if (failed) return noAnswer() // billed, but it did not answer (an abort part way): counted above, dates and records nothing
+    pingFailing = null // a read that worked
     // A ping that writes instead of reading did not hit the cache: stop paying for it
     if ((u.cache_creation_input_tokens || 0) > 0.1 * Math.max(1, u.cache_read_input_tokens || 0)) {
       return stopKeepWarm($, `the ping wrote ${tokens(u.cache_creation_input_tokens)} tokens instead of reading the cache`)
