@@ -1102,14 +1102,16 @@ test('a hand-started keep warm does not hand over when auto pings already cost t
   expect(seen.toasts.filter((t) => /time limit reached/.test(t)).length).toBe(1)
 })
 
-test('an aborted turn ending long after auto keep warm stopped, on a cache that went cold, does not start it: no ping', async ($, on) => {
+// The first ping fails: as a throw (still handled), and as the engine's own return shape ($.model.fork resolves { isAnswered: false, reason: 'api-error', status, usage: all zeros } rather than throwing)
+for (const failure of ['throws', 'returns api-error']) test(`an aborted turn ending long after auto keep warm stopped, on a cache that went cold, does not start it: no ping (the failed ping ${failure})`, async ($, on) => {
   const { clock, seen } = engine($, on)
   let pings = 0
   let afterCold = 0
   let cold = false
   on('model.fork', () => {
     pings++
-    if (pings === 1) throw new Error('overloaded') // the first ping fails: auto keep warm stops, not on its cap
+    if (pings === 1 && failure === 'throws') throw new Error('overloaded') // the first ping fails: auto keep warm stops, not on its cap
+    if (pings === 1) return { value: { isAnswered: false, reason: 'api-error', status: 529, error: 'overloaded', usage: usage({ input_tokens: 0, output_tokens: 0 }) } }
     if (cold) afterCold++
     return { value: { text: 'ok', usage: usage(cold ? { cache_creation_input_tokens: 300000 } : { cache_read_input_tokens: 300000 }) } }
   })
@@ -8305,4 +8307,101 @@ test('a wake-up that showed neither the seat nor the account changed, while a pi
   expect(JSON.stringify(kept.get('last:sid-A'))).toBe(recordBefore)
   await $.command.run({ command: 'keepwarm', args: '1' })
   expect(await keepWarmLine($)).toMatch(PAID) // billed: counted
+})
+
+// ===== review round 63: $.model.fork returns a failure ({ isAnswered: false, reason }), it does not throw; an off and on again within one tick is still a new keep warm =====
+// A 300k chat on a 5-minute cache whose last request has just ended; the fork answers with `answerOf(n)` (n: the ping's number)
+async function failingFork($: any, on: any, answerOf: (n: number) => unknown, minutes = 30) {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  const hold = { pings: 0 }
+  on('model.fork', () => {
+    hold.pings++
+    return { value: answerOf(hold.pings) }
+  })
+  const step = stepper($, on)
+  await start($, 300000, clock)
+  await $.command.run({ command: 'cache', args: 'ttl 5' })
+  await step(usage({ cache_read_input_tokens: 300000 }))
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  const record = JSON.stringify(kept.get('last:sid-test'))
+  const cache = async () => ((await $.command.run({ command: 'cache', args: '' })) as any).text as string
+  const before = await cache()
+  await clock.advance(minutes * 60000)
+  return { clock, seen, kept, hold, record, before, cache }
+}
+const apiError = (extra: Record<string, unknown> = {}) => ({ isAnswered: false, reason: 'api-error', status: 429, error: 'rate_limit', usage: usage({ input_tokens: 0, output_tokens: 0 }), ...extra })
+
+test('a fork that returns api-error with zero usage, on a 5-minute cache: keep warm stops on the first ping, the cache is not dated, the record is not written', async ($, on) => {
+  const { seen, hold, kept, record } = await failingFork($, on, () => apiError())
+  expect(hold.pings).toBe(1) // not one ping every few minutes for half an hour
+  expect(seen.toasts.filter((t) => /Keep warm off/.test(t)).length).toBe(1)
+  expect(seen.toasts.some((t) => /Keep warm off \(the ping failed \(429\), so the cache may already be cold\)\. 0 ping\(s\), \$/.test(t))).toBe(true) // nothing was billed: nothing counted
+  expect(JSON.stringify(kept.get('last:sid-test'))).toBe(record) // no record written of a read that never happened
+})
+
+test('a fork that returns api-error does not date the cache: keep warm started again by hand is still due and pings at once', async ($, on) => {
+  const { clock, seen, hold } = await failingFork($, on, () => apiError())
+  expect(hold.pings).toBe(1)
+  expect(seen.toasts.filter((t) => /Keep warm off/.test(t)).length).toBe(1)
+  await $.command.run({ command: 'keepwarm', args: '1' })
+  await clock.advance(31000) // a tick: a cache dated by the failed ping would not be due again for minutes
+  expect(hold.pings).toBe(2)
+})
+
+test('a fork that returns aborted with some usage billed: counted (a ping, its cost), stops, dates nothing', async ($, on) => {
+  const { seen, hold, kept, record } = await failingFork($, on, () => ({ isAnswered: false, reason: 'aborted', usage: usage({ input_tokens: 40, output_tokens: 0, cache_read_input_tokens: 0 }) }))
+  expect(hold.pings).toBe(1)
+  expect(seen.toasts.some((t) => /Keep warm off \(the ping got no answer, so the cache may already be cold\)\. 1 ping\(s\), <?\$/.test(t))).toBe(true)
+  expect(JSON.stringify(kept.get('last:sid-test'))).toBe(record)
+})
+
+test('a fork that returns empty-reply (zero usage): stops with the no-answer reason', async ($, on) => {
+  const { seen, hold } = await failingFork($, on, () => ({ isAnswered: false, reason: 'empty-reply', usage: usage({ input_tokens: 0, output_tokens: 0 }) }))
+  expect(hold.pings).toBe(1)
+  expect(seen.toasts.some((t) => /Keep warm off \(the ping got no answer, so the cache may already be cold\)/.test(t))).toBe(true)
+})
+
+test('a fork that returns api-error with no status: the no-answer reason', async ($, on) => {
+  const { seen } = await failingFork($, on, () => apiError({ status: null }))
+  expect(seen.toasts.some((t) => /Keep warm off \(the ping got no answer, so the cache may already be cold\)/.test(t))).toBe(true)
+})
+
+test('a fork with nothing to fork (no usage key): stops with "there was nothing to ping yet", not "the cache may already be cold"', async ($, on) => {
+  const { seen, hold } = await failingFork($, on, () => ({ isAnswered: false, reason: 'nothing-to-fork' }))
+  expect(hold.pings).toBe(1)
+  expect(seen.toasts.some((t) => /Keep warm off \(there was nothing to ping yet\)\. 0 ping\(s\), \$/.test(t))).toBe(true)
+  expect(seen.toasts.some((t) => /may already be cold/.test(t))).toBe(false)
+})
+
+test('a fork that throws still stops keep warm on the first ping', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  let pings = 0
+  on('model.fork', () => {
+    pings++
+    throw new Error('overloaded')
+  })
+  const step = stepper($, on)
+  await start($, 300000, clock)
+  await $.command.run({ command: 'cache', args: 'ttl 5' })
+  await step(usage({ cache_read_input_tokens: 300000 }))
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  await clock.advance(30 * 60000)
+  expect(pings).toBe(1)
+  expect(seen.toasts.filter((t) => /Keep warm off \(the ping got no answer/.test(t)).length).toBe(1)
+})
+
+test('keep warm off then on with no tick between, the old ping past its limit: no stop toast, the new keep warm stays on, and pings once the slot frees', async ($, on) => {
+  const { clock, seen, hold } = await heldPing($, on)
+  expect(hold.pings).toBe(1)
+  await $.command.run({ command: 'keepwarm', args: 'off' })
+  await $.command.run({ command: 'keepwarm', args: '1' }) // no tick between: the old ping cannot see the off
+  await clock.advance(7 * 60000) // inside the ping's limit (8 minutes on a 1-hour cache): the slot is held
+  expect(hold.pings).toBe(1)
+  for (let i = 0; i < 12 && hold.pings < 2; i++) await clock.advance(10000) // until the limit passes
+  expect(keepWarmOffs(seen)).toBe(0) // the old ping's backstop does not end the new keep warm
+  expect(seen.toasts.filter((t) => /Keep warm off/.test(t)).length).toBe(1) // only the hand's own off
+  expect(await keepWarmLine($)).toBeDefined() // still on
+  expect(hold.pings).toBe(2) // the slot is free and the next due tick pings
 })

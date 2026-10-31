@@ -1739,7 +1739,11 @@ function autoMayRun(t) {
   return !!S.lastActivity && S.lastActivity + ttlMin() * MIN > t // a cache that went cold is not one to keep warm: a ping would pay the whole rewrite
 }
 
+// Bumped whenever keep warm is started or stopped: a ping that went under one keep warm is not the next one's, even when an off and an on both land within one tick (S.keepWarm reads on again by then)
+let keepWarmGen = 0
+
 function startKeepWarm($, hours, auto = false) {
+  keepWarmGen++
   S.keepWarm = true
   S.keepWarmAuto = auto
   S.keepWarmUntil = now + hours * 60 * MIN
@@ -1747,6 +1751,7 @@ function startKeepWarm($, hours, auto = false) {
 }
 
 function stopKeepWarm($, why) {
+  keepWarmGen++
   if (!S.keepWarm) return
   S.keepWarm = false
   $.ui.toast(`Keep warm off (${why}). ${S.pings} ping(s), ${money(S.pingUsd)}.`, { timeoutMs: 8000 })
@@ -1780,9 +1785,10 @@ async function keepWarmStep($) {
   const idGen = identityGen
   const steps = measuredSteps // a main-loop request that measures the chat while a read or the ping is out has dated the cache itself, and warmed it for a whole window from its own start
   const rotGen = rotationGen // a wake-up that showed neither the seat nor the account changed marks a rotation (rotationGen) without moving identityGen: what comes back may still be the old account's
+  const kwGen = keepWarmGen // a keep warm turned off and on again since is a new one, which this ping is not the end of
   const requested = () => measuredSteps !== steps
   const changed = () => msgChat !== chat || compactGen !== gen || identityGen !== idGen || rotationGen !== rotGen || requested()
-  const moved = () => !S.keepWarm || changed()
+  const moved = () => keepWarmGen !== kwGen || changed()
   if (S.keepWarmAuto) {
     // a setting changed while it ran (autowarm off, big 400k, in this session or another): it stops, even while the chat works
     // while the chat works only the settings count: the cap is judged when it is idle (and by a ping that has just been paid)
@@ -1847,10 +1853,16 @@ async function keepWarmStep($) {
       reply = null // a thrown error is an answer: no answer, at once
     }
     if (pingOut === ping) pingOut = null
-    if (!reply || !reply.usage) {
+    // The engine does not throw on a failure: it returns { isAnswered: false, reason: 'api-error' | 'aborted' | 'empty-reply' | 'nothing-to-fork', status?, error?, usage? } (usage all zeros on an api-error, absent on nothing-to-fork). That is no answer, whatever its usage says: a read it did not make dates nothing and records nothing
+    const failed = !reply || reply.isAnswered === false || !reply.usage
+    const billed = !!reply && !!reply.usage && Object.values(reply.usage).some((v) => typeof v === 'number' && v > 0)
+    const noAnswer = () => {
       if (ping.lost || moved()) return
-      return stopKeepWarm($, 'the ping got no answer, so the cache may already be cold')
+      if (reply && reply.reason === 'nothing-to-fork') return stopKeepWarm($, 'there was nothing to ping yet')
+      const status = reply && reply.status
+      return stopKeepWarm($, status ? `the ping failed (${status}), so the cache may already be cold` : 'the ping got no answer, so the cache may already be cold')
     }
+    if (failed && !billed) return noAnswer()
     const u = reply.usage
     // The ping was billed: it is counted whether or not the chat, the account or keep warm itself changed while it was out, and however late it came. The cap counts it only while the chat is still the one it was sent in (the same id again is the same idle stretch; another id began a new one)
     S.pings += 1
@@ -1864,6 +1876,7 @@ async function keepWarmStep($) {
     $.ui.invalidate('ui.render')
     // One that came after its backstop has already stopped keep warm (or a new one has started since): it dates and restarts nothing
     if (ping.lost || moved()) return
+    if (failed) return noAnswer() // billed, but it did not answer (an abort part way): counted above, dates and records nothing
     // A ping that writes instead of reading did not hit the cache: stop paying for it
     if ((u.cache_creation_input_tokens || 0) > 0.1 * Math.max(1, u.cache_read_input_tokens || 0)) {
       return stopKeepWarm($, `the ping wrote ${tokens(u.cache_creation_input_tokens)} tokens instead of reading the cache`)
@@ -2142,6 +2155,7 @@ export function register(on, options = {}) {
       }
     }
     S.keepWarm = false
+    keepWarmGen++
     H.armed = false
     S.coldRestarts = [] // a resumed chat's own come back with its seed
     // The box text and its put-back hold stay with a fork, which is the same conversation: the text put back before the branch is still in the box, to be sent. Not after a typed /branch (or anything submitted from the composer): that submit took the box text, and prompt.submit has already ended the tracking, and the hold too when it came from a fill
