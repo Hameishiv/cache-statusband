@@ -186,6 +186,74 @@ test('auto keep warm starts at turn end and stops once the merge-pr PR merges', 
   expect(r.text).toMatch(/off in this session/)
 })
 
+test('a chat resumed after the old chat\'s PR merged keeps warm: the PR and the auto keep warm it switched off do not carry over', SETUP, async ($, on) => {
+  const { clock } = engine($, on)
+  let state = 'OPEN'
+  on('process.run', () => ({ value: { exitCode: 0, stdout: state + '\n', stderr: '' } }))
+  on('session.usage', () => ({ value: { context: { tokens: 300000, window: 1000000 } } }))
+  on('turn.complete', () => ({ text: '' }))
+  on('model.fork', () => ({ value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }))
+  on('classic.SessionStart', () => ({}))
+  await start($, 300000, clock)
+  await $.prompt.submit({ text: '/merge-pr 123', command: { name: 'merge-pr', args: '123' }, origin: COMPOSER, wait: false } as never)
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  state = 'MERGED'
+  await clock.advance(16 * 60000)
+  let r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/off in this session/)
+  await ($ as any).classic.SessionStart({ source: 'resume' }) // another chat, which has nothing to do with PR 123
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't2', reason: 'end_turn' } as never)
+  r = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/Keep warm is on/)
+  expect(r.text).not.toMatch(/off in this session/)
+  await clock.advance(16 * 60000) // the old PR's state is no longer asked about
+  r = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/Keep warm is on/)
+})
+
+test('an auto keep warm turned off by hand stays off in a cleared chat', SETUP, async ($, on) => {
+  const { clock } = engine($, on)
+  on('process.run', () => ({ value: { exitCode: 0, stdout: 'OPEN\n', stderr: '' } }))
+  on('session.usage', () => ({ value: { context: { tokens: 300000, window: 1000000 } } }))
+  on('turn.complete', () => ({ text: '' }))
+  on('model.fork', () => ({ value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }))
+  on('classic.SessionStart', () => ({}))
+  await start($, 300000, clock)
+  await $.command.run({ command: 'keepwarm', args: 'off' })
+  await ($ as any).classic.SessionStart({ source: 'clear' })
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/Keep warm is on/)
+  expect(r.text).toMatch(/off in this session/)
+})
+
+test('after /clear the PR a prompt names is the one keep warm tracks', SETUP, async ($, on) => {
+  const { clock } = engine($, on)
+  const asked: string[] = []
+  let states: Record<string, string> = { '123': 'OPEN', '456': 'OPEN' }
+  on('process.run', (_: unknown, e: any) => {
+    const n = String(e.command?.[3] ?? e.argv?.[3] ?? '')
+    asked.push(n)
+    return { value: { exitCode: 0, stdout: (states[n] ?? 'OPEN') + '\n', stderr: '' } }
+  })
+  on('session.usage', () => ({ value: { context: { tokens: 300000, window: 1000000 } } }))
+  on('turn.complete', () => ({ text: '' }))
+  on('model.fork', () => ({ value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }))
+  on('classic.SessionStart', () => ({}))
+  await start($, 300000, clock)
+  await $.prompt.submit({ text: '/merge-pr 123', command: { name: 'merge-pr', args: '123' }, origin: COMPOSER, wait: false } as never)
+  await ($ as any).classic.SessionStart({ source: 'clear' })
+  await $.prompt.submit({ text: '/merge-pr 456', command: { name: 'merge-pr', args: '456' }, origin: COMPOSER, wait: false } as never)
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+  await clock.advance(16 * 60000)
+  expect(asked.length).toBeGreaterThan(0)
+  expect(asked.every((n) => n === '456')).toBe(true) // never asked about 123
+  states = { '123': 'OPEN', '456': 'MERGED' }
+  await clock.advance(16 * 60000)
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/Keep warm is on/)
+})
+
 test('the band reads the Fable weekly limit, the model and the reset clocks', async () => {
   const body = { limits: [
     { kind: 'weekly_scoped', scope: { model: { display_name: 'Sonnet' } }, percent: 2, resets_at: 1 },

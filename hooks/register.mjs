@@ -49,6 +49,7 @@ const S = {
   seatChangedAt: 0, // when that label last changed: the new account's cache is empty
   floor: 0, // context size right after the last compaction: what compacting can't shrink
   autoWarm: true, // false once keep warm is turned off by hand in this session
+  autoWarmOffByPr: false, // autoWarm went false because the PR merged, not by hand: a new chat starts with it on again
   pr: 0, // a merge-pr session's PR: keep warm stops once it merges or closes
   prCheckedAt: 0,
   effort: '', // the main loop's effort, as its last request named it
@@ -1445,13 +1446,19 @@ async function applyRemoteCommands($) {
   if (!c) return
   await $.store.delete('cmd:' + S.id)
   if (c.keepWarm === true) {
-    S.autoWarm = true
+    setAutoWarm(true)
     startKeepWarm($, settings.keepWarmHours)
   }
   if (c.keepWarm === false) {
-    S.autoWarm = false
+    setAutoWarm(false)
     stopKeepWarm($, 'stopped from the board')
   }
+}
+
+// Auto keep warm switched on or off by hand: the person's choice, which a new chat keeps (unlike an off from a merged PR)
+function setAutoWarm(on) {
+  S.autoWarm = on
+  S.autoWarmOffByPr = false
 }
 
 function startKeepWarm($, hours, auto = false) {
@@ -1474,7 +1481,10 @@ async function keepWarmStep($) {
     S.prCheckedAt = now
     const state = await prState($)
     if (state === 'MERGED' || state === 'CLOSED') {
-      S.autoWarm = false
+      if (S.autoWarm) {
+        S.autoWarm = false
+        S.autoWarmOffByPr = true
+      }
       return stopKeepWarm($, `PR #${S.pr} is ${state.toLowerCase()}`)
     }
   }
@@ -1731,6 +1741,10 @@ export function register(on, options = {}) {
       S.floor = 0
       S.ctx = 0 // the last chat's size; a resumed chat's own is seeded below (a cleared one starts at 0)
       pendingSeed = null // a transcript still waiting for session.start belongs to the chat this one replaces
+      // the last chat's merge-pr PR says nothing about this one: its keep warm must not stop when that PR merges, and an auto keep warm that merge switched off starts on again. The new chat's own PR is read from its first prompt that names one (prompt.submit); a resumed chat's earlier prompts are not read here, so a resumed merge-pr chat is tracked from its next prompt that names the PR. A fork is the same conversation and keeps both
+      S.pr = 0
+      S.prCheckedAt = 0
+      if (S.autoWarmOffByPr) setAutoWarm(true)
     }
     S.keepWarm = false
     H.armed = false
@@ -2114,10 +2128,10 @@ export function register(on, options = {}) {
     now = await $.clock.now()
     const arg = String(e.args || '').trim().toLowerCase()
     if (arg === 'off' || (arg === '' && S.keepWarm)) {
-      S.autoWarm = false
+      setAutoWarm(false)
       stopKeepWarm($, 'turned off')
     } else {
-      S.autoWarm = true
+      setAutoWarm(true)
       const hours = Number(arg) > 0 ? Math.min(24, Number(arg)) : settings.keepWarmHours
       startKeepWarm($, hours)
     }
@@ -2163,9 +2177,9 @@ export function register(on, options = {}) {
     const st = cacheState(myHeartbeat())
     const big = S.ctx >= settings.bigTokens
     if (st.kind === 'cooling' && big) {
-      actions.push(Button({ key: 'keepwarm', label: 'K.W.', hotkey: '1', plain: true, onPress: async () => { now = await $.clock.now(); S.autoWarm = true; startKeepWarm($, settings.keepWarmHours); await heartbeat($, true); $.ui.invalidate('ui.render') } }))
+      actions.push(Button({ key: 'keepwarm', label: 'K.W.', hotkey: '1', plain: true, onPress: async () => { now = await $.clock.now(); setAutoWarm(true); startKeepWarm($, settings.keepWarmHours); await heartbeat($, true); $.ui.invalidate('ui.render') } }))
     } else if (st.kind === 'kept') {
-      actions.push(Button({ key: 'keepwarm', label: 'Stop K.W.', hotkey: '1', plain: true, onPress: async () => { now = await $.clock.now(); S.autoWarm = false; stopKeepWarm($, 'turned off'); await heartbeat($, true); $.ui.invalidate('ui.render') } }))
+      actions.push(Button({ key: 'keepwarm', label: 'Stop K.W.', hotkey: '1', plain: true, onPress: async () => { now = await $.clock.now(); setAutoWarm(false); stopKeepWarm($, 'turned off'); await heartbeat($, true); $.ui.invalidate('ui.render') } }))
     }
     // Right edge: one click runs /session-handoff (h while the band has the focus;
     // a letter never fires from the prompt box, unlike a digit). Once a handoff
@@ -2373,7 +2387,7 @@ function drawBoard($, e) {
           onPress: async () => {
             now = await $.clock.now()
             if (hb.self) {
-              S.autoWarm = !S.keepWarm
+              setAutoWarm(!S.keepWarm)
               if (S.keepWarm) stopKeepWarm($, 'turned off')
               else startKeepWarm($, settings.keepWarmHours)
               await heartbeat($, true)
