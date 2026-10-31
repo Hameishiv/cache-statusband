@@ -244,7 +244,9 @@ async function clearAndContinue($) {
   H.text = ''
   H.path = ''
   try {
-    await $.prompt.submit({ text, asUser: true })
+    // a submit that did not enter the chat (another hook's refusal, a Stop, a limit of the host) resolves { drop } instead of throwing: the same as a throw. This mod's own hook never drops its own submit (a plugin-origin submit is not from the composer, so the cold-send guard lets it through)
+    const r = await $.prompt.submit({ text, asUser: true })
+    if (r && r.drop) throw new Error(String(r.drop))
   } catch {
     // Not sent: leave it in the prompt box for one Enter
     let filled = false
@@ -687,7 +689,8 @@ async function resumeStep($) {
   const before = { chat: msgChat, steps: stepsSeen }
   for (const asUser of [true, false]) {
     try {
-      await $.prompt.submit({ text: 'Resume', ...(asUser ? { asUser } : {}) })
+      const r = await $.prompt.submit({ text: 'Resume', ...(asUser ? { asUser } : {}) })
+      if (r && r.drop) throw new Error(String(r.drop)) // dropped, not sent: as refused as a throw
       sendFailures = 0
       return
     } catch {
@@ -1038,7 +1041,8 @@ async function runCompactThenSend($, msg, unattended, before, wake) {
     for (const asUser of unattended ? [true, false] : [true]) {
       try {
         const stepsBefore = stepsSeen
-        await $.prompt.submit({ ...send, asUser })
+        const r = await $.prompt.submit({ ...send, asUser })
+        if (r && r.drop) throw new Error(String(r.drop)) // dropped, not sent: the next way, then the prompt box (the drop compactThenSend returns is for the composer's submit, never for this re-submit)
         const t = await $.clock.now() // read first, then check and set with no await between
         if (resume) sendFailures = 0
         // the person's own message, handed on by this mod: its request may start later (not if one already did)

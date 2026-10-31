@@ -30,7 +30,7 @@ function engine($: any, on: any, seat: { label: string; recording?: string } = {
     const reads: Record<string, number> = {}
     on('env.get', async (_: unknown, e: any) => (await disk.holdEnv!(e.name, (reads[e.name] = (reads[e.name] || 0) + 1)), { value: e.name === 'USERPROFILE' ? 'C:/Users/T' : undefined }))
   } else mock.env(on, { USERPROFILE: 'C:/Users/T' })
-  const seen = { compacts: 0, submits: [] as string[], asks: 0, toasts: [] as string[], failCompact: false, failSubmit: false, duringCompact: null as null | (() => Promise<unknown>), duringSubmit: null as null | (() => Promise<unknown>), duringClear: null as null | (() => Promise<unknown>) }
+  const seen = { compacts: 0, submits: [] as string[], asks: 0, toasts: [] as string[], failCompact: false, failSubmit: false, dropSubmit: '', duringCompact: null as null | (() => Promise<unknown>), duringSubmit: null as null | (() => Promise<unknown>), duringClear: null as null | (() => Promise<unknown>) }
   on('session.id', async () => (await disk.holdId?.(), { value: disk.id ?? 'sid-test' }))
   on('session.cwd', () => ({ value: '/repo' }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
@@ -64,6 +64,7 @@ function engine($: any, on: any, seat: { label: string; recording?: string } = {
   })
   on('prompt.submit', (_: unknown, e: any) => {
     if (e.text === 'DROPME') return { drop: 'another guard' }
+    if (seen.dropSubmit && e.origin?.kind === 'plugin') return { drop: seen.dropSubmit } // this mod's own sends do not enter the chat: the host resolves { drop } instead of throwing
     if (seen.failSubmit && e.origin?.kind === 'plugin') return Promise.resolve(seen.duringSubmit?.()).then(() => { throw new Error('refused') }) // this mod's own sends are refused, both ways, after whatever the test does while the submit is out
     if (e.text === 'SLOW') return clock.advance(40000).then(() => ({ text: e.text })) // a lower hook that takes 40 s to hand the message on
     if (e.origin?.kind === 'plugin') seen.submits.push(e.text)
@@ -8404,4 +8405,53 @@ test('keep warm off then on with no tick between, the old ping past its limit: n
   expect(seen.toasts.filter((t) => /Keep warm off/.test(t)).length).toBe(1) // only the hand's own off
   expect(await keepWarmLine($)).toBeDefined() // still on
   expect(hold.pings).toBe(2) // the slot is free and the next due tick pings
+})
+
+// ===== a submit the host resolves { drop } (it did not enter the chat) is a failed send, the same as one that throws =====
+test('a handoff the host drops after /clear is put in the prompt box, as one that throws is', SETUP, async ($, on) => {
+  const { clock, seen } = engine($, on)
+  const fills: string[] = []
+  on('prompt.fill', (_: unknown, e: any) => (fills.push(e.text), { isFilled: true }))
+  on('process.run', () => ({ value: { exitCode: 0, stdout: 'OPEN\n', stderr: '' } }))
+  on('session.usage', () => ({ value: { context: { tokens: 300000, window: 1000000 } } }))
+  on('turn.complete', () => ({ text: '' }))
+  on('model.fork', () => ({ value: { text: 'ok', usage: usage({ cache_read_input_tokens: 300000 }) } }))
+  on('classic.SessionStart', () => ({}))
+  await start($, 300000, clock)
+  await $.command.run({ command: 'session-handoff', args: '' })
+  await $.turn.complete({ answer: '# Session Handoff\n' + 'work on PR 123 continues. '.repeat(20), durationMs: 1, isAborted: false, turnId: 't2', reason: 'answer' } as never)
+  seen.dropSubmit = 'a hook refused it'
+  await $.command.run({ command: 'handoff', args: 'continue' })
+  await clock.advance(100)
+  expect(seen.submits).toEqual([])
+  expect(fills.length).toBe(1)
+  expect(fills[0]).toMatch(/^# Session Handoff|work on PR 123 continues/)
+  expect(seen.toasts.map((t) => JSON.parse(t).text)).toContain('Cleared. The handoff is in the prompt box: press Enter to send it.')
+})
+
+test('a Resume the host drops in both voices is tried again 2 minutes on, as one refused both ways is', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = engine($, on)
+  on('classic.StopFailure', () => ({}))
+  await start($, 50000, clock)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  seen.dropSubmit = 'a hook refused it'
+  await clock.advance(60 * 60000 + 30000) // no reset time is known: the Resume falls due an hour on, and both ways are dropped
+  expect(seen.toasts.filter((t) => /Could not send Resume\. Trying again at/.test(t)).length).toBe(1)
+  expect(seen.submits).toEqual([])
+  seen.dropSubmit = ''
+  await clock.advance(30000)
+  expect(seen.submits).toEqual([]) // still inside the 2 minutes
+  await clock.advance(100000)
+  expect(seen.submits).toEqual(['Resume'])
+})
+
+test('the person\'s message dropped by the host after "Compact first" is put back in the prompt box, as one refused is', SETUP, async ($, on) => {
+  heldAsk(on)
+  const { clock, seen, fills } = await coldChat($, on)
+  seen.dropSubmit = 'a hook refused it'
+  await send($, 'approve, B')
+  await clock.advance(1000)
+  expect(seen.submits).toEqual([])
+  expect(fills).toEqual(['approve, B'])
+  expect(toastTexts(seen)).toContain('Compacted. Your message is back in the prompt box: press Enter to send it.')
 })
