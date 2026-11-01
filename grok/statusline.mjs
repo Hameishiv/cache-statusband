@@ -152,7 +152,7 @@ export function remaining(ms) {
 
 /**
  * Weekly percent and reset, or null.
- * `record` is `{ percent, periodType, periodEnd }`. A monthly period, a
+ * `record` is `{ percent, periodType, periodEnd, fetchedAt }`. A monthly period, a
  * missing percent, a reset that has already passed, or a reading fetched
  * more than a day ago, or with no readable fetch time, is left out.
  */

@@ -396,7 +396,9 @@ async function writeCache(path, value) {
 async function releaseLock(handle, path) {
   let same = false;
   try {
-    const [held, named] = await Promise.all([handle.stat(), stat(path)]);
+    // bigint: a Windows file ID can pass 2^53, where plain numbers round
+    // two different files to the same ino.
+    const [held, named] = await Promise.all([handle.stat({ bigint: true }), stat(path, { bigint: true })]);
     same = held.ino === named.ino && held.dev === named.dev;
   } catch {}
   await handle.close().catch(() => {});
