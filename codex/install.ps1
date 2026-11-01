@@ -11,7 +11,7 @@ $ErrorActionPreference = "Stop"
 
 function Set-TomlKey {
   param(
-    [Parameter(Mandatory)][string]$Text,
+    [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
     [Parameter(Mandatory)][string]$Section,
     [Parameter(Mandatory)][string]$Key,
     [Parameter(Mandatory)][string]$Value

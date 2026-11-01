@@ -73,6 +73,18 @@ status_line_use_colors = false
   if ([IO.File]::ReadAllText((Join-Path $testHome "config.toml")) -ne $instructions) {
     throw "Multiline instructions changed during candidate rejection"
   }
+  # A fresh install has no config.toml, or an empty one: "" must reach Set-TomlKey.
+  foreach ($case in @("missing", "empty")) {
+    $freshHome = Join-Path $testHome ("fresh-" + $case)
+    New-Item -ItemType Directory -Path $freshHome | Out-Null
+    if ($case -eq "empty") {
+      [IO.File]::WriteAllText((Join-Path $freshHome "config.toml"), "", [Text.UTF8Encoding]::new($false))
+    }
+    & (Join-Path $root "install.ps1") -CodexHome $freshHome -SkipCliLink | Out-Null
+    $fresh = [IO.File]::ReadAllText((Join-Path $freshHome "config.toml"))
+    if ($fresh -notmatch '(?m)^\[features\]$' -or $fresh -notmatch '(?m)^hooks = true$') { throw "Fresh install ($case config) did not enable hooks" }
+    if ($fresh -notmatch '(?m)^status_line_use_colors = true$') { throw "Fresh install ($case config) did not write the footer" }
+  }
   Write-Output "install_config_test=passed"
 } finally {
   if (Test-Path -LiteralPath $testHome) {
