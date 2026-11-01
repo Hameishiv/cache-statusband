@@ -2271,6 +2271,42 @@ test('a Fable week at 100% that has not reset yet arms a resume', RESUME_WAKE, a
   expect(seen.toasts.filter((t) => /resumes on its own/.test(t)).length).toBe(1)
 })
 
+// A plan reading whose resets pass while the poll is backed off (its next fetch is a day away) is not shown as current
+async function expiredPlanReading($: any, on: any) {
+  const kept = new Map<string, unknown>()
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  on('ui.render', engineDraws)
+  on('session.authorize', () => ({ value: { handle: 'h' } }))
+  await clock.advance(60000)
+  const t0 = await clock.now()
+  const resetsAt = new Date(t0 + 10 * 60000).toISOString()
+  kept.set('plan:account:a@x', { at: t0, next: t0 + 24 * 60 * 60000, fable: { percentUsed: 100, resetsAt }, windows: [{ kind: 'five_hour', percentUsed: 100, resetsAt }, { kind: 'seven_day', percentUsed: 100, resetsAt }], why: 'ok' })
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await clock.advance(30000) // the tick takes the stored reading
+  return { clock, seen }
+}
+async function bandHas($: any, text: RegExp) {
+  const ui = await $.ui.mount({ plugin: 'test', component: 'AbovePrompt', surface: 'terminal', viewport: { columns: 200, rows: 30 }, props: {} } as never)
+  return !!(await ui.find({ type: 'Text', text }))
+}
+
+test('the band shows the plan windows and the Fable week while they are open, and neither once their reset has passed', async ($, on) => {
+  const { clock } = await expiredPlanReading($, on)
+  expect({ five: await bandHas($, /5h 100%/), week: await bandHas($, /Week 100%/), fable: await bandHas($, /Fable 100%/) }).toEqual({ five: true, week: true, fable: true })
+  await clock.advance(11 * 60000) // their reset has passed, and the next poll is a day away
+  expect({ five: await bandHas($, /5h 100%/), week: await bandHas($, /Week 100%/), fable: await bandHas($, /Fable 100%/) }).toEqual({ five: false, week: false, fable: false })
+})
+
+test('/cache does not give the Fable week as current once its reset has passed', async ($, on) => {
+  const { clock } = await expiredPlanReading($, on)
+  expect(((await $.command.run({ command: 'cache', args: '' })) as any).text).toMatch(/Fable weekly: 100% used/)
+  await clock.advance(11 * 60000)
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).not.toMatch(/Fable weekly: 100%/)
+  expect(r.text).toMatch(/Fable weekly: no reading yet/)
+})
+
 test('a resume armed from the old account\'s own windows while the account is unknown is re-armed for a minute after the new account is adopted', RESUME_WAKE, async ($, on) => {
   const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
   const { clock, seen } = engine($, on, { label: 'A' }, undefined, undefined, disk)

@@ -1227,6 +1227,9 @@ export function stillOpen(limits, at) {
   return limits.filter((l) => !l.resetsAt || Date.parse(l.resetsAt) > at)
 }
 
+// The Fable week as a reading that is still current: null once its reset has passed (stale, like an ordinary window), wherever it is shown
+const fableOpen = () => (S.fable && stillOpen([S.fable], now).length ? S.fable : null)
+
 export function borrowedLimits(list, self, at) {
   // a seat on either side must match, on the same surface (each rotator names its seats alone): a seated and an unseated session are not known to share an account.
   // With no seat on either side the signed-in accounts decide: both must be known, and equal
@@ -2078,7 +2081,7 @@ function statusText() {
   if (S.keepWarm) lines.push(`Keep warm is on until ${clock(S.keepWarmUntil)}: ${S.pings} ping(s), ${money(S.pingUsd)} so far.${st.left === null || rotatedCold() ? ' It waits for the next message before it pings.' : ''}`)
   if (S.rateLimits.length) lines.push(`Plan limits used: ${limitsText(S.rateLimits)}.`)
   if (keyUnsure()) lines.push('Fable weekly: waiting for the rotator to name the new seat or account.')
-  else lines.push(S.fable ? `Fable weekly: ${Math.round(S.fable.percentUsed)}% used.` : `Fable weekly: no reading yet${planWhy && planWhy !== 'ok' ? ` (last check: ${planWhy})` : ''}.`)
+  else lines.push(fableOpen() ? `Fable weekly: ${Math.round(S.fable.percentUsed)}% used.` : `Fable weekly: no reading yet${planWhy && planWhy !== 'ok' ? ` (last check: ${planWhy})` : ''}.`)
   lines.push(`Session cost so far: ${money(S.costUsd)}. Cold restarts in this chat: ${S.coldRestarts.length} (${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))}).`)
   lines.push(`Cold-send guard: ${settings.guard ? 'on' : 'off'} for contexts over ${tokens(settings.bigTokens)} tokens. Alerts: ${settings.alerts ? 'on' : 'off'}.`)
   lines.push(`Auto keep warm: ${settings.autoWarmHours ? `on, until ${settings.autoWarmHours}h after the last turn (sooner once its pings cost as much as the rewrite), for contexts over ${tokens(settings.bigTokens)}${S.autoWarm ? '' : ' (off in this session)'}` : 'off'}.`)
@@ -2794,13 +2797,14 @@ function bandSegments() {
   // the engine's own reading once a request has run; before that another session's on the same account, then the shared usage reading
   let limits = stillOpen(S.rateLimits, now) // a window that reset since is stale
   if (!limits.length && signedIn !== false && !keyUnsure()) limits = borrowedLimits(fleet, { seat: S.seat, account: S.account, desktop: !onTerminal }, now) // not while the seat or account is unknown: the key may name the old one
-  if (!limits.length && !keyUnsure()) limits = S.planWindows // the shared reading waits for it too: it may be the old account's
+  if (!limits.length && !keyUnsure()) limits = stillOpen(S.planWindows, now) // the shared reading waits for it too: it may be the old account's; a window that reset since is stale, as above (the poll may be backed off for hours)
   const five = limits.find((l) => l.kind === 'five_hour')
   const week = limits.find((l) => l.kind === 'seven_day')
   if (five) out.push(limitSegment('5h', five, 'purple'))
   if (week) out.push(limitSegment('Week', week, 'green'))
   // its reset is the weekly one's, already shown; the reading waits for the seat and account like the windows
-  if (S.fable && !keyUnsure()) out.push(limitSegment('Fable', S.fable, 'pink', false))
+  const fable = fableOpen()
+  if (fable && !keyUnsure()) out.push(limitSegment('Fable', fable, 'pink', false))
   for (const l of S.rateLimits) if (l.kind !== 'five_hour' && l.kind !== 'seven_day') out.push(limitSegment(LIMIT_LABEL[l.kind] || l.kind, l, 'gray'))
   out.push([`session ${money(S.costUsd)}`, 'salmon'])
   if (S.resumeAt) out.push([S.resumeAt <= now && putBackHeld() ? '⏸ Resume waits for your message' : `⏸ resumes ${resumeText(S.resumeAt, now)}`, WARN])
