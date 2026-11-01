@@ -385,6 +385,16 @@ test("formats usage windows and ages without reset prose", () => {
   assert.equal(formatAge(now - (7 * 24 + 9) * 60 * 60_000, now), "7d9h");
 });
 
+test("omits a window whose reset has passed, keeping the one still open", () => {
+  const now = Date.parse("2026-10-29T08:00:00.000Z");
+  const lines = formatUsageLines({
+    primary: { usedPercent: 100, windowDurationMins: 300, resetsAt: (now - 60_000) / 1000 },
+    secondary: { usedPercent: 52, windowDurationMins: 10_080, resetsAt: (now + 60 * 60_000) / 1000 },
+  }, now);
+  assert.ok(!lines.some((line) => line.startsWith("5h")), lines.join("\n"));
+  assert.ok(lines.includes("Week 52% · 1h00m"), lines.join("\n"));
+});
+
 test("states when Codex supplies a banked count without expiry details", () => {
   const lines = formatUsageLines(
     { availableCount: 2, credits: null },

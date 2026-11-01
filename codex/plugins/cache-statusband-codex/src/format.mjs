@@ -63,6 +63,7 @@ export function formatUsageLines(snapshot, now = Date.now(), {
     if (!Number.isFinite(window?.usedPercent)) continue;
     const label = formatWindowDuration(window.windowDurationMins);
     const resetAt = epochMilliseconds(window.resetsAt);
+    if (Number.isFinite(resetAt) && resetAt <= now) continue; // a window that has reset since is stale: its old percentage is not current
     const reset = Number.isFinite(resetAt) ? ` · ${formatDuration(Math.max(0, resetAt - now))}` : "";
     lines.push(`${label} ${Math.round(window.usedPercent)}%${reset}`);
   }
