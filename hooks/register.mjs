@@ -1015,7 +1015,8 @@ async function runCompactThenSend($, msg, unattended, before, wake) {
       : handed ? 'A message was sent meanwhile, so the automatic one was not sent.' : 'Something else was sent or chosen meanwhile, so the automatic one was not sent.'
     $.ui.toast((compacted ? 'Compacted. ' : '') + text, { timeoutMs: 8000 })
   }
-  if (cancelled()) return cancelOut()
+  // a main-loop request that started while compacting settles the Resume even if its own submit has not been counted yet: no automatic message goes after it
+  if (cancelled() || (unattended && stepsSeen !== before.steps)) return cancelOut()
   if (msgChat !== before.msgChat) return staleChat()
   if (stuck) {
     // The Resume is tried again (a counted try); the person's message and a wake-up's go back in the prompt box below

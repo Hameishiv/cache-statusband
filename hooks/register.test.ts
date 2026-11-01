@@ -3007,6 +3007,19 @@ test('a dropped prompt does not cancel the Resume while it compacts', { options:
   expect({ compacts: seen.compacts, submits: seen.submits }).toEqual({ compacts: 1, submits: ['Resume'] })
 })
 
+test('a request that starts while the Resume compacts, before its own submit is seen, cancels the Resume: no extra Resume after compacting', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = engine($, on)
+  on('classic.StopFailure', () => ({}))
+  await start($, 300000, clock)
+  const t0 = await clock.now()
+  await $.session.measure({ context: { tokens: 300000, window: 1000000, percent: 30 }, rateLimits: fiveFull(t0), changed: [] } as never)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  seen.duringCompact = () => mainStep($)
+  await clock.advance(3 * 60 * 60000)
+  expect(seen.compacts).toBe(1)
+  expect(seen.submits).toEqual([])
+})
+
 test('/clear typed while the Resume compacts cancels it: no Resume into the cleared chat', { options: { autoResume: true } }, async ($, on) => {
   const { clock, seen } = engine($, on)
   on('classic.StopFailure', () => ({}))
