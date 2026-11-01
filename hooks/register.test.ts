@@ -659,6 +659,60 @@ test('a chat measured on the 5-minute cache, reopened by a new process 10 minute
   expect(seen.asks).toBe(1)
 })
 
+test('a TTL the person forces with /cache ttl does not erase the one stored for the chat when the next record is written', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock } = engine($, on, { label: 'A' }, kept)
+  const step = stepper($, on)
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: (await clock.now()) - 2 * 60000, model: 'claude-opus-5-5', seat: 'A', desktop: false, ttlMin: 5, ttlSource: 'measured' })
+  await $.command.run({ command: 'cache', args: 'ttl 60' }) // forced before the chat is seeded: the seed leaves the stored TTL alone
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await step(usage({ cache_read_input_tokens: 300000 })) // this process detects nothing: its record carries the stored TTL on
+  expect(kept.get('last:sid-test')).toMatchObject({ ttlMin: 5, ttlSource: 'measured' })
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/cache window 60 min \(set by you\)/)
+})
+
+test('a request that completes before the seed\'s store read does not erase the stored TTL either', SETUP, async ($, on) => {
+  let release: () => void = () => {}
+  const gate = new Promise<void>((r) => (release = r))
+  let armed = false
+  const kept = new Map<string, unknown>()
+  const disk: any = { files: {} }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, async (key) => { if (armed && key === 'last:sid-test') { armed = false; await gate } }, disk)
+  answer(on, seen, 'Send anyway')
+  const req = heldRequest($, on)
+  on('classic.SessionStart', () => ({}))
+  await start($, 300000, clock)
+  const t0 = await clock.now()
+  disk.files['x.jsonl'] = prompt('hello') + reply(t0 - 2 * 60000, 590000)
+  kept.set('last:sid-test', { ctx: 590004, at: t0 - 2 * 60000, model: 'claude-opus-5-5', seat: 'A', desktop: false, ttlMin: 5, ttlSource: 'reported by the API', cold: COLD_HISTORY(t0) })
+  armed = true // the seed's own read of the record waits
+  const p = ($ as any).classic.SessionStart({ source: 'resume', transcript_path: '/h/x.jsonl' })
+  await clock.advance(10)
+  req.begin()
+  await req.finish(usage({ cache_read_input_tokens: 600000 })) // the whole request, before the seed read the record
+  expect(kept.get('last:sid-test')).toMatchObject({ ttlMin: 5, ttlSource: 'reported by the API' })
+  release()
+  await p
+  const c: any = await $.command.run({ command: 'cache', args: '' })
+  expect(c.text).toMatch(/cache window 5 min/) // and the seed, once it has read the record, restores it
+})
+
+test('a TTL stored by a request that ran on another seat is not restored, and not carried into this seat\'s record', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock } = engine($, on, { label: 'B' }, kept)
+  const step = stepper($, on)
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: (await clock.now()) - 2 * 60000, model: 'claude-opus-5-5', seat: 'A', desktop: false, ttlMin: 5, ttlSource: 'measured' })
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  let r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/cache window 60 min \(default\)/) // seat A's TTL is not B's
+  await step(usage({ cache_read_input_tokens: 300000 }))
+  expect(kept.get('last:sid-test')).toMatchObject({ seat: 'B' })
+  expect((kept.get('last:sid-test') as any).ttlMin).toBeUndefined() // the record now names B: it must not vouch for A's TTL
+})
+
 test('a TTL this process has already reported is not replaced by the record\'s, and one the person set is kept', SETUP, async ($, on) => {
   const kept = new Map<string, unknown>()
   const { clock } = engine($, on, { label: 'A' }, kept)

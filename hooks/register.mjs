@@ -305,6 +305,7 @@ function ttlRecord() {
 // What a seed takes back from a chat's record: only with the setting on auto and nothing detected in this process since (S.ttlSource is still 'default'): a TTL this process measured is newer than the record's. A request that landed meanwhile, with no TTL in its usage, measured none, so it does not stop this
 function restoreTtl(last) {
   if (!last || settings.ttlMin || S.ttlSource !== 'default') return false
+  if (ranElsewhere(last)) return false // measured on another seat or account: that cache's TTL, not this one's
   if (last.ttlMin !== 5 && last.ttlMin !== 60) return false
   S.ttlMin = last.ttlMin
   S.ttlSource = last.ttlSource === 'reported by the API' ? last.ttlSource : 'measured'
@@ -1502,7 +1503,13 @@ function mergeCold(...lists) {
   return out.sort((a, b) => (a.at || 0) - (b.at || 0)).slice(-COLD_KEEP)
 }
 
-let coldSeedChat = null // { chat, id, list }: the cold history stored for a chat, once read (by its seed or by the first record written while the seed had not merged it), so a record written meanwhile merges it without another read. Reset whenever a seed is awaited (holdStoredCold)
+// A stored record's detected TTL with who ran it, as a record carries it on (writeRecord): null when it holds none
+function storedTtl(rec) {
+  if (!rec || (rec.ttlMin !== 5 && rec.ttlMin !== 60)) return null
+  return { ttlMin: rec.ttlMin, ttlSource: rec.ttlSource, ...(rec.seat ? { seat: rec.seat } : {}), ...(rec.account ? { account: rec.account } : {}), desktop: !!rec.desktop }
+}
+
+let coldSeedChat = null // { chat, id, list, ttl }: the cold history stored for a chat (and the TTL it holds, storedTtl), once read (by its seed or by the first record written while the seed had not merged it), so a record written meanwhile merges it without another read. Reset whenever a seed is awaited (holdStoredCold)
 let writeChain = Promise.resolve() // the chat's records: each one's write starts when the one before it has finished or timed out (WRITE_LIMIT), so one waiting on the stored history is not overtaken by a later one. A write that timed out writes nothing more (its late flag, in writeRecord): a step that settles late cannot put an older record over a newer. A store.set that was already issued and lands late can: the newest record issued for that key is then written again (lastIssued), queued here, so every write issued after that waits for it, and a re-write that itself lands late is followed by another. What holds: once no set of this mod's is still out past its limit, the store has the newest record issued for each key. What stays open: two sets of the store's that are both out at once may land in either order, a re-write or record set still out past its limit may land after a later one (until it lands, and its follow-up is written), and a store that never answers loses the record (the next request writes it)
 const lastIssued = new Map() // key -> { key, value }: the newest record a write has handed to store.set for that key, for the one that lands late over it. An entry goes once its set has settled with nothing newer issued for the key and no set of the key still out (putIssued), so it holds only the keys with a set still out, or a newer record than one still out, not every id the process has had
 const setsOut = new Map() // key -> how many sets handed to store.set for it have not settled yet (a stuck one counts until it lands)
@@ -1515,9 +1522,9 @@ function holdStoredCold(chat) {
   coldSeedChat = null
 }
 
-// Reads what is stored for the chat once and keeps it (coldSeedChat); merged into this process's own list, which a seed that could not read it then no longer waits for. Returns the list it read (the caller merges from it, not from coldSeedChat, which a seed or a resume can reset meanwhile), or null when it could not be read (another session holds the store's lock): then nothing is known of the stored history.
+// Reads what is stored for the chat once and keeps it (coldSeedChat); merged into this process's own list, which a seed that could not read it then no longer waits for. Returns what it read, { list, ttl } (the caller merges from it, not from coldSeedChat, which a seed or a resume can reset meanwhile), or null when it could not be read (another session holds the store's lock): then nothing is known of the stored history.
 async function loadStoredCold($, chat, id) {
-  if (coldSeedChat && coldSeedChat.chat === chat && coldSeedChat.id === id) return coldSeedChat.list
+  if (coldSeedChat && coldSeedChat.chat === chat && coldSeedChat.id === id) return coldSeedChat
   let stored = null
   try {
     stored = await $.store.get('last:' + id)
@@ -1525,7 +1532,7 @@ async function loadStoredCold($, chat, id) {
     return null
   }
   const list = stored && Array.isArray(stored.cold) ? stored.cold : []
-  coldSeedChat = { chat, id, list }
+  coldSeedChat = { chat, id, list, ttl: storedTtl(stored) }
   if (chat === msgChat && id === S.id) {
     const merged = mergeCold(list, S.coldRestarts)
     const changed = merged.length !== S.coldRestarts.length
@@ -1533,7 +1540,7 @@ async function loadStoredCold($, chat, id) {
     if (coldSeedPending === chat) coldSeedPending = null
     if (changed) $.ui.invalidate('ui.render')
   }
-  return list
+  return coldSeedChat
 }
 
 // Writes a chat's record with its cold history, after the ones issued before it. The record is built by the caller in one go (what the request measured and where it ran, as of one moment), and so is the list of cold rewrites it carries: this process's own at that moment. While the chat's seed has not merged the stored history, that is merged into the list too, so a shorter one never replaces what is stored; when the stored history cannot be read the record is not written (the next request writes it).
@@ -1549,13 +1556,17 @@ function writeRecord($, record) {
     return bounded($, async () => {
       try {
         let cold = own
+        let held = coldSeedChat && coldSeedChat.chat === chat && coldSeedChat.id === id ? coldSeedChat.ttl : null // the TTL stored for the chat, when the seed (or an earlier write) has read it
         if (merge) {
           const stored = await loadStoredCold($, chat, id)
           if (!stored) return
-          cold = mergeCold(stored, own)
+          cold = mergeCold(stored.list, own)
+          held = stored.ttl
         }
         if (late) return
-        const mine = { key: 'last:' + id, value: { ...record, cold } }
+        // A record this process builds names a TTL only when it detected one: without, the one stored for the chat (a forced /cache ttl, or a write before the seed read the record, detects nothing) goes on in it, unless it was detected where the request ran on another seat or account than this one
+        const carried = record.ttlMin === undefined && held && !ranElsewhere(held) ? { ttlMin: held.ttlMin, ttlSource: held.ttlSource } : {}
+        const mine = { key: 'last:' + id, value: { ...record, ...carried, cold } }
         lastIssued.set(mine.key, mine)
         await putIssued($, mine)
         // this set landed after its step timed out, perhaps over a record written since: the newest for the key goes in again
@@ -1651,7 +1662,7 @@ async function seedFromTranscript($, path, from = seedMark(), priorHb) {
     last = null
     storeRead = false // what is stored is unknown: a record written meanwhile is not written (writeRecord) until it has been read
   }
-  if (storeRead && id) coldSeedChat = { chat: from.chat, id, list: last && Array.isArray(last.cold) ? last.cold : [] }
+  if (storeRead && id) coldSeedChat = { chat: from.chat, id, list: last && Array.isArray(last.cold) ? last.cold : [], ttl: storedTtl(last) }
   if (gone()) return
   // the cold history is the chat's own whatever has been measured since: kept with what this process has recorded meanwhile
   let changed = false
