@@ -25,6 +25,8 @@ export async function getUsageSnapshot({
   const identity = suppliedIdentity === undefined
     ? await configuredSeatIdentity(codexHome, env)
     : suppliedIdentity;
+  // No seat and no readable account: the unscoped file is shared with every account, so it is neither read nor written, and the read is shown for this call only
+  if (!identity) return await readUnidentified({ codexHome, now, fetcher, env, timeoutMs });
   const suffix = cacheSuffix(identity);
   const cachePath = join(dataDir, `rate-limits${suffix}.json`);
   const lockPath = join(dataDir, `rate-limits${suffix}.lock`);
@@ -78,6 +80,16 @@ export async function getUsageSnapshot({
     }
   } finally {
     await releaseLock(lock, lockPath);
+  }
+}
+
+async function readUnidentified({ codexHome, now, fetcher, env, timeoutMs }) {
+  const attempted = { ...emptyCache(), attemptedAt: now, nextAllowedAt: now + MIN_POLL_INTERVAL_MS };
+  try {
+    const safe = sanitizeRateLimits(await fetcher({ codexHome, env, ...(timeoutMs ? { timeoutMs } : {}) }));
+    return present({ ...attempted, ...safe, identityKey: safe.accountEmail ? `account:${safe.accountEmail}` : null, fetchedAt: now }, "live");
+  } catch (error) {
+    return present({ ...attempted, lastErrorAt: now }, "stale");
   }
 }
 

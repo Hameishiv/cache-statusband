@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { access, mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -20,6 +21,8 @@ const TEST_EMAIL = ["person", "example.invalid"].join("@");
 const SEAT_PREFIX = ["S", "eat"].join("");
 const FIRST_SEAT = ["fixture", "one"].join("-");
 const SECOND_SEAT = ["fixture", "two"].join("-");
+const ACCOUNT = { key: `account:${TEST_EMAIL}`, label: TEST_EMAIL, unavailable: false };
+const SCOPE = `-${createHash("sha256").update(ACCOUNT.key).digest("hex").slice(0, 16)}`;
 const RAW = {
   account: { type: "chatgpt", email: TEST_EMAIL, token: "fixture-private-value" },
   rateLimits: {
@@ -47,16 +50,16 @@ test("shares one rate-limit read for at least five minutes", async (t) => {
   const now = Date.parse("2026-10-29T12:00:00.000Z");
   let calls = 0;
   const fetcher = async () => { calls += 1; return RAW; };
-  const first = await getUsageSnapshot({ codexHome: root, now, fetcher });
-  const second = await getUsageSnapshot({ codexHome: root, now: now + MIN_POLL_INTERVAL_MS - 1, fetcher });
+  const first = await getUsageSnapshot({ codexHome: root, now, fetcher, identity: ACCOUNT });
+  const second = await getUsageSnapshot({ codexHome: root, now: now + MIN_POLL_INTERVAL_MS - 1, fetcher, identity: ACCOUNT });
   assert.equal(first.source, "live");
   assert.equal(second.source, "cache");
   assert.equal(second.availableCount, 2);
   assert.equal(calls, 1);
-  const stored = await readFile(join(root, "cache-statusband-codex", "rate-limits.json"), "utf8");
+  const stored = await readFile(join(root, "cache-statusband-codex", `rate-limits${SCOPE}.json`), "utf8");
   assert.match(stored, new RegExp(TEST_EMAIL.replace(".", "\\.")));
   assert.doesNotMatch(stored, /RateLimitResetCredit|account-id|fixture-private-value/);
-  await assert.rejects(access(join(root, "cache-statusband-codex", "rate-limits.json.tmp")));
+  await assert.rejects(access(join(root, "cache-statusband-codex", `rate-limits${SCOPE}.json.tmp`)));
 });
 
 test("honors a Retry-After longer than the five-minute floor", async (t) => {
@@ -69,8 +72,8 @@ test("honors a Retry-After longer than the five-minute floor", async (t) => {
     error.rpcData = { retry_after: 900 };
     throw error;
   };
-  const first = await getUsageSnapshot({ codexHome: root, now, fetcher });
-  const second = await getUsageSnapshot({ codexHome: root, now: now + 10 * 60_000, fetcher });
+  const first = await getUsageSnapshot({ codexHome: root, now, fetcher, identity: ACCOUNT });
+  const second = await getUsageSnapshot({ codexHome: root, now: now + 10 * 60_000, fetcher, identity: ACCOUNT });
   assert.equal(first.nextAllowedAt, now + 15 * 60_000);
   assert.equal(second.source, "cache");
   assert.equal(calls, 1);
@@ -208,20 +211,57 @@ test("an account-keyed read that shows no account is not saved under that accoun
   assert.equal(mismatch.fetchedAt, null);
 });
 
+test("an unidentified read neither shows another account's cached reading nor writes the shared cache", async (t) => {
+  const root = await fixtureRoot(t);
+  const dataDir = join(root, "cache-statusband-codex");
+  await mkdir(dataDir, { recursive: true });
+  const now = Date.parse("2026-10-29T12:00:00.000Z");
+  const otherEmail = ["someone", "example.invalid"].join("@");
+  const sharedPath = join(dataDir, "rate-limits.json");
+  const theirs = {
+    version: 3,
+    attemptedAt: now - 1000,
+    fetchedAt: now - 1000,
+    nextAllowedAt: now + MIN_POLL_INTERVAL_MS,
+    lastErrorAt: null,
+    identityKey: `account:${otherEmail}`,
+    accountEmail: otherEmail,
+    availableCount: 5,
+    credits: null,
+    primary: { usedPercent: 99, windowDurationMins: 300, resetsAt: 1_793_285_913 },
+    secondary: null,
+  };
+  await writeFile(sharedPath, `${JSON.stringify(theirs)}\n`);
+  // a fresh cache of another account: not shown, and no fetch is held back by it
+  let calls = 0;
+  const down = async () => { calls += 1; throw new Error("down"); };
+  const failed = await getUsageSnapshot({ codexHome: root, now, fetcher: down, env: {}, identity: null });
+  assert.equal(calls, 1);
+  assert.equal(failed.accountEmail, null);
+  assert.equal(failed.availableCount, null);
+  assert.equal(failed.primary, null);
+  // a live read is shown for this call only
+  const live = await getUsageSnapshot({ codexHome: root, now, fetcher: async () => RAW, env: {}, identity: null });
+  assert.equal(live.source, "live");
+  assert.equal(live.accountEmail, TEST_EMAIL);
+  assert.deepEqual(JSON.parse(await readFile(sharedPath, "utf8")), theirs);
+  assert.deepEqual((await readdir(dataDir)).sort(), ["rate-limits.json"]);
+});
+
 test("a stale lock is broken by a rename that leaves nothing behind, and a fresh lock is left alone", async (t) => {
   const root = await fixtureRoot(t);
   const dataDir = join(root, "cache-statusband-codex");
   await mkdir(dataDir, { recursive: true });
-  const lockPath = join(dataDir, "rate-limits.lock");
+  const lockPath = join(dataDir, `rate-limits${SCOPE}.lock`);
   let calls = 0;
   const fetcher = async () => { calls += 1; return RAW; };
   await writeFile(lockPath, "");
-  const busy = await getUsageSnapshot({ codexHome: root, now: Date.now(), fetcher, env: {}, identity: null });
+  const busy = await getUsageSnapshot({ codexHome: root, now: Date.now(), fetcher, env: {}, identity: ACCOUNT });
   assert.equal(busy.source, "cache-busy");
   assert.equal(calls, 0);
   const old = new Date(Date.now() - 120_000);
   await utimes(lockPath, old, old);
-  const live = await getUsageSnapshot({ codexHome: root, now: Date.now(), fetcher, env: {}, identity: null });
+  const live = await getUsageSnapshot({ codexHome: root, now: Date.now(), fetcher, env: {}, identity: ACCOUNT });
   assert.equal(live.source, "live");
   assert.equal(calls, 1);
   assert.deepEqual((await readdir(dataDir)).filter((name) => name.includes("lock")), []);
@@ -230,14 +270,14 @@ test("a stale lock is broken by a rename that leaves nothing behind, and a fresh
 test("a held lock that another process replaced is not deleted by the first holder's release", async (t) => {
   const root = await fixtureRoot(t);
   const dataDir = join(root, "cache-statusband-codex");
-  const lockPath = join(dataDir, "rate-limits.lock");
+  const lockPath = join(dataDir, `rate-limits${SCOPE}.lock`);
   const fetcher = async () => {
     // Another process broke this lock as stale and took its own
     await rm(lockPath);
     await writeFile(lockPath, "other");
     return RAW;
   };
-  const live = await getUsageSnapshot({ codexHome: root, now: Date.now(), fetcher, env: {}, identity: null });
+  const live = await getUsageSnapshot({ codexHome: root, now: Date.now(), fetcher, env: {}, identity: ACCOUNT });
   assert.equal(live.source, "live");
   assert.equal(await readFile(lockPath, "utf8"), "other");
 });
@@ -245,8 +285,8 @@ test("a held lock that another process replaced is not deleted by the first hold
 test("a cache write leaves no temporary file behind", async (t) => {
   const root = await fixtureRoot(t);
   const dataDir = join(root, "cache-statusband-codex");
-  await getUsageSnapshot({ codexHome: root, now: Date.now(), fetcher: async () => RAW, env: {}, identity: null });
-  await getUsageSnapshot({ codexHome: root, now: Date.now() + MIN_POLL_INTERVAL_MS, fetcher: async () => { throw new Error("down"); }, env: {}, identity: null });
+  await getUsageSnapshot({ codexHome: root, now: Date.now(), fetcher: async () => RAW, env: {}, identity: ACCOUNT });
+  await getUsageSnapshot({ codexHome: root, now: Date.now() + MIN_POLL_INTERVAL_MS, fetcher: async () => { throw new Error("down"); }, env: {}, identity: ACCOUNT });
   assert.deepEqual((await readdir(dataDir)).filter((name) => name.endsWith(".tmp")), []);
 });
 
@@ -254,9 +294,9 @@ test("a cache write does not touch the temporary file of another process", async
   const root = await fixtureRoot(t);
   const dataDir = join(root, "cache-statusband-codex");
   await mkdir(dataDir, { recursive: true });
-  const foreign = [join(dataDir, "rate-limits.json.tmp"), join(dataDir, "rate-limits.json.2147483647.tmp")];
+  const foreign = [join(dataDir, `rate-limits${SCOPE}.json.tmp`), join(dataDir, `rate-limits${SCOPE}.json.2147483647.tmp`)];
   for (const path of foreign) await writeFile(path, "other");
-  await getUsageSnapshot({ codexHome: root, now: Date.now(), fetcher: async () => RAW, env: {}, identity: null });
+  await getUsageSnapshot({ codexHome: root, now: Date.now(), fetcher: async () => RAW, env: {}, identity: ACCOUNT });
   for (const path of foreign) assert.equal(await readFile(path, "utf8"), "other");
 });
 
