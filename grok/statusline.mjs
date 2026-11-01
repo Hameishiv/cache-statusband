@@ -154,7 +154,7 @@ export function remaining(ms) {
  * Weekly percent and reset, or null.
  * `record` is `{ percent, periodType, periodEnd }`. A monthly period, a
  * missing percent, a reset that has already passed, or a reading fetched
- * more than a day ago is left out.
+ * more than a day ago, or with no readable fetch time, is left out.
  */
 export function weeklyLabel(record, nowMs) {
   if (!record || typeof record !== "object") return null;
@@ -166,7 +166,8 @@ export function weeklyLabel(record, nowMs) {
   const now = finite(nowMs);
   if (!Number.isFinite(end) || now === null || end <= now) return null;
   const fetched = Date.parse(record.fetchedAt);
-  if (Number.isFinite(fetched) && now - fetched > WEEKLY_MAX_AGE_MS) return null;
+  // A reading with no fetch time, or one that cannot be read, is too old to trust
+  if (!Number.isFinite(fetched) || now - fetched > WEEKLY_MAX_AGE_MS) return null;
   const left = remaining(end - now);
   if (!left) return null;
   return `week ${percentText(pct)}% · ${left}`;

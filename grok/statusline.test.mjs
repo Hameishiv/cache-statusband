@@ -84,6 +84,7 @@ describe("weekly usage", () => {
     percent: 23,
     periodType: "USAGE_PERIOD_TYPE_WEEKLY",
     periodEnd: "2026-11-02T22:57:09.651+00:00",
+    fetchedAt: "2026-10-29T11:00:00Z",
   };
 
   it("shows the weekly percent and the time until reset", () => {
@@ -103,6 +104,13 @@ describe("weekly usage", () => {
   it("omits a reading fetched more than a day ago", () => {
     assert.equal(weeklyLabel({ ...weekly, fetchedAt: "2026-10-29T11:00:00Z" }, now), "week 23% · 4d11h");
     assert.equal(weeklyLabel({ ...weekly, fetchedAt: "2026-10-28T11:00:00Z" }, now), null);
+  });
+
+  it("omits a reading with no fetch time, or one that cannot be read", () => {
+    const { fetchedAt, ...undated } = weekly;
+    assert.equal(weeklyLabel(undated, now), null);
+    assert.equal(weeklyLabel({ ...weekly, fetchedAt: null }, now), null);
+    assert.equal(weeklyLabel({ ...weekly, fetchedAt: "not a date" }, now), null);
   });
 
   it("caches a log with no credits line so it is not rescanned", () => {
