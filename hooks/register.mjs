@@ -549,7 +549,8 @@ function armResume($, details) {
   let limits = stillOpen(S.rateLimits, now)
   if (!limits.length && signedIn !== false && !unsure) limits = borrowedLimits(fleet, { seat: S.seat, account: S.account, desktop: !onTerminal }, now) // not while the seat or account is unknown: the key may name the old one
   if (!limits.length && !unsure) limits = stillOpen(S.planWindows, now) // nor the shared windows or Fable reading while it is unknown: the old account's
-  const full = spentWindows(limits, unsure ? null : S.fable, S.model)
+  const fable = !unsure && S.fable && stillOpen([S.fable], now).length ? S.fable : null // a reading whose reset has passed is stale, as an ordinary window's is
+  const full = spentWindows(limits, fable, S.model)
   const text = String(details || '')
   if (!full.length && !(USAGE_SPENT.test(text) && (!THROTTLE.test(text) || USAGE_MARKER.test(text)))) return // not usage exhaustion
   sendFailures = 0 // a new arm: the refusals of an earlier one are not counted against it

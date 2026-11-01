@@ -2208,6 +2208,38 @@ test('with no seat file, the old account\'s full week arms no resume while the a
   expect(seen.submits).toEqual([])
 })
 
+// A Fable week at 100% whose reset has already passed is a stale reading (the refresh failed or is late), not an exhausted week
+async function fableStopFailure($: any, on: any, resetsAt: (t0: number) => string) {
+  const kept = new Map<string, unknown>()
+  const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
+  const { clock, seen } = engine($, on, { label: 'A' }, kept, undefined, disk)
+  on('classic.StopFailure', () => ({}))
+  on('session.authorize', () => ({ value: { handle: 'h' } }))
+  on('turn.step', async function* () { return { answer: '', toolUses: [], usage: null } })
+  await clock.advance(60000)
+  const t0 = await clock.now()
+  kept.set('plan:account:a@x', { at: t0, next: t0 + 60 * 60000, fable: { percentUsed: 100, resetsAt: resetsAt(t0) }, windows: [], why: 'ok' })
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await clock.advance(30000) // the tick takes the stored reading
+  const it = ($ as any).turn.step({ model: 'claude-fable-5-1', messages: [] })
+  if (it && typeof it[Symbol.asyncIterator] === 'function') for await (const _ of it) void _
+  else await it
+  await ($ as any).classic.StopFailure(throttle)
+  return { clock, seen, t0 }
+}
+
+test('a Fable week at 100% whose reset has passed arms no resume', RESUME_WAKE, async ($, on) => {
+  const { clock, seen } = await fableStopFailure($, on, (t0) => new Date(t0 - 60 * 60000).toISOString())
+  expect(seen.toasts.some((t) => /resumes on its own/.test(t))).toBe(false)
+  await clock.advance(2 * 60 * 60000)
+  expect(seen.submits).toEqual([])
+})
+
+test('a Fable week at 100% that has not reset yet arms a resume', RESUME_WAKE, async ($, on) => {
+  const { seen } = await fableStopFailure($, on, (t0) => new Date(t0 + 60 * 60000).toISOString())
+  expect(seen.toasts.filter((t) => /resumes on its own/.test(t)).length).toBe(1)
+})
+
 test('a resume armed from the old account\'s own windows while the account is unknown is re-armed for a minute after the new account is adopted', RESUME_WAKE, async ($, on) => {
   const disk: { files: Record<string, string> } = { files: { '.claude.json': account('a@x') } }
   const { clock, seen } = engine($, on, { label: 'A' }, undefined, undefined, disk)
