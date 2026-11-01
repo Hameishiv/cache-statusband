@@ -1,0 +1,14 @@
+{
+  "name": "cache-statusband",
+  "description": "Cache Keeper with a ccstatusline-style status band for Claude Code",
+  "owner": {
+    "name": "Hameishiv"
+  },
+  "plugins": [
+    {
+      "name": "cache-statusband",
+      "source": "./",
+      "description": "Nate Herk's Cache Keeper plus a ccstatusline-style status band: model, effort, context, cache, 5-hour/weekly/Fable usage with resets, and reopened chats measured before you send"
+    }
+  ]
+}

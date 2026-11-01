@@ -1,0 +1,14 @@
+{
+  "$schema": "https://developers.openai.com/codex/plugins/schema/plugin.schema.json",
+  "name": "cache-statusband-codex",
+  "version": "0.4.0",
+  "description": "A truthful Codex status footer preset, account and banked-reset display, resume summary, and local session board.",
+  "license": "MIT",
+  "interface": {
+    "displayName": "Cache Statusband Codex",
+    "shortDescription": "Codex context, quota, and local-session status"
+  },
+  "extensions": {
+    "com.openai.hooks": "./hooks/hooks.json"
+  }
+}

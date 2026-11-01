@@ -1,0 +1,17 @@
+{
+  "name": "cache-statusband-codex",
+  "version": "0.4.0",
+  "description": "Truthful status and local session tools for Codex CLI and desktop.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "bin": {
+    "cache-statusband-codex": "./bin/cache-statusband-codex.mjs"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

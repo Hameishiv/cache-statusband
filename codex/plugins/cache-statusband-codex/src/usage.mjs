@@ -1,0 +1,499 @@
+import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { link, mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { createInterface } from "node:readline";
+import { configuredSeatIdentity } from "./settings.mjs";
+
+const CACHE_VERSION = 3;
+export const MIN_POLL_INTERVAL_MS = 5 * 60 * 1000;
+export const MAX_RETRY_AFTER_MS = 60 * 60 * 1000;
+const LOCK_STALE_MS = 30 * 1000;
+
+export async function getUsageSnapshot({
+  codexHome,
+  now = Date.now(),
+  fetcher = fetchRateLimitsViaAppServer,
+  env = process.env,
+  identity: suppliedIdentity,
+  timeoutMs,
+} = {}) {
+  if (!codexHome) throw new Error("codexHome is required");
+  const dataDir = join(codexHome, "cache-statusband-codex");
+  await mkdir(dataDir, { recursive: true });
+
+  const identity = suppliedIdentity === undefined
+    ? await configuredSeatIdentity(codexHome, env)
+    : suppliedIdentity;
+  // No seat and no readable account: the unscoped file is shared with every account, so it is neither read nor written, and the read is shown for this call only
+  if (!identity) return await readUnidentified({ codexHome, now, fetcher, env, timeoutMs });
+  const suffix = cacheSuffix(identity);
+  const cachePath = join(dataDir, `rate-limits${suffix}.json`);
+  const lockPath = join(dataDir, `rate-limits${suffix}.lock`);
+  const legacyPath = join(dataDir, "rate-limits.json");
+  let aligned = alignCache(await readScopedCache(cachePath, legacyPath, identity), identity);
+  let cached = aligned.cache;
+  if (fresh(cached, now)) return present(cached, aligned.mismatch ? "identity-changed" : "cache");
+
+  const lock = await acquireLock(lockPath, now);
+  if (!lock) return present(cached, aligned.mismatch ? "identity-changed" : "cache-busy");
+  try {
+    aligned = alignCache(await readScopedCache(cachePath, legacyPath, identity), identity);
+    cached = aligned.cache;
+    if (fresh(cached, now)) return present(cached, aligned.mismatch ? "identity-changed" : "cache");
+
+    const attempted = {
+      ...emptyCache(),
+      ...cached,
+      identityKey: identity?.key ?? cached?.identityKey ?? null,
+      attemptedAt: now,
+      nextAllowedAt: now + MIN_POLL_INTERVAL_MS,
+    };
+    await writeCache(cachePath, attempted);
+
+    try {
+      const raw = await fetcher({ codexHome, env, ...(timeoutMs ? { timeoutMs } : {}) });
+      const safe = sanitizeRateLimits(raw);
+      // An account-keyed read must show the same account: one that shows another, or none, cannot be told apart from a switch, so it is not saved under this key
+      if (identity?.key?.startsWith("account:") && safe.accountEmail !== identity.label) {
+        throw new Error("Codex account changed during the usage read");
+      }
+      // A seat names no account, so the email cannot prove the read matches: the seat is read again, and a different seat, or none, means the account may have rotated with it
+      if (identity?.key?.startsWith("seat:")) {
+        const after = await configuredSeatIdentity(codexHome, env);
+        if (after?.key !== identity.key) throw new Error("Codex seat changed during the usage read");
+      }
+      const saved = {
+        ...emptyCache(),
+        ...safe,
+        identityKey: identity?.key ?? (safe.accountEmail ? `account:${safe.accountEmail}` : null),
+        fetchedAt: now,
+        attemptedAt: now,
+        nextAllowedAt: now + MIN_POLL_INTERVAL_MS,
+      };
+      await writeCache(cachePath, saved);
+      return present(saved, "live");
+    } catch (error) {
+      const retryMs = retryAfterMilliseconds(error, now);
+      const failed = {
+        ...attempted,
+        nextAllowedAt: now + Math.min(MAX_RETRY_AFTER_MS, Math.max(MIN_POLL_INTERVAL_MS, retryMs ?? 0)),
+        lastErrorAt: now,
+      };
+      await writeCache(cachePath, failed);
+      return present(failed, "stale");
+    }
+  } finally {
+    await releaseLock(lock, lockPath);
+  }
+}
+
+async function readUnidentified({ codexHome, now, fetcher, env, timeoutMs }) {
+  const attempted = { ...emptyCache(), attemptedAt: now, nextAllowedAt: now + MIN_POLL_INTERVAL_MS };
+  try {
+    const safe = sanitizeRateLimits(await fetcher({ codexHome, env, ...(timeoutMs ? { timeoutMs } : {}) }));
+    return present({ ...attempted, ...safe, identityKey: safe.accountEmail ? `account:${safe.accountEmail}` : null, fetchedAt: now }, "live");
+  } catch (error) {
+    return present({ ...attempted, lastErrorAt: now }, "stale");
+  }
+}
+
+export async function captureUsageIdentity(codexHome, {
+  env = process.env,
+  accountReader = readAccountViaAppServer,
+  timeoutMs,
+} = {}) {
+  const seat = await configuredSeatIdentity(codexHome, env);
+  if (seat) return seat;
+  try {
+    const account = await accountReader({ codexHome, env, ...(timeoutMs ? { timeoutMs } : {}) });
+    const email = safeEmail(account?.email);
+    return email ? { key: `account:${email}`, label: email, unavailable: false } : null;
+  } catch {
+    return null;
+  }
+}
+
+// Node cannot spawn the npm codex.cmd shim directly on Windows, so a command that is (or may resolve to) a .cmd/.bat shim goes through cmd.exe: one with a .cmd/.bat extension, or none (cmd.exe finds the shim through PATHEXT). A command with another extension, such as a real codex.exe, is spawned directly, as is any command off Windows.
+// cmd.exe is given one line, every word in double quotes and the whole in one more pair (windowsVerbatimArguments, so Node adds no quoting of its own): a path with spaces stays one word. A word that cannot be quoted for it (a double quote, %, or a line break) is refused, not run.
+function appServerLaunch(command, args, { platform = process.platform, env = process.env } = {}) {
+  if (platform !== "win32") return { command, args };
+  const extension = /\.[^\\/.]*$/.exec(command);
+  if (extension && !/^\.(cmd|bat)$/i.test(extension[0])) return { command, args };
+  const words = [command, ...args];
+  if (words.some((word) => /["%\r\n\0]/.test(word))) throw new Error("Codex command cannot be launched through cmd.exe: its path has a quote, a percent sign or a line break");
+  return { command: env.ComSpec || process.env.ComSpec || "cmd.exe", args: ["/d", "/s", "/c", `"${words.map((word) => `"${word}"`).join(" ")}"`], windowsVerbatimArguments: true };
+}
+
+// On a timeout or failure child.kill() ends cmd.exe but not the codex it started, which keeps the pipes open and the hook alive.
+// The tree goes first: once cmd.exe is gone, taskkill /T can no longer find the codex under it.
+// A finished read only closes stdin, which ends codex, so it skips the tree kill.
+function stopChild(child, launch, command, abort, platform = process.platform) {
+  if (abort && platform === "win32" && launch.command !== command && child.pid) {
+    try {
+      spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true, timeout: 3000 });
+    } catch {}
+  }
+  child.kill();
+  child.stdout?.destroy?.();
+  child.stderr?.destroy?.();
+}
+
+export async function readAccountViaAppServer({
+  codexHome,
+  command = process.env.CODEX_BIN || "codex",
+  args = ["app-server"],
+  timeoutMs = 10_000,
+  spawnImpl = spawn,
+  env = process.env,
+  platform = process.platform,
+} = {}) {
+  const childEnv = { ...env };
+  if (codexHome) childEnv.CODEX_HOME = codexHome;
+  const launch = appServerLaunch(command, args, { platform, env });
+  const child = spawnImpl(launch.command, launch.args, {
+    env: childEnv,
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+    windowsVerbatimArguments: launch.windowsVerbatimArguments === true,
+  });
+  const lines = createInterface({ input: child.stdout });
+  let settled = false;
+  return await new Promise((resolve, reject) => {
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      lines.close();
+      child.stdin.end();
+      stopChild(child, launch, command, callback === reject, platform);
+      callback(value);
+    };
+    const timer = setTimeout(() => finish(reject, new Error("Codex account read timed out")), timeoutMs);
+    child.once("error", (error) => finish(reject, error));
+    child.stdin.once("error", (error) => finish(reject, error));
+    child.once("exit", (code) => {
+      if (!settled) finish(reject, new Error(`Codex app-server exited before the account response (${code ?? "unknown"})`));
+    });
+    child.stderr.on("data", () => {});
+    lines.on("line", (line) => {
+      let message;
+      try {
+        message = JSON.parse(line);
+      } catch {
+        return;
+      }
+      if (message.id !== 2) return;
+      if (message.error) finish(reject, new Error("Codex account read failed"));
+      else finish(resolve, message.result?.account ?? null);
+    });
+    const send = (value) => child.stdin.write(`${JSON.stringify(value)}\n`);
+    send({
+      method: "initialize",
+      id: 1,
+      params: { clientInfo: { name: "cache_statusband_codex", title: "Cache Statusband Codex", version: "0.4.0" } },
+    });
+    send({ method: "initialized", params: {} });
+    send({ method: "account/read", id: 2, params: { refreshToken: false } });
+  });
+}
+
+export async function fetchRateLimitsViaAppServer({
+  codexHome,
+  command = process.env.CODEX_BIN || "codex",
+  args = ["app-server"],
+  timeoutMs = 10_000,
+  spawnImpl = spawn,
+  env = process.env,
+  platform = process.platform,
+} = {}) {
+  const childEnv = { ...env };
+  if (codexHome) childEnv.CODEX_HOME = codexHome;
+  const launch = appServerLaunch(command, args, { platform, env });
+  const child = spawnImpl(launch.command, launch.args, {
+    env: childEnv,
+    stdio: ["pipe", "pipe", "pipe"],
+    windowsHide: true,
+    windowsVerbatimArguments: launch.windowsVerbatimArguments === true,
+  });
+  const lines = createInterface({ input: child.stdout });
+  let settled = false;
+  let accountDone = false;
+  let rateLimitsDone = false;
+  let account = null;
+  let rateLimits = null;
+
+  return await new Promise((resolve, reject) => {
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      lines.close();
+      child.stdin.end();
+      stopChild(child, launch, command, callback === reject, platform);
+      callback(value);
+    };
+    const timer = setTimeout(() => finish(reject, new Error("Codex rate-limit read timed out")), timeoutMs);
+
+    child.once("error", (error) => finish(reject, error));
+    child.stdin.once("error", (error) => finish(reject, error));
+    child.once("exit", (code) => {
+      if (!settled) finish(reject, new Error(`Codex app-server exited before the rate-limit response (${code ?? "unknown"})`));
+    });
+    child.stderr.on("data", () => {});
+    const maybeFinish = () => {
+      if (accountDone && rateLimitsDone) finish(resolve, { ...rateLimits, account });
+    };
+    lines.on("line", (line) => {
+      let message;
+      try {
+        message = JSON.parse(line);
+      } catch {
+        return;
+      }
+      if (message.id === 2) {
+        accountDone = true;
+        account = message.error ? null : message.result?.account ?? null;
+        maybeFinish();
+        return;
+      }
+      if (message.id !== 3) return;
+      if (message.error) {
+        const error = new Error("Codex rate-limit read failed");
+        error.rpcData = message.error.data;
+        error.rpcMessage = message.error.message;
+        finish(reject, error);
+      } else {
+        rateLimitsDone = true;
+        rateLimits = message.result ?? {};
+        maybeFinish();
+      }
+    });
+
+    const send = (value) => child.stdin.write(`${JSON.stringify(value)}\n`);
+    send({
+      method: "initialize",
+      id: 1,
+      params: { clientInfo: { name: "cache_statusband_codex", title: "Cache Statusband Codex", version: "0.4.0" } },
+    });
+    send({ method: "initialized", params: {} });
+    send({ method: "account/read", id: 2, params: { refreshToken: false } });
+    send({ method: "account/rateLimits/read", id: 3, params: {} });
+  });
+}
+
+export function sanitizeRateLimits(raw) {
+  const bank = raw?.rateLimitResetCredits;
+  const availableCount = finiteNonnegative(bank?.availableCount);
+  const credits = Array.isArray(bank?.credits)
+    ? bank.credits.slice(0, 20).map((credit) => ({
+        title: safeText(credit?.title),
+        expiresAt: finiteNonnegative(credit?.expiresAt),
+      }))
+    : null;
+  const rateLimits = raw?.rateLimits;
+  return {
+    accountEmail: safeEmail(raw?.account?.email),
+    availableCount,
+    credits,
+    primary: safeWindow(rateLimits?.primary),
+    secondary: safeWindow(rateLimits?.secondary),
+  };
+}
+
+export function retryAfterMilliseconds(error, now = Date.now()) {
+  const data = error?.rpcData ?? error?.data ?? null;
+  const candidates = [];
+  if (data && typeof data === "object") {
+    walk(data, (key, value) => {
+      const normalized = key.toLowerCase().replaceAll("_", "").replaceAll("-", "");
+      if (normalized === "retryafterms" && Number.isFinite(Number(value))) candidates.push(Number(value));
+      if (normalized === "retryafter") {
+        if (Number.isFinite(Number(value))) candidates.push(Number(value) * 1000);
+        else {
+          const at = Date.parse(value);
+          if (Number.isFinite(at)) candidates.push(Math.max(0, at - now));
+        }
+      }
+      if (normalized === "retryat" || normalized === "retryatms") {
+        const numeric = Number(value);
+        if (Number.isFinite(numeric)) {
+          const timestamp = normalized === "retryatms" || numeric > 10_000_000_000 ? numeric : numeric * 1000;
+          candidates.push(Math.max(0, timestamp - now));
+        } else {
+          const at = Date.parse(value);
+          if (Number.isFinite(at)) candidates.push(Math.max(0, at - now));
+        }
+      }
+    });
+  }
+  const message = error?.rpcMessage ?? error?.message;
+  if (typeof message === "string") {
+    // a bare number is seconds; ms and milliseconds are tried before m (minutes), and the unit must end at a word boundary ("5 more" is not minutes)
+    // a key named for milliseconds (retry_after_ms=1500, Retry-After-Ms: 1500) holds milliseconds
+    // an HTTP date (Retry-After: Wed, 21 Oct 2026 07:28:00 GMT) is read as a date, before the numeric forms would take its day for seconds
+    const dated = message.match(/retry[\s_-]*after[\s:=]*((?:mon|tue|wed|thu|fri|sat|sun)[a-z]*,\s*\d{1,2}\s+[a-z]{3}\s+\d{4}\s+\d{2}:\d{2}:\d{2}\s*(?:gmt|utc|[+-]\d{4})?)/i);
+    const datedAt = dated ? Date.parse(dated[1]) : NaN;
+    if (Number.isFinite(datedAt)) candidates.push(Math.max(0, datedAt - now));
+    const named = Number.isFinite(datedAt) ? null : message.match(/retry[\s_-]*after[\s_-]*ms\b[^0-9]*(\d+(?:\.\d+)?)/i);
+    const match = named || Number.isFinite(datedAt) ? null : message.match(/retry[\s_-]*after[^0-9]*(\d+(?:\.\d+)?)(?:\s*(msecs?|ms|milliseconds?|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)\b)?/i);
+    if (named) candidates.push(Number(named[1]));
+    else if (match) {
+      const unit = (match[2] ?? "s").toLowerCase();
+      const scale = unit.startsWith("ms") || unit.startsWith("milli") ? 1 : unit.startsWith("m") ? 60_000 : unit.startsWith("h") ? 3_600_000 : 1000;
+      candidates.push(Number(match[1]) * scale);
+    }
+  }
+  return candidates.length ? Math.max(...candidates.filter((value) => value >= 0)) : null;
+}
+
+function emptyCache() {
+  return {
+    version: CACHE_VERSION,
+    attemptedAt: null,
+    fetchedAt: null,
+    nextAllowedAt: null,
+    lastErrorAt: null,
+    identityKey: null,
+    accountEmail: null,
+    availableCount: null,
+    credits: null,
+    primary: null,
+    secondary: null,
+  };
+}
+
+function alignCache(cache, identity) {
+  if (!cache || !identity || cache.identityKey === identity.key) return { cache, mismatch: false };
+  return {
+    mismatch: true,
+    cache: {
+      ...emptyCache(),
+      attemptedAt: cache.attemptedAt,
+      nextAllowedAt: cache.nextAllowedAt,
+      lastErrorAt: cache.lastErrorAt,
+      identityKey: identity.key,
+    },
+  };
+}
+
+function present(cache, source) {
+  return cache ? { ...cache, source } : { ...emptyCache(), source };
+}
+
+function fresh(cache, now) {
+  return Number.isFinite(cache?.nextAllowedAt) && now < cache.nextAllowedAt;
+}
+
+async function readCache(path) {
+  try {
+    const value = JSON.parse(await readFile(path, "utf8"));
+    return value?.version === CACHE_VERSION ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+async function readScopedCache(path, legacyPath, identity) {
+  const scoped = await readCache(path);
+  if (scoped || path === legacyPath) return scoped;
+  const legacy = await readCache(legacyPath);
+  return legacy?.identityKey === identity?.key ? legacy : null;
+}
+
+function cacheSuffix(identity) {
+  if (!identity?.key) return "";
+  return `-${createHash("sha256").update(identity.key).digest("hex").slice(0, 16)}`;
+}
+
+// The temporary name is per process, so two processes writing at once cannot share, overwrite or unlink each other's file
+async function writeCache(path, value) {
+  const temporary = `${path}.${process.pid}.tmp`;
+  try {
+    await writeFile(temporary, `${JSON.stringify(value)}\n`, { encoding: "utf8", mode: 0o600 });
+    await rename(temporary, path);
+  } catch (error) {
+    // The rename moved the file on success; a failed write or rename leaves it behind
+    await unlink(temporary).catch(() => {});
+    throw error;
+  }
+}
+
+// The lock is removed only if the file at its name is still the one this process opened: a lock broken as stale and taken
+// by another process while this one ran is that process's, and unlinking it by name would let a third in
+async function releaseLock(handle, path) {
+  let same = false;
+  try {
+    // bigint: a Windows file ID can pass 2^53, where plain numbers round
+    // two different files to the same ino.
+    const [held, named] = await Promise.all([handle.stat({ bigint: true }), stat(path, { bigint: true })]);
+    same = held.ino === named.ino && held.dev === named.dev;
+  } catch {}
+  await handle.close().catch(() => {});
+  if (same) await unlink(path).catch(() => {});
+}
+
+async function acquireLock(path, now) {
+  try {
+    return await open(path, "wx", 0o600);
+  } catch (error) {
+    if (error.code !== "EEXIST") throw error;
+  }
+  // A stale lock is broken by renaming it to a name only this process uses: of several that find it stale, one rename succeeds
+  // (the others find no file and treat the lock as held), where stat, unlink and open let a second unlink remove the lock a
+  // first had just taken
+  const stale = `${path}.${process.pid}.${Date.now()}.stale`;
+  try {
+    const info = await stat(path);
+    if (now - info.mtimeMs <= LOCK_STALE_MS) return null;
+    await rename(path, stale);
+  } catch {
+    return null;
+  }
+  // The file renamed may not be the one that was seen: another process may have broken that lock and taken a new one in between. A fresh one is put back only when nothing else has taken its place (link does not overwrite); a drive without hard links cannot put it back
+  const taken = await stat(stale).catch(() => null);
+  if (taken && now - taken.mtimeMs <= LOCK_STALE_MS) {
+    await link(stale, path).catch(() => {});
+    await unlink(stale).catch(() => {});
+    return null;
+  }
+  await unlink(stale).catch(() => {});
+  try {
+    return await open(path, "wx", 0o600);
+  } catch {
+    return null;
+  }
+}
+
+export function safeWindow(value) {
+  if (!value || typeof value !== "object") return null;
+  return {
+    usedPercent: finiteNonnegative(value.usedPercent),
+    windowDurationMins: finiteNonnegative(value.windowDurationMins),
+    resetsAt: finiteNonnegative(value.resetsAt),
+  };
+}
+
+function finiteNonnegative(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : null;
+}
+
+function safeText(value) {
+  return typeof value === "string" ? value.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, 200) : null;
+}
+
+function safeEmail(value) {
+  if (typeof value !== "string") return null;
+  const text = value.trim();
+  return /^[^\s@]+@[^\s@]+$/.test(text) ? text.slice(0, 320) : null;
+}
+
+function walk(value, callback) {
+  if (!value || typeof value !== "object") return;
+  for (const [key, child] of Object.entries(value)) {
+    callback(key, child);
+    if (child && typeof child === "object") walk(child, callback);
+  }
+}

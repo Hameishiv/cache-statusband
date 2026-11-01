@@ -1,0 +1,139 @@
+# Cache Statusband
+
+A status band and prompt-cache guard for coding agents. The main version is a Claude Code mod. It keeps a big chat's prompt cache warm, warns before an expensive cold rewrite, resumes chats cut short by spent usage, and draws a colour-blocked status band above the prompt with the numbers you'd otherwise need a status line for.
+
+```
+ Opus 5.5 ▶ High ▶ Ctx 287k · Rewrite ≈ $2.29 ▶ ● Cache warm 42m ▶ Chat cold rewrites $4.10 (2) ▶ 5h 27% · 3h22m ▶ Week 33% · 5d19h ▶ Fable 6% ▶ Session $23 ▶ you@example.com
+```
+
+It works in the terminal and in the Desktop app's Code tab, so it replaces a command status line.
+
+## Three versions
+
+| Folder | Agent | What it covers |
+|---|---|---|
+| repository root | Claude Code | Everything below. |
+| [`codex/`](codex/) | OpenAI Codex CLI | What Codex lets an add-on do: its built-in footer set up to show model, effort, context and 5-hour/weekly usage; a hook that reports a reopened session's last context size; a `board` command listing local sessions. |
+| [`grok/`](grok/) | xAI Grok Build | A status-line command showing model, effort, context, cache token counts, weekly usage and session cost. |
+
+The cache half (keep warm, the cold-send guard, rewrite costs) exists only in the Claude Code version. It is built around Anthropic's prompt cache, which expires after 5 minutes or an hour and charges extra to write again. OpenAI and xAI cache automatically, with no lifetime the user pays to renew, so there is nothing for it to act on there. Each port's README says what it ported, what it could not, and why.
+
+## Credits and origin
+
+Two MIT-licensed projects made this possible.
+
+- **[Cache Keeper](https://github.com/nateherkai/claude-code-mods) by Nate Herk.** The Claude Code version started from his version 1.0.0, and his code is still its core: the warm/cold tracking, keep warm, the cold-send guard, `/board`, `/handoff`, the session-handoff skill, the pricing table and recording-mode masking. 
+- **[ccstatusline](https://github.com/sirmalloc/ccstatusline) by Matthew Breedlove (sirmalloc).** The band's look (coloured segments, powerline-style arrows) and the choice of what to show (model, effort, context, 5-hour and weekly usage with reset times) follow ccstatusline. No ccstatusline code is used.
+
+## What it adds to Cache Keeper
+
+- **A status band, always shown.** Coloured segments for:
+  - model and effort (terminal only, since the app's composer already shows them)
+  - context size and the cost of rewriting it
+  - cache state, and what this chat has already paid to rewrite cold caches (kept when the chat is reopened)
+  - 5-hour and weekly usage with time to reset
+  - weekly Fable usage
+  - session cost
+  - the signed-in account's email (terminal only; masked while recording mode is on), or a seat label when a seat file is configured
+- **Weekly Fable usage.** Read from the same usage endpoint the app's usage card reads, through the session's own credential (the mod never sees the token). One check every 5 minutes per account (per seat when a seat file is set), shared by that account's open sessions, and it honours the server's `Retry-After` (seconds or a date, an hour at most). A session that can name neither a seat nor an account (signed in, or with its sign-in check not yet answered) fetches for itself and shares nothing: it reads and writes no shared reading, lends no windows to other sessions and borrows none. No model tokens are spent.
+- **Reopened chats are measured before you send.** When you resume or reopen a chat, the mod reads the end of its transcript: the last reply's token usage is what your first message will re-read, and its time says how cold the cache is. So you see the real context size and the cache's age straight away, and the cold-send guard can offer "compact first, then send" on your first message. A transcript over 4 MB is too big for the Desktop app to read, so the mod also keeps each chat's last context size and time in its own store and falls back on that. It also keeps the seat and the account that request ran on: a chat reopened on a different seat (compared only when both are on the same surface, terminal or Desktop), or else on a different account, reads cold, since that account's cache is empty. If neither can be compared, it is taken as unchanged, unless this session itself saw a rotation after the chat's last touch (its last reply in the transcript, or its record's last request or keep-warm ping), which makes it cold. After a rotator's wake-up, a seat or account that still looks unchanged (or an account file that reads empty) is treated as unknown for up to 3 minutes while the rotator finishes writing (the mod keeps looking, each file on its own, and takes a late change as that rotation, marking the cache cold if a request has run or started since, the wake-up's own request included even while it is still out, as it may have run on the old account. The account is what switches the credential and the seat label can be written before it, so a late account marks it even after a late seat, unless the wake-up itself already showed the seat change; a late seat never marks it once the account was already taken); a chat resumed meanwhile is compared by the fields that are known, or by time alone. After that the session keeps the seat and account it has, and a later change counts only with the next wake-up. Meanwhile, while the seat or the account is unknown, the session takes no plan usage reading, lends no usage windows to other sessions (and, while the account is unknown, names no account in its heartbeat), and neither borrows from them nor shows or resumes on the shared windows and Fable reading, since the key they are filed under may still name the old account (a reading would be filed under the wrong one); a plan fetch that was already out when the wake-up came is dropped. Once the seat or the account is known to have changed, whether at the wake-up or late, the session drops the old account's readings, its own 5-hour and weekly ones included, and moves a resume still pending that was armed from them to a minute from then, since the new account presumably has usage (the three-try cap still holds), until a request measures the new account's. A wake-up prompt is itself the resume, so one armed before it is not moved: the request the wake-up starts settles it, and until that request starts (or the 3 minutes end) a due resume waits. While the seat or the account is unknown a due resume waits, until the seat and account are both known or the 3 minutes end, without spending a try or compacting. A request already out when the account changed reports the old account's windows, which are ignored; if it fails on that account's usage, a resume is armed for a minute from then without spending a try. Until a new request measures, the band shows the readings it can borrow or fetch for the new account. Without a seat file the account is read when the session starts, so switching accounts with /login inside a running session isn't seen until it restarts (or a rotator's wake-up prompt, which reads it again); and a `--fork-session` started in a new process has no record, so it is judged from its transcript time alone. The stored time also counts keep-warm pings, which never reach the transcript.
+- **Auto-resume after usage renews (opt-in).** When a turn is cut short because the plan's usage ran out, the band shows `⏸ resumes <time>`, and the chat is sent "Resume" a minute after the full window resets.
+  - **What arms it.** Only usage exhaustion. A short throttle or an overload does not.
+  - **What settles it.** A message that reaches the chat settles it: the request that message starts (any main-loop request; a subagent's does not) removes the pending resume, so a later account change does not bring it back. /clear and resuming another chat cancel it too. A branch does not: it carries the conversation on, so a pending Resume, or one that is compacting, goes on in the branch.
+  - **Rotator wake-ups.** A rotator's wake-up is itself the resume. A due resume waits from the wake-up's arrival until its request starts. A wake-up that is cancelled (a message of yours reached the chat while it compacted, or the chat was cleared) arms no Resume in its place, so with auto-resume off no Resume is ever sent.
+  - **What leaves it pending.** A local command such as /usage, /cache or a typed /branch; a message another hook drops; a send you cancel in the cold-send dialog. `/plan` with a description is not local: it goes to the model unless the chat is already in plan mode, where it only shows the plan. A mod is not told the permission mode, so it counts as a send either way. The cold-send guard skips the same local commands, with these differences:
+    - `/btw` with a question sends the chat to the model, so on a cold chat it gets the dialog.
+    - A bare `/btw` stays local. So does `/btw` with a question while a turn is running, because that turn's requests keep the cache warm.
+    - `/permissions` and `/login` are skipped too, but they count as sends, because they open their own dialog first.
+  - **What makes a due resume wait.** It waits while the guard's dialog is open. It waits while any send handed on that is not this mod's own is being handed on, or has not yet started its request (for at most 2 minutes). It waits while a compaction before your send is running.
+  - **When it is tried.** A resume still pending that was armed from a full window is tried a minute after the account changes (a rotator's wake-up), not at that window's reset, because the window was the old account's. A failure from a request that was still out when the account changed is retried a minute later too, without counting as a try. With no known reset time it tries hourly, three times at most.
+  - **Compacting first.** On a big chat the Resume compacts first. While that runs, these cancel it: a message that reaches the chat (another plugin's too), a rotator wake-up arriving, /clear, and resuming another chat. These do not: a local command, a branch, and a message another hook drops. A wake-up that arrives while the Resume compacts waits for that compaction and uses it if it succeeded.
+  - **A cold-send dialog open during the compaction.** A dialog open for a message of yours holds the Resume until it closes. Cancel lets it go. Send anyway or Compact first cancels it (a `/btw` question does not: it never reaches the chat). If no request of any message starts within 2 minutes after such a cancel (for example a "Compact first" on a slash message, which goes back to the prompt box), the Resume is armed again 2 minutes after the cancel, and the band shows `⏸ resumes` meanwhile. If its compaction succeeded, it goes without compacting again (nor does a "Compact first" answered after it compact again).
+  - **A failed compaction.** If the Resume's compaction failed and you answered Cancel on a cold-send dialog for a message of yours while it compacted, the Resume is not sent uncompacted. It is armed again 2 minutes later and compacts again. If that compaction fails too, it is not sent at all, and a toast says to send Resume yourself. For a `/btw` question, an answer other than Cancel (such as Send anyway) does not count: the Resume goes as typed. For an ordinary message, Send anyway cancels the Resume, which is then armed again.
+  - **A compaction that hangs.** A compaction still running after 15 minutes is abandoned, so a hung one does not hold the Resume, a message or a wake-up for good. It may still finish, and until it does no send starts another compaction. The message you chose "Compact first" for, the wake-up's, and any send that was waiting on that compaction when it was abandoned go back in the prompt box together, in the order sent, as one text. None of them is sent uncompacted, and neither is the Resume itself. A slash command is never joined with other text: a toast quotes it to send again. The Resume is tried again 2 minutes later without starting another compaction while the abandoned one is still out. That is a counted try, four in all, and the last toast names the cause of the last failed try: a send refused, or compaction not finished. If the abandoned compaction finishes later and succeeded, the chat counts as compacted and later sends go without compacting again.
+  - **Putting a message back in the prompt box.** The mod never rewrites text it did not put there.
+    - A message put back while text this mod left in the box is still unsent goes in behind that text when the message does not come from the prompt box (a remote or bridge send, such as a wake-up delivered remotely).
+    - A message you send from the prompt box takes the box's text with it, as any submit from the prompt box does (see below), so it is put back on its own.
+    - The box is read when the engine allows it. If it is empty (text you deleted does not come back), or holds exactly the text this mod last put back (a trailing newline or CRLF line ends do not count), the new text is added behind it.
+    - If it holds anything else (a draft you are typing, or your edit of the put-back text), it is left exactly as it is. The put-back text is no longer remembered, and each message is quoted in full in a toast instead ("Also not sent: <text> — send it again when ready."). That toast holds a due Resume just as a put-back does.
+    - A read that the engine does not answer within 2 seconds, or that fails, shows nothing about the box. The box is left alone and each message is quoted the same way. The remembered put-back text is not used then, because it may be text you have since edited or deleted. A read that shows the box empty ends it.
+    - A slash command is never joined with other text and is quoted in full in a toast instead. When the box holds a slash command this mod put back and plain text is put back, the text is filled and the command quoted. A slash command or refused message put back after a compaction that finished goes the same way. The cold-send dialog then offers only Send anyway and Cancel, and says an earlier compaction is still running.
+  - **How long the put-back text is remembered.** With no time limit, until a message is handed on, a request starts, or you clear the chat or resume another. A branch keeps it, unless you typed it as a command: anything you submit from the prompt box, `/branch` included, takes the text in the box, so it ends the remembered text, and the Resume hold below too when the message was put back in the box (not when it was only quoted in a toast). The remembered text is used in place of a read only when the engine has no way to read the box.
+  - **A fill of the box that does not answer.**
+    - A fill that does not answer within 2 seconds may still land. The toast says the message "may not have been put back" (after a compaction that was abandoned; after one that finished it says "Compacted, but the message may not have been sent again", and when that compaction failed, "The message may not have been sent again"), and quotes it in full. Nothing waits on it, the box counts as unknown (no put-back text is remembered), and the message holds a due Resume as a put-back does.
+    - While that fill is still out, a put-back quotes its message and leaves the box alone, even when a read shows the box empty. "Still out" lasts until it answers or fails, with 15 minutes as the limit for one that never does, and it holds across a /clear or a resume, because the prompt box is shared.
+    - The engine's own timeout for a fill is 5 seconds for each client it tries in turn, so a fill can answer well after 7 seconds. An answer that says it did not fill may be only the engine giving up, with the text still to be written. So the Resume stops waiting for that message only if the box, read afterwards, shows the text is not in it. With no way to read the box, or a read that fails or does not answer, it keeps waiting, for 15 minutes at most.
+    - That ends only the wait that fill started. A message quoted in a toast earlier keeps holding (15 minutes after it was quoted). When the fill was joined behind an earlier put-back still shown in the box, that put-back keeps holding and is remembered again.
+    - With no way to read the box, a late answer that did not fill makes the earlier put-back's text the remembered text again. This is best effort: the box most likely still starts with it, and if the engine writes the joined text after all, the next put-back may replace the newer part. A late answer that filled makes the text it filled (joined or not) the remembered one, so a later put-back goes in behind it. Neither is remembered if you submitted from the prompt box, a message was handed on or a request started meanwhile, or another put-back was started since.
+    - A fill that lands after you submitted something from the prompt box (which ended the wait and the remembered text) starts the wait again, and remembers the text when a read of the box shows it there. With no way to read the box, or a read that fails or does not answer, it starts the wait again but remembers nothing. Only a read that works and does not show the text starts nothing.
+    - Once it has answered, or the 15 minutes have passed, a put-back on an engine that can read the box reads it and leaves it alone unless it is empty. On an engine with no way to read it, with no put-back text remembered, the box is overwritten.
+  - **What a pending Resume waits for after a put-back.** It waits until you send what was put back, you clear the chat, you submit a command or other text from the prompt box over a message that was put back in it, or 15 minutes have passed since the put-back. So it never goes ahead of a message you still have to send. A message only quoted in the toast was never in the box, so it keeps holding, also when another message was put back in the box after it. While it waits, the band shows `⏸ Resume waits for your message` instead of a time. A message that could not be put back, or a `/btw` question (it never reaches the chat), holds nothing and ends nothing: the wait for an earlier message stays as it was.
+  - **A compaction from a chat that was cleared or replaced.** It is never remembered and never counts for the new chat.
+    - A message waiting on it is not sent into the new chat, nor put back in its box. A toast says "Not sent, because the chat was cleared", or "... was replaced by a resumed chat", and quotes the message in full.
+    - A branch carries the conversation on, so its message is sent, and a compaction in flight when you branch stays that conversation's: it is waited for, and its end or abandonment counts as before.
+    - A message whose chat is cleared while it is being put back gets the toast "The chat was cleared while your message was being put back: <text>" (or "... replaced by a resumed chat ..."), because the text may already be in the box. What the fill left out is quoted in full as usual.
+    - A message waiting on that compaction is dropped when it ends, and is not held on a compaction of the new chat. A send in the new chat does not wait on it. While it is still out, the engine's compaction notices are ignored, so its late end does not mark the new chat compacted (a compaction out for more than 30 minutes no longer counts).
+  - **When the abandoned-compaction mark is forgotten.** When any later compaction succeeds (your own /compact too), once a second 15 minutes have passed, and on /clear or resuming another chat. A compaction that started before a newer abandoned one does not forget that one. Nor does an engine compaction notice while an older compaction of this mod is still out and started under 30 minutes ago, because it may be that one's end.
+  - **When the Resume cannot be sent.** Whether directly or after compacting, it is tried again 2 minutes later, four attempts in all, then a toast says to send it yourself. A request that starts, or a chat that is cleared or replaced meanwhile, settles it, so it is not tried again into that chat.
+  - **Desktop app.** The app's "Try again" prompt is drawn by the app itself, which a mod cannot remove, so it may stay on screen. The resume goes to the session either way.
+- **Usage on a fresh or reopened chat.** Until a chat has made its own request, the 5-hour and weekly figures come from the freshest open chat on the same seat and the same surface (terminal or Desktop) (or, with no seat file, the same signed-in account on the same surface; a chat whose account is unknown borrows nothing), then from the usage check shared by that account's sessions (by seat when a seat file is set).
+
+## Requirements
+
+- Claude Code with mods turned on for your account (run `claude plugin test` in any folder: "no hooks module to load" means mods can load).
+- `gh` (GitHub CLI) only if you use the PR setting below.
+
+## Install
+
+At the prompt of a terminal session:
+
+```
+/plugin install cache-statusband --marketplace Hameishiv/cache-statusband
+```
+
+From a shell:
+
+```bash
+claude plugin install cache-statusband --marketplace Hameishiv/cache-statusband
+```
+
+In the Desktop app, where `/plugin` does not run: click **+** next to the prompt box, then **Plugins**, **Add marketplace** with `Hameishiv/cache-statusband`, then **Add plugin**.
+
+If you also have Nate Herk's `cache-keeper` installed, turn one of them off: they track the same thing.
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `/cache` | Status and settings: `ttl 5\|60\|auto`, `guard on\|off`, `big 150k`, `alerts on\|off`, `autowarm 8\|off` |
+| `/keepwarm [hours\|off]` | Keep this chat's cache warm (default 4 hours), and stop at the end of those hours; a bare `/keepwarm` turns keep warm off when it is on (as the band's `Stop K.W.` does), and starts it when it is off |
+| `/board` | Every local Claude Code chat: state, context, cache, cost |
+| `/handoff [continue]` | Session handoff, then clear this chat and continue with it |
+
+Auto keep warm (the default for big chats, `/cache autowarm 8|off`) stops on its own once its pings since your last message have cost as much as the rewrite they protect. On a 5-minute cache that happens much sooner than on a 1-hour one. `/keepwarm` started by hand is not capped while its own hours run, and it stops at the end of them (the toast says the time limit was reached): auto keep warm does not take it on. Auto keep warm starts again when your next turn ends. Auto keep warm itself never pings a cache that has already gone cold, and a resume of the same chat keeps the cap. A running auto keep warm follows these settings too: `/cache autowarm off`, or a `big` size above the chat, stops it (with a toast saying why), and fewer `autowarm` hours end it that long after the last turn ended. After a compaction, or after the account rotated, a running auto keep warm waits for your next message (the band shows `K.W.` with "waits for next message"); if none comes within the cache window, it stops and says so. On a rotated chat auto keep warm does not start before that message. A slow keep-warm ping is waited for and counted when it answers; only one that has not answered by the time the cache it was meant to save would have run out (the time the cache had left when the ping went: usually 8 minutes on a 1-hour cache and 90 seconds on a 5-minute one, less when the ping went late, and never under 30 seconds) stops keep warm, with a toast saying the cache may already be cold, and its answer, if it still comes, is counted but changes nothing else. A ping that comes back failed stops keep warm at once, with a toast naming the HTTP status if there is one (or saying there was nothing to ping yet); a rate limit, a server error, or an API error with no HTTP status, when nothing was billed, is the exception: tried again at each tick (every second tick from the second failure in a row, but never the last tick before that time) until that same time runs out. A failed ping is counted only if something was billed, and it never dates the cache. A ping that a message of yours, a compaction, a resume, a rotation (a rotator's wake-up included) or an off overtakes is let go of without stopping anything (a `/keepwarm 2` while keep warm is already on starts the hours again from now as a hand-started keep warm, with no cap while they run, and the ping in flight stays its own): it is counted when it answers, and a message's own request is what dates the cache. After an off alone no new ping goes while that one is still out (even if keep warm is started again), until it answers or the time above passes.
+
+## Optional settings
+
+Everything below is off by default. Set the values in Claude Code's config menu, or in `~/.claude/settings.json` under `pluginConfigs`:
+
+| Setting | What it does |
+|---|---|
+| `seatFileTerminal` | For account rotators: a file holding the active seat's label (e.g. `~/.claude-cli-accounts/.active`). Read when a session starts: the band shows `Seat <label>` in place of the account email (the label is masked in recording mode, like the email). A running session keeps the account it signed in with, so a change counts (and marks the cache cold) only once the rotator's wake-up prompt reaches that session, or within 3 minutes after it. |
+| `seatFileDesktop` | The same for sessions the Desktop app runs, so each seat keeps its own usage reading. |
+| `rotatorWakePattern` | A regular expression matching the prompt an unattended account rotator types after rotating. That prompt is compacted first without asking, since nobody is there to answer, whenever the cold-send guard would apply: the guard is on (`/cache guard off` turns it off), the context is at least the `big` size (`/cache big`) and at least 100k tokens above what the last compaction left, the prompt has no attachment, the chat was not just compacted, and it is not typed inside a running turn. Otherwise the wake-up is sent as it is, uncompacted. |
+| `autoResume` | `true` to turn on auto-resume (above). Off by default because it spends usage without asking. |
+| `prPattern` | A regular expression whose first group is a PR number, matched against any prompt while the chat has no PR tracked, and against a resumed chat's transcript (e.g. `(?:^\|\s)/?merge-pr\s+#?(\d+)`). Keep warm then stops once `gh` reports that PR merged or closed. |
+
+## Development
+
+The `tsconfig.json` extends `.claude-plugin/types/tsconfig.json`. That folder is generated by Claude Code and is not committed (it is in `.gitignore`), so the editor's type checking works only once Claude Code has generated it.
+
+Tests: `claude plugin test` runs the mod's own. `node --test hooks/local-builtins.test.mjs` checks that every command the mod treats as local is a local one in the installed engine (it is skipped when the engine's files cannot be read, and sees only each command's top-level type).
+
+## Fonts
+
+The arrows are `▶` (U+25B6), which every font has. The true Powerline arrow (U+E0B0) needs a Nerd Font in the terminal and has no font in the Desktop app.
+
+## License
+
+MIT. See [LICENSE](LICENSE), which keeps Nate Herk's copyright notice.
