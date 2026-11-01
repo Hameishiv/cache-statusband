@@ -227,6 +227,39 @@ test("a stale lock is broken by a rename that leaves nothing behind, and a fresh
   assert.deepEqual((await readdir(dataDir)).filter((name) => name.includes("lock")), []);
 });
 
+test("a held lock that another process replaced is not deleted by the first holder's release", async (t) => {
+  const root = await fixtureRoot(t);
+  const dataDir = join(root, "cache-statusband-codex");
+  const lockPath = join(dataDir, "rate-limits.lock");
+  const fetcher = async () => {
+    // Another process broke this lock as stale and took its own
+    await rm(lockPath);
+    await writeFile(lockPath, "other");
+    return RAW;
+  };
+  const live = await getUsageSnapshot({ codexHome: root, now: Date.now(), fetcher, env: {}, identity: null });
+  assert.equal(live.source, "live");
+  assert.equal(await readFile(lockPath, "utf8"), "other");
+});
+
+test("a cache write leaves no temporary file behind", async (t) => {
+  const root = await fixtureRoot(t);
+  const dataDir = join(root, "cache-statusband-codex");
+  await getUsageSnapshot({ codexHome: root, now: Date.now(), fetcher: async () => RAW, env: {}, identity: null });
+  await getUsageSnapshot({ codexHome: root, now: Date.now() + MIN_POLL_INTERVAL_MS, fetcher: async () => { throw new Error("down"); }, env: {}, identity: null });
+  assert.deepEqual((await readdir(dataDir)).filter((name) => name.endsWith(".tmp")), []);
+});
+
+test("a cache write does not touch the temporary file of another process", async (t) => {
+  const root = await fixtureRoot(t);
+  const dataDir = join(root, "cache-statusband-codex");
+  await mkdir(dataDir, { recursive: true });
+  const foreign = [join(dataDir, "rate-limits.json.tmp"), join(dataDir, "rate-limits.json.2147483647.tmp")];
+  for (const path of foreign) await writeFile(path, "other");
+  await getUsageSnapshot({ codexHome: root, now: Date.now(), fetcher: async () => RAW, env: {}, identity: null });
+  for (const path of foreign) assert.equal(await readFile(path, "utf8"), "other");
+});
+
 test("prints every supplied expiry as an absolute local date in detailed output", () => {
   const now = Date.parse("2026-10-29T12:00:00.000Z");
   const snapshot = {

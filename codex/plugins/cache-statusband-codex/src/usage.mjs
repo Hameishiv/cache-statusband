@@ -77,8 +77,7 @@ export async function getUsageSnapshot({
       return present(failed, "stale");
     }
   } finally {
-    await lock.close();
-    await unlink(lockPath).catch(() => {});
+    await releaseLock(lock, lockPath);
   }
 }
 
@@ -379,14 +378,29 @@ function cacheSuffix(identity) {
   return `-${createHash("sha256").update(identity.key).digest("hex").slice(0, 16)}`;
 }
 
+// The temporary name is per process, so two processes writing at once cannot share, overwrite or unlink each other's file
 async function writeCache(path, value) {
-  const temporary = `${path}.tmp`;
+  const temporary = `${path}.${process.pid}.tmp`;
   try {
     await writeFile(temporary, `${JSON.stringify(value)}\n`, { encoding: "utf8", mode: 0o600 });
     await rename(temporary, path);
-  } finally {
+  } catch (error) {
+    // The rename moved the file on success; a failed write or rename leaves it behind
     await unlink(temporary).catch(() => {});
+    throw error;
   }
+}
+
+// The lock is removed only if the file at its name is still the one this process opened: a lock broken as stale and taken
+// by another process while this one ran is that process's, and unlinking it by name would let a third in
+async function releaseLock(handle, path) {
+  let same = false;
+  try {
+    const [held, named] = await Promise.all([handle.stat(), stat(path)]);
+    same = held.ino === named.ino && held.dev === named.dev;
+  } catch {}
+  await handle.close().catch(() => {});
+  if (same) await unlink(path).catch(() => {});
 }
 
 async function acquireLock(path, now) {
@@ -406,7 +420,7 @@ async function acquireLock(path, now) {
   } catch {
     return null;
   }
-  // The file renamed may not be the one that was seen: another process may have broken that lock and taken a new one in between. A fresh one is put back (link does not overwrite) and the lock is held
+  // The file renamed may not be the one that was seen: another process may have broken that lock and taken a new one in between. A fresh one is put back only when nothing else has taken its place (link does not overwrite); a drive without hard links cannot put it back
   const taken = await stat(stale).catch(() => null);
   if (taken && now - taken.mtimeMs <= LOCK_STALE_MS) {
     await link(stale, path).catch(() => {});
