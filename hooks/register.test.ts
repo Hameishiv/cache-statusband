@@ -8,13 +8,14 @@ const SETUP = { options: { seatFileTerminal: '~/.claude-cli-accounts/.active', s
 
 // The engine beneath the mod: a terminal session on seat A, nothing on disk but the seat file
 // `disk` adds files by name (a transcript, the account file); `holdAccount` makes reading the account file wait, `holdEnv` an environment read (its name and how many times that name was read), `hold` a named file's
-function engine($: any, on: any, seat: { label: string; recording?: string } = { label: 'A' }, kept?: Map<string, unknown>, onGet?: (key: string) => Promise<void> | void, disk: { files?: Record<string, string>; holdAccount?: Promise<void>; hold?: Record<string, Promise<void>>; hangSet?: (key: string) => boolean; hangDelete?: (key: string) => boolean; holdId?: () => Promise<void> | undefined; holdSet?: (key: string) => Promise<void> | undefined; id?: string; holdEnv?: (name: string, nth: number) => Promise<void> | void; messages?: { role: string; text: string }[] } = {}) {
+function engine($: any, on: any, seat: { label: string; recording?: string } = { label: 'A' }, kept?: Map<string, unknown>, onGet?: (key: string) => Promise<void> | void, disk: { files?: Record<string, string>; holdAccount?: Promise<void>; hold?: Record<string, Promise<void>>; hangSet?: (key: string) => boolean; failSet?: (key: string) => boolean; hangDelete?: (key: string) => boolean; holdId?: () => Promise<void> | undefined; holdSet?: (key: string) => Promise<void> | undefined; id?: string; holdEnv?: (name: string, nth: number) => Promise<void> | void; messages?: { role: string; text: string }[] } = {}) {
   const clock = mock.clock(on)
   if (kept) {
     // a store already holding what an earlier run of this mod wrote
     on('store.get', async (_: unknown, e: any) => (await onGet?.(e.key), { value: kept.get(e.key) }))
     on('store.set', async (_: unknown, e: any) => {
       if (disk.hangSet?.(e.key)) await new Promise(() => {}) // a store call that never settles
+      if (disk.failSet?.(e.key)) throw new Error('store is locked') // another session holds the store's lock
       await disk.holdSet?.(e.key) // a store call that settles when the test lets it
       kept.set(e.key, e.value)
       return { value: undefined }
@@ -2372,6 +2373,57 @@ test('a signed-in session with neither seat nor account fetches for itself and w
   expect(kept.get('plan')).toEqual(stale)
   await clock.advance(2 * 60000)
   expect(fetches).toBe(1) // its own planNext holds the next fetch back, with nothing in the store to do it
+})
+
+// Sessions on one account that wake together share one poll: the slot is claimed with a token of the session's own, and read back
+const PLAN = 'plan:account:a@x'
+const planBody = JSON.stringify({ five_hour: { utilization: 7, resets_at: 9999999999 } })
+function claimEngine($: any, on: any, onGet?: (key: string) => void, failSet?: (key: string) => boolean) {
+  const kept = new Map<string, unknown>()
+  const disk: { files: Record<string, string>; failSet?: (key: string) => boolean } = { files: { '.claude.json': account('a@x') }, failSet }
+  const { clock } = engine($, on, { label: 'A' }, kept, onGet, disk)
+  kept.set(PLAN, { at: 1, next: 2, fable: null, windows: [], why: 'ok' }) // long past due
+  on('session.authorize', () => ({ value: { handle: 'h' } }))
+  const fetched = { n: 0 }
+  on('http.fetch', () => (fetched.n++, { value: { ok: true, status: 200, headers: {}, text: planBody } }))
+  return { kept, clock, fetched }
+}
+
+test('a plan poll whose claim another session overwrote meanwhile is not fetched', async ($, on) => {
+  let rival: (() => void) | null = null
+  const { kept, clock, fetched } = claimEngine($, on, (key) => { if (key === PLAN) rival?.() })
+  rival = () => {
+    const v: any = kept.get(PLAN)
+    if (v && v.claim) { rival = null; kept.set(PLAN, { ...v, claim: 'rival' }) } // a session that read the same expired deadline wrote after this one
+  }
+  await clock.advance(60000)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await clock.advance(31000)
+  expect(fetched.n).toBe(0)
+  expect((kept.get(PLAN) as any).claim).toBe('rival')
+})
+
+test('a plan poll whose claim cannot be written is not fetched', async ($, on) => {
+  const { clock, fetched } = claimEngine($, on, undefined, (key) => key === PLAN)
+  await clock.advance(60000)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await clock.advance(60000)
+  expect(fetched.n).toBe(0)
+})
+
+test('a plan poll claim never shortens a later deadline another session set meanwhile', async ($, on) => {
+  let gets = 0
+  let later = 0
+  const { kept, clock, fetched } = claimEngine($, on, (key) => {
+    if (key !== PLAN || ++gets !== 2) return
+    kept.set(PLAN, { at: 1, next: later, fable: null, windows: [], why: 'HTTP 429' }) // a server backoff written after this session read the old deadline
+  })
+  await clock.advance(60000)
+  later = (await clock.now()) + 30 * 60000
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await clock.advance(31000)
+  expect(fetched.n).toBe(0)
+  expect((kept.get(PLAN) as any).next).toBeGreaterThanOrEqual(later)
 })
 
 // Two unseated sessions on one surface: another session's heartbeat in the store

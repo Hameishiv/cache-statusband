@@ -1339,13 +1339,30 @@ async function refreshPlan($) {
   // the store's backoff, or this session's own where a held lock kept it out of the store
   if (now < Math.max(prior.next || (prior.at || 0) + PLAN_EVERY, planNext)) return
   planNext = now + PLAN_EVERY
-  // claim the slot first, so a session that wakes meanwhile finds it taken
-  try {
-    if (!alone) await $.store.set(key, { ...prior, next: now + PLAN_EVERY })
-  } catch {
-    // lock held: this session's own planNext still holds it back
+  // claim the slot first, so a session that wakes meanwhile finds it taken: the claim carries a token of this session's own, and only a session that reads its own token back fetches
+  if (!alone) {
+    const token = `${now}-${Math.random().toString(36).slice(2)}`
+    let mine = false
+    try {
+      // a deadline another session set since the read above (a server backoff) is never shortened
+      const live = await bounded($, () => $.store.get(key), WRITE_LIMIT)
+      if (stale()) return
+      const there = live !== TIMED_OUT && live && typeof live === 'object' ? live : prior
+      const until = Math.max(there.next || 0, now + PLAN_EVERY)
+      if (!(there.next > now)) {
+        const put = await bounded($, () => $.store.set(key, { ...there, next: until, claim: token }), WRITE_LIMIT)
+        if (stale()) return
+        if (put !== TIMED_OUT) {
+          const back = await bounded($, () => $.store.get(key), WRITE_LIMIT)
+          mine = back !== TIMED_OUT && !!back && typeof back === 'object' && back.claim === token
+        }
+      }
+    } catch {
+      // lock held: this session's own planNext still holds it back
+    }
+    if (stale()) return
+    if (!mine) return // another session holds the slot, or the claim could not be written or read back: no fetch
   }
-  if (stale()) return
   let fable = prior.fable || S.fable
   let windows = Array.isArray(prior.windows) && prior.windows.length ? prior.windows : S.planWindows
   let at = prior.at || 0 // when the reading was taken: a failure keeps the last good one
