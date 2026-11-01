@@ -2079,7 +2079,7 @@ function statusText() {
   if (st.kind === 'cold') lines.push(`Cache ${st.left === null ? 'is cold' : `went cold ${minutes(-st.left)} ago`}. The next message rewrites it for about ${money(rewriteCost(S.ctx, S.model, ttl))}.`)
   if (rotatedCold()) lines.push(`The account rotated${rotatedAgo()} (now ${mask(S.seat || S.account)}), so the cache is cold.`)
   if (S.keepWarm) lines.push(`Keep warm is on until ${clock(S.keepWarmUntil)}: ${S.pings} ping(s), ${money(S.pingUsd)} so far.${st.left === null || rotatedCold() ? ' It waits for the next message before it pings.' : ''}`)
-  if (S.rateLimits.length) lines.push(`Plan limits used: ${limitsText(S.rateLimits)}.`)
+  { const open = stillOpen(S.rateLimits, now); if (open.length) lines.push(`Plan limits used: ${limitsText(open)}.`) } // a window that reset since is stale
   if (keyUnsure()) lines.push('Fable weekly: waiting for the rotator to name the new seat or account.')
   else lines.push(fableOpen() ? `Fable weekly: ${Math.round(S.fable.percentUsed)}% used.` : `Fable weekly: no reading yet${planWhy && planWhy !== 'ok' ? ` (last check: ${planWhy})` : ''}.`)
   lines.push(`Session cost so far: ${money(S.costUsd)}. Cold restarts in this chat: ${S.coldRestarts.length} (${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))}).`)
@@ -2805,7 +2805,7 @@ function bandSegments() {
   // its reset is the weekly one's, already shown; the reading waits for the seat and account like the windows
   const fable = fableOpen()
   if (fable && !keyUnsure()) out.push(limitSegment('Fable', fable, 'pink', false))
-  for (const l of S.rateLimits) if (l.kind !== 'five_hour' && l.kind !== 'seven_day') out.push(limitSegment(LIMIT_LABEL[l.kind] || l.kind, l, 'gray'))
+  for (const l of stillOpen(S.rateLimits, now)) if (l.kind !== 'five_hour' && l.kind !== 'seven_day') out.push(limitSegment(LIMIT_LABEL[l.kind] || l.kind, l, 'gray'))
   out.push([`session ${money(S.costUsd)}`, 'salmon'])
   if (S.resumeAt) out.push([S.resumeAt <= now && putBackHeld() ? '⏸ Resume waits for your message' : `⏸ resumes ${resumeText(S.resumeAt, now)}`, WARN])
   // who the terminal session runs as: a configured seat's label, else the signed-in account
@@ -2823,7 +2823,7 @@ function footerLabel() {
   else if (st.kind === 'cold' && big) parts.push(`cache cold · rewrite ≈ ${money(rewriteCost(S.ctx, S.model, ttlMin()))}`)
   // a rotated chat reads cold whatever keep warm is doing (cacheState), so keep warm being on, and that it waits, is said beside it, as the band's K.W. segment does
   if (S.keepWarm && rotatedCold()) parts.push('keep warm waits for next message')
-  const high = S.rateLimits.filter((l) => (l.percentUsed || 0) >= 80)
+  const high = stillOpen(S.rateLimits, now).filter((l) => (l.percentUsed || 0) >= 80)
   if (high.length) parts.push(limitsText(high))
   if (H.text) parts.push(`handoff ready · /${names.handoff} continue`)
   return parts.join(' · ')
