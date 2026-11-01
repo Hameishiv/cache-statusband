@@ -72,6 +72,8 @@ cache-statusband-codex usage
 cache-statusband-codex session "$env:CODEX_HOME\sessions\YYYY\MM\DD\rollout-....jsonl"
 ```
 
+`board --limit N` reads only the N rollout files modified most recently (by file time, before any is parsed), then lists them newest event first. After a copy or restore of `.codex` that changed the files' times, the N it keeps may differ from the N sessions with the newest last event.
+
 `usage` captures the configured seat or signed-in email once with `account/read`, then reads five-hour/weekly limits and `rateLimitResetCredits.availableCount` through Codex app-server ([official account protocol](https://learn.chatgpt.com/docs/app-server#1-check-auth-state), [official rate-limit protocol](https://learn.chatgpt.com/docs/app-server#8-earned-rate-limit-resets-chatgpt)). `refreshToken` is false. `board` prints the same usage header, ending with that captured email or seat, then scans active rollout JSONL files under `%CODEX_HOME%\sessions`; `--all` also includes `%CODEX_HOME%\archived_sessions`. It extracts only session metadata and the latest token-count record; prompt and response fields are never inspected, printed, or retained. It does not depend on Codex's private SQLite schema.
 
 Human-readable `usage` output lists every reset detail Codex returns, with an absolute date/time in the machine's local timezone and a relative countdown. `usage --json` retains the raw Unix-seconds `expiresAt` value. The compact board header and resume hook show only the nearest countdown. If Codex returns an authoritative count without detail rows, the command says that expiration details were not supplied instead of inventing dates.

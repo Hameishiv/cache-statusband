@@ -96,7 +96,7 @@ test("scans active sessions and includes archived sessions only when requested",
   assert.deepEqual(new Set(all.map((item) => item.archived)), new Set([true, false]));
 });
 
-test("a limit picks the newest rollouts by file time before any is parsed, and gives the same rows as scanning them all", async (t) => {
+test("a limit picks the newest rollouts by file time before any is parsed, and where file and event times agree gives a full scan's first rows", async (t) => {
   const root = await fixtureRoot(t);
   await mkdir(join(root, "sessions", "2026", "10"), { recursive: true });
   await mkdir(join(root, "archived_sessions"), { recursive: true });
@@ -117,7 +117,7 @@ test("a limit picks the newest rollouts by file time before any is parsed, and g
   assert.deepEqual(limited.map((item) => item.id), ["r5", "r4"]);
   assert.deepEqual(limited, (await scanSessions(root, { includeArchived: true })).slice(0, 2));
 
-  // a newest rollout that cannot be read is omitted, as in a full scan, and the next one takes its place
+  // a newest rollout that cannot be read is omitted, and the next newest by file time takes its place
   parsed.length = 0;
   const failing = async (path) => {
     parsed.push(path);
@@ -127,6 +127,22 @@ test("a limit picks the newest rollouts by file time before any is parsed, and g
   const skipped = await scanSessions(root, { includeArchived: true, limit: 2, parse: failing });
   assert.deepEqual(skipped.map((item) => item.id), ["r4", "r3"]);
   assert.equal(parsed.length, 3);
+});
+
+test("a limit goes by file time, not by the last event's time, when the two disagree", async (t) => {
+  const root = await fixtureRoot(t);
+  await mkdir(join(root, "sessions"), { recursive: true });
+  // r1's last event is the newest, r4's the oldest, but the files were touched the other way round (as after a copy or restore)
+  for (let n = 1; n <= 4; n += 1) {
+    const path = join(root, "sessions", `r${n}.jsonl`);
+    const event = new Date(Date.parse("2026-10-29T12:00:00.000Z") + (5 - n) * 60000);
+    const touched = new Date(Date.parse("2026-10-30T12:00:00.000Z") + n * 60000);
+    await writeFile(path, JSON.stringify({ timestamp: event.toISOString(), type: "session_meta", payload: { id: `r${n}`, cwd: "/w" } }) + "\n", "utf8");
+    await utimes(path, touched, touched);
+  }
+  assert.deepEqual((await scanSessions(root)).slice(0, 2).map((item) => item.id), ["r1", "r2"]); // a full scan: newest event first
+  const limited = await scanSessions(root, { limit: 2 });
+  assert.deepEqual(limited.map((item) => item.id), ["r3", "r4"]); // the limit: the two files touched last, then ordered by event time
 });
 
 test("SessionStart hook returns a visible, truthful resume summary", async (t) => {

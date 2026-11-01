@@ -44,7 +44,7 @@ export async function parseRollout(path) {
   return summary;
 }
 
-// With a `limit`, the newest rollouts by file time are parsed, and no others: reading each one's edges is the cost of a scan. An unreadable one is passed over for the next newest, so the rows are the first `limit` of a full scan's (`parse` is the reader, for a test to count with)
+// With a `limit`, the newest rollouts by FILE time (mtime) are parsed, and no others: reading each one's edges is the cost of a scan. An unreadable one is passed over for the next newest. The rows are then ordered by their last event's time, so they match a full scan's first `limit` only while file time and event time agree (a copied or restored ~/.codex can break that: the limit then keeps the files touched last, not the sessions whose last event is newest). `parse` is the reader, for a test to count with
 export async function scanSessions(codexHome, { includeArchived = false, limit = Infinity, parse = parseRollout } = {}) {
   const roots = [{ path: join(codexHome, "sessions"), archived: false }];
   if (includeArchived) roots.push({ path: join(codexHome, "archived_sessions"), archived: true });
