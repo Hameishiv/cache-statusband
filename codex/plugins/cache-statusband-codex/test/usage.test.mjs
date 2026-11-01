@@ -81,6 +81,13 @@ test("honors a Retry-After longer than the five-minute floor", async (t) => {
   assert.equal(retryAfterMilliseconds({ rpcMessage: "limited; retry after 75 seconds" }, now), 75_000);
 });
 
+test("reads a textual retry-after HTTP date as a date, not its day as seconds", () => {
+  const now = Date.parse("2026-10-21T07:00:00Z");
+  assert.equal(retryAfterMilliseconds({ rpcMessage: "rate limited; Retry-After: Wed, 21 Oct 2026 07:30:00 GMT" }, now), 30 * 60_000);
+  assert.equal(retryAfterMilliseconds({ rpcMessage: "retry after Wednesday, 21 Oct 2026 07:28:00 GMT" }, now), 28 * 60_000);
+  assert.equal(retryAfterMilliseconds({ rpcMessage: "retry after 75 seconds" }, now), 75_000);
+});
+
 test("reads the unit of a textual retry-after: minutes and hours as well as seconds and milliseconds", () => {
   const ms = (rpcMessage) => retryAfterMilliseconds({ rpcMessage }, 0);
   assert.equal(ms("rate limited, retry after 30 minutes"), 30 * 60_000);

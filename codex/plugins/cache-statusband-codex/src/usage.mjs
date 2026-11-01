@@ -324,8 +324,12 @@ export function retryAfterMilliseconds(error, now = Date.now()) {
   if (typeof message === "string") {
     // a bare number is seconds; ms and milliseconds are tried before m (minutes), and the unit must end at a word boundary ("5 more" is not minutes)
     // a key named for milliseconds (retry_after_ms=1500, Retry-After-Ms: 1500) holds milliseconds
-    const named = message.match(/retry[\s_-]*after[\s_-]*ms\b[^0-9]*(\d+(?:\.\d+)?)/i);
-    const match = named ? null : message.match(/retry[\s_-]*after[^0-9]*(\d+(?:\.\d+)?)(?:\s*(msecs?|ms|milliseconds?|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)\b)?/i);
+    // an HTTP date (Retry-After: Wed, 21 Oct 2026 07:28:00 GMT) is read as a date, before the numeric forms would take its day for seconds
+    const dated = message.match(/retry[\s_-]*after[\s:=]*((?:mon|tue|wed|thu|fri|sat|sun)[a-z]*,\s*\d{1,2}\s+[a-z]{3}\s+\d{4}\s+\d{2}:\d{2}:\d{2}\s*(?:gmt|utc|[+-]\d{4})?)/i);
+    const datedAt = dated ? Date.parse(dated[1]) : NaN;
+    if (Number.isFinite(datedAt)) candidates.push(Math.max(0, datedAt - now));
+    const named = Number.isFinite(datedAt) ? null : message.match(/retry[\s_-]*after[\s_-]*ms\b[^0-9]*(\d+(?:\.\d+)?)/i);
+    const match = named || Number.isFinite(datedAt) ? null : message.match(/retry[\s_-]*after[^0-9]*(\d+(?:\.\d+)?)(?:\s*(msecs?|ms|milliseconds?|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)\b)?/i);
     if (named) candidates.push(Number(named[1]));
     else if (match) {
       const unit = (match[2] ?? "s").toLowerCase();
