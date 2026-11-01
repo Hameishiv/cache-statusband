@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { access, mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { createHash } from "node:crypto";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -9,6 +11,7 @@ import { capFirst, formatAge, formatDuration, formatUsageLines, plainSpaces } fr
 import { displayIdentity, usagePresentation } from "../src/settings.mjs";
 import {
   fetchRateLimitsViaAppServer,
+  readAccountViaAppServer,
   captureUsageIdentity,
   getUsageSnapshot,
   MAX_RETRY_AFTER_MS,
@@ -152,6 +155,53 @@ test("speaks the documented app-server protocol", async () => {
   assert.equal(result.rateLimitResetCredits.availableCount, 2);
   assert.equal(result.account.email, ["test", "example.invalid"].join("@"));
 });
+
+// What each reader hands to spawn, with a fake child that never answers (a short timeout ends the read)
+async function launchOf(reader, options) {
+  let launched = null;
+  const spawnImpl = (command, args, spawnOptions) => {
+    launched = { command, args, verbatim: spawnOptions.windowsVerbatimArguments === true };
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.stdin = new PassThrough();
+    child.kill = () => {};
+    return child;
+  };
+  await reader({ timeoutMs: 20, spawnImpl, env: { ComSpec: "C:\\Windows\\System32\\cmd.exe" }, ...options }).catch(() => {});
+  return launched;
+}
+
+for (const [name, reader] of [["the account read", readAccountViaAppServer], ["the rate-limit read", fetchRateLimitsViaAppServer]]) {
+  test(`${name} goes through cmd.exe on Windows for a codex.cmd or .bat shim, whether or not CODEX_BIN names it`, async () => {
+    for (const command of ["codex", "codex.cmd", "C:\\Program Files\\nodejs\\codex.CMD", "C:\\tools\\codex", "D:\\a.b\\codex.bat"]) {
+      const launched = await launchOf(reader, { platform: "win32", command });
+      assert.equal(launched.command, "C:\\Windows\\System32\\cmd.exe", command);
+      assert.deepEqual(launched.args, ["/d", "/s", "/c", `""${command}" "app-server""`], command);
+      assert.equal(launched.verbatim, true, command);
+    }
+  });
+
+  test(`${name} spawns a real .exe, or any command off Windows, directly`, async () => {
+    for (const [platform, command] of [["win32", "C:\\codex\\codex.exe"], ["win32", "codex.EXE"], ["linux", "codex"], ["linux", "/opt/codex.cmd"], ["darwin", "codex"]]) {
+      const launched = await launchOf(reader, { platform, command });
+      assert.equal(launched.command, command);
+      assert.deepEqual(launched.args, ["app-server"]);
+      assert.equal(launched.verbatim, false);
+    }
+  });
+
+  test(`${name} refuses a Windows shim path that cmd.exe could not take as one word`, async () => {
+    for (const command of ['C:\\x"&calc&"\\codex.cmd', "C:\\%TEMP%\\codex.cmd", "codex\nwhoami.cmd"]) {
+      let spawned = false;
+      await assert.rejects(
+        reader({ platform: "win32", command, timeoutMs: 20, env: {}, spawnImpl: () => { spawned = true; throw new Error("spawned"); } }),
+        /cmd\.exe/,
+      );
+      assert.equal(spawned, false, command);
+    }
+  });
+}
 
 test("keeps usage polling and presentation scoped to the captured seat", async (t) => {
   const root = await fixtureRoot(t);

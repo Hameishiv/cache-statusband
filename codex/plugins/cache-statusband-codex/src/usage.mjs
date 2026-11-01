@@ -114,19 +114,22 @@ export async function captureUsageIdentity(codexHome, {
   }
 }
 
-// Node cannot spawn the npm codex.cmd shim directly on Windows, so the default launch goes through cmd.exe.
-function appServerLaunch(command, args) {
-  if (process.platform === "win32" && command === "codex" && !process.env.CODEX_BIN) {
-    return { command: process.env.ComSpec || "cmd.exe", args: ["/d", "/s", "/c", "codex", ...args] };
-  }
-  return { command, args };
+// Node cannot spawn the npm codex.cmd shim directly on Windows, so a command that is (or may resolve to) a .cmd/.bat shim goes through cmd.exe: one with a .cmd/.bat extension, or none (cmd.exe finds the shim through PATHEXT). A command with another extension, such as a real codex.exe, is spawned directly, as is any command off Windows.
+// cmd.exe is given one line, every word in double quotes and the whole in one more pair (windowsVerbatimArguments, so Node adds no quoting of its own): a path with spaces stays one word. A word that cannot be quoted for it (a double quote, %, or a line break) is refused, not run.
+function appServerLaunch(command, args, { platform = process.platform, env = process.env } = {}) {
+  if (platform !== "win32") return { command, args };
+  const extension = /\.[^\\/.]*$/.exec(command);
+  if (extension && !/^\.(cmd|bat)$/i.test(extension[0])) return { command, args };
+  const words = [command, ...args];
+  if (words.some((word) => /["%\r\n\0]/.test(word))) throw new Error("Codex command cannot be launched through cmd.exe: its path has a quote, a percent sign or a line break");
+  return { command: env.ComSpec || process.env.ComSpec || "cmd.exe", args: ["/d", "/s", "/c", `"${words.map((word) => `"${word}"`).join(" ")}"`], windowsVerbatimArguments: true };
 }
 
 // On a timeout or failure child.kill() ends cmd.exe but not the codex it started, which keeps the pipes open and the hook alive.
 // The tree goes first: once cmd.exe is gone, taskkill /T can no longer find the codex under it.
 // A finished read only closes stdin, which ends codex, so it skips the tree kill.
-function stopChild(child, launch, command, abort) {
-  if (abort && process.platform === "win32" && launch.command !== command && child.pid) {
+function stopChild(child, launch, command, abort, platform = process.platform) {
+  if (abort && platform === "win32" && launch.command !== command && child.pid) {
     try {
       spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true, timeout: 3000 });
     } catch {}
@@ -143,14 +146,16 @@ export async function readAccountViaAppServer({
   timeoutMs = 10_000,
   spawnImpl = spawn,
   env = process.env,
+  platform = process.platform,
 } = {}) {
   const childEnv = { ...env };
   if (codexHome) childEnv.CODEX_HOME = codexHome;
-  const launch = appServerLaunch(command, args);
+  const launch = appServerLaunch(command, args, { platform, env });
   const child = spawnImpl(launch.command, launch.args, {
     env: childEnv,
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
+    windowsVerbatimArguments: launch.windowsVerbatimArguments === true,
   });
   const lines = createInterface({ input: child.stdout });
   let settled = false;
@@ -161,7 +166,7 @@ export async function readAccountViaAppServer({
       clearTimeout(timer);
       lines.close();
       child.stdin.end();
-      stopChild(child, launch, command, callback === reject);
+      stopChild(child, launch, command, callback === reject, platform);
       callback(value);
     };
     const timer = setTimeout(() => finish(reject, new Error("Codex account read timed out")), timeoutMs);
@@ -200,14 +205,16 @@ export async function fetchRateLimitsViaAppServer({
   timeoutMs = 10_000,
   spawnImpl = spawn,
   env = process.env,
+  platform = process.platform,
 } = {}) {
   const childEnv = { ...env };
   if (codexHome) childEnv.CODEX_HOME = codexHome;
-  const launch = appServerLaunch(command, args);
+  const launch = appServerLaunch(command, args, { platform, env });
   const child = spawnImpl(launch.command, launch.args, {
     env: childEnv,
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
+    windowsVerbatimArguments: launch.windowsVerbatimArguments === true,
   });
   const lines = createInterface({ input: child.stdout });
   let settled = false;
@@ -223,7 +230,7 @@ export async function fetchRateLimitsViaAppServer({
       clearTimeout(timer);
       lines.close();
       child.stdin.end();
-      stopChild(child, launch, command, callback === reject);
+      stopChild(child, launch, command, callback === reject, platform);
       callback(value);
     };
     const timer = setTimeout(() => finish(reject, new Error("Codex rate-limit read timed out")), timeoutMs);
