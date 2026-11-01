@@ -42,7 +42,7 @@ async function board(argv) {
   const options = parseOptions(argv);
   const home = resolve(options["codex-home"] ?? defaultCodexHome());
   const limit = integer(options.limit ?? "30", "--limit");
-  const summaries = (await scanSessions(home, { includeArchived: Boolean(options.all) })).slice(0, limit);
+  const summaries = await scanSessions(home, { includeArchived: Boolean(options.all), limit });
   const identity = await captureUsageIdentity(home);
   const usageSnapshot = await getUsageSnapshot({ codexHome: home, identity });
   const presented = await usagePresentation(usageSnapshot, { codexHome: home, identity });

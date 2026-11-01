@@ -44,17 +44,31 @@ export async function parseRollout(path) {
   return summary;
 }
 
-export async function scanSessions(codexHome, { includeArchived = false } = {}) {
+// With a `limit`, the newest rollouts by file time are parsed, and no others: reading each one's edges is the cost of a scan. An unreadable one is passed over for the next newest, so the rows are the first `limit` of a full scan's (`parse` is the reader, for a test to count with)
+export async function scanSessions(codexHome, { includeArchived = false, limit = Infinity, parse = parseRollout } = {}) {
   const roots = [{ path: join(codexHome, "sessions"), archived: false }];
   if (includeArchived) roots.push({ path: join(codexHome, "archived_sessions"), archived: true });
   const found = [];
   for (const root of roots) {
     for (const path of await findJsonl(root.path)) found.push({ path, archived: root.archived });
   }
+  let candidates = found;
+  if (Number.isFinite(limit)) {
+    const dated = [];
+    for (const item of found) {
+      try {
+        dated.push({ ...item, mtime: (await stat(item.path)).mtimeMs });
+      } catch {
+        // gone since it was listed
+      }
+    }
+    candidates = dated.sort((a, b) => b.mtime - a.mtime);
+  }
   const summaries = [];
-  for (const item of found) {
+  for (const item of candidates) {
+    if (summaries.length >= limit) break;
     try {
-      summaries.push({ ...(await parseRollout(item.path)), archived: item.archived });
+      summaries.push({ ...(await parse(item.path)), archived: item.archived });
     } catch {
       // A session can move or be written while scanning; omit that one snapshot.
     }

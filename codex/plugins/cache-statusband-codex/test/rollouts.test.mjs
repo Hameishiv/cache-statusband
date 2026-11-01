@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -94,6 +94,39 @@ test("scans active sessions and includes archived sessions only when requested",
   const all = await scanSessions(root, { includeArchived: true });
   assert.equal(all.length, 2);
   assert.deepEqual(new Set(all.map((item) => item.archived)), new Set([true, false]));
+});
+
+test("a limit picks the newest rollouts by file time before any is parsed, and gives the same rows as scanning them all", async (t) => {
+  const root = await fixtureRoot(t);
+  await mkdir(join(root, "sessions", "2026", "10"), { recursive: true });
+  await mkdir(join(root, "archived_sessions"), { recursive: true });
+  // five rollouts whose last event is as old as the file: the 1st is the oldest, the 5th the newest (one of them archived)
+  const names = [];
+  for (let n = 1; n <= 5; n += 1) {
+    const archived = n === 2;
+    const path = join(root, archived ? "archived_sessions" : "sessions/2026/10", `r${n}.jsonl`);
+    const at = new Date(Date.parse("2026-10-29T12:00:00.000Z") + n * 60000);
+    await writeFile(path, JSON.stringify({ timestamp: at.toISOString(), type: "session_meta", payload: { id: `r${n}`, cwd: "/w" } }) + "\n", "utf8");
+    await utimes(path, at, at);
+    names.push(path);
+  }
+  const parsed = [];
+  const parse = async (path) => (parsed.push(path), parseRollout(path));
+  const limited = await scanSessions(root, { includeArchived: true, limit: 2, parse });
+  assert.deepEqual(parsed.sort(), [names[3], names[4]].sort());
+  assert.deepEqual(limited.map((item) => item.id), ["r5", "r4"]);
+  assert.deepEqual(limited, (await scanSessions(root, { includeArchived: true })).slice(0, 2));
+
+  // a newest rollout that cannot be read is omitted, as in a full scan, and the next one takes its place
+  parsed.length = 0;
+  const failing = async (path) => {
+    parsed.push(path);
+    if (path === names[4]) throw new Error("moved while scanning");
+    return parseRollout(path);
+  };
+  const skipped = await scanSessions(root, { includeArchived: true, limit: 2, parse: failing });
+  assert.deepEqual(skipped.map((item) => item.id), ["r4", "r3"]);
+  assert.equal(parsed.length, 3);
 });
 
 test("SessionStart hook returns a visible, truthful resume summary", async (t) => {
