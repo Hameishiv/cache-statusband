@@ -400,6 +400,36 @@ test('setup-specific features stay off unless configured, and a bad pattern turn
   expect(pattern(String.raw`merge-pr (\d+)`)?.exec('merge-pr 12')?.[1]).toBe('12')
 })
 
+test('borrowed windows are ranked by when they were read, not by the last heartbeat', async () => {
+  const at = Date.parse('2026-10-29T10:00:00Z')
+  const five = (pct: number) => [{ kind: 'five_hour', percentUsed: pct, resetsAt: '2026-10-29T12:00:00Z' }]
+  const list = [
+    { seat: 'A', desktop: false, updatedAt: at, limitsAt: at - 600000, rateLimits: five(40) }, // idle: beats every tick, read ten minutes ago
+    { seat: 'A', desktop: false, updatedAt: at - 20000, limitsAt: at - 5000, rateLimits: five(44) }, // active: read seconds ago
+  ]
+  expect(borrowedLimits(list, { seat: 'A', desktop: false }, at)[0].percentUsed).toBe(44)
+  // a heartbeat from an older version has no limitsAt: its updatedAt stands in
+  const older = [
+    { seat: 'A', desktop: false, updatedAt: at - 60000, rateLimits: five(40) },
+    { seat: 'A', desktop: false, updatedAt: at - 1000, rateLimits: five(44) },
+  ]
+  expect(borrowedLimits(older, { seat: 'A', desktop: false }, at)[0].percentUsed).toBe(44)
+})
+
+test('the heartbeat dates the windows by when they were read, not by the beat', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock } = engine($, on, { label: 'A' }, kept)
+  await clock.advance(60000)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  const readAt = await clock.now()
+  await $.session.measure({ context: { tokens: 100000, window: 1000000, percent: 10 }, rateLimits: [{ kind: 'five_hour', percentUsed: 40, resetsAt: '2099-01-01T00:00:00Z' }], changed: [] } as never)
+  await clock.advance(90000)
+  const hb = kept.get('hb:sid-test') as any
+  expect(hb.rateLimits.length).toBe(1)
+  expect(hb.limitsAt).toBe(readAt)
+  expect(hb.updatedAt).toBeGreaterThan(readAt)
+})
+
 test('a reopened chat borrows plan windows from the freshest session on the same account', async () => {
   const at = Date.parse('2026-10-29T10:00:00Z')
   const five = (pct: number, resetsAt: string) => [{ kind: 'five_hour', percentUsed: pct, resetsAt }]

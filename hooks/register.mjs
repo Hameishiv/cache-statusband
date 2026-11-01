@@ -48,6 +48,7 @@ const S = {
   warnedFor: 0,
   agentsRunning: 0,
   rateLimits: [],
+  rateLimitsAt: 0, // when S.rateLimits was last read from the engine: the heartbeat's updatedAt moves every tick, this only on a real reading
   seat: '', // the signed-in account label the rotator last wrote
   seatChangedAt: 0, // when that label last changed: the new account's cache is empty
   floor: 0, // context size right after the last compaction: what compacting can't shrink
@@ -438,6 +439,7 @@ let requestGen = 0 // identityGen as the latest main-loop request started: sessi
 function dropReadings(rearm = true) {
   identityGen++
   S.rateLimits = []
+  S.rateLimitsAt = 0
   S.fable = null
   S.planWindows = []
   planNext = 0
@@ -1211,6 +1213,7 @@ function myHeartbeat() {
     desktop: !onTerminal,
     signedIn, // an API-key session's windows are not an account's: others must not borrow them
     rateLimits: keyUnsure() || unidentified() ? [] : S.rateLimits, // the engine's own reading, which a reopened chat borrows; none while the seat or account is unknown, as it may be the old account's, nor from a session that has neither
+    limitsAt: S.rateLimitsAt, // when those windows were read, which updatedAt is not: borrowers rank by it
     updatedAt: now,
   }
 }
@@ -1227,7 +1230,7 @@ export function borrowedLimits(list, self, at) {
   const same = (hb) => hb.desktop === self.desktop && (self.seat || hb.seat ? hb.seat === self.seat : !!self.account && hb.account === self.account)
   const best = list
     .filter((hb) => !hb.self && hb.signedIn !== false && Array.isArray(hb.rateLimits) && hb.rateLimits.length && same(hb))
-    .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))[0]
+    .sort((a, b) => (b.limitsAt || b.updatedAt || 0) - (a.limitsAt || a.updatedAt || 0))[0] // a beat from an older version has no limitsAt: its updatedAt stands in
   if (!best) return []
   return stillOpen(best.rateLimits, at)
 }
@@ -2142,7 +2145,7 @@ export function register(on, options = {}) {
       // the plan windows the status line already holds: free, and there before the first send
       const usage = await $.session.usage()
       // not a request that started before an account change: its windows are the old account's
-      if (Array.isArray(usage.rateLimits) && usage.rateLimits.length && requestGen === identityGen) S.rateLimits = usage.rateLimits
+      if (Array.isArray(usage.rateLimits) && usage.rateLimits.length && requestGen === identityGen) { S.rateLimits = usage.rateLimits; S.rateLimitsAt = now }
     } catch {
       // none yet: the first measure fills them
     }
@@ -2490,7 +2493,7 @@ export function register(on, options = {}) {
       if (usage.context && usage.context.window) S.window = usage.context.window
       if (usage.cost) S.costUsd = usage.cost.usd
       // not a request that started before an account change: its windows are the old account's
-      if (Array.isArray(usage.rateLimits) && usage.rateLimits.length && requestGen === identityGen) S.rateLimits = usage.rateLimits
+      if (Array.isArray(usage.rateLimits) && usage.rateLimits.length && requestGen === identityGen) { S.rateLimits = usage.rateLimits; S.rateLimitsAt = now }
     } catch {
       // usage unavailable: keep the per-request figures
     }
@@ -2548,7 +2551,7 @@ export function register(on, options = {}) {
     }
     if (e.context && e.context.window) S.window = e.context.window
     if (e.cost) S.costUsd = e.cost.usd
-    if (Array.isArray(e.rateLimits) && e.rateLimits.length && requestGen === identityGen) S.rateLimits = e.rateLimits // as in turn.complete
+    if (Array.isArray(e.rateLimits) && e.rateLimits.length && requestGen === identityGen) { S.rateLimits = e.rateLimits; S.rateLimitsAt = now } // as in turn.complete
     return next(e)
   })
 
