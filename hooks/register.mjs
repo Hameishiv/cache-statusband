@@ -41,7 +41,7 @@ const S = {
   pings: 0,
   pingUsd: 0,
   autoPingUsd: 0, // what auto keep warm's pings cost since the last real request
-  autoCappedStretch: false, // auto keep warm stopped on its cost cap since the last real request. autoMayRun() is the single gate for starting auto keep warm or handing over to it (turn.complete, keepWarmStep): it needs auto keep warm on, a big chat, this cap unspent (autoStopReason(), whose settings a running one also meets each step: only the settings while a request runs), a turn of this chat within the auto hours, a cache still warm, and no rotation that no request has landed on; so neither a turn that ends without a request, nor a hand-over, re-arms it after the cap stop until a real request
+  autoCappedStretch: false, // auto keep warm stopped on its cost cap since the last real request. autoMayRun() is the single gate for starting auto keep warm (turn.complete): it needs auto keep warm on, a big chat, this cap unspent (autoStopReason(), whose settings a running one also meets each step: only the settings while a request runs), a turn of this chat within the auto hours, a cache still warm, and no rotation that no request has landed on; so a turn that ends without a request does not re-arm it after the cap stop until a real request
   capId: '', // the chat (session id) autoPingUsd, autoCappedStretch and lastTurnEnd describe: a /clear or resume into another id starts them clean, one into the same id (or one whose id could not be read: only lastTurnEnd, which dates the chat it replaces) does not; a fork takes its own id
   keepWarmAuto: false, // the running keep warm began on its own, not by hand
   lastPingAt: 0,
@@ -1770,7 +1770,7 @@ function setAutoWarm(on) {
   S.autoWarmOffByPr = false
 }
 
-// Why auto keep warm may not run in this chat now, by what is set (on, big chat) and what it has spent (the cap on its pings in this idle stretch); '' when it may. Checked by every start and hand-over (autoMayRun) and, each step, by an auto keep warm that is running (only the settings while a request runs), so a setting changed meanwhile (here or in another session) applies to it
+// Why auto keep warm may not run in this chat now, by what is set (on, big chat) and what it has spent (the cap on its pings in this idle stretch); '' when it may. Checked by every start (autoMayRun) and, each step, by an auto keep warm that is running (only the settings while a request runs), so a setting changed meanwhile (here or in another session) applies to it
 function autoStopReason(settingsOnly = false) {
   if (!(settings.autoWarmHours > 0) || !S.autoWarm) return 'auto keep warm was turned off'
   if (S.ctx < settings.bigTokens) return 'this chat is now under the big size'
@@ -1779,7 +1779,7 @@ function autoStopReason(settingsOnly = false) {
   return ''
 }
 
-// May auto keep warm run now? The one decision behind every place that starts it or hands over to it
+// May auto keep warm start now? The one decision behind every place that starts it
 function autoMayRun(t) {
   if (autoStopReason()) return false
   if (rotatedCold()) return false // the account rotated: its cache is empty, so there is nothing for auto keep warm to be covering until a request lands on it
@@ -1856,19 +1856,7 @@ async function keepWarmStep($) {
     // fewer auto hours than it started with: it ends that long after the last turn
     if (S.lastTurnEnd) S.keepWarmUntil = Math.min(S.keepWarmUntil, S.lastTurnEnd + settings.autoWarmHours * 60 * MIN)
   }
-  if (now >= S.keepWarmUntil) {
-    // One started by hand ends at its own time, but if auto keep warm would still be covering this chat, it takes over
-    // (with its cost cap) rather than leaving the cache to go cold sooner than if nothing had been pressed. The pings
-    // so far stay counted (the cap is per idle stretch, not per keep warm), and once auto keep warm has stopped on that
-    // cap in this stretch nothing hands over again (nor once the pings have already cost the cap without stopping on it,
-    // as when a ping wrote the cache)
-    // (no turn of this chat yet, or a cache that has already gone cold: nothing for auto keep warm to be covering, see autoMayRun)
-    if (!S.keepWarmAuto && autoMayRun(now)) {
-      S.keepWarmAuto = true
-      S.keepWarmUntil = S.lastTurnEnd + settings.autoWarmHours * 60 * MIN
-      $.ui.toast(`Keep warm now runs as auto keep warm until ${clock(S.keepWarmUntil)}; it stops sooner once its pings since your last message cost as much as the rewrite.`)
-    } else return stopKeepWarm($, 'time limit reached')
-  }
+  if (now >= S.keepWarmUntil) return stopKeepWarm($, 'time limit reached')
   if (S.pr && now - S.prCheckedAt > 15 * MIN) {
     S.prCheckedAt = now
     const state = await prState($)
@@ -2258,7 +2246,7 @@ export function register(on, options = {}) {
       const id = await $.session.id()
       // the msgChat check is defensive: SessionStarts run one at a time, so no later /clear or resume has bumped msgChat while this read was out
       if (id && msgChat === chat) {
-        // The last chat's idle stretch says nothing about a different chat: its auto pings must not count toward this chat's cap, its cap stop must not block this chat's hand-over, and its last turn must not date this chat's auto window. The same id again (a resume of the chat the cap was counted under) is the same idle stretch: the cap stands. A fork is the same conversation and keeps all three
+        // The last chat's idle stretch says nothing about a different chat: its auto pings must not count toward this chat's cap, its cap stop must not block this chat's auto keep warm, and its last turn must not date this chat's auto window. The same id again (a resume of the chat the cap was counted under) is the same idle stretch: the cap stands. A fork is the same conversation and keeps all three
         if (e.source !== 'fork' && id !== S.capId) {
           S.autoPingUsd = 0
           S.autoCappedStretch = false
@@ -2271,7 +2259,7 @@ export function register(on, options = {}) {
     } catch {
       // keep the old id
     }
-    // An id that could not be read says nothing of whether this is another chat: the cap stands (the same chat's spent pings must not be forgiven), but the last turn is dated for the chat it replaces and must not date this one's auto window (a hand-over from it would run under the old chat's hours)
+    // An id that could not be read says nothing of whether this is another chat: the cap stands (the same chat's spent pings must not be forgiven), but the last turn is dated for the chat it replaces and must not date this one's auto window (a running auto keep warm would end under the old chat's hours)
     if (e.source !== 'fork' && msgChat === chat && idChat !== chat) S.lastTurnEnd = 0
     S.label = basename(S.cwd)
     // a fork keeps its parent's cache, so only a resume seeds; before session.start has read the seat and account it waits for there
@@ -2525,7 +2513,7 @@ export function register(on, options = {}) {
     if (!S.keepWarm) {
       if (autoMayRun(now)) startKeepWarm($, settings.autoWarmHours, true)
     } else if (S.keepWarmAuto && !autoStopReason()) {
-      // only the auto one is extended: one started by hand (/keepwarm N, the band's button, the board's) keeps its own end; at that end auto keep warm takes it over (see keepWarmStep), and its cap applies from then
+      // only the auto one is extended: one started by hand (/keepwarm N, the band's button, the board's) keeps its own end, and stops there (keepWarmStep)
       S.keepWarmUntil = Math.max(S.keepWarmUntil, now + settings.autoWarmHours * 60 * MIN)
     }
     await heartbeat($, true)
