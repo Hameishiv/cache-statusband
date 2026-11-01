@@ -297,6 +297,20 @@ function ttlMin() {
   return settings.ttlMin || S.ttlMin
 }
 
+// The TTL this process detected (measured, or reported by the API), as a record carries it: a reopened chat, in a new process that has measured nothing, would otherwise take the 60-minute default for a cache that is 5 minutes. Nothing detected, nothing to keep
+function ttlRecord() {
+  return S.ttlSource === 'default' ? {} : { ttlMin: S.ttlMin, ttlSource: S.ttlSource }
+}
+
+// What a seed takes back from a chat's record: only with the setting on auto and nothing detected in this process since (S.ttlSource is still 'default'): a TTL this process measured is newer than the record's. A request that landed meanwhile, with no TTL in its usage, measured none, so it does not stop this
+function restoreTtl(last) {
+  if (!last || settings.ttlMin || S.ttlSource !== 'default') return false
+  if (last.ttlMin !== 5 && last.ttlMin !== 60) return false
+  S.ttlMin = last.ttlMin
+  S.ttlSource = last.ttlSource === 'reported by the API' ? last.ttlSource : 'measured'
+  return true
+}
+
 // A rotation moves the session to another account, whose cache is empty, until a request lands on it;
 // so does reopening a chat whose last request ran on another seat or account
 function rotatedCold() {
@@ -384,7 +398,7 @@ function judgeChat(found, last) {
 // The compacted size isn't known until the next request: keep the one before it, as rememberLast shapes it (keptAt dates an `at` of 0 for the prune)
 async function rememberCompacted($) {
   if (!S.id || !S.ctx) return
-  await writeRecord($, { ctx: S.ctx, at: 0, keptAt: now, model: S.model, effort: S.effort, ...whoRan() })
+  await writeRecord($, { ctx: S.ctx, at: 0, keptAt: now, model: S.model, effort: S.effort, ...whoRan(), ...ttlRecord() })
 }
 
 // The signed-in account, as Claude Code keeps it in .claude.json: what the band shows
@@ -1599,7 +1613,7 @@ function reissue($, key) {
 async function rememberLast($) {
   if (!S.id || !S.ctx) return
   // the chat's cold rewrites too, so their cost survives a reopen
-  await writeRecord($, { ctx: S.ctx, at: S.lastActivity, model: S.model, effort: S.effort, ...whoRan() })
+  await writeRecord($, { ctx: S.ctx, at: S.lastActivity, model: S.model, effort: S.effort, ...whoRan(), ...ttlRecord() })
 }
 
 // What a seed was asked for at: the chat (msgChat) its transcript belongs to, and the counts that say what has happened to that chat since. Taken before any await, and carried by a seed that waits (pendingSeed)
@@ -1647,6 +1661,8 @@ async function seedFromTranscript($, path, from = seedMark(), priorHb) {
     S.coldRestarts = merged
   }
   if (storeRead && coldSeedPending === from.chat) coldSeedPending = null
+  // the chat's detected TTL is its own whatever has been measured since, and is read before judging the chat: the warmth that follows is measured against it
+  if (restoreTtl(last)) changed = true
   if (!found && own() && !measured()) {
     try {
       // before its first record, a chat open under an earlier version still has its heartbeat

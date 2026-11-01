@@ -631,6 +631,49 @@ test('a big chat the app reopens asks before a cold send, from the kept record w
   expect(seen.asks).toBe(1)
 })
 
+const fiveMinuteWrite = (n: number) => ({ cache_creation_input_tokens: n, cache_creation: { ephemeral_1h_input_tokens: 0, ephemeral_5m_input_tokens: n } })
+
+test('a chat measured on the 5-minute cache keeps that TTL in its record', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock } = engine($, on, { label: 'A' }, kept)
+  const step = stepper($, on)
+  await start($, 300000, clock)
+  await step(fiveMinuteWrite(290000))
+  expect(kept.get('last:sid-test')).toMatchObject({ ttlMin: 5 })
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/cache window 5 min/)
+})
+
+test('a chat measured on the 5-minute cache, reopened by a new process 10 minutes later, is cold and asks before a send', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, 'Send anyway')
+  await clock.advance(60000)
+  // the record the first process left: its last request 10 minutes ago, on the 5-minute cache it measured, on this seat
+  kept.set('last:sid-test', { ctx: 300000, at: (await clock.now()) - 10 * 60000, model: 'claude-opus-5-5', seat: 'A', desktop: false, ttlMin: 5, ttlSource: 'reported by the API' })
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/cache window 5 min/)
+  expect(r.text).toMatch(/Cache went cold/)
+  await $.prompt.submit({ text: 'carry on', origin: COMPOSER, wait: false } as never)
+  expect(seen.asks).toBe(1)
+})
+
+test('a TTL this process has already reported is not replaced by the record\'s, and one the person set is kept', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock } = engine($, on, { label: 'A' }, kept)
+  const step = stepper($, on)
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: (await clock.now()) - 10 * 60000, model: 'claude-opus-5-5', seat: 'A', desktop: false, ttlMin: 5, ttlSource: 'measured' })
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await step(oneHourWrite(290000)) // this process's own request reports the 1-hour cache
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/cache window 60 min \(reported by the API\)/)
+  await $.command.run({ command: 'cache', args: 'ttl 60' })
+  const set: any = await $.command.run({ command: 'cache', args: '' })
+  expect(set.text).toMatch(/cache window 60 min \(set by you\)/)
+})
+
 test('a cold send that Claude Code auto-compacts still counts as a cold rewrite, and the count is kept for a reopen', async ($, on) => {
   const kept = new Map<string, unknown>()
   const { clock } = engine($, on, { label: 'A' }, kept)
