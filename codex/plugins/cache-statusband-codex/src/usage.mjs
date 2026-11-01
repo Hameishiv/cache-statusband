@@ -58,6 +58,11 @@ export async function getUsageSnapshot({
       if (identity?.key?.startsWith("account:") && safe.accountEmail !== identity.label) {
         throw new Error("Codex account changed during the usage read");
       }
+      // A seat names no account, so the email cannot prove the read matches: the seat is read again, and a different seat, or none, means the account may have rotated with it
+      if (identity?.key?.startsWith("seat:")) {
+        const after = await configuredSeatIdentity(codexHome, env);
+        if (after?.key !== identity.key) throw new Error("Codex seat changed during the usage read");
+      }
       const saved = {
         ...emptyCache(),
         ...safe,

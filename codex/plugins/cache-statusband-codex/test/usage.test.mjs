@@ -103,12 +103,21 @@ test("reads the unit of a textual retry-after: minutes and hours as well as seco
 test("caps Retry-After at one hour and keeps the last good reading", async (t) => {
   const root = await fixtureRoot(t);
   const now = Date.parse("2026-10-29T12:00:00.000Z");
+  const seatPath = join(root, "active-seat.txt");
+  await writeFile(seatPath, `${FIRST_SEAT}\n`, "utf8");
+  await mkdir(join(root, "cache-statusband-codex"), { recursive: true });
+  await writeFile(
+    join(root, "cache-statusband-codex", "settings.json"),
+    `${JSON.stringify({ version: 1, seatFile: seatPath })}\n`,
+    "utf8",
+  );
   const identity = { key: `seat:${FIRST_SEAT}`, label: `${SEAT_PREFIX} ${FIRST_SEAT}`, unavailable: false };
-  const good = await getUsageSnapshot({ codexHome: root, now, identity, fetcher: async () => RAW });
+  const good = await getUsageSnapshot({ codexHome: root, now, identity, fetcher: async () => RAW, env: {} });
   const failed = await getUsageSnapshot({
     codexHome: root,
     now: now + MIN_POLL_INTERVAL_MS,
     identity,
+    env: {},
     fetcher: async () => {
       const error = new Error("limited");
       error.rpcData = { retry_after: 86_400 };
@@ -180,6 +189,43 @@ test("keeps usage polling and presentation scoped to the captured seat", async (
   assert.equal(backToFirst.source, "cache");
   assert.equal(backToFirst.identityKey, `seat:${FIRST_SEAT}`);
   assert.equal(calls, 2);
+});
+
+test("a seat-keyed read is not saved under the seat if the seat changed during the read", async (t) => {
+  const root = await fixtureRoot(t);
+  const seatPath = join(root, "active-seat.txt");
+  await writeFile(seatPath, `${FIRST_SEAT}\n`, "utf8");
+  await mkdir(join(root, "cache-statusband-codex"), { recursive: true });
+  await writeFile(
+    join(root, "cache-statusband-codex", "settings.json"),
+    `${JSON.stringify({ version: 1, seatFile: seatPath })}\n`,
+    "utf8",
+  );
+  const now = Date.parse("2026-10-29T12:00:00.000Z");
+  const identity = await captureUsageIdentity(root, { env: {} });
+  const good = await getUsageSnapshot({ codexHome: root, now, fetcher: async () => RAW, env: {}, identity });
+  assert.equal(good.source, "live");
+
+  // The seat file and the signed-in account rotate after the identity was captured but before the read returns
+  const otherAccount = { ...RAW, account: { ...RAW.account, email: ["other", "example.invalid"].join("@") }, rateLimits: { primary: { usedPercent: 3, windowDurationMins: 300, resetsAt: 1_793_285_913 } } };
+  const rotated = await getUsageSnapshot({
+    codexHome: root,
+    now: now + MIN_POLL_INTERVAL_MS,
+    env: {},
+    identity,
+    fetcher: async () => {
+      await writeFile(seatPath, `${SECOND_SEAT}\n`, "utf8");
+      return otherAccount;
+    },
+  });
+  assert.equal(rotated.source, "stale");
+  assert.equal(rotated.primary.usedPercent, 70);
+  assert.equal(rotated.fetchedAt, now);
+
+  // Seat one's cache still holds seat one's own reading
+  await writeFile(seatPath, `${FIRST_SEAT}\n`, "utf8");
+  const back = await getUsageSnapshot({ codexHome: root, now: now + MIN_POLL_INTERVAL_MS + 1, env: {}, identity });
+  assert.notEqual(back.primary?.usedPercent, 3);
 });
 
 test("captures the account identity once when no seat file is configured", async (t) => {
