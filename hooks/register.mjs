@@ -690,7 +690,9 @@ async function resumeStep($) {
     return
   }
   const before = { chat: msgChat, steps: stepsSeen }
+  const seen = submitsSeen // a message handed on, a /clear or a resume while the first way was out: the plugin's own voice does not follow it
   for (const asUser of [true, false]) {
+    if (!asUser && (msgChat !== before.chat || stepsSeen !== before.steps || submitsSeen !== seen)) break // the Resume is settled or cancelled: as a refused one (below), which arms nothing once a chat was replaced or a request started
     try {
       const r = await $.prompt.submit({ text: 'Resume', ...(asUser ? { asUser } : {}) })
       if (r && r.drop) throw new Error(String(r.drop)) // dropped, not sent: as refused as a throw
@@ -1002,7 +1004,7 @@ async function runCompactThenSend($, msg, unattended, before, wake) {
     }
     return { t, ok }
   }
-  if (cancelled()) {
+  const cancelOut = async () => {
     // a message that reached the chat while compacting (another plugin's too), "Send anyway" or "Compact first" on a cold-send dialog, a wake-up that starts compacting, or /clear or a resume, cancels an automatic one (a local command such as /btw, which never reaches the chat, even answered Compact first, a dropped send or Cancel does not), and with it the wake-up's turn. A cancelled Resume is armed again when no request starts (resumeAt)
     lowerWake(wake)
     const { t, ok } = resume ? await rearmResume() : { t: await $.clock.now(), ok: false } // a cancelled wake-up arms nothing: its turn is over, and a Resume sent in its place was never asked for (autoResume may be off)
@@ -1012,8 +1014,8 @@ async function runCompactThenSend($, msg, unattended, before, wake) {
       ? handed ? `A message was sent meanwhile, so the automatic one waits until ${resumeText(S.resumeAt, t)} unless that message's request starts.` : `Something else was sent or chosen meanwhile, so the automatic one waits until ${resumeText(S.resumeAt, t)}.`
       : handed ? 'A message was sent meanwhile, so the automatic one was not sent.' : 'Something else was sent or chosen meanwhile, so the automatic one was not sent.'
     $.ui.toast((compacted ? 'Compacted. ' : '') + text, { timeoutMs: 8000 })
-    return
   }
+  if (cancelled()) return cancelOut()
   if (msgChat !== before.msgChat) return staleChat()
   if (stuck) {
     // The Resume is tried again (a counted try); the person's message and a wake-up's go back in the prompt box below
@@ -1042,6 +1044,7 @@ async function runCompactThenSend($, msg, unattended, before, wake) {
   if (!msg.slash && !stuck) {
     const tried = { chat: msgChat, steps: stepsSeen }
     for (const asUser of unattended ? [true, false] : [true]) {
+      if (!asUser && (cancelled() || stepsSeen !== tried.steps)) return cancelOut() // what cancels an automatic send before it is sent cancels it between the ways, too: never the plugin's own voice after the first way was refused while a message was handed on, a request started or the chat was replaced
       try {
         const stepsBefore = stepsSeen
         const r = await $.prompt.submit({ ...send, asUser })

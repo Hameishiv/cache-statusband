@@ -3515,6 +3515,73 @@ test('a refused Resume is not armed again once a request of the main loop settle
   expect(seen.toasts.filter((t) => /Trying again at/.test(t))).toEqual([])
 })
 
+// The first way of sending the Resume was refused while something happened that settles it; the second way (the plugin's own voice) must not then send it. `during` runs once, while the first submit is out, and the first submit's refusal is then the last: the second one would be accepted
+const afterFirstRefusal = (seen: { failSubmit: boolean; duringSubmit: null | (() => Promise<unknown>) }, during: () => Promise<unknown>) => {
+  seen.failSubmit = true
+  let n = 0
+  seen.duringSubmit = async () => { if (++n === 1) { await during(); seen.failSubmit = false } }
+}
+
+test('a Resume whose first submit was refused is not sent the second way into a chat cleared meanwhile', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = engine($, on)
+  on('classic.StopFailure', () => ({}))
+  on('classic.SessionStart', () => ({}))
+  await start($, 50000, clock)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  afterFirstRefusal(seen, () => ($ as any).classic.SessionStart({ source: 'clear' }))
+  await clock.advance(60 * 60000 + 30000)
+  await clock.advance(10 * 60000)
+  expect(seen.submits).toEqual([])
+})
+
+test("a Resume whose first submit was refused is not sent the second way after the person's own message was handed on meanwhile", { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = engine($, on)
+  on('classic.StopFailure', () => ({}))
+  await start($, 50000, clock)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  afterFirstRefusal(seen, async () => { await $.prompt.submit({ text: 'my own request', origin: COMPOSER, wait: false } as never) })
+  await clock.advance(60 * 60000 + 30000)
+  expect(seen.submits).toEqual([])
+})
+
+test('a Resume whose first submit was refused is not sent the second way once a request started meanwhile', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = engine($, on)
+  on('classic.StopFailure', () => ({}))
+  on('turn.step', async function* () { return { answer: '', toolUses: [], usage: null } })
+  await start($, 50000, clock)
+  await ($ as any).classic.StopFailure({ error: 'rate_limit', error_details: "You've hit your usage limit" })
+  afterFirstRefusal(seen, () => mainStep($))
+  await clock.advance(60 * 60000 + 30000)
+  await clock.advance(10 * 60000)
+  expect(seen.submits).toEqual([])
+})
+
+test('a Resume sent after compacting, whose first submit was refused, is not sent the second way into a chat cleared meanwhile', { options: { autoResume: true } }, async ($, on) => {
+  on('classic.SessionStart', () => ({}))
+  const { clock, seen } = await resumeCompacting($, on)
+  afterFirstRefusal(seen, () => ($ as any).classic.SessionStart({ source: 'clear' }))
+  await clock.advance(91 * 60000 + 1000)
+  await clock.advance(10 * 60000)
+  expect(seen.submits).toEqual([])
+  expect(seen.toasts.filter((t) => /Trying again at/.test(t))).toEqual([])
+})
+
+test("a Resume sent after compacting, whose first submit was refused, is not sent the second way after the person's own message was handed on meanwhile", { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = await resumeCompacting($, on)
+  afterFirstRefusal(seen, async () => { await $.prompt.submit({ text: 'my own request', origin: COMPOSER, wait: false } as never) })
+  await clock.advance(91 * 60000 + 1000)
+  expect(seen.submits).toEqual([])
+  expect(seen.toasts.filter((t) => /A message was sent meanwhile/.test(t)).length).toBe(1) // the one cancel path's toast
+})
+
+test('a Resume sent after compacting, whose first submit was refused, is not sent the second way once a request started meanwhile', { options: { autoResume: true } }, async ($, on) => {
+  const { clock, seen } = await resumeCompacting($, on)
+  afterFirstRefusal(seen, () => mainStep($))
+  await clock.advance(91 * 60000 + 1000)
+  await clock.advance(10 * 60000)
+  expect(seen.submits).toEqual([])
+})
+
 test('a Resume sent after compacting and refused both ways is tried again 2 minutes on, not put in the prompt box', { options: { autoResume: true } }, async ($, on) => {
   const fills: string[] = []
   const { clock, seen } = await resumeCompacting($, on, () => on('prompt.fill', (_: unknown, e: any) => (fills.push(e.text), { isFilled: true })))
