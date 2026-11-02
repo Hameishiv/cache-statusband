@@ -147,6 +147,29 @@ test('the TTL comes from the API report, so a rewrite after 20 idle minutes stay
   expect(r.text).toMatch(/cache window 60 min \(reported by the API\)/)
 })
 
+// The real engine's usage has no cache_creation split: the idle gap alone must not drop to 5
+test('a rewrite after 20 idle minutes with no TTL report stays on 1 hour', async ($, on) => {
+  const { clock } = engine($, on)
+  let next: unknown = null
+  on('turn.step', async function* () {
+    return { answer: '', toolUses: [], usage: next }
+  })
+  on('turn.complete', () => ({ text: '' }))
+  on('session.usage', () => ({ value: {} }))
+  await start($, 300000, clock)
+  const step = async (u: unknown) => {
+    next = u
+    const it = ($ as any).turn.step({ model: 'claude-opus-5-5', messages: [] })
+    if (it && typeof it[Symbol.asyncIterator] === 'function') for await (const _ of it) void _
+    else await it
+  }
+  await step(usage({ cache_read_input_tokens: 290000, cache_creation_input_tokens: 0 }))
+  await clock.advance(20 * 60000)
+  await step(usage({ cache_creation_input_tokens: 290000 }))
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/cache window 60 min/)
+})
+
 test('auto keep warm starts at turn end and stops once the merge-pr PR merges', SETUP, async ($, on) => {
   const { clock } = engine($, on)
   let state = 'OPEN'

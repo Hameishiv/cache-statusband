@@ -1037,12 +1037,9 @@ export function register(on, options = {}) {
       if (compactedCold && written > 30000) S.coldRestarts.push({ at: now, tokens: written, usd: rewriteCost(written, S.model, ttlMin()), gapMin: 0 })
       compactedCold = false
     } else if (S.lastActivity && total > 30000 && written / total > 0.5) {
-      // Without the API's word: a rewrite after 5-60 idle minutes suggests the 5-minute TTL,
-      // unless a rotation emptied the cache (a compaction already cleared lastActivity)
-      if (!settings.ttlMin && !split && !rotatedCold() && gap > 5.5 * MIN && gap < S.ttlMin * MIN) {
-        S.ttlMin = 5
-        S.ttlSource = 'measured'
-      }
+      // No TTL guess from the idle gap: the engine's usage carries no TTL split, and on the
+      // 1-hour cache a rotation, missed compaction or model switch also rewrites inside 60
+      // minutes. Guessing 5 here made keep warm ping every 3.5 minutes (2026-11-02).
       S.coldRestarts.push({ at: now, tokens: written, usd: rewriteCost(written, S.model, ttlMin()), gapMin: Math.round(gap / MIN) })
     } else if (S.lastActivity && total > 30000 && gap > 5.5 * MIN && cachedShare(u) > 0.8) {
       // A hit after more than 5 idle minutes proves the 1-hour TTL
