@@ -17,7 +17,7 @@ function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unkno
     on('store.keys', () => ({ value: [...kept.keys()] }))
   } else mock.store(on)
   mock.env(on, { USERPROFILE: 'C:/Users/T' })
-  const seen = { compacts: 0, submits: [] as string[], asks: 0 }
+  const seen = { compacts: 0, submits: [] as string[], asks: 0, toasts: [] as string[] }
   on('session.id', () => ({ value: 'sid-test' }))
   on('session.cwd', () => ({ value: '/repo' }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
@@ -37,7 +37,7 @@ function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unkno
   })
   on('session.start', (_: unknown, e: any) => ({ cwd: e.cwd }))
   on('session.measure', () => ({ changed: [] }))
-  on('ui.toast', () => ({ value: undefined }))
+  on('ui.toast', (_: unknown, e: unknown) => (seen.toasts.push(JSON.stringify(e)), { value: undefined }))
   return { clock, seen }
 }
 
@@ -173,6 +173,31 @@ test('a rewrite after 6 idle minutes with no TTL report stays on 1 hour', async 
   expect(set.text).toMatch(/cache window 5 min \(set by you\)/)
   expect(set.text).not.toMatch(/assumed/)
 })
+
+// A keep-warm ping that writes means the cache was already cold: on an assumed window, say how to set 5
+for (const [ttl, hint] of [['', true], ['ttl 60', false]] as const) {
+  test(`a keep-warm ping that finds the cache cold ${hint ? 'names' : 'does not name'} /cache ttl 5 (${ttl || 'auto'})`, SETUP, async ($, on) => {
+    const { clock, seen } = engine($, on)
+    on('process.run', () => ({ value: { exitCode: 0, stdout: 'OPEN\n', stderr: '' } }))
+    on('session.usage', () => ({ value: { context: { tokens: 300000, window: 1000000 } } }))
+    on('turn.complete', () => ({ text: '' }))
+    on('model.fork', () => ({ value: { text: 'ok', usage: usage({ cache_creation_input_tokens: 300000 }) } }))
+    on('turn.step', async function* () {
+      return { answer: '', toolUses: [], usage: usage({ cache_read_input_tokens: 290000 }) }
+    })
+    await start($, 300000, clock)
+    if (ttl) await $.command.run({ command: 'cache', args: ttl })
+    const it = ($ as any).turn.step({ model: 'claude-opus-5-5', messages: [] })
+    if (it && typeof it[Symbol.asyncIterator] === 'function') for await (const _ of it) void _
+    else await it
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+    await clock.advance(53 * 60000)
+    const stop = seen.toasts.find((t) => /Keep warm off/.test(t)) ?? ''
+    expect(stop).toMatch(/instead of reading the cache/)
+    if (hint) expect(stop).toMatch(/\/cache ttl 5/)
+    else expect(stop).not.toMatch(/ttl 5/)
+  })
+}
 
 test('auto keep warm starts at turn end and stops once the merge-pr PR merges', SETUP, async ($, on) => {
   const { clock } = engine($, on)
