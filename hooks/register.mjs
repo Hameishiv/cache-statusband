@@ -70,6 +70,7 @@ const alerted = new Map() // sessionId -> state or warning key already announced
 let paneOpen = false
 let justCompacted = false
 let compactedCold = false
+let compactTriedAt = 0 // when compactThenSend last ran
 let handoffPending = false
 let seatFile = ''
 let onTerminal = false
@@ -358,15 +359,30 @@ async function resumeStep($) {
 
 function compactThenSend($, e, unattended) {
   const msg = { text: e.text, attachments: e.attachments, slash: !!e.command }
+  compactTriedAt = now // a failed compact resends the message: this keeps that resend from compacting again
   $.clock.after(50, () => runCompactThenSend($, msg, unattended).catch(() => {}))
   return { drop: 'cache-keeper: compacting first on a cold cache; the message is sent again once that finishes' }
+}
+
+// The cold-compact decisions, on disk, so a session's own behaviour can be checked afterwards
+// shortcut: $.fs has no append, so read + rewrite; a log over 4 MiB fails the read and restarts empty
+async function coldLog($, fields) {
+  try {
+    const path = `${home.replace(/\\/g, '/')}/.claude-shared/state/cache-keeper-cold-compact-log.txt` // an existing folder: $.fs.write makes none
+    const old = await $.fs.read(path).catch(() => '')
+    await $.fs.write(path, `${typeof old === 'string' ? old : ''}${JSON.stringify({ t: new Date(now).toISOString(), sid: S.id, ctx: S.ctx, ...fields })}\n`)
+  } catch {
+    // logging never blocks a send
+  }
 }
 
 async function runCompactThenSend($, msg, unattended) {
   try {
     await $.command.run({ command: 'compact', args: '' })
     markCompacted()
+    if (unattended) await coldLog($, { action: 'compacted' })
   } catch (err) {
+    if (unattended) await coldLog($, { action: 'compact-failed', error: String((err && err.message) || err) })
     $.ui.toast('Could not compact (' + clip(String((err && err.message) || err), 80) + '), so the message goes as typed.', { timeoutMs: 8000 })
   }
   const send = { text: msg.text, ...(msg.attachments ? { attachments: msg.attachments } : {}) }
@@ -844,7 +860,7 @@ function statusText() {
   if (S.rateLimits.length) lines.push(`Plan limits used: ${limitsText(S.rateLimits)}.`)
   lines.push(S.fable ? `Fable weekly: ${Math.round(S.fable.percentUsed)}% used.` : `Fable weekly: no reading yet${planWhy && planWhy !== 'ok' ? ` (last check: ${planWhy})` : ''}.`)
   lines.push(`Session cost so far: ${money(S.costUsd)}. Cold restarts this session: ${S.coldRestarts.length} (${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))}).`)
-  lines.push(`Cold-send guard: ${settings.guard ? 'on' : 'off'} for contexts over ${tokens(settings.bigTokens)} tokens. Alerts: ${settings.alerts ? 'on' : 'off'}.`)
+  lines.push(`Cold-send guard: ${settings.guard ? 'on' : 'off'} for contexts over ${tokens(settings.bigTokens)} tokens (asks you; a message from anyone else compacts first). Alerts: ${settings.alerts ? 'on' : 'off'}.`)
   lines.push(`Auto keep warm: ${settings.autoWarmHours ? `on, until ${settings.autoWarmHours}h after the last turn, for contexts over ${tokens(settings.bigTokens)}${S.autoWarm ? '' : ' (off in this session)'}` : 'off'}.`)
   lines.push(`Settings: /${names.cache} ttl 5|60|auto, /${names.cache} guard on|off, /${names.cache} big 150k, /${names.cache} alerts on|off, /${names.cache} autowarm 8|off. Board: /${names.board}.`)
   return lines.join('\n')
@@ -974,10 +990,20 @@ export function register(on, options = {}) {
     const isCold = rotated || (left !== null && left <= 0)
     // These run locally or start afresh: a cold cache costs them nothing
     const local = e.command && ['compact', 'clear', names.cache, names.keepwarm, names.board, names.handoff].includes(e.command.name)
-    if (!settings.guard || !fromUser || !isCold || local || justCompacted || S.ctx < settings.bigTokens || e.turnId) return next(e)
+    if (!settings.guard || !isCold || local || justCompacted || S.ctx < settings.bigTokens || e.turnId) return next(e)
     // an attachment's handle lives only while this submit is in flight: a resend after compacting would drop it
     const media = Array.isArray(e.attachments) && e.attachments.length > 0
     if (wake) return worthCompacting() && !media ? compactThenSend($, e, true) : next(e)
+    // Owner 2026-11-02: an idle chat woken cold by anything but the person at the prompt (another
+    // session's message, a task notification, a schedule, the desktop app's own turn) compacts
+    // first, with no dialog: nobody may be there to answer it. Not a plugin's own prompt (our
+    // resend included), not a slash command (a plugin can't resubmit one), not an attachment.
+    if (!fromUser) {
+      const kind = (e.origin && e.origin.kind) || 'none'
+      const skip = kind === 'plugin' ? 'plugin' : e.command ? 'slash' : media ? 'media' : !worthCompacting() ? 'floor' : now - compactTriedAt < 2 * MIN ? 'just-tried' : ''
+      await coldLog($, { origin: kind, coldMin: Math.round((rotated ? now - S.seatChangedAt : -left) / MIN), action: skip ? 'skip-' + skip : 'compact-first' })
+      return skip ? next(e) : compactThenSend($, e, true)
+    }
     const cost = money(rewriteCost(S.ctx, S.model, ttl))
     const why = rotated ? `The account rotated to ${S.seat || 'another seat'} ${minutes(now - S.seatChangedAt)} ago, so the cache is cold.` : `Cache went cold ${minutes(-left)} ago.`
     const floor = S.floor ? ` Compacting last left ${tokens(S.floor)}.` : ''

@@ -17,7 +17,7 @@ function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unkno
     on('store.keys', () => ({ value: [...kept.keys()] }))
   } else mock.store(on)
   mock.env(on, { USERPROFILE: 'C:/Users/T' })
-  const seen = { compacts: 0, submits: [] as string[], asks: 0 }
+  const seen = { compacts: 0, submits: [] as string[], asks: 0, order: [] as string[] }
   on('session.id', () => ({ value: 'sid-test' }))
   on('session.cwd', () => ({ value: '/repo' }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
@@ -28,11 +28,11 @@ function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unkno
   on('fs.exists', (_: unknown, e: any) => ({ value: String(e.path ?? e).includes('.active') }))
   on('fs.read', () => ({ value: seat.label }))
   on('command.run', (_: unknown, e: any) => {
-    if (e.command === 'compact') seen.compacts++
+    if (e.command === 'compact') seen.compacts++, seen.order.push('compact')
     return { text: '' }
   })
   on('prompt.submit', (_: unknown, e: any) => {
-    if (e.origin?.kind === 'plugin') seen.submits.push(e.text)
+    if (e.origin?.kind === 'plugin') seen.submits.push(e.text), seen.order.push('send:' + e.text)
     return { text: e.text }
   })
   on('session.start', (_: unknown, e: any) => ({ cwd: e.cwd }))
@@ -354,4 +354,38 @@ test('a cold send that Claude Code auto-compacts still counts as a cold rewrite,
   await step(usage(oneHour(260000)))
   const rec = kept.get('last:sid-test') as { cold: unknown[] }
   expect(rec.cold.length).toBe(1)
+})
+
+// Owner 2026-11-02: a cold, big, idle chat woken by another session compacts BEFORE the message is processed
+const PEER = { kind: 'peer' } as never
+async function coldPeer($: any, on: any, idleMin: number, ctx = 300000) {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, null) // nobody is there to answer a dialog
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx, at: await clock.now(), model: 'claude-opus-5-5' })
+  await clock.advance(idleMin * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+  const r = await $.prompt.submit({ text: 'PR 12 merged; pick up the next one', origin: PEER, wait: false } as never)
+  await clock.advance(100)
+  return { r, seen }
+}
+
+test('a cold, large session woken by another session compacts before the message runs, with no dialog', async ($, on) => {
+  const { r, seen } = await coldPeer($, on, 77)
+  expect('drop' in (r as object)).toBe(true) // the message did not reach the model on the cold cache
+  expect(seen.asks).toBe(0)
+  expect(seen.order).toEqual(['compact', 'send:PR 12 merged; pick up the next one'])
+})
+
+test("a warm session takes another session's message as is", async ($, on) => {
+  const warm = await coldPeer($, on, 20)
+  expect('drop' in (warm.r as object)).toBe(false)
+  expect(warm.seen.compacts).toBe(0)
+})
+
+test("a small cold session takes another session's message as is", async ($, on) => {
+  const small = await coldPeer($, on, 77, 100000)
+  expect('drop' in (small.r as object)).toBe(false)
+  expect(small.seen.compacts).toBe(0)
 })
