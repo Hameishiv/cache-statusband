@@ -192,7 +192,7 @@ test('a 5-minute TTL from the API split shows no hint, even without a write', as
 })
 
 // A keep-warm ping that writes means the cache was already cold: on an assumed window, say how to set 5
-for (const [ttl, hint] of [['', true], ['ttl 60', false], ['measured', false]] as const) {
+for (const [ttl, hint] of [['', true], ['ttl 60', false], ['measured', false], ['5m split', false]] as const) {
   test(`a keep-warm ping that finds the cache cold ${hint ? 'names' : 'does not name'} /cache ttl 5 (${ttl || 'auto'})`, SETUP, async ($, on) => {
     const { clock, seen } = engine($, on)
     on('process.run', () => ({ value: { exitCode: 0, stdout: 'OPEN\n', stderr: '' } }))
@@ -200,7 +200,9 @@ for (const [ttl, hint] of [['', true], ['ttl 60', false], ['measured', false]] a
     on('turn.complete', () => ({ text: '' }))
     on('model.fork', () => ({ value: { text: 'ok', usage: usage({ cache_creation_input_tokens: 300000 }) } }))
     on('turn.step', async function* () {
-      return { answer: '', toolUses: [], usage: usage({ cache_read_input_tokens: 290000 }) }
+      // '5m split': the API reports a 5-minute TTL with no write, so the window is 5 but not assumed
+      const split = ttl === '5m split' ? { cache_creation: { ephemeral_5m_input_tokens: 1 } } : {}
+      return { answer: '', toolUses: [], usage: usage({ cache_read_input_tokens: 290000, ...split }) }
     })
     await start($, 300000, clock)
     if (ttl === 'ttl 60') await $.command.run({ command: 'cache', args: ttl })
