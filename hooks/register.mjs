@@ -835,7 +835,7 @@ function statusText() {
   const st = cacheState(myHeartbeat())
   const ttl = ttlMin()
   const lines = []
-  lines.push(`Cache Keeper: ${tokens(S.ctx)} tokens in context on ${priceFor(S.model).id}, cache window ${ttl} min (${settings.ttlMin ? 'set by you' : S.ttlSource}).`)
+  lines.push(`Cache Keeper: ${tokens(S.ctx)} tokens in context on ${priceFor(S.model).id}, cache window ${ttl} min (${settings.ttlMin ? 'set by you' : S.ttlSource === 'default' ? `assumed; on the 5-minute API cache run /${names.cache} ttl 5` : S.ttlSource}).`)
   if (st.kind === 'unknown') lines.push('No request yet this session, so the cache state is unknown.')
   if (st.kind === 'warm' || st.kind === 'cooling') lines.push(`Cache is warm for about ${minutes(st.left)} more.`)
   if (st.kind === 'cold') lines.push(`Cache went cold ${minutes(-st.left)} ago. The next message rewrites it for about ${money(rewriteCost(S.ctx, S.model, ttl))}.`)
@@ -1023,7 +1023,8 @@ export function register(on, options = {}) {
     S.model = u.model || S.model
     const afterCompact = justCompacted
     justCompacted = false
-    // The API names the TTL each write used: that beats any guess from idle gaps
+    // The API names the TTL each write used, when the usage carries that split. The engine's turn
+    // usage does not today, so without /cache ttl the window stays on its 60-minute default
     const split = u.cache_creation
     if (split && !settings.ttlMin) {
       if ((split.ephemeral_1h_input_tokens || 0) > 0) S.ttlMin = 60

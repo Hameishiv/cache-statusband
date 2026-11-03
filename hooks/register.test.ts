@@ -124,7 +124,7 @@ test('no compact prompt right after a compaction, nor for /compact itself', asyn
 
 const usage = (o: Record<string, unknown>) => ({ input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, model: 'claude-opus-5-5', ...o })
 
-test('the TTL comes from the API report, so a rewrite after 20 idle minutes stays on 1 hour', async ($, on) => {
+test('the TTL comes from the API report: a 1-hour write reported after 20 idle minutes stays on 1 hour', async ($, on) => {
   const { clock } = engine($, on)
   let next: unknown = null
   on('turn.step', async function* () {
@@ -148,7 +148,7 @@ test('the TTL comes from the API report, so a rewrite after 20 idle minutes stay
 })
 
 // The real engine's usage has no cache_creation split: the idle gap alone must not drop to 5
-test('a rewrite after 20 idle minutes with no TTL report stays on 1 hour', async ($, on) => {
+test('a rewrite after 6 idle minutes with no TTL report stays on 1 hour', async ($, on) => {
   const { clock } = engine($, on)
   let next: unknown = null
   on('turn.step', async function* () {
@@ -164,10 +164,10 @@ test('a rewrite after 20 idle minutes with no TTL report stays on 1 hour', async
     else await it
   }
   await step(usage({ cache_read_input_tokens: 290000, cache_creation_input_tokens: 0 }))
-  await clock.advance(20 * 60000)
+  await clock.advance(6 * 60000)
   await step(usage({ cache_creation_input_tokens: 290000 }))
   const r: any = await $.command.run({ command: 'cache', args: '' })
-  expect(r.text).toMatch(/cache window 60 min/)
+  expect(r.text).toMatch(/cache window 60 min \(assumed; on the 5-minute API cache run \/cache ttl 5\)/)
 })
 
 test('auto keep warm starts at turn end and stops once the merge-pr PR merges', SETUP, async ($, on) => {
