@@ -777,7 +777,8 @@ async function keepWarmStep($) {
   S.pingUsd += requestCost(u, S.model, ttl)
   // A ping that writes instead of reading did not hit the cache: stop paying for it
   if ((u.cache_creation_input_tokens || 0) > 0.1 * Math.max(1, u.cache_read_input_tokens || 0)) {
-    return stopKeepWarm($, `the ping wrote ${tokens(u.cache_creation_input_tokens)} tokens instead of reading the cache`)
+    const hint = !settings.ttlMin && S.ttlSource === 'default' ? `; on the 5-minute API cache run /${names.cache} ttl 5` : ''
+    return stopKeepWarm($, `the ping wrote ${tokens(u.cache_creation_input_tokens)} tokens instead of reading the cache${hint}`)
   }
   S.lastActivity = now
   await rememberLast($)
