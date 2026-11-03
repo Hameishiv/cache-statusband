@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { configuredSeatIdentity } from "./settings.mjs";
 
@@ -22,26 +22,34 @@ export async function getUsageSnapshot({
   await mkdir(dataDir, { recursive: true });
 
   const identity = suppliedIdentity === undefined
-    ? await configuredSeatIdentity(codexHome, env)
+    ? await captureUsageIdentity(codexHome, { env })
     : suppliedIdentity;
+  // A seat is a display label, not proof of which account the client will use.
+  const expectedEmail = identity?.key?.startsWith("account:") ? safeEmail(identity.key.slice(8)) : null;
+  if (!expectedEmail || identity?.unavailable) return present(null, "identity-unavailable");
   const suffix = cacheSuffix(identity);
   const cachePath = join(dataDir, `rate-limits${suffix}.json`);
   const lockPath = join(dataDir, `rate-limits${suffix}.lock`);
   const legacyPath = join(dataDir, "rate-limits.json");
   let aligned = alignCache(await readScopedCache(cachePath, legacyPath, identity), identity);
   let cached = aligned.cache;
-  if (fresh(cached, now)) return present(cached, aligned.mismatch ? "identity-changed" : "cache");
+  if (fresh(cached, now) && !cached?.migrateSeatDeadline) return present(cached, aligned.mismatch ? "identity-changed" : "cache");
 
   const lock = await acquireLock(lockPath, now);
   if (!lock) return present(cached, aligned.mismatch ? "identity-changed" : "cache-busy");
   try {
     aligned = alignCache(await readScopedCache(cachePath, legacyPath, identity), identity);
     cached = aligned.cache;
-    if (fresh(cached, now)) return present(cached, aligned.mismatch ? "identity-changed" : "cache");
+    if (fresh(cached, now)) {
+      const { migrateSeatDeadline, ...saved } = cached;
+      if (migrateSeatDeadline) await writeCache(cachePath, saved);
+      return present(saved, aligned.mismatch ? "identity-changed" : "cache");
+    }
 
     const attempted = {
       ...emptyCache(),
       ...cached,
+      migrateSeatDeadline: undefined,
       identityKey: identity?.key ?? cached?.identityKey ?? null,
       attemptedAt: now,
       nextAllowedAt: now + MIN_POLL_INTERVAL_MS,
@@ -51,7 +59,7 @@ export async function getUsageSnapshot({
     try {
       const raw = await fetcher({ codexHome, env });
       const safe = sanitizeRateLimits(raw);
-      if (identity?.key?.startsWith("account:") && safe.accountEmail && safe.accountEmail !== identity.label) {
+      if (safe.accountEmail !== expectedEmail) {
         throw new Error("Codex account changed during the usage read");
       }
       const saved = {
@@ -85,11 +93,12 @@ export async function captureUsageIdentity(codexHome, {
   accountReader = readAccountViaAppServer,
 } = {}) {
   const seat = await configuredSeatIdentity(codexHome, env);
-  if (seat) return seat;
   try {
     const account = await accountReader({ codexHome, env });
     const email = safeEmail(account?.email);
-    return email ? { key: `account:${email}`, label: email, unavailable: false } : null;
+    const seatAfter = await configuredSeatIdentity(codexHome, env);
+    if (seat?.key !== seatAfter?.key) return null;
+    return email ? { key: `account:${email}`, label: seat?.label ?? email, unavailable: false } : null;
   } catch {
     return null;
   }
@@ -144,7 +153,7 @@ export async function readAccountViaAppServer({
     send({
       method: "initialize",
       id: 1,
-      params: { clientInfo: { name: "cache_statusband_codex", title: "Cache Statusband Codex", version: "0.4.0" } },
+      params: { clientInfo: { name: "cache_statusband_codex", title: "Cache Statusband Codex", version: "0.4.1" } },
     });
     send({ method: "initialized", params: {} });
     send({ method: "account/read", id: 2, params: { refreshToken: false } });
@@ -224,7 +233,7 @@ export async function fetchRateLimitsViaAppServer({
     send({
       method: "initialize",
       id: 1,
-      params: { clientInfo: { name: "cache_statusband_codex", title: "Cache Statusband Codex", version: "0.4.0" } },
+      params: { clientInfo: { name: "cache_statusband_codex", title: "Cache Statusband Codex", version: "0.4.1" } },
     });
     send({ method: "initialized", params: {} });
     send({ method: "account/read", id: 2, params: { refreshToken: false } });
@@ -336,7 +345,22 @@ async function readScopedCache(path, legacyPath, identity) {
   const scoped = await readCache(path);
   if (scoped || path === legacyPath) return scoped;
   const legacy = await readCache(legacyPath);
-  return legacy?.identityKey === identity?.key ? legacy : null;
+  if (legacy?.identityKey === identity?.key) return legacy;
+  if (!identity?.label?.startsWith("Seat ")) return null;
+  const oldIdentity = { key: `seat:${identity.label.slice(5)}` };
+  const oldPath = join(dirname(path), `rate-limits${cacheSuffix(oldIdentity)}.json`);
+  const old = await readCache(oldPath);
+  if (old?.identityKey !== oldIdentity.key) return null;
+  // Earlier versions keyed by seat. Preserve their backoff on upgrade, but their
+  // readings were not bound to an account and must never be migrated as facts.
+  return {
+    ...emptyCache(),
+    identityKey: identity.key,
+    attemptedAt: old.attemptedAt,
+    nextAllowedAt: old.nextAllowedAt,
+    lastErrorAt: old.lastErrorAt,
+    migrateSeatDeadline: true,
+  };
 }
 
 function cacheSuffix(identity) {

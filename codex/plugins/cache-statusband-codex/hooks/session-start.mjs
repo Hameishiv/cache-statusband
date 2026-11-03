@@ -3,7 +3,7 @@ import { pathToFileURL } from "node:url";
 import { formatUsageLines } from "../src/format.mjs";
 import { defaultCodexHome, parseRollout } from "../src/rollouts.mjs";
 import { resumeMessage } from "../src/resume.mjs";
-import { loadSessionState, mergeSavedContext } from "../src/session-state.mjs";
+import { getSessionIdentity, loadSessionState, mergeSavedContext } from "../src/session-state.mjs";
 import { usagePresentation } from "../src/settings.mjs";
 import { captureUsageIdentity, getUsageSnapshot } from "../src/usage.mjs";
 
@@ -33,7 +33,10 @@ export async function handleSessionStart(input, {
   } catch {}
   try {
     if (!home) throw new Error("CODEX_HOME is unavailable");
-    const identity = await identityGetter(home);
+    // Earlier versions did not retain the original login. Today's login cannot
+    // establish a resumed session's historical identity when its record is absent.
+    const capture = source === "resume" ? async () => null : identityGetter;
+    const identity = await getSessionIdentity(home, input.session_id, capture);
     const usage = await usageGetter({ codexHome: home, now, identity });
     const presented = await usagePresentation(usage, { codexHome: home, identity });
     if (Number.isFinite(presented.snapshot.availableCount)) messages.push(formatUsageLines(presented.snapshot, now)[0]);

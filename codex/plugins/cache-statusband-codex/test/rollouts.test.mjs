@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { handleSessionStart } from "../hooks/session-start.mjs";
 import { handleStop } from "../hooks/stop.mjs";
 import { parseRollout, scanSessions } from "../src/rollouts.mjs";
-import { loadSessionState, saveSessionState } from "../src/session-state.mjs";
+import { getSessionIdentity, loadSessionState, saveSessionState } from "../src/session-state.mjs";
 
 const FIXTURE = [
   { timestamp: "2026-10-29T12:00:00.000Z", type: "session_meta", payload: { id: "session-1", timestamp: "2026-10-29T12:00:00.000Z", cwd: "/workspace/example", source: "cli", context_window: 200000 } },
@@ -59,8 +59,9 @@ test("SessionStart hook returns a visible, truthful resume summary", async (t) =
   const path = join(root, "rollout.jsonl");
   await writeFixture(path);
   const testEmail = ["person", "example.invalid"].join("@");
+  await getSessionIdentity(root, "session-1", async () => ({ key: `account:${testEmail}`, label: testEmail, unavailable: false }));
   const output = await handleSessionStart(
-    { source: "resume", transcript_path: path },
+    { source: "resume", session_id: "session-1", transcript_path: path },
     {
       codexHome: root,
       now: Date.parse("2026-10-29T12:04:00.000Z"),
@@ -116,6 +117,73 @@ test("an older Stop result cannot replace a newer saved context snapshot", async
   assert.equal(await saveSessionState(root, "session-1", newer), true);
   assert.equal(await saveSessionState(root, "session-1", older), false);
   assert.equal((await loadSessionState(root, "session-1")).contextUsed, 50000);
+});
+
+test("resuming a session retains its starting identity after account rotation", async (t) => {
+  const root = await fixtureRoot(t);
+  const path = join(root, "rollout.jsonl");
+  await writeFixture(path);
+  const email = ["initial", "example.invalid"].join("@");
+  const original = { key: `account:${email}`, label: ["Seat", "fixture-start"].join(" "), unavailable: false };
+  let captures = 0;
+  const options = {
+    codexHome: root,
+    identityGetter: async () => { captures += 1; return original; },
+    usageGetter: async ({ identity }) => {
+      assert.deepEqual(identity, original);
+      return { identityKey: original.key, accountEmail: email, availableCount: 2 };
+    },
+  };
+  const startup = await handleSessionStart({ source: "startup", session_id: "stable-session", transcript_path: path }, options);
+  const resumed = await handleSessionStart({ source: "resume", session_id: "stable-session", transcript_path: path }, {
+    ...options,
+    identityGetter: async () => { throw new Error("must not recapture a resumed account"); },
+  });
+  assert.ok(startup.systemMessage.includes(original.label));
+  assert.ok(resumed.systemMessage.includes(original.label));
+  assert.match(resumed.systemMessage, /Banked resets: 2/);
+  assert.equal(captures, 1);
+  const files = await readdir(join(root, "cache-statusband-codex", "sessions"));
+  const record = JSON.parse(await readFile(join(root, "cache-statusband-codex", "sessions", files.find((file) => file.endsWith(".identity.json"))), "utf8"));
+  assert.deepEqual(record, { version: 1, identity: original });
+});
+
+test("concurrent session starts publish only one complete starting identity", async (t) => {
+  const root = await fixtureRoot(t);
+  const identity = (name) => {
+    const email = [name, "example.invalid"].join("@");
+    return { key: `account:${email}`, label: email, unavailable: false };
+  };
+  const first = identity("first");
+  const second = identity("second");
+  const results = await Promise.all([
+    getSessionIdentity(root, "shared-session", async () => first),
+    getSessionIdentity(root, "shared-session", async () => second),
+  ]);
+  assert.deepEqual(results[0], results[1]);
+  assert.ok([first.key, second.key].includes(results[0].key));
+  assert.deepEqual(await getSessionIdentity(root, "shared-session", async () => { throw new Error("must not recapture"); }), results[0]);
+});
+
+test("an unknown starting identity remains unknown rather than adopting a later login", async (t) => {
+  const root = await fixtureRoot(t);
+  assert.equal(await getSessionIdentity(root, "unknown-session", async () => null), null);
+  assert.equal(await getSessionIdentity(root, "unknown-session", async () => { throw new Error("must not adopt a new login"); }), null);
+});
+
+test("a legacy resumed session without identity state does not adopt today's login", async (t) => {
+  const root = await fixtureRoot(t);
+  const output = await handleSessionStart({ source: "resume", session_id: "legacy-session", transcript_path: "missing.jsonl" }, {
+    codexHome: root,
+    identityGetter: async () => { throw new Error("cannot infer a historical login"); },
+    rolloutParser: async () => null,
+    usageGetter: async ({ identity }) => {
+      assert.equal(identity, null);
+      return { availableCount: null };
+    },
+  });
+  assert.deepEqual(output, {});
+  assert.equal(await getSessionIdentity(root, "legacy-session", async () => { throw new Error("must remain unknown"); }), null);
 });
 
 async function fixtureRoot(t) {

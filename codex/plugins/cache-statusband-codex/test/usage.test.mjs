@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -17,6 +18,8 @@ import {
 } from "../src/usage.mjs";
 
 const TEST_EMAIL = ["person", "example.invalid"].join("@");
+const OTHER_EMAIL = ["other", "example.invalid"].join("@");
+const ACCOUNT_IDENTITY = { key: `account:${TEST_EMAIL}`, label: TEST_EMAIL, unavailable: false };
 const SEAT_PREFIX = ["S", "eat"].join("");
 const FIRST_SEAT = ["fixture", "one"].join("-");
 const SECOND_SEAT = ["fixture", "two"].join("-");
@@ -47,16 +50,17 @@ test("shares one rate-limit read for at least five minutes", async (t) => {
   const now = Date.parse("2026-10-29T12:00:00.000Z");
   let calls = 0;
   const fetcher = async () => { calls += 1; return RAW; };
-  const first = await getUsageSnapshot({ codexHome: root, now, fetcher });
-  const second = await getUsageSnapshot({ codexHome: root, now: now + MIN_POLL_INTERVAL_MS - 1, fetcher });
+  const first = await getUsageSnapshot({ codexHome: root, now, fetcher, identity: ACCOUNT_IDENTITY });
+  const second = await getUsageSnapshot({ codexHome: root, now: now + MIN_POLL_INTERVAL_MS - 1, fetcher, identity: ACCOUNT_IDENTITY });
   assert.equal(first.source, "live");
   assert.equal(second.source, "cache");
   assert.equal(second.availableCount, 2);
   assert.equal(calls, 1);
-  const stored = await readFile(join(root, "cache-statusband-codex", "rate-limits.json"), "utf8");
+  const cacheName = `rate-limits-${createHash("sha256").update(ACCOUNT_IDENTITY.key).digest("hex").slice(0, 16)}.json`;
+  const stored = await readFile(join(root, "cache-statusband-codex", cacheName), "utf8");
   assert.match(stored, new RegExp(TEST_EMAIL.replace(".", "\\.")));
   assert.doesNotMatch(stored, /RateLimitResetCredit|account-id|fixture-private-value/);
-  await assert.rejects(access(join(root, "cache-statusband-codex", "rate-limits.json.tmp")));
+  await assert.rejects(access(join(root, "cache-statusband-codex", `${cacheName}.tmp`)));
 });
 
 test("honors a Retry-After longer than the five-minute floor", async (t) => {
@@ -69,8 +73,8 @@ test("honors a Retry-After longer than the five-minute floor", async (t) => {
     error.rpcData = { retry_after: 900 };
     throw error;
   };
-  const first = await getUsageSnapshot({ codexHome: root, now, fetcher });
-  const second = await getUsageSnapshot({ codexHome: root, now: now + 10 * 60_000, fetcher });
+  const first = await getUsageSnapshot({ codexHome: root, now, fetcher, identity: ACCOUNT_IDENTITY });
+  const second = await getUsageSnapshot({ codexHome: root, now: now + 10 * 60_000, fetcher, identity: ACCOUNT_IDENTITY });
   assert.equal(first.nextAllowedAt, now + 15 * 60_000);
   assert.equal(second.source, "cache");
   assert.equal(calls, 1);
@@ -81,7 +85,7 @@ test("honors a Retry-After longer than the five-minute floor", async (t) => {
 test("caps Retry-After at one hour and keeps the last good reading", async (t) => {
   const root = await fixtureRoot(t);
   const now = Date.parse("2026-10-29T12:00:00.000Z");
-  const identity = { key: `seat:${FIRST_SEAT}`, label: `${SEAT_PREFIX} ${FIRST_SEAT}`, unavailable: false };
+  const identity = { ...ACCOUNT_IDENTITY, label: `${SEAT_PREFIX} ${FIRST_SEAT}` };
   const good = await getUsageSnapshot({ codexHome: root, now, identity, fetcher: async () => RAW });
   const failed = await getUsageSnapshot({
     codexHome: root,
@@ -127,37 +131,107 @@ test("keeps usage polling and presentation scoped to the captured seat", async (
   );
   const now = Date.parse("2026-10-29T12:00:00.000Z");
   let calls = 0;
-  const fetcher = async () => { calls += 1; return RAW; };
+  let currentEmail = TEST_EMAIL;
+  const accountReader = async () => ({ email: currentEmail });
+  const fetcher = async () => { calls += 1; return { ...RAW, account: { email: currentEmail } }; };
 
-  const firstIdentity = await captureUsageIdentity(root, { env: {} });
+  const firstIdentity = await captureUsageIdentity(root, { env: {}, accountReader });
   const first = await getUsageSnapshot({ codexHome: root, now, fetcher, env: {}, identity: firstIdentity });
-  assert.equal(first.identityKey, `seat:${FIRST_SEAT}`);
+  assert.equal(first.identityKey, `account:${TEST_EMAIL}`);
   assert.equal(first.availableCount, 2);
   await writeFile(seatPath, `${SECOND_SEAT}\n`, "utf8");
+  currentEmail = OTHER_EMAIL;
 
   const firstPresented = await usagePresentation(first, { codexHome: root, env: {}, identity: firstIdentity });
   assert.equal(firstPresented.identity, `${SEAT_PREFIX} ${FIRST_SEAT}`);
   assert.equal(firstPresented.snapshot.primary.usedPercent, 70);
   assert.equal(calls, 1);
 
-  const secondIdentity = await captureUsageIdentity(root, { env: {} });
+  const secondIdentity = await captureUsageIdentity(root, { env: {}, accountReader });
   const second = await getUsageSnapshot({ codexHome: root, now: now + 1_000, fetcher, env: {}, identity: secondIdentity });
   assert.equal(second.source, "live");
-  assert.equal(second.identityKey, `seat:${SECOND_SEAT}`);
+  assert.equal(second.identityKey, `account:${OTHER_EMAIL}`);
   assert.equal(second.availableCount, 2);
   assert.equal(calls, 2);
 
   await writeFile(seatPath, `${FIRST_SEAT}\n`, "utf8");
+  currentEmail = TEST_EMAIL;
   const backToFirst = await getUsageSnapshot({
     codexHome: root,
     now: now + 2_000,
     fetcher,
     env: {},
-    identity: await captureUsageIdentity(root, { env: {} }),
+    identity: await captureUsageIdentity(root, { env: {}, accountReader }),
   });
   assert.equal(backToFirst.source, "cache");
-  assert.equal(backToFirst.identityKey, `seat:${FIRST_SEAT}`);
+  assert.equal(backToFirst.identityKey, `account:${TEST_EMAIL}`);
   assert.equal(calls, 2);
+});
+
+test("rotation after seat capture cannot replace the original account's usage", async (t) => {
+  const root = await fixtureRoot(t);
+  const now = Date.parse("2026-10-29T12:00:00.000Z");
+  const identity = { ...ACCOUNT_IDENTITY, label: `${SEAT_PREFIX} ${FIRST_SEAT}` };
+  await getUsageSnapshot({ codexHome: root, now, identity, fetcher: async () => RAW });
+  const wrongAccount = { ...RAW, account: { email: OTHER_EMAIL }, rateLimitResetCredits: { availableCount: 6 }, rateLimits: { primary: { usedPercent: 91 } } };
+  let calls = 0;
+  const fetcher = async () => { calls += 1; return wrongAccount; };
+  const rejected = await getUsageSnapshot({ codexHome: root, now: now + MIN_POLL_INTERVAL_MS, identity, fetcher });
+  assert.equal(rejected.source, "stale");
+  assert.equal(rejected.accountEmail, TEST_EMAIL);
+  assert.equal(rejected.availableCount, 2);
+  assert.equal(rejected.primary.usedPercent, 70);
+  assert.equal(rejected.fetchedAt, now);
+  const shared = await getUsageSnapshot({ codexHome: root, now: now + MIN_POLL_INTERVAL_MS + 1, identity: ACCOUNT_IDENTITY, fetcher });
+  assert.equal(shared.source, "cache");
+  assert.equal(shared.availableCount, 2);
+  assert.equal(calls, 1);
+});
+
+test("unverifiable accounts cannot authorize a poll or a blank replacement", async (t) => {
+  const root = await fixtureRoot(t);
+  const now = Date.parse("2026-10-29T12:00:00.000Z");
+  const unavailable = await getUsageSnapshot({ codexHome: root, now, identity: null, fetcher: async () => { throw new Error("must not poll"); } });
+  assert.equal(unavailable.source, "identity-unavailable");
+  assert.equal(unavailable.availableCount, null);
+  await getUsageSnapshot({ codexHome: root, now, identity: ACCOUNT_IDENTITY, fetcher: async () => RAW });
+  const missingEmail = await getUsageSnapshot({ codexHome: root, now: now + MIN_POLL_INTERVAL_MS, identity: ACCOUNT_IDENTITY, fetcher: async () => ({ ...RAW, account: null }) });
+  assert.equal(missingEmail.source, "stale");
+  assert.equal(missingEmail.availableCount, 2);
+});
+
+test("seat rotation during identity capture yields no guessed account binding", async (t) => {
+  const root = await fixtureRoot(t);
+  const seatPath = join(root, "seat.txt");
+  await writeFile(seatPath, FIRST_SEAT);
+  const identity = await captureUsageIdentity(root, {
+    env: { CACHE_STATUSBAND_CODEX_SEAT_FILE: seatPath },
+    accountReader: async () => {
+      await writeFile(seatPath, SECOND_SEAT);
+      return { email: OTHER_EMAIL };
+    },
+  });
+  assert.equal(identity, null);
+});
+
+test("upgrading a seat-keyed cache preserves its deadline but discards unverified readings", async (t) => {
+  const root = await fixtureRoot(t);
+  const now = Date.parse("2026-10-29T12:00:00.000Z");
+  const oldKey = `seat:${FIRST_SEAT}`;
+  const dataDir = join(root, "cache-statusband-codex");
+  await mkdir(dataDir, { recursive: true });
+  const name = `rate-limits-${createHash("sha256").update(oldKey).digest("hex").slice(0, 16)}.json`;
+  await writeFile(join(dataDir, name), JSON.stringify({ version: 3, identityKey: oldKey, accountEmail: OTHER_EMAIL, availableCount: 6, nextAllowedAt: now + MIN_POLL_INTERVAL_MS }));
+  const identity = { ...ACCOUNT_IDENTITY, label: `${SEAT_PREFIX} ${FIRST_SEAT}` };
+  const snapshot = await getUsageSnapshot({ codexHome: root, now, identity, fetcher: async () => { throw new Error("must not poll before old deadline"); } });
+  assert.equal(snapshot.source, "cache");
+  assert.equal(snapshot.availableCount, null);
+  assert.equal(snapshot.accountEmail, null);
+  assert.equal(snapshot.nextAllowedAt, now + MIN_POLL_INTERVAL_MS);
+  const alias = { ...ACCOUNT_IDENTITY, label: `${SEAT_PREFIX} ${SECOND_SEAT}` };
+  const shared = await getUsageSnapshot({ codexHome: root, now: now + 1, identity: alias, fetcher: async () => { throw new Error("must share migrated deadline"); } });
+  assert.equal(shared.source, "cache");
+  assert.equal(shared.nextAllowedAt, snapshot.nextAllowedAt);
 });
 
 test("captures the account identity once when no seat file is configured", async (t) => {
