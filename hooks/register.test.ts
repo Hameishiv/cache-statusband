@@ -402,9 +402,38 @@ test('a cold compact that went through is logged as compacted', async ($, on) =>
 })
 
 test("a warm session takes another session's message as is", async ($, on) => {
-  const warm = await coldPeer($, on, 20)
-  expect('drop' in (warm.r as object)).toBe(false)
-  expect(warm.seen.compacts).toBe(0)
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  on('turn.step', async function* () {
+    return { answer: '', toolUses: [], usage: usage({ cache_read_input_tokens: 300000 }) }
+  })
+  on('session.usage', () => ({ value: {} }))
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+  await clock.advance(2 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+  // a reply in this process: its cache is this process's own, and warm
+  const it = ($ as any).turn.step({ model: 'claude-opus-5-5', messages: [] })
+  if (it && typeof it[Symbol.asyncIterator] === 'function') for await (const _ of it) void _
+  else await it
+  await clock.advance(20 * 60000)
+  const r = await $.prompt.submit({ text: 'PR 12 merged; pick up the next one', origin: PEER, wait: false } as never)
+  expect('drop' in (r as object)).toBe(false)
+  expect(seen.compacts).toBe(0)
+})
+
+// Owner 2026-11-03 ("no longer prompting to compact on cold cache starts"): a reopened chat
+// misses its cache inside the hour too, so the guard asks before its first send
+test('a big chat reopened inside the hour asks before its first send', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, 'Send anyway')
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 260000, at: await clock.now(), model: 'claude-opus-5-5' })
+  await clock.advance(31 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+  await $.prompt.submit({ text: 'Try again', origin: COMPOSER, wait: false } as never)
+  expect(seen.asks).toBe(1)
 })
 
 test("a small cold session takes another session's message as is", async ($, on) => {

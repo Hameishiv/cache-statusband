@@ -45,6 +45,7 @@ const S = {
   rateLimits: [],
   seat: '', // the signed-in account label the rotator last wrote
   seatChangedAt: 0, // when that label last changed: the new account's cache is empty
+  reopenedAt: 0, // when this process picked the chat up from its record: a reopened chat's cache is gone
   floor: 0, // context size right after the last compaction: what compacting can't shrink
   autoWarm: true, // false once keep warm is turned off by hand in this session
   pr: 0, // a merge-pr session's PR: keep warm stops once it merges or closes
@@ -251,6 +252,13 @@ function rotatedCold() {
   return S.seatChangedAt > S.lastActivity
 }
 
+// A chat reopened in a new process misses its cache whatever the clock says (45 of 48 reopens
+// measured 2026-11-03, inside the hour too: the new process's system prompt differs). Its first
+// request settles it.
+function reopenedCold() {
+  return !!S.lastActivity && S.reopenedAt > S.lastActivity
+}
+
 // A /compact the compactor refuses still returns, its output line saying so ("Not compacted · fast-jev: below 5% minimum")
 const REFUSED = /\bnot compacted\b/i
 const refused = (r) => REFUSED.test(String((r && r.text) || ''))
@@ -259,7 +267,7 @@ const refused = (r) => REFUSED.test(String((r && r.text) || ''))
 function markCompacted() {
   // a compaction of a cold cache (Claude Code auto-compacts a big chat as it is sent) still pays a rewrite
   const left = msLeft(S.lastActivity, ttlMin())
-  compactedCold = compactedCold || (left !== null && left <= 0) || rotatedCold()
+  compactedCold = compactedCold || (left !== null && left <= 0) || rotatedCold() || reopenedCold()
   justCompacted = true
   S.lastActivity = 0
 }
@@ -474,8 +482,9 @@ function myHeartbeat() {
     window: S.window,
     ttlMin: ttlMin(),
     lastActivity: S.lastActivity,
-    rotated: rotatedCold(),
-    seatChangedAt: S.seatChangedAt,
+    rotated: rotatedCold() || reopenedCold(),
+    // cacheState reads this as when the cache went cold
+    seatChangedAt: rotatedCold() || !reopenedCold() ? S.seatChangedAt : S.reopenedAt,
     keepWarm: S.keepWarm,
     keepWarmUntil: S.keepWarmUntil,
     pings: S.pings,
@@ -694,6 +703,7 @@ async function seedFromTranscript($, path) {
     markCompacted()
   } else {
     S.lastActivity = found.at // the cache's real age: the band and the cold-send guard read it
+    S.reopenedAt = await $.clock.now()
   }
   $.ui.invalidate('ui.render')
 }
@@ -785,7 +795,7 @@ async function keepWarmStep($) {
     }
   }
   // After a rotation a ping would pay the whole rewrite: leave that to the next real turn
-  if (S.working || !S.lastActivity || rotatedCold()) return
+  if (S.working || !S.lastActivity || rotatedCold() || reopenedCold()) return
   const ttl = ttlMin()
   const margin = ttl >= 60 ? 8 * MIN : 90000
   if (now - S.lastActivity < ttl * MIN - margin) return
@@ -867,6 +877,7 @@ function statusText() {
   if (st.kind === 'warm' || st.kind === 'cooling') lines.push(`Cache is warm for about ${minutes(st.left)} more.`)
   if (st.kind === 'cold') lines.push(`Cache went cold ${minutes(-st.left)} ago. The next message rewrites it for about ${money(rewriteCost(S.ctx, S.model, ttl))}.`)
   if (rotatedCold()) lines.push(`The account rotated ${minutes(now - S.seatChangedAt)} ago (now ${S.seat}), so the cache is cold.`)
+  if (reopenedCold()) lines.push('This chat was reopened, so its cache is cold until the next message rewrites it.')
   if (S.keepWarm) lines.push(`Keep warm is on until ${clock(S.keepWarmUntil)}: ${S.pings} ping(s), ${money(S.pingUsd)} so far.`)
   if (S.rateLimits.length) lines.push(`Plan limits used: ${limitsText(S.rateLimits)}.`)
   lines.push(S.fable ? `Fable weekly: ${Math.round(S.fable.percentUsed)}% used.` : `Fable weekly: no reading yet${planWhy && planWhy !== 'ok' ? ` (last check: ${planWhy})` : ''}.`)
@@ -998,7 +1009,8 @@ export function register(on, options = {}) {
     const ttl = ttlMin()
     const left = msLeft(S.lastActivity, ttl)
     const rotated = rotatedCold()
-    const isCold = rotated || (left !== null && left <= 0)
+    const reopened = !rotated && reopenedCold()
+    const isCold = rotated || reopened || (left !== null && left <= 0)
     // These run locally or start afresh: a cold cache costs them nothing
     const local = e.command && ['compact', 'clear', names.cache, names.keepwarm, names.board, names.handoff].includes(e.command.name)
     if (!settings.guard || !isCold || local || justCompacted || S.ctx < settings.bigTokens || e.turnId) return next(e)
@@ -1012,11 +1024,11 @@ export function register(on, options = {}) {
     if (!fromUser) {
       const kind = (e.origin && e.origin.kind) || 'none'
       const skip = kind === 'plugin' ? 'plugin' : e.command ? 'slash' : media ? 'media' : !worthCompacting() ? 'floor' : now - compactTriedAt < 2 * MIN ? 'just-tried' : ''
-      await coldLog($, { origin: kind, coldMin: Math.round((rotated ? now - S.seatChangedAt : -left) / MIN), action: skip ? 'skip-' + skip : 'compact-first' })
+      await coldLog($, { origin: kind, coldMin: Math.round((rotated ? now - S.seatChangedAt : reopened ? now - S.lastActivity : -left) / MIN), ...(reopened ? { reopened: true } : {}), action: skip ? 'skip-' + skip : 'compact-first' })
       return skip ? next(e) : compactThenSend($, e, true)
     }
     const cost = money(rewriteCost(S.ctx, S.model, ttl))
-    const why = rotated ? `The account rotated to ${S.seat || 'another seat'} ${minutes(now - S.seatChangedAt)} ago, so the cache is cold.` : `Cache went cold ${minutes(-left)} ago.`
+    const why = rotated ? `The account rotated to ${S.seat || 'another seat'} ${minutes(now - S.seatChangedAt)} ago, so the cache is cold.` : reopened ? `This chat was reopened ${minutes(now - S.lastActivity)} after its last reply, and a reopened chat starts on a cold cache.` : `Cache went cold ${minutes(-left)} ago.`
     const floor = S.floor ? ` Compacting last left ${tokens(S.floor)}.` : ''
     let answer = 'Send anyway'
     try {
