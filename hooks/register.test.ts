@@ -42,10 +42,11 @@ function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unkno
 }
 
 // $.ui.ask reaches the engine as an AskUserQuestion tool call
-function answer(on: any, seen: { asks: number }, label: string | null) {
+function answer(on: any, seen: { asks: number; options?: string[] }, label: string | null) {
   on('tool.call', (_: unknown, e: any) => {
     if (e.tool !== 'AskUserQuestion') return { result: {} }
     seen.asks++
+    ;(seen as any).options = (e.questions?.[0]?.options ?? []).map((o: any) => o.label ?? o)
     if (label === null) throw new Error('asked')
     const q = e.questions?.[0]?.question ?? ''
     return { result: { questions: e.questions, answers: { [q]: label } } }
@@ -95,6 +96,8 @@ test('"Compact first, then send" really compacts, then sends the message', SETUP
   await clock.advance(100)
   expect(seen.compacts).toBe(1)
   expect(seen.submits).toEqual(['approve, B'])
+  // owner 2026-11-03: compacting is the dialog's first, preselected option
+  expect(seen.options[0]).toBe('Compact first, then send')
 })
 
 test('the rotator changing the seat file leaves a running chat alone: only its wake-up moves it', SETUP, async ($, on) => {

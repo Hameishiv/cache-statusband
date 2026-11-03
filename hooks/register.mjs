@@ -1011,7 +1011,8 @@ export function register(on, options = {}) {
     try {
       answer = await $.ui.ask(
         `${why} Sending now rewrites ${tokens(S.ctx)} tokens of context (about ${cost}).${floor}${media ? ' (Compacting first would drop the attachment: run /compact yourself, then send again.)' : ''} What should happen?`,
-        media ? ['Send anyway', 'Cancel'] : ['Send anyway', 'Compact first, then send', 'Cancel'],
+        // Owner 2026-11-03: compacting is the default, so it goes first (the dialog preselects it)
+        media ? ['Send anyway', 'Cancel'] : ['Compact first, then send', 'Send anyway', 'Cancel'],
       )
     } catch {
       // nobody to ask (a -p run, or the dialog was dismissed): send as typed
