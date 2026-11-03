@@ -192,7 +192,7 @@ test('a 5-minute TTL from the API split shows no hint, even without a write', as
 })
 
 // A keep-warm ping that writes means the cache was already cold: on an assumed window, say how to set 5
-for (const [ttl, hint] of [['', true], ['ttl 60', false]] as const) {
+for (const [ttl, hint] of [['', true], ['ttl 60', false], ['measured', false]] as const) {
   test(`a keep-warm ping that finds the cache cold ${hint ? 'names' : 'does not name'} /cache ttl 5 (${ttl || 'auto'})`, SETUP, async ($, on) => {
     const { clock, seen } = engine($, on)
     on('process.run', () => ({ value: { exitCode: 0, stdout: 'OPEN\n', stderr: '' } }))
@@ -203,10 +203,20 @@ for (const [ttl, hint] of [['', true], ['ttl 60', false]] as const) {
       return { answer: '', toolUses: [], usage: usage({ cache_read_input_tokens: 290000 }) }
     })
     await start($, 300000, clock)
-    if (ttl) await $.command.run({ command: 'cache', args: ttl })
-    const it = ($ as any).turn.step({ model: 'claude-opus-5-5', messages: [] })
-    if (it && typeof it[Symbol.asyncIterator] === 'function') for await (const _ of it) void _
-    else await it
+    if (ttl === 'ttl 60') await $.command.run({ command: 'cache', args: ttl })
+    const step = async () => {
+      const it = ($ as any).turn.step({ model: 'claude-opus-5-5', messages: [] })
+      if (it && typeof it[Symbol.asyncIterator] === 'function') for await (const _ of it) void _
+      else await it
+    }
+    await step()
+    if (ttl === 'measured') {
+      // a cache hit after 6 idle minutes measures the 1-hour TTL
+      await clock.advance(6 * 60000)
+      await step()
+      const r: any = await $.command.run({ command: 'cache', args: '' })
+      expect(r.text).toMatch(/cache window 60 min \(measured\)/)
+    }
     await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
     await clock.advance(53 * 60000)
     const stop = seen.toasts.find((t) => /Keep warm off/.test(t)) ?? ''
