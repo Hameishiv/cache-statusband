@@ -438,6 +438,38 @@ test('a big chat reopened inside the hour asks before its first send', async ($,
   expect(seen.asks).toBe(1)
 })
 
+test('a big prompt the guard lets through is logged with why', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  on('turn.step', async function* () {
+    return { answer: '', toolUses: [], usage: usage({ cache_read_input_tokens: 300000 }) }
+  })
+  on('session.usage', () => ({ value: {} }))
+  await clock.advance(60000)
+  await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+  const it = ($ as any).turn.step({ model: 'claude-opus-5-5', messages: [] })
+  if (it && typeof it[Symbol.asyncIterator] === 'function') for await (const _ of it) void _
+  else await it
+  await clock.advance(10 * 60000)
+  await $.prompt.submit({ text: 'next', origin: COMPOSER, wait: false } as never)
+  expect(seen.log).toContain('"event":"guard-pass"')
+  expect(seen.log).toContain('"isCold":false')
+  expect(seen.log).toContain('"idleMin":10')
+})
+
+test('the dialog answer is logged', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, 'Send anyway')
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 260000, at: await clock.now(), model: 'claude-opus-5-5' })
+  await clock.advance(31 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+  await $.prompt.submit({ text: 'Try again', origin: COMPOSER, wait: false } as never)
+  expect(seen.log).toContain('"event":"asked"')
+  expect(seen.log).toContain('"answer":"Send anyway"')
+})
+
 test("a small cold session takes another session's message as is", async ($, on) => {
   const small = await coldPeer($, on, 77, 100000)
   expect('drop' in (small.r as object)).toBe(false)

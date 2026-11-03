@@ -1013,7 +1013,11 @@ export function register(on, options = {}) {
     const isCold = rotated || reopened || (left !== null && left <= 0)
     // These run locally or start afresh: a cold cache costs them nothing
     const local = e.command && ['compact', 'clear', names.cache, names.keepwarm, names.board, names.handoff].includes(e.command.name)
-    if (!settings.guard || !isCold || local || justCompacted || S.ctx < settings.bigTokens || e.turnId) return next(e)
+    if (!settings.guard || !isCold || local || justCompacted || S.ctx < settings.bigTokens || e.turnId) {
+      // Why a big (or unmeasured) prompt went through unasked: the evidence for a cold send nobody was asked about
+      if (!e.turnId && (!S.ctx || S.ctx >= settings.bigTokens)) await coldLog($, { event: 'guard-pass', origin: (e.origin && e.origin.kind) || 'none', isCold, leftMin: left === null ? null : Math.round(left / MIN), idleMin: S.lastActivity ? Math.round((now - S.lastActivity) / MIN) : null, rotated, reopened, justCompacted, local: !!local, guard: settings.guard })
+      return next(e)
+    }
     // an attachment's handle lives only while this submit is in flight: a resend after compacting would drop it
     const media = Array.isArray(e.attachments) && e.attachments.length > 0
     if (wake) return worthCompacting() && !media ? compactThenSend($, e, true) : next(e)
@@ -1037,10 +1041,12 @@ export function register(on, options = {}) {
         // Owner 2026-11-03: compacting is the default, so it goes first (the dialog preselects it)
         media ? ['Send anyway', 'Cancel'] : ['Compact first, then send', 'Send anyway', 'Cancel'],
       )
-    } catch {
+    } catch (err) {
       // nobody to ask (a -p run, or the dialog was dismissed): send as typed
+      await coldLog($, { event: 'ask-failed', origin: e.origin.kind, error: String((err && err.message) || err).slice(0, 120) })
       return next(e)
     }
+    await coldLog($, { event: 'asked', origin: e.origin.kind, reopened, rotated, answer })
     // $.session.compact() is refused on SDK hosts (the desktop app), so this queues /compact
     if (answer === 'Compact first, then send') return compactThenSend($, e, false)
     if (answer === 'Send anyway') return next(e)
