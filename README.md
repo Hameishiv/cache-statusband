@@ -67,7 +67,7 @@ If you also have Nate Herk's `cache-keeper` installed, turn one of them off: the
 
 | Command | What it does |
 |---|---|
-| `/cache` | Status and settings: `ttl 5\|60\|auto` (`auto` assumes the 1-hour cache unless a request reports its TTL, and so do keep warm, the cold-send guard and the cost figures; on the 5-minute API cache set `ttl 5`), `guard on\|off`, `big 150k`, `alerts on\|off`, `autowarm 8\|off` |
+| `/cache` | Status and settings: `ttl 5\|60\|auto` (`auto` assumes the 1-hour cache unless a request reports its TTL, and so do keep warm, the cold-send guard and the cost figures; on the 5-minute API cache set `ttl 5`; like every `/cache` setting it applies to every session on this machine), `guard on\|off`, `big 150k`, `alerts on\|off`, `autowarm 8\|off` |
 | `/keepwarm [hours\|off]` | Keep this chat's cache warm (default 4 hours) |
 | `/board` | Every local Claude Code chat: state, context, cache, cost |
 | `/handoff [continue]` | Session handoff, then clear this chat and continue with it |

@@ -167,11 +167,28 @@ test('a rewrite after 6 idle minutes with no TTL report stays on 1 hour', async 
   await clock.advance(6 * 60000)
   await step(usage({ cache_creation_input_tokens: 290000 }))
   const r: any = await $.command.run({ command: 'cache', args: '' })
-  expect(r.text).toMatch(/cache window 60 min \(assumed; on the 5-minute API cache run \/cache ttl 5\)/)
+  expect(r.text).toMatch(/cache window 60 min \(assumed; on the 5-minute API cache run \/cache ttl 5, which sets every session\)/)
   await $.command.run({ command: 'cache', args: 'ttl 5' })
   const set: any = await $.command.run({ command: 'cache', args: '' })
   expect(set.text).toMatch(/cache window 5 min \(set by you\)/)
   expect(set.text).not.toMatch(/assumed/)
+})
+
+// A TTL the API reports as 5 minutes is not "assumed", so the status line names no setting
+test('a 5-minute TTL from the API split shows no hint, even without a write', async ($, on) => {
+  const { clock } = engine($, on)
+  on('turn.step', async function* () {
+    return { answer: '', toolUses: [], usage: usage({ cache_read_input_tokens: 290000, cache_creation: { ephemeral_5m_input_tokens: 1 } }) }
+  })
+  on('turn.complete', () => ({ text: '' }))
+  on('session.usage', () => ({ value: {} }))
+  await start($, 300000, clock)
+  const it = ($ as any).turn.step({ model: 'claude-opus-5-5', messages: [] })
+  if (it && typeof it[Symbol.asyncIterator] === 'function') for await (const _ of it) void _
+  else await it
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/cache window 5 min/)
+  expect(r.text).not.toMatch(/assumed|ttl 5,/)
 })
 
 // A keep-warm ping that writes means the cache was already cold: on an assumed window, say how to set 5
