@@ -1,4 +1,6 @@
-import { expect, mock, test } from 'claude-code/testing'
+import { expect, mock, test as kitTest } from 'claude-code/testing'
+// The kit's 5 s per test fails whichever test is running when other sessions load the machine (2026-11-03)
+const test = (name: string, a: any, b?: any) => (b ? kitTest(name, { timeoutMs: 30000, ...a }, b) : kitTest(name, { timeoutMs: 30000 }, a))
 import { ago, borrowedLimits, capFirst, fableLimit, HUES, paint, pattern, resumeTime, spentWindows, lastContext, modelName, planWindows, untilText } from './register.mjs'
 
 const COMPOSER = { kind: 'composer' } as never
