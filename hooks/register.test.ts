@@ -168,6 +168,10 @@ test('a rewrite after 6 idle minutes with no TTL report stays on 1 hour', async 
   await step(usage({ cache_creation_input_tokens: 290000 }))
   const r: any = await $.command.run({ command: 'cache', args: '' })
   expect(r.text).toMatch(/cache window 60 min \(assumed; on the 5-minute API cache run \/cache ttl 5\)/)
+  await $.command.run({ command: 'cache', args: 'ttl 5' })
+  const set: any = await $.command.run({ command: 'cache', args: '' })
+  expect(set.text).toMatch(/cache window 5 min \(set by you\)/)
+  expect(set.text).not.toMatch(/assumed/)
 })
 
 test('auto keep warm starts at turn end and stops once the merge-pr PR merges', SETUP, async ($, on) => {
