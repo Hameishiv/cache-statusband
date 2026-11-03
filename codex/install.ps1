@@ -149,14 +149,18 @@ if (-not (Test-Path -LiteralPath $pluginRoot -PathType Container)) {
   throw "Plugin folder not found: $pluginRoot"
 }
 
+function Set-StatusbandPreferences([string]$Text) {
+  $Text = Set-TomlKey -Text $Text -Section "features" -Key "hooks" -Value "true"
+  if (-not $KeepExistingFooter) {
+    $footer = '["model-with-reasoning", "context-remaining", "five-hour-limit", "weekly-limit", "estimated-thread-cost", "current-dir", "git-branch"]'
+    $Text = Set-TomlKey -Text $Text -Section "tui" -Key "status_line" -Value $footer
+    $Text = Set-TomlKey -Text $Text -Section "tui" -Key "status_line_use_colors" -Value "true"
+  }
+  return $Text
+}
 New-Item -ItemType Directory -Force -Path $CodexHome | Out-Null
 $configText = if (Test-Path -LiteralPath $configPath) { [IO.File]::ReadAllText($configPath) } else { "" }
-$configText = Set-TomlKey -Text $configText -Section "features" -Key "hooks" -Value "true"
-if (-not $KeepExistingFooter) {
-  $footer = '["model-with-reasoning", "context-remaining", "five-hour-limit", "weekly-limit", "estimated-thread-cost", "current-dir", "git-branch"]'
-  $configText = Set-TomlKey -Text $configText -Section "tui" -Key "status_line" -Value $footer
-  $configText = Set-TomlKey -Text $configText -Section "tui" -Key "status_line_use_colors" -Value "true"
-}
+$configText = Set-StatusbandPreferences -Text $configText
 Assert-CodexConfig -Text $configText -CodexCommand $codexCommand
 
 if (Test-Path -LiteralPath $configPath) {
@@ -177,6 +181,11 @@ try {
   $env:CODEX_HOME = $previousCodexHome
 }
 
+# Registration writes marketplace/plugin settings. Merge into its result rather
+# than overwriting those writes with the pre-registration configuration.
+$configText = if (Test-Path -LiteralPath $configPath) { [IO.File]::ReadAllText($configPath) } else { "" }
+$configText = Set-StatusbandPreferences -Text $configText
+Assert-CodexConfig -Text $configText -CodexCommand $codexCommand
 $configCandidate = Join-Path $CodexHome (".config.toml.cache-statusband-" + [guid]::NewGuid().ToString("N") + ".tmp")
 try {
   [IO.File]::WriteAllText($configCandidate, $configText, [Text.UTF8Encoding]::new($false))

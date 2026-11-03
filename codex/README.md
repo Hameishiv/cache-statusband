@@ -82,6 +82,8 @@ Companion segments capitalize their first word, matching the current original. E
 
 This is an external command, not `/board`: Codex does not expose third-party slash-command registration.
 
+The board selects candidates by filesystem modification time and applies `--limit` before parsing transcript bodies, continuing to the next candidate if a file moved during the scan. Directory discovery and file metadata are still scanned, but old transcript bodies beyond the limit are not read.
+
 ## Codex desktop app
 
 The plugin and `SessionStart` hook also load in the local Codex desktop app. On a session with a saved token report, the hook shows a short message such as:
@@ -149,7 +151,7 @@ node .\bin\cache-statusband-codex.mjs board --limit 2
 Pop-Location
 ```
 
-The current Node suite has 26 tests covering malformed/in-progress JSONL, latest-token selection, bounded large-transcript parsing, persisted context fallback, out-of-order state protection, active/archived discovery, the resume/stop hooks, account/token/ID sanitization, immutable session identity, per-account five-minute caching, last-good failure behavior, the one-hour `Retry-After` cap, first-word capitalization, the documented app-server protocol, compact reset/age formatting, absolute local expiration formatting, and missing-detail handling. Account regressions in `test/usage.test.mjs` prove that rotation and missing account emails cannot replace a good reading, rotation during capture produces no guessed binding, and legacy cache deadlines survive migration. Session regressions in `test/rollouts.test.mjs` prove identity survives resume, simultaneous starts keep one identity, an initially unknown identity stays unknown, and legacy sessions do not adopt today's login. The PowerShell test separately proves that installation replaces a multiline footer under a commented `[tui]` header, preserves unrelated TOML, validates the candidate, and leaves the live file unchanged after rejection.
+The current Node suite has 27 tests covering malformed/in-progress JSONL, latest-token selection, bounded large-transcript parsing, persisted context fallback, out-of-order state protection, active/archived discovery, the resume/stop hooks, account/token/ID sanitization, immutable session identity, per-account five-minute caching, last-good failure behavior, the one-hour `Retry-After` cap, first-word capitalization, the documented app-server protocol, compact reset/age formatting, absolute local expiration formatting, and missing-detail handling. Account regressions in `test/usage.test.mjs` prove that rotation and missing account emails cannot replace a good reading, rotation during capture produces no guessed binding, and legacy cache deadlines survive migration. Session regressions in `test/rollouts.test.mjs` prove identity survives resume, simultaneous starts keep one identity, an initially unknown identity stays unknown, and legacy sessions do not adopt today's login. The board-limit regression proves only recent candidates are parsed and a missing candidate is skipped. The PowerShell test separately proves that installation preserves its marketplace registration and enabled plugin, replaces a multiline footer under a commented `[tui]` header, preserves unrelated TOML, validates the candidate, and leaves the live file unchanged after rejection. The installer validates preferences before registration, then re-reads Codex's updated configuration and validates the final merged candidate before replacement.
 
 ## Credits
 

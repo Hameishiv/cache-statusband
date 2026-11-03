@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -52,6 +52,30 @@ test("scans active sessions and includes archived sessions only when requested",
   const all = await scanSessions(root, { includeArchived: true });
   assert.equal(all.length, 2);
   assert.deepEqual(new Set(all.map((item) => item.archived)), new Set([true, false]));
+});
+
+test("board limits transcript reads to recent candidates and skips files lost during scanning", async (t) => {
+  const root = await fixtureRoot(t);
+  const sessions = join(root, "sessions");
+  await mkdir(sessions);
+  const paths = ["old.jsonl", "recent.jsonl", "newest.jsonl"].map((name) => join(sessions, name));
+  for (const [index, path] of paths.entries()) {
+    await writeFixture(path);
+    const time = new Date(Date.parse("2026-10-29T12:00:00.000Z") + index * 60_000);
+    await utimes(path, time, time);
+  }
+  const reads = [];
+  const found = await scanSessions(root, {
+    limit: 1,
+    rolloutParser: async (path) => {
+      reads.push(path);
+      if (path === paths[2]) throw new Error("session moved after stat");
+      return { id: path, updatedAt: "2026-10-29T12:00:00.000Z" };
+    },
+  });
+  assert.equal(found.length, 1);
+  assert.equal(found[0].id, paths[1]);
+  assert.deepEqual(reads, [paths[2], paths[1]]);
 });
 
 test("SessionStart hook returns a visible, truthful resume summary", async (t) => {

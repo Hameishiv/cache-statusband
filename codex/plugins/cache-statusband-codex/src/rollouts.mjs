@@ -43,22 +43,30 @@ export async function parseRollout(path) {
   return summary;
 }
 
-export async function scanSessions(codexHome, { includeArchived = false } = {}) {
+export async function scanSessions(codexHome, { includeArchived = false, limit = Infinity, rolloutParser = parseRollout } = {}) {
   const roots = [{ path: join(codexHome, "sessions"), archived: false }];
   if (includeArchived) roots.push({ path: join(codexHome, "archived_sessions"), archived: true });
   const found = [];
   for (const root of roots) {
-    for (const path of await findJsonl(root.path)) found.push({ path, archived: root.archived });
+    for (const path of await findJsonl(root.path)) {
+      try {
+        found.push({ path, archived: root.archived, modifiedAt: (await stat(path)).mtimeMs });
+      } catch {
+        // A session may move between directory enumeration and stat.
+      }
+    }
   }
+  found.sort((a, b) => b.modifiedAt - a.modifiedAt || a.path.localeCompare(b.path));
   const summaries = [];
   for (const item of found) {
+    if (summaries.length >= limit) break;
     try {
-      summaries.push({ ...(await parseRollout(item.path)), archived: item.archived });
+      summaries.push({ ...(await rolloutParser(item.path)), archived: item.archived });
     } catch {
       // A session can move or be written while scanning; omit that one snapshot.
     }
   }
-  return summaries.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+  return summaries;
 }
 
 function consume(item, summary) {
