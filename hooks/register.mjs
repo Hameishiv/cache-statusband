@@ -777,7 +777,8 @@ async function keepWarmStep($) {
   S.pingUsd += requestCost(u, S.model, ttl)
   // A ping that writes instead of reading did not hit the cache: stop paying for it
   if ((u.cache_creation_input_tokens || 0) > 0.1 * Math.max(1, u.cache_read_input_tokens || 0)) {
-    return stopKeepWarm($, `the ping wrote ${tokens(u.cache_creation_input_tokens)} tokens instead of reading the cache`)
+    const hint = !settings.ttlMin && S.ttlSource === 'default' && ttl === 60 ? `; on the 5-minute API cache run /${names.cache} ttl 5, which sets every session` : ''
+    return stopKeepWarm($, `the ping wrote ${tokens(u.cache_creation_input_tokens)} tokens instead of reading the cache${hint}`)
   }
   S.lastActivity = now
   await rememberLast($)
@@ -835,7 +836,7 @@ function statusText() {
   const st = cacheState(myHeartbeat())
   const ttl = ttlMin()
   const lines = []
-  lines.push(`Cache Keeper: ${tokens(S.ctx)} tokens in context on ${priceFor(S.model).id}, cache window ${ttl} min (${settings.ttlMin ? 'set by you' : S.ttlSource}).`)
+  lines.push(`Cache Keeper: ${tokens(S.ctx)} tokens in context on ${priceFor(S.model).id}, cache window ${ttl} min (${settings.ttlMin ? 'set by you' : S.ttlSource === 'default' && ttl === 60 ? `assumed; on the 5-minute API cache run /${names.cache} ttl 5, which sets every session` : S.ttlSource}).`)
   if (st.kind === 'unknown') lines.push('No request yet this session, so the cache state is unknown.')
   if (st.kind === 'warm' || st.kind === 'cooling') lines.push(`Cache is warm for about ${minutes(st.left)} more.`)
   if (st.kind === 'cold') lines.push(`Cache went cold ${minutes(-st.left)} ago. The next message rewrites it for about ${money(rewriteCost(S.ctx, S.model, ttl))}.`)
@@ -1023,7 +1024,8 @@ export function register(on, options = {}) {
     S.model = u.model || S.model
     const afterCompact = justCompacted
     justCompacted = false
-    // The API names the TTL each write used: that beats any guess from idle gaps
+    // The API names the TTL each write used, when the usage carries that split. The engine's turn
+    // usage does not today, so without /cache ttl the window stays on its 60-minute default
     const split = u.cache_creation
     if (split && !settings.ttlMin) {
       if ((split.ephemeral_1h_input_tokens || 0) > 0) S.ttlMin = 60
@@ -1037,12 +1039,9 @@ export function register(on, options = {}) {
       if (compactedCold && written > 30000) S.coldRestarts.push({ at: now, tokens: written, usd: rewriteCost(written, S.model, ttlMin()), gapMin: 0 })
       compactedCold = false
     } else if (S.lastActivity && total > 30000 && written / total > 0.5) {
-      // Without the API's word: a rewrite after 5-60 idle minutes suggests the 5-minute TTL,
-      // unless a rotation emptied the cache (a compaction already cleared lastActivity)
-      if (!settings.ttlMin && !split && !rotatedCold() && gap > 5.5 * MIN && gap < S.ttlMin * MIN) {
-        S.ttlMin = 5
-        S.ttlSource = 'measured'
-      }
+      // No TTL guess from the idle gap: the engine's usage carries no TTL split, and on the
+      // 1-hour cache a rotation, missed compaction or model switch also rewrites inside 60
+      // minutes. Guessing 5 here made keep warm ping every 3.5 minutes (2026-11-02).
       S.coldRestarts.push({ at: now, tokens: written, usd: rewriteCost(written, S.model, ttlMin()), gapMin: Math.round(gap / MIN) })
     } else if (S.lastActivity && total > 30000 && gap > 5.5 * MIN && cachedShare(u) > 0.8) {
       // A hit after more than 5 idle minutes proves the 1-hour TTL
