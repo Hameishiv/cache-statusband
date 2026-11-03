@@ -251,6 +251,10 @@ function rotatedCold() {
   return S.seatChangedAt > S.lastActivity
 }
 
+// A /compact the compactor refuses still returns, its output line saying so ("Not compacted · fast-jev: below 5% minimum")
+const REFUSED = /\bnot compacted\b/i
+const refused = (r) => REFUSED.test(String((r && r.text) || ''))
+
 // The next request writes the shorter context: no TTL evidence and nothing to warn about
 function markCompacted() {
   // a compaction of a cold cache (Claude Code auto-compacts a big chat as it is sent) still pays a rewrite
@@ -378,9 +382,16 @@ async function coldLog($, fields) {
 
 async function runCompactThenSend($, msg, unattended) {
   try {
-    await $.command.run({ command: 'compact', args: '' })
-    markCompacted()
-    if (unattended) await coldLog($, { action: 'compacted' })
+    const before = S.ctx
+    const r = await $.command.run({ command: 'compact', args: '' })
+    if (refused(r)) {
+      // the context did not shrink: the guard stays armed and the log says so
+      if (unattended) await coldLog($, { action: 'compact-skipped', before, reason: clip(String(r.text), 160) })
+      $.ui.toast('Not compacted (' + clip(String(r.text), 80) + '), so the message goes as typed.', { timeoutMs: 8000 })
+    } else {
+      markCompacted()
+      if (unattended) await coldLog($, { action: 'compacted', before })
+    }
   } catch (err) {
     if (unattended) await coldLog($, { action: 'compact-failed', error: String((err && err.message) || err) })
     $.ui.toast('Could not compact (' + clip(String((err && err.message) || err), 80) + '), so the message goes as typed.', { timeoutMs: 8000 })
@@ -1115,7 +1126,7 @@ export function register(on, options = {}) {
   on('session.compact', async ($, e, next) => {
     now = await $.clock.now()
     const r = await next(e)
-    if (!e.agentId) markCompacted()
+    if (!e.agentId && !(r && r.skip)) markCompacted()
     return r
   })
   on('classic.PostCompact', async ($, e, next) => {
@@ -1128,7 +1139,7 @@ export function register(on, options = {}) {
   })
   on('command.run', { command: ['compact'] }, async ($, e, next) => {
     const r = await next(e)
-    markCompacted()
+    if (!refused(r)) markCompacted()
     return r
   })
 

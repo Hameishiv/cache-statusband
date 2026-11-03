@@ -2,6 +2,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import { ago, borrowedLimits, capFirst, fableLimit, HUES, paint, pattern, resumeTime, spentWindows, lastContext, modelName, planWindows, untilText } from './register.mjs'
 
 const COMPOSER = { kind: 'composer' } as never
+let compactOutput = '' // what the engine's /compact prints: '' compacted, 'Not compacted · …' refused
 // An example setup: an account rotator and a merge-pr workflow, as the README describes
 const SETUP = { options: { seatFileTerminal: '~/.claude-cli-accounts/.active', seatFileDesktop: '~/.claude-app-seats/.active', rotatorWakePattern: String.raw`^\s*Usage reset:[^\n]*\baccount was rotated\b`, prPattern: String.raw`(?:^|\s)/?merge-pr\s+#?(\d+)` } }
 
@@ -17,7 +18,7 @@ function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unkno
     on('store.keys', () => ({ value: [...kept.keys()] }))
   } else mock.store(on)
   mock.env(on, { USERPROFILE: 'C:/Users/T' })
-  const seen = { compacts: 0, submits: [] as string[], asks: 0, order: [] as string[] }
+  const seen = { compacts: 0, submits: [] as string[], asks: 0, order: [] as string[], log: '' }
   on('session.id', () => ({ value: 'sid-test' }))
   on('session.cwd', () => ({ value: '/repo' }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
@@ -29,7 +30,7 @@ function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unkno
   on('fs.read', () => ({ value: seat.label }))
   on('command.run', (_: unknown, e: any) => {
     if (e.command === 'compact') seen.compacts++, seen.order.push('compact')
-    return { text: '' }
+    return { text: e.command === 'compact' ? compactOutput : '' }
   })
   on('prompt.submit', (_: unknown, e: any) => {
     if (e.origin?.kind === 'plugin') seen.submits.push(e.text), seen.order.push('send:' + e.text)
@@ -38,6 +39,7 @@ function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unkno
   on('session.start', (_: unknown, e: any) => ({ cwd: e.cwd }))
   on('session.measure', () => ({ changed: [] }))
   on('ui.toast', () => ({ value: undefined }))
+  on('fs.write', (_: unknown, e: any) => ((seen.log = String(e.text)), { value: undefined }))
   return { clock, seen }
 }
 
@@ -379,6 +381,24 @@ test('a cold, large session woken by another session compacts before the message
   expect('drop' in (r as object)).toBe(true) // the message did not reach the model on the cold cache
   expect(seen.asks).toBe(0)
   expect(seen.order).toEqual(['compact', 'send:PR 12 merged; pick up the next one'])
+})
+
+// R10 2026-11-03: a refused /compact still returns; it must not be logged, or treated, as a compaction
+test('a cold compact the compactor refuses is logged as skipped, not as compacted', async ($, on) => {
+  compactOutput = 'Not compacted · fast-jev: below 5% minimum: 2% reduction'
+  try {
+    const { seen } = await coldPeer($, on, 77)
+    expect(seen.log).toContain('"action":"compact-skipped"')
+    expect(seen.log).not.toContain('"action":"compacted"')
+    expect(seen.order).toEqual(['compact', 'send:PR 12 merged; pick up the next one'])
+  } finally {
+    compactOutput = ''
+  }
+})
+
+test('a cold compact that went through is logged as compacted', async ($, on) => {
+  const { seen } = await coldPeer($, on, 77)
+  expect(seen.log).toContain('"action":"compacted"')
 })
 
 test("a warm session takes another session's message as is", async ($, on) => {
