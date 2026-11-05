@@ -386,10 +386,11 @@ async function resumeStep($) {
 
 // `from` names a sender other than the person (a peer, a task notification): the resend says so,
 // and goes in without `asUser`, so the model reads it as the mod's message, not the person's own words
-function compactThenSend($, e, unattended, from = '') {
+// `logged` writes the compaction's outcome to the log, as for an unattended message, whatever the modes
+function compactThenSend($, e, unattended, from = '', logged = false) {
   // the ways to submit it, in order: `true` is asUser, `false` omits it
   const modes = from ? [false] : unattended ? [true, false] : [true]
-  const msg = { text: from ? `[${from} message, resent by cache-keeper after /compact]\n${e.text}` : e.text, attachments: e.attachments, slash: !!e.command, unattended, modes }
+  const msg = { text: from ? `[${from} message, resent by cache-keeper after /compact]\n${e.text}` : e.text, attachments: e.attachments, slash: !!e.command, unattended, logged: logged || unattended, modes }
   const drop = { drop: 'cache-keeper: compacting first on a cold cache; the message is sent again once that finishes' }
   // a compaction is already under way: this message waits behind the ones before it
   if (pending) return pending.push(msg), drop
@@ -450,7 +451,7 @@ const COMPACT_DEADLINE = 10 * MIN
 const TIMED_OUT = Symbol('timed out')
 
 async function runCompactThenSend($) {
-  const unattended = pending.some((m) => m.unattended)
+  const unattended = pending.some((m) => m.logged)
   const epoch = chatEpoch
   try {
     const before = S.ctx
@@ -514,8 +515,6 @@ async function fillBox($, text, mode) {
   }
 }
 
-// Messages that cannot be sent go back to the prompt box after whatever the person has typed, a blank
-// line between, so neither runs into the other; if the box will not take them, each is logged in full.
 // What the person has typed in the prompt box; '' when there is none to read
 async function boxText($) {
   try {
@@ -525,6 +524,8 @@ async function boxText($) {
   }
 }
 
+// Messages that cannot be sent go back to the prompt box after whatever the person has typed, a blank
+// line between, so neither runs into the other; if the box will not take them, each is logged in full.
 async function putBack($, back) {
   const box = await boxText($)
   const sep = !box || /\n\s*\n\s*$/.test(box) ? '' : /\n\s*$/.test(box) ? '\n' : '\n\n'
@@ -537,7 +538,9 @@ async function putBack($, back) {
 // by the prompt.submit hook and goes out after the ones before it. The first message that cannot be
 // submitted goes back to the prompt box together with every one behind it, so nothing is dropped and
 // none overtakes it. A slash line (only ever the head, from the person's dialog) is filled as the
-// draft, the rest still go, and a later failure is logged rather than filled over that draft.
+// draft when the box is empty (otherwise logged), the rest still go, and a later failure is logged
+// rather than filled over that draft. A resend the host holds past the deadline is left to the host,
+// and the rest go back to the prompt box; if the host later refuses it, it goes back there too.
 // It runs only for the chat its compaction started in: after a /clear, /resume or /fork it stops.
 // The previous chat's messages go back to the prompt box in arrival order: `first` (the drain's own,
 // in flight when the chat changed and not sent) ahead of the rest the session-change handler held.
@@ -560,10 +563,17 @@ async function drain($, epoch = chatEpoch) {
     while (epoch === chatEpoch && pending && pending.length) {
       const msg = pending.shift()
       // a resend the host holds must not pin the queue: after the deadline the drain stops waiting
-      const sent = await Promise.race([resend($, msg, epoch).catch(() => false), new Promise((res) => $.clock.after(COMPACT_DEADLINE, () => res(TIMED_OUT)))])
+      const attempt = resend($, msg, epoch).catch(() => false)
+      const sent = await Promise.race([attempt, new Promise((res) => $.clock.after(COMPACT_DEADLINE, () => res(TIMED_OUT)))])
       if (sent === TIMED_OUT) {
-        // the host still holds this one, so it is the host's to deliver: putting it back could send it twice
+        // the host still holds this one, so it is the host's to deliver: putting it back now could send it twice
         coldLog($, { action: 'resend-held', text: msg.text })
+        // a later refusal means it was never sent: then it goes back to the prompt box, not lost
+        attempt.then(async (ok) => {
+          if (ok) return
+          const back = await putBack($, [msg])
+          $.ui.toast(back ? 'A held message was refused by Claude Code: it is back in the prompt box.' : 'A held message was refused by Claude Code and could not be put back (logged if ~/.claude-shared/state exists).', { timeoutMs: 15000 })
+        })
         if (epoch !== chatEpoch) return handBack($, [], epoch)
         const back = [...(pending || [])]
         pending = null
@@ -1280,7 +1290,7 @@ export function register(on, options = {}) {
       const kind = sender(e)
       const skip = ownPrompt($, e) ? 'plugin' : e.isMeta ? 'meta' : e.command ? 'slash' : media ? 'media' : !worthCompacting() ? 'floor' : compacting() ? 'running' : now - compactTriedAt < 2 * MIN ? 'just-tried' : ''
       coldLog($, { origin: kind, coldMin: Math.round((rotated ? now - S.seatChangedAt : reopened ? now - S.lastActivity : -left) / MIN), ...(reopened ? { reopened: true } : {}), action: skip ? 'skip-' + skip : 'compact-first', ...(skip ? {} : { text: e.text }) })
-      return skip ? next(e) : asPerson ? compactThenSend($, e, false) : compactThenSend($, e, true, kind)
+      return skip ? next(e) : asPerson ? compactThenSend($, e, false, '', true) : compactThenSend($, e, true, kind)
     }
     // a compaction just ran or is running: asking again would only queue behind it, or compact twice
     if (pending || compacting()) {

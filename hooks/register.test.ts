@@ -44,7 +44,8 @@ function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unkno
     if (e.origin?.kind === 'plugin') seen.attempts.push(e.text)
     if (e.origin?.kind === 'plugin' && beforeDrop) await beforeDrop(e)
     if (e.origin?.kind === 'plugin' && dropSubmit && dropSubmit.test(e.text)) return { drop: 'refused' }
-    if (e.origin?.kind === 'plugin' && holdSubmit && holdSubmit.test(e.text)) return new Promise(() => {})
+    if (e.origin?.kind === 'plugin' && holdSubmit && holdSubmit.test(e.text)) return new Promise((res) => (heldResolve = res))
+    if (e.origin?.kind === 'plugin' && failAsUser && e.origin.asUser && failAsUser.test(e.text)) throw new Error('not as the person')
     // the host shows asUser on the origin
     if (e.origin?.kind === 'plugin') seen.submits.push(e.text), seen.asUsers.push(e.origin.asUser), seen.order.push('send:' + e.text)
     if (e.origin?.kind === 'plugin' && duringSubmit) await duringSubmit(e)
@@ -66,6 +67,9 @@ let failSubmit: RegExp | null = null
 let dropSubmit: RegExp | null = null
 // a plugin resend whose text matches this never settles, as a host holding it would
 let holdSubmit: RegExp | null = null
+let heldResolve: ((v: unknown) => void) | null = null
+// a plugin resend sent asUser whose text matches this throws; without asUser it goes through
+let failAsUser: RegExp | null = null
 // runs inside a plugin resend before the host decides whether to refuse it
 let beforeDrop: ((e: any) => Promise<void>) | null = null
 // runs inside a plugin resend, while the drain is under way
@@ -1277,5 +1281,56 @@ test('a resend the host holds past the deadline hands the rest back instead of s
     expect(seen.log).toContain('resend-held')
   } finally {
     holdSubmit = null
+  }
+})
+
+// Fable 2026-11-05: a held resend the host later refuses was never sent, so it goes back to the prompt box
+test('a held resend that the host later refuses goes back to the prompt box', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, null)
+  holdSubmit = /first/
+  try {
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+    await $.prompt.submit({ text: 'first', origin: PEER, wait: false } as never)
+    await clock.advance(100)
+    await clock.advance(11 * 60000)
+    await settle(clock, () => seen.log.includes('resend-held'))
+    expect(seen.fills.length).toBe(0)
+    heldResolve!({ drop: 'refused' })
+    await settle(clock, () => seen.fills.length >= 1)
+    expect(seen.fills[0].text).toContain('first')
+    expect(seen.toasts.some((t) => t.includes('held message was refused'))).toBe(true)
+  } finally {
+    holdSubmit = null
+    heldResolve = null
+  }
+})
+
+// Fable 2026-11-05: a rotator wake queued behind another message's compaction keeps its unattended fallback
+test('a rotator wake queued behind a running compaction still falls back to the plain resend', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, null)
+  failAsUser = /Usage reset/
+  try {
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+    await $.prompt.submit({ text: 'first', origin: PEER, wait: false } as never)
+    const r = await $.prompt.submit({ text: 'Usage reset: the 5h limit capped, so the CLI account was rotated to C. Go on.', origin: COMPOSER, wait: false } as never)
+    expect('drop' in (r as object)).toBe(true) // it waits behind the running compaction
+    await clock.advance(100)
+    await settle(clock, () => seen.submits.length >= 2)
+    expect(seen.compacts).toBe(1)
+    expect(seen.submits[1]).toMatch(/^Usage reset:/)
+    expect(seen.asUsers[1]).toBe(undefined) // the asUser try threw; the plain resend went in, not the prompt box
+    expect(seen.fills).toEqual([])
+  } finally {
+    failAsUser = null
   }
 })
