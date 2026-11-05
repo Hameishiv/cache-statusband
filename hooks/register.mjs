@@ -73,6 +73,7 @@ let justCompacted = false
 let compactedCold = false
 let compactTriedAt = 0 // when a cold compact last failed or was refused: no retry for 2 minutes
 let pending = null // messages waiting on the compaction under way, in arrival order
+let resending = false // true while this mod resubmits a queued message, whatever origin the host gives it
 let logChain = Promise.resolve() // one log write at a time in this process
 let handoffPending = false
 let seatFile = ''
@@ -379,8 +380,14 @@ function compactThenSend($, e, unattended, from = '') {
   // a compaction is already under way: this message waits behind the ones before it
   if (pending) return pending.push(msg), drop
   pending = [msg]
-  // a throw must not leave the queue set, or every later message would wait forever
-  $.clock.after(50, () => runCompactThenSend($).catch(() => { pending = null }))
+  // a throw must not leave the queue set, or every later message would wait forever: send what is left as is
+  $.clock.after(50, () =>
+    runCompactThenSend($).catch(async () => {
+      const left = pending || []
+      pending = null
+      for (const m of left) await resend($, m).catch(() => {})
+    }),
+  )
   return drop
 }
 
@@ -436,6 +443,15 @@ async function runCompactThenSend($) {
 }
 
 async function resend($, msg) {
+  resending = true
+  try {
+    await resendOnce($, msg)
+  } finally {
+    resending = false
+  }
+}
+
+async function resendOnce($, msg) {
   const send = { text: msg.text, ...(msg.attachments ? { attachments: msg.attachments } : {}) }
   // A plugin can't submit a "/" line: those go back in the prompt box
   if (!msg.slash) {
@@ -1047,9 +1063,10 @@ export function register(on, options = {}) {
     // These run locally or start afresh: a cold cache costs them nothing
     const local = e.command && ['compact', 'clear', names.cache, names.keepwarm, names.board, names.handoff].includes(e.command.name)
     // A compaction is under way: anything else waits behind it and goes after, in order, with no dialog
-    if (pending && !ownPrompt($, e) && !local && !e.turnId && !e.command && !(Array.isArray(e.attachments) && e.attachments.length)) {
+    if (pending && !resending && !ownPrompt($, e) && !local && !e.turnId && !e.command && !(Array.isArray(e.attachments) && e.attachments.length)) {
       const kind = (e.origin && e.origin.kind) || 'none'
-      await coldLog($, { origin: kind, action: 'queued-behind-compact' })
+      // not awaited: the queue could drain during the write, and this message would start a second compact
+      coldLog($, { origin: kind, action: 'queued-behind-compact' })
       return compactThenSend($, e, !fromUser, fromUser ? '' : kind)
     }
     if (!settings.guard || !isCold || local || justCompacted || S.ctx < settings.bigTokens || e.turnId) {
