@@ -365,7 +365,8 @@ async function resumeStep($) {
   if (!S.resumeAt || now < S.resumeAt || S.working) return
   S.resumeAt = 0
   $.ui.invalidate('ui.render')
-  if (worthCompacting() && !compactLive) {
+  // a queue waiting on a compaction takes it in turn, never ahead of the messages already there
+  if (pending || (worthCompacting() && !compactLive)) {
     compactThenSend($, { text: 'Resume' }, true)
     return
   }

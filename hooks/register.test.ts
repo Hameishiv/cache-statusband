@@ -639,8 +639,8 @@ test('an sdk prompt in a plain -p run is asked, not auto-compacted', async ($, o
     headlessRun = false
   }
 })
-// while the desktop app's own sdk turn, drawn on a surface, still compacts first
-test("the desktop app's own sdk turn compacts first", async ($, on) => {
+// while an sdk turn in a session that draws on a surface (not a plain -p run) still compacts first
+test('an sdk turn in a session with a surface compacts first', async ($, on) => {
   const { r, seen } = await coldPeer($, on, 77, 300000, { kind: 'sdk' })
   expect('drop' in (r as object)).toBe(true)
   expect(seen.compacts).toBe(1)
