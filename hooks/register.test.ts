@@ -563,7 +563,7 @@ test('a resend the host refuses with a drop goes back to the prompt box with the
   }
 })
 
-// Codex review: a put-back message must not run into what the person has typed
+// A put-back message must not run into what the person has typed
 test('messages put back in the prompt box start a blank line after the draft', async ($, on) => {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)
@@ -586,7 +586,7 @@ test('messages put back in the prompt box start a blank line after the draft', a
   }
 })
 
-// Codex review: messages queued for one chat never go into the next one after /clear
+// Messages queued for one chat never go into the next one after /clear
 test('a /clear during a compaction puts the queued messages back instead of sending them to the new chat', async ($, on) => {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)
@@ -602,7 +602,7 @@ test('a /clear during a compaction puts the queued messages back instead of send
     await clock.advance(100)
     await settle(clock, () => seen.compacts >= 1)
     await ($ as any).classic.SessionStart({ source: 'clear', transcript_path: '' })
-    await settle(clock, () => seen.fills.length >= 1)
+    await settle(clock, () => seen.toasts.some((t) => /meant for the previous chat/.test(t)))
     expect(seen.fills[0].text).toContain('first')
     expect(seen.toasts.some((t) => /meant for the previous chat/.test(t))).toBe(true)
     // a later message in the new chat is not held behind the old chat's queue
@@ -615,7 +615,7 @@ test('a /clear during a compaction puts the queued messages back instead of send
   }
 })
 
-// Verification of a992242: the old chat's compaction ending after /clear leaves the new chat as it found it
+// The old chat's compaction ending after /clear leaves the new chat as it found it
 test('a compaction that ends after /clear does not mark the new chat compacted', async ($, on) => {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)
@@ -645,7 +645,7 @@ test('a compaction that ends after /clear does not mark the new chat compacted',
   }
 })
 
-// Verification of 1798f6e: a /clear during the last resend must not leave the queue open with no drain
+// A /clear during the last resend must not leave the queue open with no drain
 test('a /clear during the last resend leaves no queue behind to swallow the next message', async ($, on) => {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)

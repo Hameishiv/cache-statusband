@@ -461,14 +461,14 @@ async function runCompactThenSend($) {
     run.then((r) => late && epoch === chatEpoch && !refused(r) && markCompacted(), () => {}) // a failure after the deadline has no one waiting
     const timeout = new Promise((resolve) => $.clock.after(COMPACT_DEADLINE, () => resolve(TIMED_OUT)))
     const r = await Promise.race([run, timeout])
-    // nor does a /compact that never ends hold every later one back, in this chat or the next: give it as long again
+    // a /compact that never ends must not hold every later one back, in this chat or the next: give it as long again
     if (r === TIMED_OUT) $.clock.after(COMPACT_DEADLINE, settled)
     // the chat changed while it ran: its queue was already handed back, and its outcome is not this chat's
     if (epoch !== chatEpoch) return
     if (r === TIMED_OUT) {
       // stop waiting: the queue goes as typed
       late = true
-      compactTriedAt = await $.clock.now()
+      compactTriedAt = now
       await coldLog($, { action: 'compact-timeout', before })
       $.ui.toast('Compacting took over 10 minutes, so the message goes as typed.', { timeoutMs: 8000 })
     } else if (refused(r)) {
@@ -520,6 +520,7 @@ async function putBack($, back) {
 // submitted goes back to the prompt box together with every one behind it, so nothing is dropped and
 // none overtakes it. A slash line (only ever the head, from the person's dialog) is filled as the
 // draft, the rest still go, and a later failure is logged rather than filled over that draft.
+// It runs only for the chat its compaction started in: after a /clear, /resume or /fork it stops.
 async function drain($, epoch = chatEpoch) {
   // the chat the queue was made for: if it changed, the queue was handed back and a later chat's is never this drain's
   if (epoch !== chatEpoch) return
@@ -533,7 +534,8 @@ async function drain($, epoch = chatEpoch) {
       if (await resend($, msg).catch(() => false)) continue
       // the chat changed while that resend was refused: the rest was handed back, and this one goes with it
       if (epoch !== chatEpoch) {
-        await putBack($, [msg])
+        const ok = await putBack($, [msg])
+        $.ui.toast(ok ? 'A message meant for the previous chat is in the prompt box: send it only if it still applies.' : 'A message meant for the previous chat could not be sent (logged if ~/.claude-shared/state exists).', { timeoutMs: 15000 })
         return
       }
       if (msg.slash) {
@@ -1141,9 +1143,11 @@ export function register(on, options = {}) {
     const back = pending || []
     pending = null
     draining = false
+    // not awaited: the new chat's start does not wait on the prompt box
     if (back.length) {
-      const ok = await putBack($, back)
-      $.ui.toast(ok ? `${back.length} message(s) meant for the previous chat are in the prompt box: send them only if they still apply.` : `${back.length} message(s) meant for the previous chat could not be sent (logged if ~/.claude-shared/state exists).`, { timeoutMs: 15000 })
+      putBack($, back)
+        .then((ok) => $.ui.toast(ok ? `${back.length} message(s) meant for the previous chat are in the prompt box: send them only if they still apply.` : `${back.length} message(s) meant for the previous chat could not be sent (logged if ~/.claude-shared/state exists).`, { timeoutMs: 15000 }))
+        .catch(() => {})
     }
     try {
       S.id = (await $.session.id()) || S.id
