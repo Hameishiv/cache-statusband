@@ -603,6 +603,8 @@ test('a /clear during a compaction puts the queued messages back instead of send
     expect(seen.toasts.some((t) => /meant for the previous chat/.test(t))).toBe(true)
     // a later message in the new chat is not held behind the old chat's queue
     await $.prompt.submit({ text: 'new chat', origin: PEER, wait: false } as never)
+    await clock.advance(200)
+    expect(seen.log).toContain('"event":"guard-pass"') // the new chat's message went through, so the next line is not vacuous
     expect(seen.log).not.toContain('"queued-behind-compact","text":"new chat"')
   } finally {
     hangCompact = false

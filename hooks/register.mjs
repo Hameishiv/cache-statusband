@@ -75,6 +75,7 @@ let compactRuns = 0 // cold compactions this mod has started: a dialog answered 
 let compactLive = false // the latest is still running, waited on or not: past its deadline too, for as long again
 let compactTriedAt = 0 // when a cold compact last failed or was refused: no retry for 2 minutes
 let pending = null // messages waiting on the compaction under way, in arrival order
+let chatEpoch = 0 // raised on /clear, /resume and /fork: a compaction started for one chat leaves the next one alone
 let draining = false // the compaction is over and the queue is being resent: the person's own prompts no longer wait
 let liveHb = null // this session's heartbeat as the mod found it on loading: under three beats old means a reload in a live process, not a reopen
 let entry = '' // CLAUDE_CODE_ENTRYPOINT: 'claude-desktop' for the app, 'sdk-cli' for a -p run, 'cli' for the REPL
@@ -440,6 +441,7 @@ const TIMED_OUT = Symbol('timed out')
 
 async function runCompactThenSend($) {
   const unattended = pending.some((m) => m.unattended)
+  const epoch = chatEpoch
   try {
     const before = S.ctx
     compactRuns++
@@ -454,9 +456,11 @@ async function runCompactThenSend($) {
     run.then(settled, settled)
     let late = false
     // this mod's own /compact never reaches its own command.run hook: a compaction that ends after the deadline is marked here
-    run.then((r) => late && !refused(r) && markCompacted(), () => {}) // a failure after the deadline has no one waiting
+    run.then((r) => late && epoch === chatEpoch && !refused(r) && markCompacted(), () => {}) // a failure after the deadline has no one waiting
     const timeout = new Promise((resolve) => $.clock.after(COMPACT_DEADLINE, () => resolve(TIMED_OUT)))
     const r = await Promise.race([run, timeout])
+    // the chat changed while it ran: its queue was already handed back, and its outcome is not this chat's
+    if (epoch !== chatEpoch) return
     if (r === TIMED_OUT) {
       // stop waiting: the queue goes as typed
       late = true
@@ -476,6 +480,7 @@ async function runCompactThenSend($) {
       if (unattended) await coldLog($, { action: 'compacted', before })
     }
   } catch (err) {
+    if (epoch !== chatEpoch) return
     compactTriedAt = now
     if (unattended) await coldLog($, { action: 'compact-failed', error: String((err && err.message) || err) })
     $.ui.toast('Could not compact (' + clip(String((err && err.message) || err), 80) + '), so the message goes as typed.', { timeoutMs: 8000 })
@@ -529,7 +534,7 @@ async function drain($) {
       } else if (draft) lose(msg)
       else {
         // this one and all behind it; the queue closes in the same tick, so nothing slips in unseen
-        const back = [msg, ...pending]
+        const back = [msg, ...(pending || [])]
         pending = null
         draining = false
         if (await putBack($, back)) {
@@ -1119,6 +1124,7 @@ export function register(on, options = {}) {
     compactTriedAt = 0 // nor does its failed or refused compact hold back this one's
     refusedAt = 0
     S.coldRestarts = [] // the new chat's own, from its record below
+    chatEpoch++
     // what waited on the last chat's compaction was meant for that chat: back to the box, never into this one
     if (pending && pending.length) {
       const back = pending
