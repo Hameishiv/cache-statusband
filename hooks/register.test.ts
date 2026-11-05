@@ -781,6 +781,64 @@ test('a refused /compact the person typed sets the floor for cold wakes', async 
   }
 })
 
+// A /compact the person started is running: a cold wake meanwhile does not start a second one
+test('a cold wake during a /compact the person typed does not compact again', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, null)
+  holdCompact = true
+  try {
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+    const manual = $.command.run({ command: 'compact', args: '' })
+    await settle(clock, () => seen.compacts >= 1)
+    await $.prompt.submit({ text: 'peer', origin: PEER, wait: false } as never)
+    await clock.advance(200)
+    expect(seen.compacts).toBe(1)
+    expect(seen.log).toContain('"action":"skip-running"')
+    releaseCompact()
+    await manual
+  } finally {
+    holdCompact = false
+  }
+})
+
+// "Compact first" answered while a peer's compaction is still queueing waits behind it, in order
+test('"Compact first" answered during a running compaction queues behind it', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  holdCompact = true
+  try {
+    let ran = false
+    on('tool.call', async (_: unknown, e: any) => {
+      if (e.tool !== 'AskUserQuestion') return { result: {} }
+      seen.asks++
+      if (!ran) {
+        ran = true
+        await $.prompt.submit({ text: 'from a peer', origin: PEER, wait: false } as never)
+        await clock.advance(100)
+        await settle(clock, () => seen.compacts >= 1)
+      }
+      const q = e.questions?.[0]?.question ?? ''
+      return { result: { questions: e.questions, answers: { [q]: 'Compact first, then send' } } }
+    })
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+    const r = await $.prompt.submit({ text: 'mine', origin: COMPOSER, wait: false } as never)
+    expect('drop' in (r as object)).toBe(true) // queued, not sent ahead
+    releaseCompact()
+    await settle(clock, () => seen.submits.length >= 2)
+    expect(seen.compacts).toBe(1)
+    expect(seen.order).toEqual(['compact', 'send:[peer message, resent by cache-keeper after /compact]\nfrom a peer', 'send:mine'])
+  } finally {
+    holdCompact = false
+  }
+})
+
 // Anything the host could not classify may be the person at the prompt: it gets the dialog, not the silent compact
 async function unknownOrigin($: any, on: any, origin: unknown) {
   const kept = new Map<string, unknown>()

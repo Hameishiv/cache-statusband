@@ -73,6 +73,8 @@ let justCompacted = false
 let compactedCold = false
 let compactRuns = 0 // cold compactions this mod has started: a dialog answered after one started must not start another
 let compactLive = false // the latest is still running, waited on or not: past its deadline too, for as long again
+let manualLive = 0 // /compact runs the person (or another plugin) started, still under way
+const compacting = () => compactLive || manualLive > 0
 let compactTriedAt = 0 // when a cold compact last failed or was refused: no retry for 2 minutes
 let pending = null // messages waiting on the compaction under way, in arrival order
 let chatEpoch = 0 // raised on /clear, /resume and /fork: a compaction started for one chat leaves the next one alone
@@ -367,7 +369,7 @@ async function resumeStep($) {
   S.resumeAt = 0
   $.ui.invalidate('ui.render')
   // a queue waiting on a compaction takes it in turn, never ahead of the messages already there
-  if (pending || (worthCompacting() && !compactLive)) {
+  if (pending || (worthCompacting() && !compacting())) {
     compactThenSend($, { text: 'Resume' }, true)
     return
   }
@@ -531,7 +533,7 @@ async function drain($, epoch = chatEpoch) {
   try {
     while (epoch === chatEpoch && pending && pending.length) {
       const msg = pending.shift()
-      if (await resend($, msg).catch(() => false)) continue
+      if (await resend($, msg, epoch).catch(() => false)) continue
       // the chat changed while that resend was refused: the rest was handed back, and this one goes with it
       if (epoch !== chatEpoch) {
         const ok = await putBack($, [msg])
@@ -568,11 +570,13 @@ async function drain($, epoch = chatEpoch) {
 }
 
 // true once the message is submitted; false when it was refused or could not be (the caller puts it back)
-async function resend($, msg) {
+async function resend($, msg, epoch = chatEpoch) {
   // A plugin can't submit a "/" line: it goes back in the prompt box
   if (msg.slash) return false
   const send = { text: msg.text, ...(msg.attachments ? { attachments: msg.attachments } : {}) }
   for (const asUser of msg.modes) {
+    // the chat changed while an earlier attempt was out: never try the old chat's message in the new one
+    if (epoch !== chatEpoch) return false
     let r
     try {
       r = await $.prompt.submit(asUser ? { ...send, asUser } : send)
@@ -1227,19 +1231,19 @@ export function register(on, options = {}) {
     }
     // an attachment's handle lives only while this submit is in flight: a resend after compacting would drop it
     const media = Array.isArray(e.attachments) && e.attachments.length > 0
-    if (wake) return worthCompacting() && !media && !compactLive ? compactThenSend($, e, true) : next(e)
+    if (wake) return worthCompacting() && !media && !compacting() ? compactThenSend($, e, true) : next(e)
     // Owner 2026-11-02: an idle chat woken cold by anything but the person at the prompt (another
     // session's message, a task notification, a schedule, the desktop app's own turn) compacts
     // first, with no dialog: nobody may be there to answer it. Not this mod's own prompt (defensive:
     // the host does not send it here), not a slash command (a plugin can't resubmit one), not an attachment.
     if (!maybePerson) {
       const kind = sender(e)
-      const skip = ownPrompt($, e) ? 'plugin' : e.isMeta ? 'meta' : e.command ? 'slash' : media ? 'media' : !worthCompacting() ? 'floor' : compactLive ? 'running' : now - compactTriedAt < 2 * MIN ? 'just-tried' : ''
+      const skip = ownPrompt($, e) ? 'plugin' : e.isMeta ? 'meta' : e.command ? 'slash' : media ? 'media' : !worthCompacting() ? 'floor' : compacting() ? 'running' : now - compactTriedAt < 2 * MIN ? 'just-tried' : ''
       coldLog($, { origin: kind, coldMin: Math.round((rotated ? now - S.seatChangedAt : reopened ? now - S.lastActivity : -left) / MIN), ...(reopened ? { reopened: true } : {}), action: skip ? 'skip-' + skip : 'compact-first', ...(skip ? {} : { text: e.text }) })
       return skip ? next(e) : compactThenSend($, e, true, kind)
     }
     // a compaction just ran or is running: asking again would only queue behind it, or compact twice
-    if (pending || compactLive) {
+    if (pending || compacting()) {
       coldLog($, { event: 'pass-during-compact', origin: sender(e) })
       return next(e)
     }
@@ -1262,7 +1266,11 @@ export function register(on, options = {}) {
     coldLog($, { event: 'asked', origin: (e.origin && e.origin.kind) || 'none', reopened, rotated, answer })
     // $.session.compact() is refused on SDK hosts (the desktop app), so this queues /compact
     // the dialog waited on the person: a compaction may have run or started meanwhile
-    if (answer === 'Compact first, then send') return compactRuns !== runs || compactLive || justCompacted || (pending && e.command) ? next(e) : compactThenSend($, e, false)
+    if (answer === 'Compact first, then send') {
+      // one started meanwhile and is still queueing: wait behind it, in order, rather than overtake it
+      if (pending && !e.command) return compactThenSend($, e, false)
+      return compactRuns !== runs || compacting() || justCompacted || pending ? next(e) : compactThenSend($, e, false)
+    }
     if (answer === 'Send anyway') return next(e)
     $.ui.toast('Not sent. A fresh session with a short handoff avoids the rewrite entirely.', { timeoutMs: 8000 })
     return { drop: 'Cancelled by cache-keeper before a cold cache rewrite' }
@@ -1372,7 +1380,14 @@ export function register(on, options = {}) {
     return next(e)
   })
   on('command.run', { command: ['compact'] }, async ($, e, next) => {
-    const r = await next(e)
+    // under way: a cold wake meanwhile waits for it rather than starting a second one
+    manualLive++
+    let r
+    try {
+      r = await next(e)
+    } finally {
+      manualLive--
+    }
     if (!refused(r)) markCompacted()
     else {
       // a typed /compact the compactor refused: the cold-wake path must not try the same size again
