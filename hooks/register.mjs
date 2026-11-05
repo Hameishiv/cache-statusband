@@ -493,6 +493,21 @@ async function fillBox($, text, mode) {
   }
 }
 
+// Messages that cannot be sent go back to the prompt box after whatever the person has typed, a blank
+// line between, so neither runs into the other; if the box will not take them, each is logged in full.
+async function putBack($, back) {
+  let box = ''
+  try {
+    box = String(((await $.prompt.read()) || {}).text || '')
+  } catch {
+    // no box to read: append as is
+  }
+  const sep = !box || /\n\s*\n\s*$/.test(box) ? '' : /\n\s*$/.test(box) ? '\n' : '\n\n'
+  if (await fillBox($, sep + back.map((m) => m.text).join('\n\n'), 'append')) return true
+  back.forEach((m) => coldLog($, { action: 'not-resent', text: m.text }))
+  return false
+}
+
 // Resend the queue in order, with the queue live: a message arriving during the drain is appended
 // by the prompt.submit hook and goes out after the ones before it. The first message that cannot be
 // submitted goes back to the prompt box together with every one behind it, so nothing is dropped and
@@ -517,10 +532,9 @@ async function drain($) {
         const back = [msg, ...pending]
         pending = null
         draining = false
-        if (await fillBox($, back.map((m) => m.text).join('\n\n'), 'append')) {
+        if (await putBack($, back)) {
           $.ui.toast(back.length === 1 ? 'The message is back in the prompt box: press Enter to send it.' : `${back.length} messages are back in the prompt box: press Enter to send them.`, { timeoutMs: 15000 })
         } else {
-          back.forEach(lose)
           $.ui.toast(`${back.length} message(s) could not be sent again (logged if ~/.claude-shared/state exists).`, { timeoutMs: 15000 })
         }
         return
@@ -1105,6 +1119,14 @@ export function register(on, options = {}) {
     compactTriedAt = 0 // nor does its failed or refused compact hold back this one's
     refusedAt = 0
     S.coldRestarts = [] // the new chat's own, from its record below
+    // what waited on the last chat's compaction was meant for that chat: back to the box, never into this one
+    if (pending && pending.length) {
+      const back = pending
+      pending = null
+      draining = false
+      const ok = await putBack($, back)
+      $.ui.toast(ok ? `${back.length} message(s) meant for the previous chat are in the prompt box: send them only if they still apply.` : `${back.length} message(s) meant for the previous chat could not be sent (logged if ~/.claude-shared/state exists).`, { timeoutMs: 15000 })
+    }
     try {
       S.id = (await $.session.id()) || S.id
     } catch {

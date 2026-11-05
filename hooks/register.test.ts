@@ -47,6 +47,7 @@ function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unkno
     return { text: e.text }
   })
   on('prompt.fill', (_: unknown, e: any) => (seen.fills.push({ text: e.text, mode: e.mode }), { isFilled: true }))
+  on('prompt.read', () => ({ value: { text: boxDraft, cursor: boxDraft.length } }))
   on('session.start', (_: unknown, e: any) => ({ cwd: e.cwd }))
   on('session.measure', () => ({ changed: [] }))
   on('ui.toast', (_: unknown, e: unknown) => (seen.toasts.push(JSON.stringify(e)), { value: undefined }))
@@ -69,6 +70,8 @@ let noStateDir = false
 let headlessRun = false
 // the desktop app's entrypoint
 let desktopEntry = false
+// what the person has typed in the prompt box
+let boxDraft = ''
 
 function answer(on: any, seen: { asks: number; options?: string[] }, label: string | null) {
   on('tool.call', (_: unknown, e: any) => {
@@ -553,6 +556,56 @@ test('a resend the host refuses with a drop goes back to the prompt box with the
     expect(seen.log).not.toContain('not-resent') // put back, not lost
   } finally {
     dropSubmit = null
+  }
+})
+
+// Codex review: a put-back message must not run into what the person has typed
+test('messages put back in the prompt box start a blank line after the draft', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, null)
+  dropSubmit = /first/
+  boxDraft = 'half typed'
+  try {
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+    await $.prompt.submit({ text: 'first', origin: PEER, wait: false } as never)
+    await clock.advance(100)
+    await settle(clock, () => seen.fills.length >= 1)
+    expect(seen.fills[0].mode).toBe('append')
+    expect(seen.fills[0].text.startsWith('\n\n[peer message')).toBe(true)
+  } finally {
+    dropSubmit = null
+    boxDraft = ''
+  }
+})
+
+// Codex review: messages queued for one chat never go into the next one after /clear
+test('a /clear during a compaction puts the queued messages back instead of sending them to the new chat', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, null)
+  on('classic.SessionStart', () => ({}))
+  hangCompact = true
+  try {
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+    await $.prompt.submit({ text: 'first', origin: PEER, wait: false } as never)
+    await clock.advance(100)
+    await settle(clock, () => seen.compacts >= 1)
+    await ($ as any).classic.SessionStart({ source: 'clear', transcript_path: '' })
+    await settle(clock, () => seen.fills.length >= 1)
+    expect(seen.fills[0].text).toContain('first')
+    expect(seen.toasts.some((t) => /meant for the previous chat/.test(t))).toBe(true)
+    // a later message in the new chat is not held behind the old chat's queue
+    await $.prompt.submit({ text: 'new chat', origin: PEER, wait: false } as never)
+    expect(seen.log).not.toContain('"queued-behind-compact","text":"new chat"')
+  } finally {
+    hangCompact = false
   }
 })
 
