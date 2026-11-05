@@ -903,6 +903,35 @@ test('a /clear while a resend is out puts the messages back in arrival order', a
   }
 })
 
+// A refusal that comes after the 10-minute deadline is recorded, like one that came in time
+test('a compaction refused after its deadline still sets the floor', async ($, on) => {
+  compactOutput = 'Not compacted · fast-jev: below 5% minimum: 2% reduction'
+  holdCompact = true
+  try {
+    const kept = new Map<string, unknown>()
+    const { clock, seen } = engine($, on, { label: 'A' }, kept)
+    answer(on, seen, null)
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+    await $.prompt.submit({ text: 'one', origin: PEER, wait: false } as never)
+    await clock.advance(100)
+    await settle(clock, () => seen.compacts >= 1)
+    await clock.advance(11 * 60000) // past the deadline: the queue goes as typed
+    await settle(clock, () => seen.submits.length >= 1)
+    releaseCompact() // and only now the compactor refuses
+    await clock.advance(3 * 60000)
+    await $.prompt.submit({ text: 'two', origin: PEER, wait: false } as never)
+    await clock.advance(100)
+    await settle(clock, () => seen.log.includes('skip-floor'))
+    expect(seen.compacts).toBe(1)
+  } finally {
+    compactOutput = ''
+    holdCompact = false
+  }
+})
+
 // Anything the host could not classify may be the person at the prompt: it gets the dialog, not the silent compact
 async function unknownOrigin($: any, on: any, origin: unknown) {
   const kept = new Map<string, unknown>()
