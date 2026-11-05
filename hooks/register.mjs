@@ -446,7 +446,7 @@ async function runCompactThenSend($) {
 // prompt box must not be overtaken, or overwritten by the next one's fallback
 async function drain($, left) {
   for (let i = 0; i < left.length; i++) {
-    if (await resend($, left[i])) continue
+    if (await resend($, left[i]).catch(() => false)) continue
     const rest = left.slice(i + 1)
     for (const m of rest) coldLog($, { action: 'not-resent', text: clip(m.text, 200) })
     if (rest.length) $.ui.toast(`${rest.length} more message(s) were not sent again; they are in the cold-compact log.`, { timeoutMs: 15000 })
