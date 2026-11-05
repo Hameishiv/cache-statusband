@@ -625,6 +625,59 @@ async function unknownOrigin($: any, on: any, origin: unknown) {
 }
 test('a prompt with an unclassified origin is asked, not auto-compacted', ($, on) => unknownOrigin($, on, { kind: 'unclassified' }))
 test('a prompt with no origin is asked, not auto-compacted', ($, on) => unknownOrigin($, on, undefined))
+test("an auto-continuation prompt (after the person's own click) is asked, not auto-compacted", ($, on) => unknownOrigin($, on, { kind: 'auto-continuation' }))
+
+// A plugin's resend leaves an @ mention unexpanded: the person's prompt with one does not join the queue
+test('a prompt of the person with an @ mention does not wait behind a running compaction', async ($, on) => {
+  hangCompact = true
+  try {
+    const kept = new Map<string, unknown>()
+    const { clock, seen } = engine($, on, { label: 'A' }, kept)
+    answer(on, seen, null)
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+    await $.prompt.submit({ text: 'first', origin: PEER, wait: false } as never)
+    await clock.advance(100)
+    expect(seen.compacts).toBe(1)
+    const plain = await $.prompt.submit({ text: 'and this', origin: COMPOSER, wait: false } as never)
+    const mention = await $.prompt.submit({ text: 'look at @src/x.ts', origin: COMPOSER, wait: false } as never)
+    expect('drop' in (plain as object)).toBe(true) // queued behind the compaction
+    expect('drop' in (mention as object)).toBe(false) // goes as typed, its mention expanded
+    expect(seen.asks).toBe(0) // and is not asked while the compaction runs
+  } finally {
+    hangCompact = false
+  }
+})
+
+// The dialog waits on the person: a compaction that ran meanwhile is not followed by a second one
+test('"Compact first" answered after a compaction ran during the dialog does not compact again', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  let ran = false
+  on('tool.call', async (_: unknown, e: any) => {
+    if (e.tool !== 'AskUserQuestion') return { result: {} }
+    seen.asks++
+    if (!ran) {
+      ran = true
+      // while the person reads the dialog, a peer's message compacts first and is resent
+      await $.prompt.submit({ text: 'from a peer', origin: PEER, wait: false } as never)
+      await settle(clock, () => seen.submits.length >= 1)
+    }
+    const q = e.questions?.[0]?.question ?? ''
+    return { result: { questions: e.questions, answers: { [q]: 'Compact first, then send' } } }
+  })
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+  await clock.advance(77 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+  const r = await $.prompt.submit({ text: 'mine', origin: COMPOSER, wait: false } as never)
+  await clock.advance(200)
+  expect(seen.asks).toBe(1)
+  expect(seen.compacts).toBe(1)
+  expect('drop' in (r as object)).toBe(false)
+})
 
 // An unclassified prompt the engine marks isMeta is an engine notice, not the person: never asked, and never
 // compacted for, since a resend could not carry isMeta and would turn a receipt into a turn of its own
