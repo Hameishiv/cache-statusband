@@ -20,7 +20,7 @@ function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unkno
     on('store.keys', () => ({ value: [...kept.keys()] }))
   } else mock.store(on)
   mock.env(on, { USERPROFILE: 'C:/Users/T', ...(desktopEntry ? { CLAUDE_CODE_ENTRYPOINT: 'claude-desktop' } : {}) })
-  const seen = { compacts: 0, submits: [] as string[], asUsers: [] as unknown[], fills: [] as { text: string; mode?: string }[], asks: 0, toasts: [] as string[], order: [] as string[], log: '', logPath: '' }
+  const seen = { compacts: 0, submits: [] as string[], asUsers: [] as unknown[], fills: [] as { text: string; mode?: string }[], asks: 0, toasts: [] as string[], order: [] as string[], attempts: [] as string[], log: '', logPath: '' }
   on('session.id', () => ({ value: 'sid-test' }))
   on('session.cwd', () => ({ value: '/repo' }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
@@ -41,6 +41,7 @@ function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unkno
   on('prompt.submit', async (_: unknown, e: any) => {
     if (e.origin?.kind === 'plugin' && failSubmit && failSubmit.test(e.text)) throw new Error('not now')
     // a host that refuses the submit (Stop, its limit, another hook) resolves { drop }
+    if (e.origin?.kind === 'plugin') seen.attempts.push(e.text)
     if (e.origin?.kind === 'plugin' && dropSubmit && dropSubmit.test(e.text)) return { drop: 'refused' }
     // the host shows asUser on the origin
     if (e.origin?.kind === 'plugin') seen.submits.push(e.text), seen.asUsers.push(e.origin.asUser), seen.order.push('send:' + e.text)
@@ -671,6 +672,33 @@ test('a /clear during the last resend leaves no queue behind to swallow the next
     expect(seen.log).not.toContain('"queued-behind-compact","text":"later"')
   } finally {
     duringSubmit = null
+  }
+})
+
+// A resend the host refuses is not tried again as the mod: Stop or another hook meant it
+test('a refused resend is not retried under another identity', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, null)
+  holdCompact = true
+  dropSubmit = /wake/
+  try {
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+    await $.prompt.submit({ text: 'first', origin: PEER, wait: false } as never)
+    await clock.advance(100)
+    await settle(clock, () => seen.compacts >= 1)
+    // no origin: queued as possibly the person's, so it would try asUser and then without it
+    await $.prompt.submit({ text: 'wake', wait: false } as never)
+    releaseCompact()
+    await settle(clock, () => seen.fills.length >= 1)
+    expect(seen.attempts.filter((t) => t === 'wake')).toEqual(['wake'])
+    expect(seen.fills[0].text).toContain('wake')
+  } finally {
+    holdCompact = false
+    dropSubmit = null
   }
 })
 

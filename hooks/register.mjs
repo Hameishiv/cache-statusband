@@ -573,13 +573,15 @@ async function resend($, msg) {
   if (msg.slash) return false
   const send = { text: msg.text, ...(msg.attachments ? { attachments: msg.attachments } : {}) }
   for (const asUser of msg.modes) {
+    let r
     try {
-      // a refused submit (Stop, a host limit, another hook) resolves { drop }: a failure too
-      const r = await $.prompt.submit(asUser ? { ...send, asUser } : send)
-      if (!(r && r.drop !== undefined)) return true
+      r = await $.prompt.submit(asUser ? { ...send, asUser } : send)
     } catch {
-      // try the next way
+      continue // a submit that throws (one the host cannot take this way): try the next way
     }
+    // a refused submit (Stop, a host limit, another hook) resolves { drop }: never retried under another
+    // identity, which could start a turn the person cancelled; it goes back to the prompt box instead
+    return !(r && r.drop !== undefined)
   }
   return false
 }
