@@ -501,7 +501,7 @@ test('a message that arrives while the cold compact runs goes after the first on
 })
 
 // Pre-push review round 2: a resend that cannot be submitted stops the rest, so none overtakes or overwrites it
-test('when a queued resend cannot be submitted, the messages behind it are not sent and the person is told', async ($, on) => {
+test('when a queued resend cannot be submitted, it goes back to the prompt box with the messages behind it', async ($, on) => {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)
   answer(on, seen, null)
@@ -623,6 +623,22 @@ async function unknownOrigin($: any, on: any, origin: unknown) {
 }
 test('a prompt with an unclassified origin is asked, not auto-compacted', ($, on) => unknownOrigin($, on, { kind: 'unclassified' }))
 test('a prompt with no origin is asked, not auto-compacted', ($, on) => unknownOrigin($, on, undefined))
+
+// An unclassified prompt the engine marks isMeta is an engine notice, not the person: it compacts first, unasked
+test('an unclassified engine notice (isMeta) compacts first, with no dialog', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, 'Send anyway')
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+  await clock.advance(77 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+  const r = await $.prompt.submit({ text: 'idle notice', origin: { kind: 'unclassified' }, isMeta: true, wait: false } as never)
+  await clock.advance(100)
+  expect(seen.asks).toBe(0)
+  expect('drop' in (r as object)).toBe(true)
+  expect(seen.log).toContain('compact-first')
+})
 
 // A compaction that never settles must not hold the queue forever
 test('a compaction that does not settle in 10 minutes lets the queue go as typed', async ($, on) => {

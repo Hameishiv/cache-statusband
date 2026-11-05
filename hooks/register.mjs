@@ -73,6 +73,8 @@ let justCompacted = false
 let compactedCold = false
 let compactTriedAt = 0 // when a cold compact last failed or was refused: no retry for 2 minutes
 let pending = null // messages waiting on the compaction under way, in arrival order
+let draining = false // the compaction is over and the queue is being resent: the person's own prompts no longer wait
+let refusedAt = 0 // the context size a compaction was last refused at: no cold compact until it grows 100k past it
 let logChain = Promise.resolve() // one log write at a time in this process
 let handoffPending = false
 let seatFile = ''
@@ -271,6 +273,7 @@ function markCompacted() {
   const left = msLeft(S.lastActivity, ttlMin())
   compactedCold = compactedCold || (left !== null && left <= 0) || rotatedCold() || reopenedCold()
   justCompacted = true
+  refusedAt = 0
   S.lastActivity = 0
 }
 
@@ -313,7 +316,7 @@ async function readSeat($, adopt = false) {
 
 // Compacting on a cold cache pays only when it frees a real share of the context
 function worthCompacting() {
-  return S.ctx >= settings.bigTokens && S.ctx - S.floor >= 100000
+  return S.ctx >= settings.bigTokens && S.ctx - Math.max(S.floor, refusedAt) >= 100000
 }
 
 // Run off the hook: a command started inside a hook the session waits on is refused
@@ -426,18 +429,21 @@ async function runCompactThenSend($) {
   try {
     const before = S.ctx
     const run = Promise.resolve($.command.run({ command: 'compact', args: '' }))
-    run.catch(() => {}) // a failure after the deadline has no one waiting
+    let late = false
+    // this mod's own /compact never reaches its own command.run hook: a compaction that ends after the deadline is marked here
+    run.then((r) => late && !refused(r) && markCompacted(), () => {}) // a failure after the deadline has no one waiting
     const timeout = new Promise((resolve) => $.clock.after(COMPACT_DEADLINE, () => resolve(TIMED_OUT)))
     const r = await Promise.race([run, timeout])
     if (r === TIMED_OUT) {
-      // stop waiting: the queue goes as typed. A late settle is marked by the command.run hook alone
+      // stop waiting: the queue goes as typed
+      late = true
       compactTriedAt = await $.clock.now()
       await coldLog($, { action: 'compact-timeout', before })
       $.ui.toast('Compacting took over 10 minutes, so the message goes as typed.', { timeoutMs: 8000 })
     } else if (refused(r)) {
       // the context did not shrink: no retry until it has grown 100k more, and the log says so
       compactTriedAt = now
-      S.floor = S.ctx
+      refusedAt = S.ctx
       if (unattended) await coldLog($, { action: 'compact-skipped', before, reason: clip(String(r.text), 160) })
       $.ui.toast('Not compacted (' + clip(String(r.text), 80) + '), so the message goes as typed.', { timeoutMs: 8000 })
     } else {
@@ -468,6 +474,7 @@ async function fillBox($, text, mode) {
 // none overtakes it. A slash line (only ever the head, from the person's dialog) is filled as the
 // draft, the rest still go, and a later failure is logged rather than filled over that draft.
 async function drain($) {
+  draining = true
   let draft = false // a slash line sits in the prompt box
   let lost = 0 // not sent again and not put back
   const lose = (m) => (lost++, coldLog($, { action: 'not-resent', text: m.text }))
@@ -484,6 +491,7 @@ async function drain($) {
         // this one and all behind it; the queue closes in the same tick, so nothing slips in unseen
         const back = [msg, ...pending]
         pending = null
+        draining = false
         if (await fillBox($, back.map((m) => m.text).join('\n\n'), 'append')) {
           $.ui.toast(back.length === 1 ? 'Your message is back in the prompt box: press Enter to send it.' : `${back.length} messages are back in the prompt box: press Enter to send them.`, { timeoutMs: 15000 })
         } else {
@@ -498,6 +506,7 @@ async function drain($) {
     ;(pending || []).forEach(lose)
   }
   pending = null
+  draining = false
   if (lost) $.ui.toast(`${lost} message(s) could not be sent again (logged if ~/.claude-shared/state exists).`, { timeoutMs: 15000 })
 }
 
@@ -1054,6 +1063,7 @@ export function register(on, options = {}) {
     compactedCold = false
     S.floor = 0
     compactTriedAt = 0 // nor does its failed or refused compact hold back this one's
+    refusedAt = 0
     S.coldRestarts = [] // the new chat's own, from its record below
     try {
       S.id = (await $.session.id()) || S.id
@@ -1096,7 +1106,8 @@ export function register(on, options = {}) {
     if (!S.pr) S.pr = findPr(e.command ? `/${e.command.name} ${e.command.args}` : e.text)
     const fromUser = e.origin && (e.origin.kind === 'composer' || e.origin.kind === 'bridge')
     // no origin, or one the host could not classify, may be the person at the prompt: it gets the dialog, never the silent compact
-    const maybePerson = !e.origin || fromUser || e.origin.kind === 'unclassified'
+    // (an isMeta prompt is an engine notice, never the person)
+    const maybePerson = !e.isMeta && (!e.origin || fromUser || e.origin.kind === 'unclassified')
     const wake = fromUser && !!cfg.rotatorWake && cfg.rotatorWake.test(String(e.text || ''))
     if (wake) {
       // The wake-up is the rotation reaching this session: take the new seat now
@@ -1111,7 +1122,8 @@ export function register(on, options = {}) {
     // These run locally or start afresh: a cold cache costs them nothing
     const local = e.command && ['compact', 'clear', names.cache, names.keepwarm, names.board, names.handoff].includes(e.command.name)
     // A compaction is under way: anything else waits behind it and goes after, in order, with no dialog
-    if (pending && !ownPrompt($, e) && !local && !e.turnId && !e.command && !(Array.isArray(e.attachments) && e.attachments.length)) {
+    // the person's own prompt waits only while /compact runs: a resend the host holds must never swallow it
+    if (pending && !(draining && fromUser) && !ownPrompt($, e) && !local && !e.turnId && !e.command && !(Array.isArray(e.attachments) && e.attachments.length)) {
       const kind = (e.origin && e.origin.kind) || 'none'
       // not awaited: the queue could drain during the write, and this message would start a second compact
       coldLog($, { origin: kind, action: 'queued-behind-compact' })
@@ -1127,8 +1139,8 @@ export function register(on, options = {}) {
     if (wake) return worthCompacting() && !media ? compactThenSend($, e, true) : next(e)
     // Owner 2026-11-02: an idle chat woken cold by anything but the person at the prompt (another
     // session's message, a task notification, a schedule, the desktop app's own turn) compacts
-    // first, with no dialog: nobody may be there to answer it. Not a plugin's own prompt (our
-    // resend included), not a slash command (a plugin can't resubmit one), not an attachment.
+    // first, with no dialog: nobody may be there to answer it. Not this mod's own prompt (defensive:
+    // the host does not send it here), not a slash command (a plugin can't resubmit one), not an attachment.
     if (!maybePerson) {
       const kind = (e.origin && e.origin.kind) || 'none'
       const skip = ownPrompt($, e) ? 'plugin' : e.command ? 'slash' : media ? 'media' : !worthCompacting() ? 'floor' : now - compactTriedAt < 2 * MIN ? 'just-tried' : ''
