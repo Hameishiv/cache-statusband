@@ -35,6 +35,7 @@ function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unkno
     return { text: e.command === 'compact' ? compactOutput : '' }
   })
   on('prompt.submit', (_: unknown, e: any) => {
+    if (e.origin?.kind === 'plugin' && failSubmit && failSubmit.test(e.text)) throw new Error('not now')
     if (e.origin?.kind === 'plugin') seen.submits.push(e.text), seen.order.push('send:' + e.text)
     return { text: e.text }
   })
@@ -46,6 +47,9 @@ function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unkno
 }
 
 // $.ui.ask reaches the engine as an AskUserQuestion tool call
+// a plugin resend whose text matches this throws, as a host that refuses the submit would
+let failSubmit: RegExp | null = null
+
 function answer(on: any, seen: { asks: number; options?: string[] }, label: string | null) {
   on('tool.call', (_: unknown, e: any) => {
     if (e.tool !== 'AskUserQuestion') return { result: {} }
@@ -472,6 +476,27 @@ test('a message that arrives while the cold compact runs goes after the first on
   expect('drop' in (b as object)).toBe(true)
   expect(seen.compacts).toBe(1)
   expect(seen.order).toEqual(['compact', 'send:[peer message, resent by cache-keeper after /compact]\nfirst', 'send:[task-notification message, resent by cache-keeper after /compact]\nsecond'])
+})
+
+// Pre-push review round 2: a resend that cannot be submitted stops the rest, so none overtakes or overwrites it
+test('when a queued resend cannot be submitted, the messages behind it are not sent and the person is told', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, null)
+  failSubmit = /first/
+  try {
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+    await $.prompt.submit({ text: 'first', origin: PEER, wait: false } as never)
+    await $.prompt.submit({ text: 'second', origin: PEER, wait: false } as never)
+    await clock.advance(100)
+    expect(seen.order).toEqual(['compact'])
+    expect(seen.toasts.some((t) => /1 more message\(s\) were not sent again/.test(t))).toBe(true)
+  } finally {
+    failSubmit = null
+  }
 })
 
 test('the cold-compact log is one file per session, stamped in local time', async ($, on) => {

@@ -73,7 +73,6 @@ let justCompacted = false
 let compactedCold = false
 let compactTriedAt = 0 // when a cold compact last failed or was refused: no retry for 2 minutes
 let pending = null // messages waiting on the compaction under way, in arrival order
-let resending = false // true while this mod resubmits a queued message, whatever origin the host gives it
 let logChain = Promise.resolve() // one log write at a time in this process
 let handoffPending = false
 let seatFile = ''
@@ -382,10 +381,10 @@ function compactThenSend($, e, unattended, from = '') {
   pending = [msg]
   // a throw must not leave the queue set, or every later message would wait forever: send what is left as is
   $.clock.after(50, () =>
-    runCompactThenSend($).catch(async () => {
+    runCompactThenSend($).catch(() => {
       const left = pending || []
       pending = null
-      for (const m of left) await resend($, m).catch(() => {})
+      return drain($, left).catch(() => {})
     }),
   )
   return drop
@@ -437,28 +436,33 @@ async function runCompactThenSend($) {
     if (unattended) await coldLog($, { action: 'compact-failed', error: String((err && err.message) || err) })
     $.ui.toast('Could not compact (' + clip(String((err && err.message) || err), 80) + '), so the message goes as typed.', { timeoutMs: 8000 })
   }
-  // send every waiting message in the order it arrived, including any that queue while these go
-  while (pending.length) await resend($, pending.shift())
+  // what waited during the compaction goes now, in order; anything later takes the normal path
+  const left = pending
   pending = null
+  await drain($, left)
 }
 
-async function resend($, msg) {
-  resending = true
-  try {
-    await resendOnce($, msg)
-  } finally {
-    resending = false
+// Resend in order and stop at the first message that could not be submitted: one left in the
+// prompt box must not be overtaken, or overwritten by the next one's fallback
+async function drain($, left) {
+  for (let i = 0; i < left.length; i++) {
+    if (await resend($, left[i])) continue
+    const rest = left.slice(i + 1)
+    for (const m of rest) coldLog($, { action: 'not-resent', text: clip(m.text, 200) })
+    if (rest.length) $.ui.toast(`${rest.length} more message(s) were not sent again; they are in the cold-compact log.`, { timeoutMs: 15000 })
+    return
   }
 }
 
-async function resendOnce($, msg) {
+// true once the message is submitted; false when it went back to the prompt box or was lost
+async function resend($, msg) {
   const send = { text: msg.text, ...(msg.attachments ? { attachments: msg.attachments } : {}) }
   // A plugin can't submit a "/" line: those go back in the prompt box
   if (!msg.slash) {
     for (const asUser of msg.unattended ? [true, false] : [true]) {
       try {
         await $.prompt.submit({ ...send, asUser })
-        return
+        return true
       } catch {
         // try the next way, then the prompt box
       }
@@ -471,6 +475,7 @@ async function resendOnce($, msg) {
     filled = false
   }
   $.ui.toast(filled ? 'Compacted. Your message is back in the prompt box: press Enter to send it.' : 'Compacted, but the message could not be sent again: ' + clip(msg.text, 80), { timeoutMs: 15000 })
+  return false
 }
 
 function findPr(text) {
@@ -1063,7 +1068,7 @@ export function register(on, options = {}) {
     // These run locally or start afresh: a cold cache costs them nothing
     const local = e.command && ['compact', 'clear', names.cache, names.keepwarm, names.board, names.handoff].includes(e.command.name)
     // A compaction is under way: anything else waits behind it and goes after, in order, with no dialog
-    if (pending && !resending && !ownPrompt($, e) && !local && !e.turnId && !e.command && !(Array.isArray(e.attachments) && e.attachments.length)) {
+    if (pending && !ownPrompt($, e) && !local && !e.turnId && !e.command && !(Array.isArray(e.attachments) && e.attachments.length)) {
       const kind = (e.origin && e.origin.kind) || 'none'
       // not awaited: the queue could drain during the write, and this message would start a second compact
       coldLog($, { origin: kind, action: 'queued-behind-compact' })
