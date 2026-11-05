@@ -20,7 +20,7 @@ function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unkno
     on('store.keys', () => ({ value: [...kept.keys()] }))
   } else mock.store(on)
   mock.env(on, { USERPROFILE: 'C:/Users/T' })
-  const seen = { compacts: 0, submits: [] as string[], asks: 0, toasts: [] as string[], order: [] as string[], log: '', logPath: '' }
+  const seen = { compacts: 0, submits: [] as string[], asUsers: [] as unknown[], fills: [] as { text: string; mode?: string }[], asks: 0, toasts: [] as string[], order: [] as string[], log: '', logPath: '' }
   on('session.id', () => ({ value: 'sid-test' }))
   on('session.cwd', () => ({ value: '/repo' }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
@@ -28,17 +28,24 @@ function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unkno
   on('session.messages', () => ({ value: [] }))
   on('command.register', (_: unknown, e: any) => ({ value: { command: e.name } }))
   on('agent.list', () => ({ value: [] }))
-  on('fs.exists', (_: unknown, e: any) => ({ value: String(e.path ?? e).includes('.active') }))
-  on('fs.read', () => ({ value: seat.label }))
+  // the cold-compact log is a file that exists once something has been written to it
+  on('fs.exists', (_: unknown, e: any) => ({ value: String(e.path ?? e).includes('.active') || (String(e.path ?? e).includes('cold-compact-log') && seen.log !== '') }))
+  on('fs.read', (_: unknown, e: any) => ({ value: String(e.path ?? e).includes('cold-compact-log') ? seen.log : seat.label }))
   on('command.run', (_: unknown, e: any) => {
     if (e.command === 'compact') seen.compacts++, seen.order.push('compact')
+    if (e.command === 'compact' && hangCompact) return new Promise(() => {})
     return { text: e.command === 'compact' ? compactOutput : '' }
   })
-  on('prompt.submit', (_: unknown, e: any) => {
+  on('prompt.submit', async (_: unknown, e: any) => {
     if (e.origin?.kind === 'plugin' && failSubmit && failSubmit.test(e.text)) throw new Error('not now')
-    if (e.origin?.kind === 'plugin') seen.submits.push(e.text), seen.order.push('send:' + e.text)
+    // a host that refuses the submit (Stop, its limit, another hook) resolves { drop }
+    if (e.origin?.kind === 'plugin' && dropSubmit && dropSubmit.test(e.text)) return { drop: 'refused' }
+    // the host shows asUser on the origin
+    if (e.origin?.kind === 'plugin') seen.submits.push(e.text), seen.asUsers.push(e.origin.asUser), seen.order.push('send:' + e.text)
+    if (e.origin?.kind === 'plugin' && duringSubmit) await duringSubmit(e)
     return { text: e.text }
   })
+  on('prompt.fill', (_: unknown, e: any) => (seen.fills.push({ text: e.text, mode: e.mode }), { isFilled: true }))
   on('session.start', (_: unknown, e: any) => ({ cwd: e.cwd }))
   on('session.measure', () => ({ changed: [] }))
   on('ui.toast', (_: unknown, e: unknown) => (seen.toasts.push(JSON.stringify(e)), { value: undefined }))
@@ -49,6 +56,12 @@ function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unkno
 // $.ui.ask reaches the engine as an AskUserQuestion tool call
 // a plugin resend whose text matches this throws, as a host that refuses the submit would
 let failSubmit: RegExp | null = null
+// a plugin resend whose text matches this resolves { drop }, as a host that refuses it does without throwing
+let dropSubmit: RegExp | null = null
+// runs inside a plugin resend, while the drain is under way
+let duringSubmit: ((e: any) => Promise<void>) | null = null
+// the engine's /compact never settles
+let hangCompact = false
 
 function answer(on: any, seen: { asks: number; options?: string[] }, label: string | null) {
   on('tool.call', (_: unknown, e: any) => {
@@ -104,6 +117,7 @@ test('"Compact first, then send" really compacts, then sends the message', SETUP
   await clock.advance(100)
   expect(seen.compacts).toBe(1)
   expect(seen.submits).toEqual(['approve, B'])
+  expect(seen.asUsers).toEqual([true]) // the person's own words stay the person's
   // owner 2026-11-03: compacting is the dialog's first, preselected option
   expect(seen.options[0]).toBe('Compact first, then send')
 })
@@ -425,6 +439,11 @@ test('a cold send that Claude Code auto-compacts still counts as a cold rewrite,
   expect(rec.cold.length).toBe(1)
 })
 
+// The resend runs through several host round trips after the timer fires: wait for it, a few ticks at a time
+async function settle(clock: any, done: () => boolean) {
+  for (let i = 0; i < 100 && !done(); i++) await clock.advance(10)
+}
+
 // Owner 2026-11-02: a cold, big, idle chat woken by another session compacts BEFORE the message is processed
 const PEER = { kind: 'peer' } as never
 async function coldPeer($: any, on: any, idleMin: number, ctx = 300000) {
@@ -437,6 +456,7 @@ async function coldPeer($: any, on: any, idleMin: number, ctx = 300000) {
   await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
   const r = await $.prompt.submit({ text: 'PR 12 merged; pick up the next one', origin: PEER, wait: false } as never)
   await clock.advance(100)
+  await settle(clock, () => seen.submits.length + seen.fills.length >= 1)
   return { r, seen }
 }
 
@@ -445,6 +465,7 @@ test('a cold, large session woken by another session compacts before the message
   expect('drop' in (r as object)).toBe(true) // the message did not reach the model on the cold cache
   expect(seen.asks).toBe(0)
   expect(seen.order).toEqual(['compact', 'send:[peer message, resent by cache-keeper after /compact]\nPR 12 merged; pick up the next one'])
+  expect(seen.asUsers).toEqual([undefined]) // a peer's message is framed as the mod's, never the person's own words
 })
 
 // R10 2026-11-03: a refused /compact still returns; it must not be logged, or treated, as a compaction
@@ -472,6 +493,7 @@ test('a message that arrives while the cold compact runs goes after the first on
   const a = await $.prompt.submit({ text: 'first', origin: PEER, wait: false } as never)
   const b = await $.prompt.submit({ text: 'second', origin: { kind: 'task-notification' } as never, wait: false } as never)
   await clock.advance(100)
+  await settle(clock, () => seen.submits.length >= 2)
   expect('drop' in (a as object)).toBe(true)
   expect('drop' in (b as object)).toBe(true)
   expect(seen.compacts).toBe(1)
@@ -492,10 +514,135 @@ test('when a queued resend cannot be submitted, the messages behind it are not s
     await $.prompt.submit({ text: 'first', origin: PEER, wait: false } as never)
     await $.prompt.submit({ text: 'second', origin: PEER, wait: false } as never)
     await clock.advance(100)
+    await settle(clock, () => seen.fills.length >= 1)
     expect(seen.order).toEqual(['compact'])
-    expect(seen.toasts.some((t) => /1 more message\(s\) were not sent again/.test(t))).toBe(true)
+    // both go back in the prompt box, the failed one first, appended to whatever is there
+    expect(seen.fills).toEqual([{ text: '[peer message, resent by cache-keeper after /compact]\nfirst\n\n[peer message, resent by cache-keeper after /compact]\nsecond', mode: 'append' }])
+    expect(seen.toasts.some((t) => /2 messages are back in the prompt box/.test(t))).toBe(true)
   } finally {
     failSubmit = null
+  }
+})
+
+// Review round 3: a submit the host refuses RESOLVES { drop }; it is a failure, not a delivery
+test('a resend the host refuses with a drop goes back to the prompt box with the messages behind it', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, null)
+  dropSubmit = /first/
+  try {
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+    await $.prompt.submit({ text: 'first', origin: PEER, wait: false } as never)
+    await $.prompt.submit({ text: 'second', origin: PEER, wait: false } as never)
+    await clock.advance(100)
+    await settle(clock, () => seen.fills.length >= 1)
+    expect(seen.submits).toEqual([])
+    expect(seen.fills.length).toBe(1)
+    expect(seen.fills[0].mode).toBe('append')
+    expect(seen.fills[0].text).toMatch(/first[\s\S]*\n\n[\s\S]*second/)
+    expect(seen.log).not.toContain('not-resent') // put back, not lost
+  } finally {
+    dropSubmit = null
+  }
+})
+
+// A message arriving while the queue drains is appended to it, so it cannot overtake an earlier one
+test('a message that arrives during the drain goes after the queued ones', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, null)
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+  await clock.advance(77 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+  await $.prompt.submit({ text: 'first', origin: PEER, wait: false } as never)
+  await $.prompt.submit({ text: 'second', origin: PEER, wait: false } as never)
+  // the third arrives while the first is being resent, mid-drain
+  let late: unknown
+  duringSubmit = async (e) => {
+    if (/first/.test(e.text) && !late) late = await $.prompt.submit({ text: 'third', origin: PEER, wait: false } as never)
+  }
+  try {
+    await clock.advance(100)
+  await settle(clock, () => seen.submits.length >= 3)
+  } finally {
+    duringSubmit = null
+  }
+  expect('drop' in (late as object)).toBe(true) // queued behind, not sent ahead
+  expect(seen.compacts).toBe(1)
+  expect(seen.order.filter((o) => o.startsWith('send:')).map((o) => o.split('\n')[1])).toEqual(['first', 'second', 'third'])
+})
+
+// A refused compaction leaves the context as big as it was: retrying on every wake would refuse again
+test('a refused compaction sets the floor, so the next cold peer wake is skipped', async ($, on) => {
+  compactOutput = 'Not compacted · fast-jev: below 5% minimum: 2% reduction'
+  try {
+    const kept = new Map<string, unknown>()
+    const { clock, seen } = engine($, on, { label: 'A' }, kept)
+    answer(on, seen, null)
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+    await $.prompt.submit({ text: 'one', origin: PEER, wait: false } as never)
+    await clock.advance(100)
+    await settle(clock, () => seen.submits.length >= 1)
+    expect(seen.compacts).toBe(1)
+    // past the 2-minute retry pause, and the cache is cold again
+    await clock.advance(3 * 60000)
+    const r = await $.prompt.submit({ text: 'two', origin: PEER, wait: false } as never)
+    await clock.advance(100)
+    await settle(clock, () => seen.log.includes('skip-floor'))
+    expect('drop' in (r as object)).toBe(false) // goes through as is
+    expect(seen.compacts).toBe(1)
+    expect(seen.log).toContain('"action":"skip-floor"')
+  } finally {
+    compactOutput = ''
+  }
+})
+
+// Anything the host could not classify may be the person at the prompt: it gets the dialog, not the silent compact
+async function unknownOrigin($: any, on: any, origin: unknown) {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, 'Send anyway')
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+  await clock.advance(77 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+  const r = await $.prompt.submit({ text: 'who am I', ...(origin ? { origin } : {}), wait: false } as never)
+  await clock.advance(100)
+  expect(seen.asks).toBe(1)
+  expect(seen.compacts).toBe(0)
+  expect('drop' in (r as object)).toBe(false)
+  expect(seen.log).toContain('"event":"asked"')
+  expect(seen.log).not.toContain('compact-first')
+}
+test('a prompt with an unclassified origin is asked, not auto-compacted', ($, on) => unknownOrigin($, on, { kind: 'unclassified' }))
+test('a prompt with no origin is asked, not auto-compacted', ($, on) => unknownOrigin($, on, undefined))
+
+// A compaction that never settles must not hold the queue forever
+test('a compaction that does not settle in 10 minutes lets the queue go as typed', async ($, on) => {
+  hangCompact = true
+  try {
+    const kept = new Map<string, unknown>()
+    const { clock, seen } = engine($, on, { label: 'A' }, kept)
+    answer(on, seen, null)
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+    await $.prompt.submit({ text: 'first', origin: PEER, wait: false } as never)
+    await clock.advance(9 * 60000)
+    expect(seen.submits).toEqual([]) // still waiting
+    await clock.advance(2 * 60000)
+    expect(seen.submits.length).toBe(1)
+    expect(seen.log).toContain('"action":"compact-timeout"')
+  } finally {
+    hangCompact = false
   }
 })
 

@@ -372,25 +372,22 @@ async function resumeStep($) {
 }
 
 // `from` names a sender other than the person (a peer, a task notification): the resend says so,
-// so the message does not come back as the person's own words
+// and goes in without `asUser`, so the model reads it as the mod's message, not the person's own words
 function compactThenSend($, e, unattended, from = '') {
-  const msg = { text: from ? `[${from} message, resent by cache-keeper after /compact]\n${e.text}` : e.text, attachments: e.attachments, slash: !!e.command, unattended }
+  // the ways to submit it, in order: `true` is asUser, `false` omits it
+  const modes = from ? [false] : unattended ? [true, false] : [true]
+  const msg = { text: from ? `[${from} message, resent by cache-keeper after /compact]\n${e.text}` : e.text, attachments: e.attachments, slash: !!e.command, unattended, modes }
   const drop = { drop: 'cache-keeper: compacting first on a cold cache; the message is sent again once that finishes' }
   // a compaction is already under way: this message waits behind the ones before it
   if (pending) return pending.push(msg), drop
   pending = [msg]
   // a throw must not leave the queue set, or every later message would wait forever: send what is left as is
-  $.clock.after(50, () =>
-    runCompactThenSend($).catch(() => {
-      const left = pending || []
-      pending = null
-      return drain($, left).catch(() => {})
-    }),
-  )
+  $.clock.after(50, () => runCompactThenSend($).catch(() => drain($).catch(() => {})))
   return drop
 }
 
-// This mod's own resend comes back through the guard: it must pass, never queue or compact again
+// The host never runs this plugin's own hook for its own submit, so this is defensive only: for another
+// copy of this mod, or a host version that does. Such a resend must pass, never queue or compact again
 const ownPrompt = ($, e) => !!e.origin && e.origin.kind === 'plugin' && (!e.origin.name || e.origin.name === $.plugin.name)
 
 // Local wall-clock time with its offset (owner rule: log times are local, not UTC)
@@ -402,14 +399,18 @@ function localStamp(ms) {
 
 // The cold-compact decisions, on disk, so a session's own behaviour can be checked afterwards
 // One file per session, so sessions never overwrite each other's lines; writes in this process run one at a time.
-// shortcut: $.fs has no append, so read + rewrite; a log over 4 MiB fails the read and restarts empty
+// shortcut: $.fs has no append, so read + rewrite; a log over 4 MiB fails the read, and then that line is lost, not the file
 function coldLog($, fields) {
   const line = `${JSON.stringify({ t: localStamp(now), sid: S.id, ctx: S.ctx, ...fields })}\n`
   const path = `${home.replace(/\\/g, '/')}/.claude-shared/state/cache-keeper-cold-compact-log-${S.id || 'unknown'}.txt` // an existing folder: $.fs.write makes none
   logChain = logChain.then(async () => {
     try {
-      const old = await $.fs.read(path).catch(() => '')
-      await $.fs.write(path, `${typeof old === 'string' ? old : ''}${line}`)
+      let old = ''
+      if (await $.fs.exists(path)) {
+        old = await $.fs.read(path)
+        if (typeof old !== 'string') return // unreadable: lose this line rather than the file
+      }
+      await $.fs.write(path, `${old}${line}`)
     } catch {
       // logging never blocks a send
     }
@@ -417,14 +418,26 @@ function coldLog($, fields) {
   return logChain
 }
 
+const COMPACT_DEADLINE = 10 * MIN
+const TIMED_OUT = Symbol('timed out')
+
 async function runCompactThenSend($) {
   const unattended = pending.some((m) => m.unattended)
   try {
     const before = S.ctx
-    const r = await $.command.run({ command: 'compact', args: '' })
-    if (refused(r)) {
-      // the context did not shrink: the guard stays armed and the log says so
+    const run = Promise.resolve($.command.run({ command: 'compact', args: '' }))
+    run.catch(() => {}) // a failure after the deadline has no one waiting
+    const timeout = new Promise((resolve) => $.clock.after(COMPACT_DEADLINE, () => resolve(TIMED_OUT)))
+    const r = await Promise.race([run, timeout])
+    if (r === TIMED_OUT) {
+      // stop waiting: the queue goes as typed. A late settle is marked by the command.run hook alone
+      compactTriedAt = await $.clock.now()
+      await coldLog($, { action: 'compact-timeout', before })
+      $.ui.toast('Compacting took over 10 minutes, so the message goes as typed.', { timeoutMs: 8000 })
+    } else if (refused(r)) {
+      // the context did not shrink: no retry until it has grown 100k more, and the log says so
       compactTriedAt = now
+      S.floor = S.ctx
       if (unattended) await coldLog($, { action: 'compact-skipped', before, reason: clip(String(r.text), 160) })
       $.ui.toast('Not compacted (' + clip(String(r.text), 80) + '), so the message goes as typed.', { timeoutMs: 8000 })
     } else {
@@ -436,45 +449,72 @@ async function runCompactThenSend($) {
     if (unattended) await coldLog($, { action: 'compact-failed', error: String((err && err.message) || err) })
     $.ui.toast('Could not compact (' + clip(String((err && err.message) || err), 80) + '), so the message goes as typed.', { timeoutMs: 8000 })
   }
-  // what waited during the compaction goes now, in order; anything later takes the normal path
-  const left = pending
-  pending = null
-  await drain($, left)
+  // what waited during the compaction goes now, in order; anything arriving meanwhile joins the queue
+  await drain($)
 }
 
-// Resend in order and stop at the first message that could not be submitted: one left in the
-// prompt box must not be overtaken, or overwritten by the next one's fallback
-async function drain($, left) {
-  for (let i = 0; i < left.length; i++) {
-    if (await resend($, left[i]).catch(() => false)) continue
-    const rest = left.slice(i + 1)
-    for (const m of rest) coldLog($, { action: 'not-resent', text: clip(m.text, 200) })
-    if (rest.length) $.ui.toast(`${rest.length} more message(s) were not sent again; they are in the cold-compact log.`, { timeoutMs: 15000 })
-    return
+// Fill the prompt box with `text`; false when it was not filled (a dialog is up, or headless)
+async function fillBox($, text, mode) {
+  try {
+    return !!(await $.prompt.fill({ text, ...(mode ? { mode } : {}) })).isFilled
+  } catch {
+    return false
   }
 }
 
-// true once the message is submitted; false when it went back to the prompt box or was lost
-async function resend($, msg) {
-  const send = { text: msg.text, ...(msg.attachments ? { attachments: msg.attachments } : {}) }
-  // A plugin can't submit a "/" line: those go back in the prompt box
-  if (!msg.slash) {
-    for (const asUser of msg.unattended ? [true, false] : [true]) {
-      try {
-        await $.prompt.submit({ ...send, asUser })
-        return true
-      } catch {
-        // try the next way, then the prompt box
+// Resend the queue in order, with the queue live: a message arriving during the drain is appended
+// by the prompt.submit hook and goes out after the ones before it. The first message that cannot be
+// submitted goes back to the prompt box together with every one behind it, so nothing is dropped and
+// none overtakes it. A slash line (only ever the head, from the person's dialog) is filled as the
+// draft, the rest still go, and a later failure is logged rather than filled over that draft.
+async function drain($) {
+  let draft = false // a slash line sits in the prompt box
+  let lost = 0 // not sent again and not put back
+  const lose = (m) => (lost++, coldLog($, { action: 'not-resent', text: m.text }))
+  try {
+    while (pending && pending.length) {
+      const msg = pending.shift()
+      if (await resend($, msg).catch(() => false)) continue
+      if (msg.slash) {
+        draft = await fillBox($, msg.text)
+        if (!draft) lose(msg)
+        $.ui.toast(draft ? 'Compacted. Your message is back in the prompt box: press Enter to send it.' : 'Compacted, but the message could not be sent again: ' + clip(msg.text, 80), { timeoutMs: 15000 })
+      } else if (draft) lose(msg)
+      else {
+        // this one and all behind it; the queue closes in the same tick, so nothing slips in unseen
+        const back = [msg, ...pending]
+        pending = null
+        if (await fillBox($, back.map((m) => m.text).join('\n\n'), 'append')) {
+          $.ui.toast(back.length === 1 ? 'Your message is back in the prompt box: press Enter to send it.' : `${back.length} messages are back in the prompt box: press Enter to send them.`, { timeoutMs: 15000 })
+        } else {
+          back.forEach(lose)
+          $.ui.toast(`${back.length} message(s) could not be sent again (logged if ~/.claude-shared/state exists).`, { timeoutMs: 15000 })
+        }
+        return
       }
     }
-  }
-  let filled = false
-  try {
-    filled = !!(await $.prompt.fill({ text: msg.text })).isFilled
   } catch {
-    filled = false
+    // an unexpected throw: what is still queued is logged, never silently dropped
+    ;(pending || []).forEach(lose)
   }
-  $.ui.toast(filled ? 'Compacted. Your message is back in the prompt box: press Enter to send it.' : 'Compacted, but the message could not be sent again: ' + clip(msg.text, 80), { timeoutMs: 15000 })
+  pending = null
+  if (lost) $.ui.toast(`${lost} message(s) could not be sent again (logged if ~/.claude-shared/state exists).`, { timeoutMs: 15000 })
+}
+
+// true once the message is submitted; false when it was refused or could not be (the caller puts it back)
+async function resend($, msg) {
+  // A plugin can't submit a "/" line: it goes back in the prompt box
+  if (msg.slash) return false
+  const send = { text: msg.text, ...(msg.attachments ? { attachments: msg.attachments } : {}) }
+  for (const asUser of msg.modes) {
+    try {
+      // a refused submit (Stop, a host limit, another hook) resolves { drop }: a failure too
+      const r = await $.prompt.submit(asUser ? { ...send, asUser } : send)
+      if (!(r && r.drop !== undefined)) return true
+    } catch {
+      // try the next way
+    }
+  }
   return false
 }
 
@@ -1013,6 +1053,7 @@ export function register(on, options = {}) {
     justCompacted = false
     compactedCold = false
     S.floor = 0
+    compactTriedAt = 0 // nor does its failed or refused compact hold back this one's
     S.coldRestarts = [] // the new chat's own, from its record below
     try {
       S.id = (await $.session.id()) || S.id
@@ -1054,6 +1095,8 @@ export function register(on, options = {}) {
     }
     if (!S.pr) S.pr = findPr(e.command ? `/${e.command.name} ${e.command.args}` : e.text)
     const fromUser = e.origin && (e.origin.kind === 'composer' || e.origin.kind === 'bridge')
+    // no origin, or one the host could not classify, may be the person at the prompt: it gets the dialog, never the silent compact
+    const maybePerson = !e.origin || fromUser || e.origin.kind === 'unclassified'
     const wake = fromUser && !!cfg.rotatorWake && cfg.rotatorWake.test(String(e.text || ''))
     if (wake) {
       // The wake-up is the rotation reaching this session: take the new seat now
@@ -1072,11 +1115,11 @@ export function register(on, options = {}) {
       const kind = (e.origin && e.origin.kind) || 'none'
       // not awaited: the queue could drain during the write, and this message would start a second compact
       coldLog($, { origin: kind, action: 'queued-behind-compact' })
-      return compactThenSend($, e, !fromUser, fromUser ? '' : kind)
+      return compactThenSend($, e, !fromUser, maybePerson ? '' : kind)
     }
     if (!settings.guard || !isCold || local || justCompacted || S.ctx < settings.bigTokens || e.turnId) {
       // Why a big (or unmeasured) prompt went through unasked: the evidence for a cold send nobody was asked about
-      if (!e.turnId && (!S.ctx || S.ctx >= settings.bigTokens)) await coldLog($, { event: 'guard-pass', origin: (e.origin && e.origin.kind) || 'none', isCold, leftMin: left === null ? null : Math.round(left / MIN), idleMin: S.lastActivity ? Math.round((now - S.lastActivity) / MIN) : null, rotated, reopened, justCompacted, local: !!local, guard: settings.guard })
+      if (!e.turnId && (!S.ctx || S.ctx >= settings.bigTokens)) coldLog($, { event: 'guard-pass', origin: (e.origin && e.origin.kind) || 'none', isCold, leftMin: left === null ? null : Math.round(left / MIN), idleMin: S.lastActivity ? Math.round((now - S.lastActivity) / MIN) : null, rotated, reopened, justCompacted, local: !!local, guard: settings.guard })
       return next(e)
     }
     // an attachment's handle lives only while this submit is in flight: a resend after compacting would drop it
@@ -1086,10 +1129,10 @@ export function register(on, options = {}) {
     // session's message, a task notification, a schedule, the desktop app's own turn) compacts
     // first, with no dialog: nobody may be there to answer it. Not a plugin's own prompt (our
     // resend included), not a slash command (a plugin can't resubmit one), not an attachment.
-    if (!fromUser) {
+    if (!maybePerson) {
       const kind = (e.origin && e.origin.kind) || 'none'
       const skip = ownPrompt($, e) ? 'plugin' : e.command ? 'slash' : media ? 'media' : !worthCompacting() ? 'floor' : now - compactTriedAt < 2 * MIN ? 'just-tried' : ''
-      await coldLog($, { origin: kind, coldMin: Math.round((rotated ? now - S.seatChangedAt : reopened ? now - S.lastActivity : -left) / MIN), ...(reopened ? { reopened: true } : {}), action: skip ? 'skip-' + skip : 'compact-first' })
+      coldLog($, { origin: kind, coldMin: Math.round((rotated ? now - S.seatChangedAt : reopened ? now - S.lastActivity : -left) / MIN), ...(reopened ? { reopened: true } : {}), action: skip ? 'skip-' + skip : 'compact-first' })
       return skip ? next(e) : compactThenSend($, e, true, kind)
     }
     const cost = money(rewriteCost(S.ctx, S.model, ttl))
@@ -1104,10 +1147,10 @@ export function register(on, options = {}) {
       )
     } catch (err) {
       // nobody to ask (a -p run, or the dialog was dismissed): send as typed
-      await coldLog($, { event: 'ask-failed', origin: e.origin.kind, error: String((err && err.message) || err).slice(0, 120) })
+      coldLog($, { event: 'ask-failed', origin: (e.origin && e.origin.kind) || 'none', error: String((err && err.message) || err).slice(0, 120) })
       return next(e)
     }
-    await coldLog($, { event: 'asked', origin: e.origin.kind, reopened, rotated, answer })
+    coldLog($, { event: 'asked', origin: (e.origin && e.origin.kind) || 'none', reopened, rotated, answer })
     // $.session.compact() is refused on SDK hosts (the desktop app), so this queues /compact
     if (answer === 'Compact first, then send') return compactThenSend($, e, false)
     if (answer === 'Send anyway') return next(e)
