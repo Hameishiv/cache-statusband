@@ -73,7 +73,8 @@ let justCompacted = false
 let compactedCold = false
 let compactRuns = 0 // cold compactions this mod has started: a dialog answered after one started must not start another
 let compactLive = false // the latest is still running, waited on or not: past its deadline too, for as long again
-let manualLive = 0 // /compact runs the person (or another plugin) started, still under way
+let manualLive = 0 // /compact runs the person (or another plugin) started, still under way (each for 20 minutes at most)
+let orphan = null // a changed chat's queue, held while its drain's resend is out, so it goes back in arrival order
 const compacting = () => compactLive || manualLive > 0
 let compactTriedAt = 0 // when a cold compact last failed or was refused: no retry for 2 minutes
 let pending = null // messages waiting on the compaction under way, in arrival order
@@ -523,6 +524,16 @@ async function putBack($, back) {
 // none overtakes it. A slash line (only ever the head, from the person's dialog) is filled as the
 // draft, the rest still go, and a later failure is logged rather than filled over that draft.
 // It runs only for the chat its compaction started in: after a /clear, /resume or /fork it stops.
+// The previous chat's messages go back to the prompt box in arrival order: `first` (the drain's own,
+// in flight when the chat changed and not sent) ahead of the rest the session-change handler held.
+async function handBack($, first) {
+  const back = [...first, ...(orphan || [])]
+  orphan = null
+  if (!back.length) return
+  const ok = await putBack($, back)
+  $.ui.toast(ok ? `${back.length} message(s) meant for the previous chat are in the prompt box: send them only if they still apply.` : `${back.length} message(s) meant for the previous chat could not be sent (logged if ~/.claude-shared/state exists).`, { timeoutMs: 15000 })
+}
+
 async function drain($, epoch = chatEpoch) {
   // the chat the queue was made for: if it changed, the queue was handed back and a later chat's is never this drain's
   if (epoch !== chatEpoch) return
@@ -534,12 +545,8 @@ async function drain($, epoch = chatEpoch) {
     while (epoch === chatEpoch && pending && pending.length) {
       const msg = pending.shift()
       if (await resend($, msg, epoch).catch(() => false)) continue
-      // the chat changed while that resend was refused: the rest was handed back, and this one goes with it
-      if (epoch !== chatEpoch) {
-        const ok = await putBack($, [msg])
-        $.ui.toast(ok ? 'A message meant for the previous chat is in the prompt box: send it only if it still applies.' : 'A message meant for the previous chat could not be sent (logged if ~/.claude-shared/state exists).', { timeoutMs: 15000 })
-        return
-      }
+      // the chat changed while that resend was refused: it goes back ahead of the rest, in arrival order
+      if (epoch !== chatEpoch) return handBack($, [msg])
       if (msg.slash) {
         draft = await fillBox($, msg.text)
         if (!draft) lose(msg)
@@ -562,6 +569,8 @@ async function drain($, epoch = chatEpoch) {
     // an unexpected throw: what is still queued is logged, never silently dropped
     if (epoch === chatEpoch) (pending || []).forEach(lose)
   }
+  // the chat changed while this drain waited on the host: what it held goes back now
+  if (epoch !== chatEpoch) return handBack($, [])
   if (epoch === chatEpoch) {
     pending = null
     draining = false
@@ -1147,14 +1156,12 @@ export function register(on, options = {}) {
     // what waited on the last chat's compaction was meant for that chat: back to the box, never into this one
     // an empty queue mid-drain is closed too, or the next chat's messages would wait on a drain that has stopped
     const back = pending || []
+    const inFlight = draining // a resend is out: the drain hands these back, after its own if that one fails
     pending = null
     draining = false
+    if (back.length && inFlight) orphan = [...(orphan || []), ...back]
     // not awaited: the new chat's start does not wait on the prompt box
-    if (back.length) {
-      putBack($, back)
-        .then((ok) => $.ui.toast(ok ? `${back.length} message(s) meant for the previous chat are in the prompt box: send them only if they still apply.` : `${back.length} message(s) meant for the previous chat could not be sent (logged if ~/.claude-shared/state exists).`, { timeoutMs: 15000 }))
-        .catch(() => {})
-    }
+    else if (back.length) handBack($, back).catch(() => {})
     try {
       S.id = (await $.session.id()) || S.id
     } catch {
@@ -1382,11 +1389,18 @@ export function register(on, options = {}) {
   on('command.run', { command: ['compact'] }, async ($, e, next) => {
     // under way: a cold wake meanwhile waits for it rather than starting a second one
     manualLive++
+    let done = false
+    // once, whichever comes first: the command ending, or 20 minutes (a /compact that never ends must
+    // not switch the cold-send guard off for good)
+    const end = () => {
+      if (!done) (done = true), manualLive--
+    }
+    $.clock.after(2 * COMPACT_DEADLINE, end)
     let r
     try {
       r = await next(e)
     } finally {
-      manualLive--
+      end()
     }
     if (!refused(r)) markCompacted()
     else {

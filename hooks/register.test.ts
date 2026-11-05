@@ -42,6 +42,7 @@ function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unkno
     if (e.origin?.kind === 'plugin' && failSubmit && failSubmit.test(e.text)) throw new Error('not now')
     // a host that refuses the submit (Stop, its limit, another hook) resolves { drop }
     if (e.origin?.kind === 'plugin') seen.attempts.push(e.text)
+    if (e.origin?.kind === 'plugin' && beforeDrop) await beforeDrop(e)
     if (e.origin?.kind === 'plugin' && dropSubmit && dropSubmit.test(e.text)) return { drop: 'refused' }
     // the host shows asUser on the origin
     if (e.origin?.kind === 'plugin') seen.submits.push(e.text), seen.asUsers.push(e.origin.asUser), seen.order.push('send:' + e.text)
@@ -62,6 +63,8 @@ function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unkno
 let failSubmit: RegExp | null = null
 // a plugin resend whose text matches this resolves { drop }, as a host that refuses it does without throwing
 let dropSubmit: RegExp | null = null
+// runs inside a plugin resend before the host decides whether to refuse it
+let beforeDrop: ((e: any) => Promise<void>) | null = null
 // runs inside a plugin resend, while the drain is under way
 let duringSubmit: ((e: any) => Promise<void>) | null = null
 // the engine's /compact never settles
@@ -836,6 +839,67 @@ test('"Compact first" answered during a running compaction queues behind it', as
     expect(seen.order).toEqual(['compact', 'send:[peer message, resent by cache-keeper after /compact]\nfrom a peer', 'send:mine'])
   } finally {
     holdCompact = false
+  }
+})
+
+// A /compact the person typed that never ends stops counting as running after 20 minutes
+test('a /compact the person typed that never ends does not switch the cold guard off for good', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, null)
+  hangCompact = true
+  try {
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+    $.command.run({ command: 'compact', args: '' }).catch(() => {})
+    await settle(clock, () => seen.compacts >= 1)
+    await clock.advance(21 * 60000)
+    await $.prompt.submit({ text: 'peer', origin: PEER, wait: false } as never)
+    await clock.advance(200)
+    await settle(clock, () => seen.compacts >= 2)
+    expect(seen.compacts).toBe(2)
+  } finally {
+    hangCompact = false
+  }
+})
+
+// A chat change while a resend is out puts the previous chat's messages back in arrival order
+test('a /clear while a resend is out puts the messages back in arrival order', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, null)
+  on('classic.SessionStart', () => ({}))
+  holdCompact = true
+  dropSubmit = /first/
+  duringSubmit = null
+  try {
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+    await $.prompt.submit({ text: 'first', origin: PEER, wait: false } as never)
+    await $.prompt.submit({ text: 'second', origin: PEER, wait: false } as never)
+    await $.prompt.submit({ text: 'third', origin: PEER, wait: false } as never)
+    await clock.advance(100)
+    await settle(clock, () => seen.compacts >= 1)
+    // the /clear lands while the first resend is out; that resend is then refused
+    beforeDrop = async (e) => {
+      if (!/first/.test(e.text)) return
+      beforeDrop = null
+      await ($ as any).classic.SessionStart({ source: 'clear', transcript_path: '' })
+    }
+    releaseCompact()
+    await settle(clock, () => seen.fills.length >= 1)
+    expect(seen.fills.length).toBe(1)
+    const t = seen.fills[0].text
+    expect(t.indexOf('first')).toBeLessThan(t.indexOf('second'))
+    expect(t.indexOf('second')).toBeLessThan(t.indexOf('third'))
+  } finally {
+    holdCompact = false
+    dropSubmit = null
+    beforeDrop = null
   }
 })
 
