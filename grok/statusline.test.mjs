@@ -257,7 +257,7 @@ describe("cli", () => {
     assert.equal(run.stdout.includes("secret-token"), false);
   });
 
-  it("starts through the windows cmd wrapper", () => {
+  it("starts through the windows cmd wrapper", { skip: process.platform !== "win32" }, () => {
     const run = spawnSync(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", join(import.meta.dirname, "statusline.cmd")], {
       cwd: import.meta.dirname,
       env: { ...process.env, CSB_BILLING_LOG: "" },
