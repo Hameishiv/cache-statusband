@@ -77,6 +77,7 @@ let compactTriedAt = 0 // when a cold compact last failed or was refused: no ret
 let pending = null // messages waiting on the compaction under way, in arrival order
 let draining = false // the compaction is over and the queue is being resent: the person's own prompts no longer wait
 let liveHb = null // this session's heartbeat as the mod found it on loading: under three beats old means a reload in a live process, not a reopen
+let entry = '' // CLAUDE_CODE_ENTRYPOINT: 'claude-desktop' for the app, 'sdk-cli' for a -p run, 'cli' for the REPL
 let logDir = null // whether the cold-compact log's folder exists (checked once): $.fs.write would make it
 let refusedAt = 0 // the context size a compaction was last refused at: no cold compact until it grows 100k past it
 let logChain = Promise.resolve() // one log write at a time in this process
@@ -364,7 +365,7 @@ async function resumeStep($) {
   if (!S.resumeAt || now < S.resumeAt || S.working) return
   S.resumeAt = 0
   $.ui.invalidate('ui.render')
-  if (worthCompacting()) {
+  if (worthCompacting() && !compactLive) {
     compactThenSend($, { text: 'Resume' }, true)
     return
   }
@@ -1032,6 +1033,7 @@ export function register(on, options = {}) {
   on('session.start', async ($, e, next) => {
     now = await $.clock.now()
     home = (await $.env.get('USERPROFILE')) || (await $.env.get('HOME')) || ''
+    entry = (await $.env.get('CLAUDE_CODE_ENTRYPOINT')) || ''
     S.id = await $.session.id()
     logDir = null // look again: the folder may have been made since
     try {
@@ -1145,9 +1147,9 @@ export function register(on, options = {}) {
     const fromUser = e.origin && (e.origin.kind === 'composer' || e.origin.kind === 'bridge')
     // no origin, or one the host could not classify, may be the person at the prompt: it gets the dialog, never the silent compact
     // (an isMeta prompt is an engine notice, never the person; auto-continuation follows the person's own click)
-    // and an sdk prompt with no surface is a plain -p run: its prompt is the person's, and dropping it could end the run.
-    // (The desktop app's own sdk turns draw on a surface: those still compact first.)
-    const headless = !!e.origin && e.origin.kind === 'sdk' && !(await $.session.surfaces().catch(() => [])).length
+    // and an sdk prompt outside the desktop app with no surface is a plain -p run: its prompt is the person's, and
+    // dropping it could end the run. The app's own sdk turns still compact first, whether or not it has attached yet.
+    const headless = !!e.origin && e.origin.kind === 'sdk' && entry !== 'claude-desktop' && !(await $.session.surfaces().catch(() => [])).length
     const maybePerson = !e.isMeta && (!e.origin || fromUser || headless || e.origin.kind === 'unclassified' || e.origin.kind === 'auto-continuation')
     const wake = fromUser && !!cfg.rotatorWake && cfg.rotatorWake.test(String(e.text || ''))
     if (wake) {
@@ -1165,7 +1167,7 @@ export function register(on, options = {}) {
     // A compaction is under way: anything else waits behind it and goes after, in order, with no dialog
     // the person's own prompt waits only while /compact runs: a resend the host holds must never swallow it
     // not an engine notice (a resend would lose isMeta), nor the person's @-mention (a plugin's resend leaves it unexpanded)
-    if (pending && !(draining && maybePerson) && !e.isMeta && !(maybePerson && /(^|\s)@\S/.test(String(e.text || ''))) && !ownPrompt($, e) && !local && !e.turnId && !e.command && !(Array.isArray(e.attachments) && e.attachments.length)) {
+    if (pending && !(draining && maybePerson) && !headless && !e.isMeta && !(maybePerson && /(^|\s)@\S/.test(String(e.text || ''))) && !ownPrompt($, e) && !local && !e.turnId && !e.command && !(Array.isArray(e.attachments) && e.attachments.length)) {
       const kind = sender(e)
       // not awaited: the queue could drain during the write, and this message would start a second compact
       coldLog($, { origin: kind, action: 'queued-behind-compact', text: e.text })

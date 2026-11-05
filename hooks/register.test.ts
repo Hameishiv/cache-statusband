@@ -19,7 +19,7 @@ function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unkno
     on('store.delete', (_: unknown, e: any) => (kept.delete(e.key), { value: undefined }))
     on('store.keys', () => ({ value: [...kept.keys()] }))
   } else mock.store(on)
-  mock.env(on, { USERPROFILE: 'C:/Users/T' })
+  mock.env(on, { USERPROFILE: 'C:/Users/T', ...(desktopEntry ? { CLAUDE_CODE_ENTRYPOINT: 'claude-desktop' } : {}) })
   const seen = { compacts: 0, submits: [] as string[], asUsers: [] as unknown[], fills: [] as { text: string; mode?: string }[], asks: 0, toasts: [] as string[], order: [] as string[], log: '', logPath: '' }
   on('session.id', () => ({ value: 'sid-test' }))
   on('session.cwd', () => ({ value: '/repo' }))
@@ -67,6 +67,8 @@ let hangCompact = false
 let noStateDir = false
 // a plain -p run: the session draws on no surface
 let headlessRun = false
+// the desktop app's entrypoint
+let desktopEntry = false
 
 function answer(on: any, seen: { asks: number; options?: string[] }, label: string | null) {
   on('tool.call', (_: unknown, e: any) => {
@@ -642,6 +644,19 @@ test("the desktop app's own sdk turn compacts first", async ($, on) => {
   const { r, seen } = await coldPeer($, on, 77, 300000, { kind: 'sdk' })
   expect('drop' in (r as object)).toBe(true)
   expect(seen.compacts).toBe(1)
+})
+// the app may not have attached a surface yet: its entrypoint says it is the app all the same
+test("the desktop app's own sdk turn compacts first before the app attaches", async ($, on) => {
+  headlessRun = true
+  desktopEntry = true
+  try {
+    const { r, seen } = await coldPeer($, on, 77, 300000, { kind: 'sdk' })
+    expect('drop' in (r as object)).toBe(true)
+    expect(seen.compacts).toBe(1)
+  } finally {
+    headlessRun = false
+    desktopEntry = false
+  }
 })
 test("an auto-continuation prompt (after the person's own click) is asked, not auto-compacted", ($, on) => unknownOrigin($, on, { kind: 'auto-continuation' }))
 
