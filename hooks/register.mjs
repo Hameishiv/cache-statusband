@@ -391,8 +391,10 @@ function compactThenSend($, e, unattended, from = '') {
   // a compaction is already under way: this message waits behind the ones before it
   if (pending) return pending.push(msg), drop
   pending = [msg]
+  // the chat this queue belongs to: a /clear before the timer fires hands it back, and this run must not take the next chat's
+  const epoch = chatEpoch
   // a throw must not leave the queue set, or every later message would wait forever: send what is left as is
-  $.clock.after(50, () => runCompactThenSend($).catch(() => drain($).catch(() => {})))
+  $.clock.after(50, () => epoch === chatEpoch && runCompactThenSend($).catch(() => epoch === chatEpoch && drain($).catch(() => {})))
   return drop
 }
 
@@ -459,13 +461,13 @@ async function runCompactThenSend($) {
     run.then((r) => late && epoch === chatEpoch && !refused(r) && markCompacted(), () => {}) // a failure after the deadline has no one waiting
     const timeout = new Promise((resolve) => $.clock.after(COMPACT_DEADLINE, () => resolve(TIMED_OUT)))
     const r = await Promise.race([run, timeout])
+    // nor does a /compact that never ends hold every later one back, in this chat or the next: give it as long again
+    if (r === TIMED_OUT) $.clock.after(COMPACT_DEADLINE, settled)
     // the chat changed while it ran: its queue was already handed back, and its outcome is not this chat's
     if (epoch !== chatEpoch) return
     if (r === TIMED_OUT) {
       // stop waiting: the queue goes as typed
       late = true
-      // nor does a /compact that never ends hold every later one back: give it as long again
-      $.clock.after(COMPACT_DEADLINE, settled)
       compactTriedAt = await $.clock.now()
       await coldLog($, { action: 'compact-timeout', before })
       $.ui.toast('Compacting took over 10 minutes, so the message goes as typed.', { timeoutMs: 8000 })
@@ -520,11 +522,12 @@ async function putBack($, back) {
 // draft, the rest still go, and a later failure is logged rather than filled over that draft.
 async function drain($) {
   draining = true
+  const epoch = chatEpoch // a /clear mid-drain hands back what is left: a later chat's queue is never this drain's
   let draft = false // a slash line sits in the prompt box
   let lost = 0 // not sent again and not put back
   const lose = (m) => (lost++, coldLog($, { action: 'not-resent', text: m.text }))
   try {
-    while (pending && pending.length) {
+    while (epoch === chatEpoch && pending && pending.length) {
       const msg = pending.shift()
       if (await resend($, msg).catch(() => false)) continue
       if (msg.slash) {
@@ -547,10 +550,12 @@ async function drain($) {
     }
   } catch {
     // an unexpected throw: what is still queued is logged, never silently dropped
-    ;(pending || []).forEach(lose)
+    if (epoch === chatEpoch) (pending || []).forEach(lose)
   }
-  pending = null
-  draining = false
+  if (epoch === chatEpoch) {
+    pending = null
+    draining = false
+  }
   if (lost) $.ui.toast(`${lost} message(s) could not be sent again (logged if ~/.claude-shared/state exists).`, { timeoutMs: 15000 })
 }
 

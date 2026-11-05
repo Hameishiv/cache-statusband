@@ -35,6 +35,7 @@ function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unkno
   on('command.run', (_: unknown, e: any) => {
     if (e.command === 'compact') seen.compacts++, seen.order.push('compact')
     if (e.command === 'compact' && hangCompact) return new Promise(() => {})
+    if (e.command === 'compact' && holdCompact) return new Promise((res) => (releaseCompact = () => res({ text: compactOutput })))
     return { text: e.command === 'compact' ? compactOutput : '' }
   })
   on('prompt.submit', async (_: unknown, e: any) => {
@@ -64,6 +65,9 @@ let dropSubmit: RegExp | null = null
 let duringSubmit: ((e: any) => Promise<void>) | null = null
 // the engine's /compact never settles
 let hangCompact = false
+// the engine's /compact waits until the test releases it
+let holdCompact = false
+let releaseCompact: () => void = () => {}
 // no ~/.claude-shared/state folder: the cold-compact log is not written, and the folder is not made
 let noStateDir = false
 // a plain -p run: the session draws on no surface
@@ -608,6 +612,36 @@ test('a /clear during a compaction puts the queued messages back instead of send
     expect(seen.log).not.toContain('"queued-behind-compact","text":"new chat"')
   } finally {
     hangCompact = false
+  }
+})
+
+// Verification of a992242: the old chat's compaction ending after /clear leaves the new chat as it found it
+test('a compaction that ends after /clear does not mark the new chat compacted', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, null)
+  on('classic.SessionStart', () => ({}))
+  holdCompact = true
+  try {
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+    await $.prompt.submit({ text: 'first', origin: PEER, wait: false } as never)
+    await clock.advance(100)
+    await settle(clock, () => seen.compacts >= 1)
+    await ($ as any).classic.SessionStart({ source: 'clear', transcript_path: '' })
+    await settle(clock, () => seen.fills.length >= 1)
+    releaseCompact()
+    await clock.advance(200)
+    await $.prompt.submit({ text: 'later', origin: PEER, wait: false } as never)
+    await clock.advance(200)
+    // the new chat's message is logged with the guard's view of it: not compacted by the old chat's run
+    expect(seen.log).toContain('"event":"guard-pass"')
+    expect(seen.log).not.toContain('"justCompacted":true')
+    expect(seen.submits).toEqual([]) // nothing of the old chat's was resent into the new one
+  } finally {
+    holdCompact = false
   }
 })
 
