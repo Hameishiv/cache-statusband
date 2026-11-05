@@ -215,7 +215,8 @@ describe("cli", () => {
         ctx: {
           config: {
             creditUsagePercent: 23,
-            currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", end: "2026-11-02T22:57:09.651+00:00" },
+            // a period that has not ended yet: an ended one is hidden, which made this test expire
+            currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", end: new Date(Date.now() + 3 * 86400000).toISOString() },
           },
           subscriptionTier: "super-secret-tier",
           email: "user@example.com",
@@ -237,7 +238,7 @@ describe("cli", () => {
   });
 
   it("starts through the windows cmd wrapper", () => {
-    const run = spawnSync(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", "statusline.cmd"], {
+    const run = spawnSync(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", join(import.meta.dirname, "statusline.cmd")], {
       cwd: import.meta.dirname,
       env: { ...process.env, CSB_BILLING_LOG: "" },
       input: JSON.stringify({
