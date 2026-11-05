@@ -29,7 +29,7 @@ function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unkno
   on('command.register', (_: unknown, e: any) => ({ value: { command: e.name } }))
   on('agent.list', () => ({ value: [] }))
   // the cold-compact log is a file that exists once something has been written to it
-  on('fs.exists', (_: unknown, e: any) => ({ value: String(e.path ?? e).includes('.active') || (String(e.path ?? e).includes('cold-compact-log') && seen.log !== '') }))
+  on('fs.exists', (_: unknown, e: any) => ({ value: String(e.path ?? e).includes('.active') || (String(e.path ?? e).split(String.fromCharCode(92)).join('/').endsWith('/.claude-shared/state') && !noStateDir) || (String(e.path ?? e).includes('cold-compact-log') && seen.log !== '') }))
   on('fs.read', (_: unknown, e: any) => ({ value: String(e.path ?? e).includes('cold-compact-log') ? seen.log : seat.label }))
   on('command.run', (_: unknown, e: any) => {
     if (e.command === 'compact') seen.compacts++, seen.order.push('compact')
@@ -62,6 +62,8 @@ let dropSubmit: RegExp | null = null
 let duringSubmit: ((e: any) => Promise<void>) | null = null
 // the engine's /compact never settles
 let hangCompact = false
+// no ~/.claude-shared/state folder: the cold-compact log is not written, and the folder is not made
+let noStateDir = false
 
 function answer(on: any, seen: { asks: number; options?: string[] }, label: string | null) {
   on('tool.call', (_: unknown, e: any) => {
@@ -624,8 +626,9 @@ async function unknownOrigin($: any, on: any, origin: unknown) {
 test('a prompt with an unclassified origin is asked, not auto-compacted', ($, on) => unknownOrigin($, on, { kind: 'unclassified' }))
 test('a prompt with no origin is asked, not auto-compacted', ($, on) => unknownOrigin($, on, undefined))
 
-// An unclassified prompt the engine marks isMeta is an engine notice, not the person: it compacts first, unasked
-test('an unclassified engine notice (isMeta) compacts first, with no dialog', async ($, on) => {
+// An unclassified prompt the engine marks isMeta is an engine notice, not the person: never asked, and never
+// compacted for, since a resend could not carry isMeta and would turn a receipt into a turn of its own
+test('an unclassified engine notice (isMeta) goes through as is, unasked', async ($, on) => {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)
   answer(on, seen, 'Send anyway')
@@ -636,8 +639,9 @@ test('an unclassified engine notice (isMeta) compacts first, with no dialog', as
   const r = await $.prompt.submit({ text: 'idle notice', origin: { kind: 'unclassified' }, isMeta: true, wait: false } as never)
   await clock.advance(100)
   expect(seen.asks).toBe(0)
-  expect('drop' in (r as object)).toBe(true)
-  expect(seen.log).toContain('compact-first')
+  expect(seen.compacts).toBe(0)
+  expect('drop' in (r as object)).toBe(false)
+  expect(seen.log).toContain('skip-meta')
 })
 
 // A compaction that never settles must not hold the queue forever
@@ -708,6 +712,45 @@ test('a big chat reopened inside the hour asks before its first send', async ($,
   expect(seen.asks).toBe(1)
 })
 
+// A reload of this mod (an update, an enable) fires session.start again in the live process: its own
+// heartbeat is moments old, so a warm chat is not taken for a reopened one and is not compacted
+test('a reload of the mod does not make a warm chat look reopened', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, 'Send anyway')
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+  await clock.advance(5 * 60000)
+  kept.set('hb:sid-test', { id: 'sid-test', ctx: 300000, lastActivity: (await clock.now()) - 5 * 60000, reopenedAt: 0, updatedAt: (await clock.now()) - 20000 })
+  await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+  const r = await $.prompt.submit({ text: 'from a peer', origin: PEER, wait: false } as never)
+  await clock.advance(100)
+  expect(seen.compacts).toBe(0)
+  expect(seen.asks).toBe(0)
+  expect('drop' in (r as object)).toBe(false)
+})
+
+// Without the shared state folder there is no log, and none is made
+test('with no ~/.claude-shared/state folder the cold-compact log is not written', async ($, on) => {
+  noStateDir = true
+  try {
+    const kept = new Map<string, unknown>()
+    const { clock, seen } = engine($, on, { label: 'A' }, kept)
+    answer(on, seen, null)
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+    await $.prompt.submit({ text: 'first', origin: PEER, wait: false } as never)
+    await clock.advance(100)
+    await settle(clock, () => seen.submits.length >= 1)
+    expect(seen.compacts).toBe(1)
+    expect(seen.log).toBe('')
+  } finally {
+    noStateDir = false
+  }
+})
+
 test('a big prompt the guard lets through is logged with why', async ($, on) => {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)
@@ -722,6 +765,7 @@ test('a big prompt the guard lets through is logged with why', async ($, on) => 
   else await it
   await clock.advance(10 * 60000)
   await $.prompt.submit({ text: 'next', origin: COMPOSER, wait: false } as never)
+  await settle(clock, () => seen.log !== '') // the hot path does not wait on the log
   expect(seen.log).toContain('"event":"guard-pass"')
   expect(seen.log).toContain('"isCold":false')
   expect(seen.log).toContain('"idleMin":10')
@@ -736,6 +780,7 @@ test('the dialog answer is logged', async ($, on) => {
   await clock.advance(31 * 60000)
   await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
   await $.prompt.submit({ text: 'Try again', origin: COMPOSER, wait: false } as never)
+  await settle(clock, () => seen.log.includes('"asked"')) // the hot path does not wait on the log
   expect(seen.log).toContain('"event":"asked"')
   expect(seen.log).toContain('"answer":"Send anyway"')
 })

@@ -74,6 +74,8 @@ let compactedCold = false
 let compactTriedAt = 0 // when a cold compact last failed or was refused: no retry for 2 minutes
 let pending = null // messages waiting on the compaction under way, in arrival order
 let draining = false // the compaction is over and the queue is being resent: the person's own prompts no longer wait
+let liveHb = null // this session's heartbeat as the mod found it on loading: under two beats old means a reload in a live process, not a reopen
+let logDir = null // whether the cold-compact log's folder exists (checked once): $.fs.write would make it
 let refusedAt = 0 // the context size a compaction was last refused at: no cold compact until it grows 100k past it
 let logChain = Promise.resolve() // one log write at a time in this process
 let handoffPending = false
@@ -408,6 +410,8 @@ function coldLog($, fields) {
   const path = `${home.replace(/\\/g, '/')}/.claude-shared/state/cache-keeper-cold-compact-log-${S.id || 'unknown'}.txt` // an existing folder: $.fs.write makes none
   logChain = logChain.then(async () => {
     try {
+      if (logDir === null) logDir = await $.fs.exists(path.slice(0, path.lastIndexOf('/')))
+      if (!logDir) return
       let old = ''
       if (await $.fs.exists(path)) {
         old = await $.fs.read(path)
@@ -587,6 +591,7 @@ function myHeartbeat() {
     rotated: rotatedCold() || reopenedCold(),
     // cacheState reads this as when the cache went cold
     seatChangedAt: rotatedCold() || !reopenedCold() ? S.seatChangedAt : S.reopenedAt,
+    reopenedAt: S.reopenedAt, // a reload of this mod takes it back, rather than taking a live cache for a reopened one
     keepWarm: S.keepWarm,
     keepWarmUntil: S.keepWarmUntil,
     pings: S.pings,
@@ -805,7 +810,8 @@ async function seedFromTranscript($, path) {
     markCompacted()
   } else {
     S.lastActivity = found.at // the cache's real age: the band and the cold-send guard read it
-    S.reopenedAt = await $.clock.now()
+    // a reload keeps what the process knew; a real reopen starts on a cold cache
+    S.reopenedAt = liveHb ? liveHb.reopenedAt || 0 : await $.clock.now()
   }
   $.ui.invalidate('ui.render')
 }
@@ -1007,6 +1013,15 @@ export function register(on, options = {}) {
     now = await $.clock.now()
     home = (await $.env.get('USERPROFILE')) || (await $.env.get('HOME')) || ''
     S.id = await $.session.id()
+    logDir = null // look again: the folder may have been made since
+    try {
+      // an enable, a worker respawn or a reload of this mod fires session.start again in a live process: its last
+      // beat is fresh. (A chat closed and reopened within a minute reads the same way, and is taken for a reload.)
+      const hb = S.id ? await $.store.get('hb:' + S.id) : null
+      liveHb = hb && now - (hb.updatedAt || 0) < 2 * HEARTBEAT_EVERY ? hb : null
+    } catch {
+      liveHb = null
+    }
     S.cwd = await $.session.cwd()
     S.label = basename(S.cwd)
     S.model = await $.session.model()
@@ -1071,6 +1086,7 @@ export function register(on, options = {}) {
       // keep the old id
     }
     S.label = basename(S.cwd)
+    liveHb = null
     if (e.source === 'resume') await seedFromTranscript($, e.transcript_path)
     return next(e)
   })
@@ -1106,8 +1122,8 @@ export function register(on, options = {}) {
     if (!S.pr) S.pr = findPr(e.command ? `/${e.command.name} ${e.command.args}` : e.text)
     const fromUser = e.origin && (e.origin.kind === 'composer' || e.origin.kind === 'bridge')
     // no origin, or one the host could not classify, may be the person at the prompt: it gets the dialog, never the silent compact
-    // (an isMeta prompt is an engine notice, never the person)
-    const maybePerson = !e.isMeta && (!e.origin || fromUser || e.origin.kind === 'unclassified')
+    // (an isMeta prompt is an engine notice, never the person; auto-continuation follows the person's own click)
+    const maybePerson = !e.isMeta && (!e.origin || fromUser || e.origin.kind === 'unclassified' || e.origin.kind === 'auto-continuation')
     const wake = fromUser && !!cfg.rotatorWake && cfg.rotatorWake.test(String(e.text || ''))
     if (wake) {
       // The wake-up is the rotation reaching this session: take the new seat now
@@ -1123,10 +1139,11 @@ export function register(on, options = {}) {
     const local = e.command && ['compact', 'clear', names.cache, names.keepwarm, names.board, names.handoff].includes(e.command.name)
     // A compaction is under way: anything else waits behind it and goes after, in order, with no dialog
     // the person's own prompt waits only while /compact runs: a resend the host holds must never swallow it
-    if (pending && !(draining && fromUser) && !ownPrompt($, e) && !local && !e.turnId && !e.command && !(Array.isArray(e.attachments) && e.attachments.length)) {
+    // not an engine notice (a resend would lose isMeta), nor the person's @-mention (a plugin's resend leaves it unexpanded)
+    if (pending && !(draining && fromUser) && !e.isMeta && !(maybePerson && /(^|\s)@\S/.test(String(e.text || ''))) && !ownPrompt($, e) && !local && !e.turnId && !e.command && !(Array.isArray(e.attachments) && e.attachments.length)) {
       const kind = (e.origin && e.origin.kind) || 'none'
       // not awaited: the queue could drain during the write, and this message would start a second compact
-      coldLog($, { origin: kind, action: 'queued-behind-compact' })
+      coldLog($, { origin: kind, action: 'queued-behind-compact', text: e.text })
       return compactThenSend($, e, !fromUser, maybePerson ? '' : kind)
     }
     if (!settings.guard || !isCold || local || justCompacted || S.ctx < settings.bigTokens || e.turnId) {
@@ -1143,10 +1160,12 @@ export function register(on, options = {}) {
     // the host does not send it here), not a slash command (a plugin can't resubmit one), not an attachment.
     if (!maybePerson) {
       const kind = (e.origin && e.origin.kind) || 'none'
-      const skip = ownPrompt($, e) ? 'plugin' : e.command ? 'slash' : media ? 'media' : !worthCompacting() ? 'floor' : now - compactTriedAt < 2 * MIN ? 'just-tried' : ''
-      coldLog($, { origin: kind, coldMin: Math.round((rotated ? now - S.seatChangedAt : reopened ? now - S.lastActivity : -left) / MIN), ...(reopened ? { reopened: true } : {}), action: skip ? 'skip-' + skip : 'compact-first' })
+      const skip = ownPrompt($, e) ? 'plugin' : e.isMeta ? 'meta' : e.command ? 'slash' : media ? 'media' : !worthCompacting() ? 'floor' : now - compactTriedAt < 2 * MIN ? 'just-tried' : ''
+      coldLog($, { origin: kind, coldMin: Math.round((rotated ? now - S.seatChangedAt : reopened ? now - S.lastActivity : -left) / MIN), ...(reopened ? { reopened: true } : {}), action: skip ? 'skip-' + skip : 'compact-first', ...(skip ? {} : { text: e.text }) })
       return skip ? next(e) : compactThenSend($, e, true, kind)
     }
+    // a compaction just ran or is running: asking again would only queue behind it, or compact twice
+    if (pending) return next(e)
     const cost = money(rewriteCost(S.ctx, S.model, ttl))
     const why = rotated ? `The account rotated to ${S.seat || 'another seat'} ${minutes(now - S.seatChangedAt)} ago, so the cache is cold.` : reopened ? `This chat was reopened ${minutes(now - S.lastActivity)} after its last reply, and a reopened chat starts on a cold cache.` : `Cache went cold ${minutes(-left)} ago.`
     const floor = S.floor ? ` Compacting last left ${tokens(S.floor)}.` : ''
@@ -1164,7 +1183,8 @@ export function register(on, options = {}) {
     }
     coldLog($, { event: 'asked', origin: (e.origin && e.origin.kind) || 'none', reopened, rotated, answer })
     // $.session.compact() is refused on SDK hosts (the desktop app), so this queues /compact
-    if (answer === 'Compact first, then send') return compactThenSend($, e, false)
+    // the dialog waited on the person: a compaction may have run or started meanwhile
+    if (answer === 'Compact first, then send') return justCompacted || draining || (pending && e.command) ? next(e) : compactThenSend($, e, false)
     if (answer === 'Send anyway') return next(e)
     $.ui.toast('Not sent. A fresh session with a short handoff avoids the rewrite entirely.', { timeoutMs: 8000 })
     return { drop: 'Cancelled by cache-keeper before a cold cache rewrite' }
