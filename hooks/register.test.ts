@@ -20,7 +20,7 @@ function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unkno
     on('store.keys', () => ({ value: [...kept.keys()] }))
   } else mock.store(on)
   mock.env(on, { USERPROFILE: 'C:/Users/T' })
-  const seen = { compacts: 0, submits: [] as string[], asks: 0, order: [] as string[], log: '' }
+  const seen = { compacts: 0, submits: [] as string[], asks: 0, toasts: [] as string[], order: [] as string[], log: '' }
   on('session.id', () => ({ value: 'sid-test' }))
   on('session.cwd', () => ({ value: '/repo' }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
@@ -40,7 +40,7 @@ function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unkno
   })
   on('session.start', (_: unknown, e: any) => ({ cwd: e.cwd }))
   on('session.measure', () => ({ changed: [] }))
-  on('ui.toast', () => ({ value: undefined }))
+  on('ui.toast', (_: unknown, e: unknown) => (seen.toasts.push(JSON.stringify(e)), { value: undefined }))
   on('fs.write', (_: unknown, e: any) => ((seen.log = String(e.text)), { value: undefined }))
   return { clock, seen }
 }
@@ -131,7 +131,7 @@ test('no compact prompt right after a compaction, nor for /compact itself', asyn
 
 const usage = (o: Record<string, unknown>) => ({ input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, model: 'claude-opus-5-5', ...o })
 
-test('the TTL comes from the API report, so a rewrite after 20 idle minutes stays on 1 hour', async ($, on) => {
+test('the TTL comes from the API report: a 1-hour write reported after 20 idle minutes stays on 1 hour', async ($, on) => {
   const { clock } = engine($, on)
   let next: unknown = null
   on('turn.step', async function* () {
@@ -155,7 +155,7 @@ test('the TTL comes from the API report, so a rewrite after 20 idle minutes stay
 })
 
 // The real engine's usage has no cache_creation split: the idle gap alone must not drop to 5
-test('a rewrite after 20 idle minutes with no TTL report stays on 1 hour', async ($, on) => {
+test('a rewrite after 6 idle minutes with no TTL report stays on 1 hour', async ($, on) => {
   const { clock } = engine($, on)
   let next: unknown = null
   on('turn.step', async function* () {
@@ -171,11 +171,69 @@ test('a rewrite after 20 idle minutes with no TTL report stays on 1 hour', async
     else await it
   }
   await step(usage({ cache_read_input_tokens: 290000, cache_creation_input_tokens: 0 }))
-  await clock.advance(20 * 60000)
+  await clock.advance(6 * 60000)
   await step(usage({ cache_creation_input_tokens: 290000 }))
   const r: any = await $.command.run({ command: 'cache', args: '' })
-  expect(r.text).toMatch(/cache window 60 min/)
+  expect(r.text).toMatch(/cache window 60 min \(assumed; on the 5-minute API cache run \/cache ttl 5, which sets every session\)/)
+  await $.command.run({ command: 'cache', args: 'ttl 5' })
+  const set: any = await $.command.run({ command: 'cache', args: '' })
+  expect(set.text).toMatch(/cache window 5 min \(set by you\)/)
+  expect(set.text).not.toMatch(/assumed/)
 })
+
+// A TTL the API reports as 5 minutes is not "assumed", so the status line names no setting
+test('a 5-minute TTL from the API split shows no hint, even without a write', async ($, on) => {
+  const { clock } = engine($, on)
+  on('turn.step', async function* () {
+    return { answer: '', toolUses: [], usage: usage({ cache_read_input_tokens: 290000, cache_creation: { ephemeral_5m_input_tokens: 1 } }) }
+  })
+  on('turn.complete', () => ({ text: '' }))
+  on('session.usage', () => ({ value: {} }))
+  await start($, 300000, clock)
+  const it = ($ as any).turn.step({ model: 'claude-opus-5-5', messages: [] })
+  if (it && typeof it[Symbol.asyncIterator] === 'function') for await (const _ of it) void _
+  else await it
+  const r: any = await $.command.run({ command: 'cache', args: '' })
+  expect(r.text).toMatch(/cache window 5 min/)
+  expect(r.text).not.toMatch(/assumed|ttl 5,/)
+})
+
+// A keep-warm ping that writes means the cache was already cold: on an assumed window, say how to set 5
+for (const [ttl, hint] of [['', true], ['ttl 60', false], ['measured', false], ['5m split', false]] as const) {
+  test(`a keep-warm ping that finds the cache cold ${hint ? 'names' : 'does not name'} /cache ttl 5 (${ttl || 'auto'})`, SETUP, async ($, on) => {
+    const { clock, seen } = engine($, on)
+    on('process.run', () => ({ value: { exitCode: 0, stdout: 'OPEN\n', stderr: '' } }))
+    on('session.usage', () => ({ value: { context: { tokens: 300000, window: 1000000 } } }))
+    on('turn.complete', () => ({ text: '' }))
+    on('model.fork', () => ({ value: { text: 'ok', usage: usage({ cache_creation_input_tokens: 300000 }) } }))
+    on('turn.step', async function* () {
+      // '5m split': the API reports a 5-minute TTL with no write, so the window is 5 but not assumed
+      const split = ttl === '5m split' ? { cache_creation: { ephemeral_5m_input_tokens: 1 } } : {}
+      return { answer: '', toolUses: [], usage: usage({ cache_read_input_tokens: 290000, ...split }) }
+    })
+    await start($, 300000, clock)
+    if (ttl === 'ttl 60') await $.command.run({ command: 'cache', args: ttl })
+    const step = async () => {
+      const it = ($ as any).turn.step({ model: 'claude-opus-5-5', messages: [] })
+      if (it && typeof it[Symbol.asyncIterator] === 'function') for await (const _ of it) void _
+      else await it
+    }
+    await step()
+    if (ttl === 'measured') {
+      // a cache hit after 6 idle minutes measures the 1-hour TTL
+      await clock.advance(6 * 60000)
+      await step()
+      const r: any = await $.command.run({ command: 'cache', args: '' })
+      expect(r.text).toMatch(/cache window 60 min \(measured\)/)
+    }
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't', reason: 'end_turn' } as never)
+    await clock.advance(53 * 60000)
+    const stop = seen.toasts.find((t) => /Keep warm off/.test(t)) ?? ''
+    expect(stop).toMatch(/instead of reading the cache/)
+    if (hint) expect(stop).toMatch(/\/cache ttl 5/)
+    else expect(stop).not.toMatch(/ttl 5/)
+  })
+}
 
 test('auto keep warm starts at turn end and stops once the merge-pr PR merges', SETUP, async ($, on) => {
   const { clock } = engine($, on)
