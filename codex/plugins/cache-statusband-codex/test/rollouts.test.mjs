@@ -1,0 +1,221 @@
+import assert from "node:assert/strict";
+import { mkdtemp, mkdir, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+import { handleSessionStart } from "../hooks/session-start.mjs";
+import { handleStop } from "../hooks/stop.mjs";
+import { parseRollout, scanSessions } from "../src/rollouts.mjs";
+import { getSessionIdentity, loadSessionState, saveSessionState } from "../src/session-state.mjs";
+
+const FIXTURE = [
+  { timestamp: "2026-10-29T12:00:00.000Z", type: "session_meta", payload: { id: "session-1", timestamp: "2026-10-29T12:00:00.000Z", cwd: "/workspace/example", source: "cli", context_window: 200000 } },
+  { timestamp: "2026-10-29T12:01:00.000Z", type: "turn_context", payload: { cwd: "/workspace/example", model: "gpt-test-sol", effort: "high" } },
+  "{malformed",
+  { timestamp: "2026-10-29T12:02:00.000Z", type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { total_tokens: 12000 }, total_token_usage: { input_tokens: 14000, cached_input_tokens: 7000, output_tokens: 1000, total_tokens: 15000 }, model_context_window: 200000 } } },
+  { timestamp: "2026-10-29T12:03:00.000Z", type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { total_tokens: 25000 }, total_token_usage: { input_tokens: 28000, cached_input_tokens: 9000, output_tokens: 2000, total_tokens: 30000 }, model_context_window: 200000 } } },
+];
+
+test("parses the latest token count and ignores malformed or prompt records", async (t) => {
+  const root = await fixtureRoot(t);
+  const path = join(root, "rollout.jsonl");
+  await writeFixture(path);
+  const summary = await parseRollout(path);
+  assert.equal(summary.id, "session-1");
+  assert.equal(summary.model, "gpt-test-sol");
+  assert.equal(summary.effort, "high");
+  assert.equal(summary.contextUsed, 25000);
+  assert.equal(summary.contextWindow, 200000);
+  assert.equal(summary.totalUsage.cachedInputTokens, 9000);
+  assert.equal(summary.totalUsage.totalTokens, 30000);
+});
+
+test("reads metadata from the head and token state from the tail of a large rollout", async (t) => {
+  const root = await fixtureRoot(t);
+  const path = join(root, "large.jsonl");
+  const filler = `${JSON.stringify({ type: "response_item", payload: { type: "message", content: "x".repeat(2048) } })}\n`.repeat(1300);
+  const head = `${JSON.stringify(FIXTURE[0])}\n${JSON.stringify(FIXTURE[1])}\n`;
+  const tail = `${JSON.stringify(FIXTURE.at(-1))}\n`;
+  await writeFile(path, head + filler + tail, "utf8");
+  const summary = await parseRollout(path);
+  assert.equal(summary.id, "session-1");
+  assert.equal(summary.contextUsed, 25000);
+});
+
+test("scans active sessions and includes archived sessions only when requested", async (t) => {
+  const root = await fixtureRoot(t);
+  await mkdir(join(root, "sessions", "2026", "10"), { recursive: true });
+  await mkdir(join(root, "archived_sessions"), { recursive: true });
+  await writeFixture(join(root, "sessions", "2026", "10", "active.jsonl"));
+  await writeFixture(join(root, "archived_sessions", "old.jsonl"));
+  assert.equal((await scanSessions(root)).length, 1);
+  const all = await scanSessions(root, { includeArchived: true });
+  assert.equal(all.length, 2);
+  assert.deepEqual(new Set(all.map((item) => item.archived)), new Set([true, false]));
+});
+
+test("board limits transcript reads to recent candidates and skips files lost during scanning", async (t) => {
+  const root = await fixtureRoot(t);
+  const sessions = join(root, "sessions");
+  await mkdir(sessions);
+  const paths = ["old.jsonl", "recent.jsonl", "newest.jsonl"].map((name) => join(sessions, name));
+  for (const [index, path] of paths.entries()) {
+    await writeFixture(path);
+    const time = new Date(Date.parse("2026-10-29T12:00:00.000Z") + index * 60_000);
+    await utimes(path, time, time);
+  }
+  const reads = [];
+  const found = await scanSessions(root, {
+    limit: 1,
+    rolloutParser: async (path) => {
+      reads.push(path);
+      if (path === paths[2]) throw new Error("session moved after stat");
+      return { id: path, updatedAt: "2026-10-29T12:00:00.000Z" };
+    },
+  });
+  assert.equal(found.length, 1);
+  assert.equal(found[0].id, paths[1]);
+  assert.deepEqual(reads, [paths[2], paths[1]]);
+});
+
+test("SessionStart hook returns a visible, truthful resume summary", async (t) => {
+  const root = await fixtureRoot(t);
+  const path = join(root, "rollout.jsonl");
+  await writeFixture(path);
+  const testEmail = ["person", "example.invalid"].join("@");
+  await getSessionIdentity(root, "session-1", async () => ({ key: `account:${testEmail}`, label: testEmail, unavailable: false }));
+  const output = await handleSessionStart(
+    { source: "resume", session_id: "session-1", transcript_path: path },
+    {
+      codexHome: root,
+      now: Date.parse("2026-10-29T12:04:00.000Z"),
+      identityGetter: async () => ({ key: `account:${testEmail}`, label: testEmail, unavailable: false }),
+      usageGetter: async () => ({ identityKey: `account:${testEmail}`, accountEmail: testEmail, availableCount: 2, credits: [], fetchedAt: Date.parse("2026-10-29T12:04:00.000Z"), source: "live" }),
+    },
+  );
+  assert.match(output.systemMessage, /saved context 25k\/200k \(13%\)/);
+  assert.match(output.systemMessage, /Prompt-cache warm\/cold state is not exposed/);
+  assert.match(output.systemMessage, /Banked resets: 2/);
+  assert.match(output.systemMessage, new RegExp(`Account: ${testEmail.replace(".", "\\.")}`));
+  assert.deepEqual(await handleSessionStart({ source: "compact", transcript_path: path }), {});
+});
+
+test("Stop saves a small context snapshot and SessionStart falls back to it", async (t) => {
+  const root = await fixtureRoot(t);
+  const contextAt = "2026-10-29T12:03:00.000Z";
+  const summary = {
+    model: "gpt-test-sol",
+    effort: "high",
+    tokenReportAt: contextAt,
+    contextUsed: 25000,
+    contextWindow: 200000,
+  };
+  await handleStop(
+    { session_id: "session-1", transcript_path: join(root, "too-large.jsonl") },
+    { codexHome: root, now: Date.parse(contextAt), rolloutParser: async () => summary },
+  );
+  const saved = await loadSessionState(root, "session-1");
+  assert.equal(saved.contextUsed, 25000);
+  assert.equal(saved.contextWindow, 200000);
+  assert.equal(saved.contextAt, contextAt);
+  assert.deepEqual(Object.keys(saved).sort(), ["contextAt", "contextUsed", "contextWindow", "effort", "model", "savedAt", "version"]);
+
+  const output = await handleSessionStart(
+    { source: "resume", session_id: "session-1", transcript_path: join(root, "too-large.jsonl") },
+    {
+      codexHome: root,
+      now: Date.parse("2026-10-29T12:04:00.000Z"),
+      rolloutParser: async () => { throw new Error("transcript unavailable"); },
+      identityGetter: async () => null,
+      usageGetter: async () => ({ availableCount: null, source: "cache" }),
+    },
+  );
+  assert.match(output.systemMessage, /saved context 25k\/200k \(13%\)/);
+  assert.match(output.systemMessage, /last token report 1m ago/);
+});
+
+test("an older Stop result cannot replace a newer saved context snapshot", async (t) => {
+  const root = await fixtureRoot(t);
+  const newer = { contextUsed: 50000, contextWindow: 200000, tokenReportAt: "2026-10-29T13:00:00.000Z" };
+  const older = { contextUsed: 25000, contextWindow: 200000, tokenReportAt: "2026-10-29T12:00:00.000Z" };
+  assert.equal(await saveSessionState(root, "session-1", newer), true);
+  assert.equal(await saveSessionState(root, "session-1", older), false);
+  assert.equal((await loadSessionState(root, "session-1")).contextUsed, 50000);
+});
+
+test("resuming a session retains its starting identity after account rotation", async (t) => {
+  const root = await fixtureRoot(t);
+  const path = join(root, "rollout.jsonl");
+  await writeFixture(path);
+  const email = ["initial", "example.invalid"].join("@");
+  const original = { key: `account:${email}`, label: ["Seat", "fixture-start"].join(" "), unavailable: false };
+  let captures = 0;
+  const options = {
+    codexHome: root,
+    identityGetter: async () => { captures += 1; return original; },
+    usageGetter: async ({ identity }) => {
+      assert.deepEqual(identity, original);
+      return { identityKey: original.key, accountEmail: email, availableCount: 2 };
+    },
+  };
+  const startup = await handleSessionStart({ source: "startup", session_id: "stable-session", transcript_path: path }, options);
+  const resumed = await handleSessionStart({ source: "resume", session_id: "stable-session", transcript_path: path }, {
+    ...options,
+    identityGetter: async () => { throw new Error("must not recapture a resumed account"); },
+  });
+  assert.ok(startup.systemMessage.includes(original.label));
+  assert.ok(resumed.systemMessage.includes(original.label));
+  assert.match(resumed.systemMessage, /Banked resets: 2/);
+  assert.equal(captures, 1);
+  const files = await readdir(join(root, "cache-statusband-codex", "sessions"));
+  const record = JSON.parse(await readFile(join(root, "cache-statusband-codex", "sessions", files.find((file) => file.endsWith(".identity.json"))), "utf8"));
+  assert.deepEqual(record, { version: 1, identity: original });
+});
+
+test("concurrent session starts publish only one complete starting identity", async (t) => {
+  const root = await fixtureRoot(t);
+  const identity = (name) => {
+    const email = [name, "example.invalid"].join("@");
+    return { key: `account:${email}`, label: email, unavailable: false };
+  };
+  const first = identity("first");
+  const second = identity("second");
+  const results = await Promise.all([
+    getSessionIdentity(root, "shared-session", async () => first),
+    getSessionIdentity(root, "shared-session", async () => second),
+  ]);
+  assert.deepEqual(results[0], results[1]);
+  assert.ok([first.key, second.key].includes(results[0].key));
+  assert.deepEqual(await getSessionIdentity(root, "shared-session", async () => { throw new Error("must not recapture"); }), results[0]);
+});
+
+test("an unknown starting identity remains unknown rather than adopting a later login", async (t) => {
+  const root = await fixtureRoot(t);
+  assert.equal(await getSessionIdentity(root, "unknown-session", async () => null), null);
+  assert.equal(await getSessionIdentity(root, "unknown-session", async () => { throw new Error("must not adopt a new login"); }), null);
+});
+
+test("a legacy resumed session without identity state does not adopt today's login", async (t) => {
+  const root = await fixtureRoot(t);
+  const output = await handleSessionStart({ source: "resume", session_id: "legacy-session", transcript_path: "missing.jsonl" }, {
+    codexHome: root,
+    identityGetter: async () => { throw new Error("cannot infer a historical login"); },
+    rolloutParser: async () => null,
+    usageGetter: async ({ identity }) => {
+      assert.equal(identity, null);
+      return { availableCount: null };
+    },
+  });
+  assert.deepEqual(output, {});
+  assert.equal(await getSessionIdentity(root, "legacy-session", async () => { throw new Error("must remain unknown"); }), null);
+});
+
+async function fixtureRoot(t) {
+  const root = await mkdtemp(join(tmpdir(), "cache-statusband-codex-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  return root;
+}
+
+async function writeFixture(path) {
+  await writeFile(path, FIXTURE.map((item) => typeof item === "string" ? item : JSON.stringify(item)).join("\n") + "\n", "utf8");
+}

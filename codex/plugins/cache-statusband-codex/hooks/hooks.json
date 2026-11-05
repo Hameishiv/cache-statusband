@@ -1,0 +1,33 @@
+{
+  "description": "Persist numeric context snapshots and summarize them when a Codex session starts or resumes.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|fork",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${PLUGIN_ROOT}/hooks/session-start.mjs\"",
+            "commandWindows": "node.exe \"${PLUGIN_ROOT}\\hooks\\session-start.mjs\"",
+            "timeout": 15,
+            "statusMessage": "Reading saved Codex context and usage"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${PLUGIN_ROOT}/hooks/stop.mjs\"",
+            "commandWindows": "node.exe \"${PLUGIN_ROOT}\\hooks\\stop.mjs\"",
+            "timeout": 10,
+            "statusMessage": "Saving Codex context snapshot"
+          }
+        ]
+      }
+    ]
+  }
+}
