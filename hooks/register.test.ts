@@ -645,6 +645,35 @@ test('a compaction that ends after /clear does not mark the new chat compacted',
   }
 })
 
+// Verification of 1798f6e: a /clear during the last resend must not leave the queue open with no drain
+test('a /clear during the last resend leaves no queue behind to swallow the next message', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, null)
+  on('classic.SessionStart', () => ({}))
+  duringSubmit = async () => {
+    duringSubmit = null
+    await ($ as any).classic.SessionStart({ source: 'clear', transcript_path: '' })
+  }
+  try {
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+    await $.prompt.submit({ text: 'first', origin: PEER, wait: false } as never)
+    await clock.advance(100)
+    await settle(clock, () => seen.submits.length >= 1)
+    await clock.advance(200)
+    const r = await $.prompt.submit({ text: 'later', origin: PEER, wait: false } as never)
+    await clock.advance(200)
+    // the new chat's message is not held behind a queue nobody will drain
+    expect('drop' in (r as object)).toBe(false)
+    expect(seen.log).not.toContain('"queued-behind-compact","text":"later"')
+  } finally {
+    duringSubmit = null
+  }
+})
+
 // A message arriving while the queue drains is appended to it, so it cannot overtake an earlier one
 test('a message that arrives during the drain goes after the queued ones', async ($, on) => {
   const kept = new Map<string, unknown>()

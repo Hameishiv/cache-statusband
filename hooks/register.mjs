@@ -394,7 +394,7 @@ function compactThenSend($, e, unattended, from = '') {
   // the chat this queue belongs to: a /clear before the timer fires hands it back, and this run must not take the next chat's
   const epoch = chatEpoch
   // a throw must not leave the queue set, or every later message would wait forever: send what is left as is
-  $.clock.after(50, () => epoch === chatEpoch && runCompactThenSend($).catch(() => epoch === chatEpoch && drain($).catch(() => {})))
+  $.clock.after(50, () => epoch === chatEpoch && runCompactThenSend($).catch(() => epoch === chatEpoch && drain($, epoch).catch(() => {})))
   return drop
 }
 
@@ -488,7 +488,7 @@ async function runCompactThenSend($) {
     $.ui.toast('Could not compact (' + clip(String((err && err.message) || err), 80) + '), so the message goes as typed.', { timeoutMs: 8000 })
   }
   // what waited during the compaction goes now, in order; anything arriving meanwhile joins the queue
-  await drain($)
+  await drain($, epoch)
 }
 
 // Fill the prompt box with `text`; false when it was not filled (a dialog is up, or headless)
@@ -520,9 +520,10 @@ async function putBack($, back) {
 // submitted goes back to the prompt box together with every one behind it, so nothing is dropped and
 // none overtakes it. A slash line (only ever the head, from the person's dialog) is filled as the
 // draft, the rest still go, and a later failure is logged rather than filled over that draft.
-async function drain($) {
+async function drain($, epoch = chatEpoch) {
+  // the chat the queue was made for: if it changed, the queue was handed back and a later chat's is never this drain's
+  if (epoch !== chatEpoch) return
   draining = true
-  const epoch = chatEpoch // a /clear mid-drain hands back what is left: a later chat's queue is never this drain's
   let draft = false // a slash line sits in the prompt box
   let lost = 0 // not sent again and not put back
   const lose = (m) => (lost++, coldLog($, { action: 'not-resent', text: m.text }))
@@ -530,6 +531,11 @@ async function drain($) {
     while (epoch === chatEpoch && pending && pending.length) {
       const msg = pending.shift()
       if (await resend($, msg).catch(() => false)) continue
+      // the chat changed while that resend was refused: the rest was handed back, and this one goes with it
+      if (epoch !== chatEpoch) {
+        await putBack($, [msg])
+        return
+      }
       if (msg.slash) {
         draft = await fillBox($, msg.text)
         if (!draft) lose(msg)
@@ -1131,10 +1137,11 @@ export function register(on, options = {}) {
     S.coldRestarts = [] // the new chat's own, from its record below
     chatEpoch++
     // what waited on the last chat's compaction was meant for that chat: back to the box, never into this one
-    if (pending && pending.length) {
-      const back = pending
-      pending = null
-      draining = false
+    // an empty queue mid-drain is closed too, or the next chat's messages would wait on a drain that has stopped
+    const back = pending || []
+    pending = null
+    draining = false
+    if (back.length) {
       const ok = await putBack($, back)
       $.ui.toast(ok ? `${back.length} message(s) meant for the previous chat are in the prompt box: send them only if they still apply.` : `${back.length} message(s) meant for the previous chat could not be sent (logged if ~/.claude-shared/state exists).`, { timeoutMs: 15000 })
     }
