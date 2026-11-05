@@ -44,6 +44,7 @@ function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unkno
     if (e.origin?.kind === 'plugin') seen.attempts.push(e.text)
     if (e.origin?.kind === 'plugin' && beforeDrop) await beforeDrop(e)
     if (e.origin?.kind === 'plugin' && dropSubmit && dropSubmit.test(e.text)) return { drop: 'refused' }
+    if (e.origin?.kind === 'plugin' && holdSubmit && holdSubmit.test(e.text)) return new Promise(() => {})
     // the host shows asUser on the origin
     if (e.origin?.kind === 'plugin') seen.submits.push(e.text), seen.asUsers.push(e.origin.asUser), seen.order.push('send:' + e.text)
     if (e.origin?.kind === 'plugin' && duringSubmit) await duringSubmit(e)
@@ -63,6 +64,8 @@ function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unkno
 let failSubmit: RegExp | null = null
 // a plugin resend whose text matches this resolves { drop }, as a host that refuses it does without throwing
 let dropSubmit: RegExp | null = null
+// a plugin resend whose text matches this never settles, as a host holding it would
+let holdSubmit: RegExp | null = null
 // runs inside a plugin resend before the host decides whether to refuse it
 let beforeDrop: ((e: any) => Promise<void>) | null = null
 // runs inside a plugin resend, while the drain is under way
@@ -1202,4 +1205,77 @@ test("a small cold session takes another session's message as is", async ($, on)
   const small = await coldPeer($, on, 77, 100000)
   expect('drop' in (small.r as object)).toBe(false)
   expect(small.seen.compacts).toBe(0)
+})
+
+// Fable 2026-11-05: another plugin submitting the person's own words is compacted first, but resent as the person's
+test("another plugin's asUser prompt is resent as the person's words, not framed as the plugin's", async ($, on) => {
+  const { r, seen } = await coldPeer($, on, 77, 300000, { kind: 'plugin', name: 'other-mod', asUser: true })
+  expect('drop' in (r as object)).toBe(true)
+  expect(seen.order).toEqual(['compact', 'send:PR 12 merged; pick up the next one'])
+  expect(seen.asUsers).toEqual([true])
+})
+
+// Fable 2026-11-05: the slash head never replaces what the person typed during the compaction
+test('a slash line from "Compact first" is not filled over a draft typed during the compaction', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, 'Compact first, then send')
+  boxDraft = 'notes typed meanwhile'
+  try {
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+    await $.prompt.submit({ text: '/merge-pr 123', command: { name: 'merge-pr', args: '123' }, origin: COMPOSER, wait: false } as never)
+    await clock.advance(100)
+    await settle(clock, () => seen.toasts.some((t) => t.includes('not put back')))
+    expect(seen.compacts).toBe(1)
+    expect(seen.fills).toEqual([])
+    expect(seen.toasts.some((t) => t.includes('not put back over what you typed'))).toBe(true)
+  } finally {
+    boxDraft = ''
+  }
+})
+
+// Fable 2026-11-05: the per-session log keeps its newest lines and never grows toward the host's read limit
+test('the cold-compact log drops its oldest lines once past 1 MiB', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, null)
+  seen.log = 'OLDEST\n' + 'x'.repeat(99) + '\n'.repeat(1) + ('y'.repeat(99) + '\n').repeat(11000)
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+  await clock.advance(77 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+  await $.prompt.submit({ text: 'PR 12 merged', origin: PEER, wait: false } as never)
+  await clock.advance(100)
+  await settle(clock, () => seen.log.includes('compact-first'))
+  expect(seen.log.length).toBeLessThan(600 * 1024)
+  expect(seen.log.startsWith('OLDEST')).toBe(false)
+  expect(seen.log.startsWith('y')).toBe(true) // cut at a line boundary
+})
+
+// Fable 2026-11-05: a resend the host never answers does not pin the queue; the ones behind it go back to the box
+test('a resend the host holds past the deadline hands the rest back instead of swallowing them', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, null)
+  hangCompact = false
+  holdSubmit = /first/
+  try {
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+    await $.prompt.submit({ text: 'first', origin: PEER, wait: false } as never)
+    await $.prompt.submit({ text: 'second', origin: PEER, wait: false } as never)
+    await clock.advance(100)
+    await clock.advance(11 * 60000)
+    await settle(clock, () => seen.fills.length >= 1)
+    expect(seen.fills[0].text).toContain('second')
+    expect(seen.fills[0].text).not.toContain('first')
+    expect(seen.log).toContain('resend-held')
+  } finally {
+    holdSubmit = null
+  }
 })
