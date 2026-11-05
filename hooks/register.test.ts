@@ -757,6 +757,30 @@ test('a refused compaction sets the floor, so the next cold peer wake is skipped
   }
 })
 
+// A typed /compact the compactor refused counts too: the next cold wake does not try the same size again
+test('a refused /compact the person typed sets the floor for cold wakes', async ($, on) => {
+  compactOutput = 'Not compacted · fast-jev: below 5% minimum: 2% reduction'
+  try {
+    const kept = new Map<string, unknown>()
+    const { clock, seen } = engine($, on, { label: 'A' }, kept)
+    answer(on, seen, null)
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+    await $.command.run({ command: 'compact', args: '' })
+    expect(seen.compacts).toBe(1)
+    await clock.advance(3 * 60000)
+    const r = await $.prompt.submit({ text: 'two', origin: PEER, wait: false } as never)
+    await clock.advance(100)
+    await settle(clock, () => seen.log.includes('skip-floor'))
+    expect('drop' in (r as object)).toBe(false)
+    expect(seen.compacts).toBe(1)
+  } finally {
+    compactOutput = ''
+  }
+})
+
 // Anything the host could not classify may be the person at the prompt: it gets the dialog, not the silent compact
 async function unknownOrigin($: any, on: any, origin: unknown) {
   const kept = new Map<string, unknown>()

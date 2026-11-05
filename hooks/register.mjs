@@ -1374,6 +1374,11 @@ export function register(on, options = {}) {
   on('command.run', { command: ['compact'] }, async ($, e, next) => {
     const r = await next(e)
     if (!refused(r)) markCompacted()
+    else {
+      // a typed /compact the compactor refused: the cold-wake path must not try the same size again
+      refusedAt = S.ctx
+      compactTriedAt = await $.clock.now()
+    }
     return r
   })
 
