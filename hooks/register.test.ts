@@ -651,8 +651,11 @@ test('a prompt of the person with an @ mention does not wait behind a running co
   }
 })
 
-// The dialog waits on the person: a compaction that ran meanwhile is not followed by a second one
+// The dialog waits on the person: a compaction that ran meanwhile is not followed by a second one. It is
+// refused here, so nothing else (justCompacted) stands in for the guard under test
 test('"Compact first" answered after a compaction ran during the dialog does not compact again', async ($, on) => {
+  compactOutput = 'Not compacted · fast-jev: below 5% minimum: 2% reduction'
+  try {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)
   let ran = false
@@ -677,6 +680,9 @@ test('"Compact first" answered after a compaction ran during the dialog does not
   expect(seen.asks).toBe(1)
   expect(seen.compacts).toBe(1)
   expect('drop' in (r as object)).toBe(false)
+  } finally {
+    compactOutput = ''
+  }
 })
 
 // An unclassified prompt the engine marks isMeta is an engine notice, not the person: never asked, and never

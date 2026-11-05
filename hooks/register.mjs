@@ -395,6 +395,12 @@ function compactThenSend($, e, unattended, from = '') {
 
 // The host never runs this plugin's own hook for its own submit, so this is defensive only: for another
 // copy of this mod, or a host version that does. Such a resend must pass, never queue or compact again
+// Who sent a prompt, for the resend's first line and the log: the kind, and a plugin's or server's name
+const sender = (e) => {
+  const o = e.origin || {}
+  return [o.kind || 'none', o.name || o.server || ''].filter(Boolean).join(' ')
+}
+
 const ownPrompt = ($, e) => !!e.origin && e.origin.kind === 'plugin' && (!e.origin.name || e.origin.name === $.plugin.name)
 
 // Local wall-clock time with its offset (owner rule: log times are local, not UTC)
@@ -436,7 +442,8 @@ async function runCompactThenSend($) {
     const before = S.ctx
     compactRuns++
     compactLive = true
-    const run = Promise.resolve($.command.run({ command: 'compact', args: '' }))
+    // async, so a synchronous throw rejects here rather than skipping the reset below
+    const run = (async () => $.command.run({ command: 'compact', args: '' }))()
     const settled = () => {
       compactLive = false
     }
@@ -449,6 +456,8 @@ async function runCompactThenSend($) {
     if (r === TIMED_OUT) {
       // stop waiting: the queue goes as typed
       late = true
+      // nor does a /compact that never ends hold every later one back: give it as long again
+      $.clock.after(COMPACT_DEADLINE, settled)
       compactTriedAt = await $.clock.now()
       await coldLog($, { action: 'compact-timeout', before })
       $.ui.toast('Compacting took over 10 minutes, so the message goes as typed.', { timeoutMs: 8000 })
@@ -505,7 +514,7 @@ async function drain($) {
         pending = null
         draining = false
         if (await fillBox($, back.map((m) => m.text).join('\n\n'), 'append')) {
-          $.ui.toast(back.length === 1 ? 'Your message is back in the prompt box: press Enter to send it.' : `${back.length} messages are back in the prompt box: press Enter to send them.`, { timeoutMs: 15000 })
+          $.ui.toast(back.length === 1 ? 'The message is back in the prompt box: press Enter to send it.' : `${back.length} messages are back in the prompt box: press Enter to send them.`, { timeoutMs: 15000 })
         } else {
           back.forEach(lose)
           $.ui.toast(`${back.length} message(s) could not be sent again (logged if ~/.claude-shared/state exists).`, { timeoutMs: 15000 })
@@ -1028,7 +1037,7 @@ export function register(on, options = {}) {
       // fresh. A chat closed and reopened within a minute reads the same way and is taken for a reload; an enable
       // after the mod was off for longer finds a stale beat and is taken for a reopen.
       const hb = S.id ? await $.store.get('hb:' + S.id) : null
-      liveHb = hb && now - (hb.updatedAt || 0) < 2 * HEARTBEAT_EVERY ? hb : null
+      liveHb = hb && now - (hb.updatedAt || 0) < 3 * HEARTBEAT_EVERY ? hb : null // a beat can run late
     } catch {
       liveHb = null
     }
@@ -1152,7 +1161,7 @@ export function register(on, options = {}) {
     // the person's own prompt waits only while /compact runs: a resend the host holds must never swallow it
     // not an engine notice (a resend would lose isMeta), nor the person's @-mention (a plugin's resend leaves it unexpanded)
     if (pending && !(draining && maybePerson) && !e.isMeta && !(maybePerson && /(^|\s)@\S/.test(String(e.text || ''))) && !ownPrompt($, e) && !local && !e.turnId && !e.command && !(Array.isArray(e.attachments) && e.attachments.length)) {
-      const kind = (e.origin && e.origin.kind) || 'none'
+      const kind = sender(e)
       // not awaited: the queue could drain during the write, and this message would start a second compact
       coldLog($, { origin: kind, action: 'queued-behind-compact', text: e.text })
       return compactThenSend($, e, !fromUser, maybePerson ? '' : kind)
@@ -1170,13 +1179,16 @@ export function register(on, options = {}) {
     // first, with no dialog: nobody may be there to answer it. Not this mod's own prompt (defensive:
     // the host does not send it here), not a slash command (a plugin can't resubmit one), not an attachment.
     if (!maybePerson) {
-      const kind = (e.origin && e.origin.kind) || 'none'
+      const kind = sender(e)
       const skip = ownPrompt($, e) ? 'plugin' : e.isMeta ? 'meta' : e.command ? 'slash' : media ? 'media' : !worthCompacting() ? 'floor' : compactLive ? 'running' : now - compactTriedAt < 2 * MIN ? 'just-tried' : ''
       coldLog($, { origin: kind, coldMin: Math.round((rotated ? now - S.seatChangedAt : reopened ? now - S.lastActivity : -left) / MIN), ...(reopened ? { reopened: true } : {}), action: skip ? 'skip-' + skip : 'compact-first', ...(skip ? {} : { text: e.text }) })
       return skip ? next(e) : compactThenSend($, e, true, kind)
     }
     // a compaction just ran or is running: asking again would only queue behind it, or compact twice
-    if (pending || compactLive) return next(e)
+    if (pending || compactLive) {
+      coldLog($, { event: 'pass-during-compact', origin: sender(e) })
+      return next(e)
+    }
     const runs = compactRuns
     const cost = money(rewriteCost(S.ctx, S.model, ttl))
     const why = rotated ? `The account rotated to ${S.seat || 'another seat'} ${minutes(now - S.seatChangedAt)} ago, so the cache is cold.` : reopened ? `This chat was reopened ${minutes(now - S.lastActivity)} after its last reply, and a reopened chat starts on a cold cache.` : `Cache went cold ${minutes(-left)} ago.`
@@ -1293,7 +1305,8 @@ export function register(on, options = {}) {
   on('session.compact', async ($, e, next) => {
     now = await $.clock.now()
     const r = await next(e)
-    if (!e.agentId && !(r && r.skip)) markCompacted()
+    // precompute installs nothing: only a compaction that replaced the conversation counts
+    if (!e.agentId && e.trigger !== 'precompute' && !(r && r.skip)) markCompacted()
     return r
   })
   on('classic.PostCompact', async ($, e, next) => {
