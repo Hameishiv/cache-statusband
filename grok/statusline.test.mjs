@@ -123,7 +123,7 @@ describe("weekly usage", () => {
     const first = loadWeekly(logPath, cachePath, now);
     assert.equal(weeklyLabel(first, now), "week 23% · 4d11h");
     const cached = JSON.parse(readFileSync(cachePath, "utf8"));
-    assert.deepEqual(Object.keys(cached).sort(), ["record", "scannedAt", "sourceMtimeMs", "sourceSize"]);
+    assert.deepEqual(Object.keys(cached).sort(), ["record", "scannedAt", "source", "sourceMtimeMs", "sourceSize"]);
     assert.deepEqual(Object.keys(cached.record).sort(), ["fetchedAt", "percent", "periodEnd", "periodType"]);
     assert.equal(JSON.stringify(cached).includes("super-secret-tier"), false);
     assert.equal(JSON.stringify(cached).includes("user@example.com"), false);
@@ -150,6 +150,26 @@ describe("weekly usage", () => {
     aged.scannedAt = now - 6 * 60 * 1000;
     writeFileSync(cachePath, JSON.stringify(aged));
     assert.equal(loadWeekly(logPath, cachePath, now + 2000).percent, 40);
+  });
+
+  it("does not show one log's reading for another log that shares the cache", () => {
+    const dir = mkdtempSync(join(tmpdir(), "csb-week-"));
+    const cachePath = join(dir, "usage.json");
+    const credits = (percent) =>
+      `${JSON.stringify({
+        ts: "2026-10-29T11:37:35.772Z",
+        msg: "billing: fetched credits config",
+        ctx: { config: { creditUsagePercent: percent, currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", end: "2026-11-02T22:57:09.651+00:00" } } },
+      })}\n`;
+    const a = join(dir, "a.jsonl");
+    const b = join(dir, "b.jsonl");
+    writeFileSync(a, credits(23));
+    writeFileSync(b, "no credits line\n");
+    assert.equal(loadWeekly(a, cachePath, now).percent, 23);
+    assert.equal(loadWeekly(b, cachePath, now + 1000), null);
+    writeFileSync(b, credits(61));
+    assert.equal(loadWeekly(b, cachePath, now + 2000).percent, 61);
+    assert.equal(loadWeekly(a, cachePath, now + 3000).percent, 23);
   });
 });
 

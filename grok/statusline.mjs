@@ -333,10 +333,12 @@ function writeCache(cachePath, body) {
 /**
  * Last weekly reading. Re-reads the log at most once per five minutes.
  * A failed re-read keeps the last good record and only moves the next check.
- * The cache stores the percent, period type, period end, and fetch time.
+ * The cache stores the log it read, the percent, period type, period end, and fetch time.
  */
 export function loadWeekly(logPath, cachePath, nowMs = Date.now()) {
-  const cached = readCache(cachePath);
+  // one cache file serves every log: a reading from another log (another GROK_HOME) is not this one's
+  const stored = readCache(cachePath);
+  const cached = stored && stored.source === logPath ? stored : null;
   const prior = storedRecord(cached);
   const freshScan = cached && finite(cached.scannedAt) !== null && nowMs - cached.scannedAt < RESCAN_MS;
   if (freshScan && prior) return prior;
@@ -356,6 +358,7 @@ export function loadWeekly(logPath, cachePath, nowMs = Date.now()) {
   if (!found) {
     if (prior) {
       writeCache(cachePath, {
+        source: logPath,
         sourceMtimeMs: cached.sourceMtimeMs,
         sourceSize: cached.sourceSize,
         scannedAt: nowMs,
@@ -371,6 +374,7 @@ export function loadWeekly(logPath, cachePath, nowMs = Date.now()) {
     fetchedAt: found.fetchedAt,
   };
   writeCache(cachePath, {
+    source: logPath,
     sourceMtimeMs: found.sourceMtimeMs,
     sourceSize: found.sourceSize,
     scannedAt: nowMs,
