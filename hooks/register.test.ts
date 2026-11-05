@@ -20,7 +20,7 @@ function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unkno
     on('store.keys', () => ({ value: [...kept.keys()] }))
   } else mock.store(on)
   mock.env(on, { USERPROFILE: 'C:/Users/T' })
-  const seen = { compacts: 0, submits: [] as string[], asks: 0, toasts: [] as string[], order: [] as string[], log: '' }
+  const seen = { compacts: 0, submits: [] as string[], asks: 0, toasts: [] as string[], order: [] as string[], log: '', logPath: '' }
   on('session.id', () => ({ value: 'sid-test' }))
   on('session.cwd', () => ({ value: '/repo' }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
@@ -41,7 +41,7 @@ function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unkno
   on('session.start', (_: unknown, e: any) => ({ cwd: e.cwd }))
   on('session.measure', () => ({ changed: [] }))
   on('ui.toast', (_: unknown, e: unknown) => (seen.toasts.push(JSON.stringify(e)), { value: undefined }))
-  on('fs.write', (_: unknown, e: any) => ((seen.log = String(e.text)), { value: undefined }))
+  on('fs.write', (_: unknown, e: any) => ((seen.log = String(e.text)), (seen.logPath = String(e.path)), { value: undefined }))
   return { clock, seen }
 }
 
@@ -440,7 +440,7 @@ test('a cold, large session woken by another session compacts before the message
   const { r, seen } = await coldPeer($, on, 77)
   expect('drop' in (r as object)).toBe(true) // the message did not reach the model on the cold cache
   expect(seen.asks).toBe(0)
-  expect(seen.order).toEqual(['compact', 'send:PR 12 merged; pick up the next one'])
+  expect(seen.order).toEqual(['compact', 'send:[peer message, resent by cache-keeper after /compact]\nPR 12 merged; pick up the next one'])
 })
 
 // R10 2026-11-03: a refused /compact still returns; it must not be logged, or treated, as a compaction
@@ -450,10 +450,34 @@ test('a cold compact the compactor refuses is logged as skipped, not as compacte
     const { seen } = await coldPeer($, on, 77)
     expect(seen.log).toContain('"action":"compact-skipped"')
     expect(seen.log).not.toContain('"action":"compacted"')
-    expect(seen.order).toEqual(['compact', 'send:PR 12 merged; pick up the next one'])
+    expect(seen.order).toEqual(['compact', 'send:[peer message, resent by cache-keeper after /compact]\nPR 12 merged; pick up the next one'])
   } finally {
     compactOutput = ''
   }
+})
+
+// Pre-push review 2026-11-05: a second message during the compaction waits; it must not overtake the first
+test('a message that arrives while the cold compact runs goes after the first one, not before', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, null)
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+  await clock.advance(77 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+  const a = await $.prompt.submit({ text: 'first', origin: PEER, wait: false } as never)
+  const b = await $.prompt.submit({ text: 'second', origin: { kind: 'task-notification' } as never, wait: false } as never)
+  await clock.advance(100)
+  expect('drop' in (a as object)).toBe(true)
+  expect('drop' in (b as object)).toBe(true)
+  expect(seen.compacts).toBe(1)
+  expect(seen.order).toEqual(['compact', 'send:[peer message, resent by cache-keeper after /compact]\nfirst', 'send:[task-notification message, resent by cache-keeper after /compact]\nsecond'])
+})
+
+test('the cold-compact log is one file per session, stamped in local time', async ($, on) => {
+  const { seen } = await coldPeer($, on, 77)
+  expect(seen.logPath).toMatch(/cache-keeper-cold-compact-log-sid-test\.txt$/)
+  expect(seen.log).toMatch(/"t":"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}[+-]\d\d:\d\d"/)
 })
 
 test('a cold compact that went through is logged as compacted', async ($, on) => {

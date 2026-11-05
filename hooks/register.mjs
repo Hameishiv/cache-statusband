@@ -71,7 +71,9 @@ const alerted = new Map() // sessionId -> state or warning key already announced
 let paneOpen = false
 let justCompacted = false
 let compactedCold = false
-let compactTriedAt = 0 // when compactThenSend last ran
+let compactTriedAt = 0 // when a cold compact last failed or was refused: no retry for 2 minutes
+let pending = null // messages waiting on the compaction under way, in arrival order
+let logChain = Promise.resolve() // one log write at a time in this process
 let handoffPending = false
 let seatFile = ''
 let onTerminal = false
@@ -369,31 +371,54 @@ async function resumeStep($) {
   }
 }
 
-function compactThenSend($, e, unattended) {
-  const msg = { text: e.text, attachments: e.attachments, slash: !!e.command }
-  compactTriedAt = now // a failed compact resends the message: this keeps that resend from compacting again
-  $.clock.after(50, () => runCompactThenSend($, msg, unattended).catch(() => {}))
-  return { drop: 'cache-keeper: compacting first on a cold cache; the message is sent again once that finishes' }
+// `from` names a sender other than the person (a peer, a task notification): the resend says so,
+// so the message does not come back as the person's own words
+function compactThenSend($, e, unattended, from = '') {
+  const msg = { text: from ? `[${from} message, resent by cache-keeper after /compact]\n${e.text}` : e.text, attachments: e.attachments, slash: !!e.command, unattended }
+  const drop = { drop: 'cache-keeper: compacting first on a cold cache; the message is sent again once that finishes' }
+  // a compaction is already under way: this message waits behind the ones before it
+  if (pending) return pending.push(msg), drop
+  pending = [msg]
+  // a throw must not leave the queue set, or every later message would wait forever
+  $.clock.after(50, () => runCompactThenSend($).catch(() => { pending = null }))
+  return drop
+}
+
+// This mod's own resend comes back through the guard: it must pass, never queue or compact again
+const ownPrompt = ($, e) => !!e.origin && e.origin.kind === 'plugin' && (!e.origin.name || e.origin.name === $.plugin.name)
+
+// Local wall-clock time with its offset (owner rule: log times are local, not UTC)
+function localStamp(ms) {
+  const off = -new Date(ms).getTimezoneOffset()
+  const hm = (n) => String(Math.floor(Math.abs(n) / 60)).padStart(2, '0') + ':' + String(Math.abs(n) % 60).padStart(2, '0')
+  return new Date(ms + off * MIN).toISOString().slice(0, -1) + (off < 0 ? '-' : '+') + hm(off)
 }
 
 // The cold-compact decisions, on disk, so a session's own behaviour can be checked afterwards
+// One file per session, so sessions never overwrite each other's lines; writes in this process run one at a time.
 // shortcut: $.fs has no append, so read + rewrite; a log over 4 MiB fails the read and restarts empty
-async function coldLog($, fields) {
-  try {
-    const path = `${home.replace(/\\/g, '/')}/.claude-shared/state/cache-keeper-cold-compact-log.txt` // an existing folder: $.fs.write makes none
-    const old = await $.fs.read(path).catch(() => '')
-    await $.fs.write(path, `${typeof old === 'string' ? old : ''}${JSON.stringify({ t: new Date(now).toISOString(), sid: S.id, ctx: S.ctx, ...fields })}\n`)
-  } catch {
-    // logging never blocks a send
-  }
+function coldLog($, fields) {
+  const line = `${JSON.stringify({ t: localStamp(now), sid: S.id, ctx: S.ctx, ...fields })}\n`
+  const path = `${home.replace(/\\/g, '/')}/.claude-shared/state/cache-keeper-cold-compact-log-${S.id || 'unknown'}.txt` // an existing folder: $.fs.write makes none
+  logChain = logChain.then(async () => {
+    try {
+      const old = await $.fs.read(path).catch(() => '')
+      await $.fs.write(path, `${typeof old === 'string' ? old : ''}${line}`)
+    } catch {
+      // logging never blocks a send
+    }
+  })
+  return logChain
 }
 
-async function runCompactThenSend($, msg, unattended) {
+async function runCompactThenSend($) {
+  const unattended = pending.some((m) => m.unattended)
   try {
     const before = S.ctx
     const r = await $.command.run({ command: 'compact', args: '' })
     if (refused(r)) {
       // the context did not shrink: the guard stays armed and the log says so
+      compactTriedAt = now
       if (unattended) await coldLog($, { action: 'compact-skipped', before, reason: clip(String(r.text), 160) })
       $.ui.toast('Not compacted (' + clip(String(r.text), 80) + '), so the message goes as typed.', { timeoutMs: 8000 })
     } else {
@@ -401,13 +426,20 @@ async function runCompactThenSend($, msg, unattended) {
       if (unattended) await coldLog($, { action: 'compacted', before })
     }
   } catch (err) {
+    compactTriedAt = now
     if (unattended) await coldLog($, { action: 'compact-failed', error: String((err && err.message) || err) })
     $.ui.toast('Could not compact (' + clip(String((err && err.message) || err), 80) + '), so the message goes as typed.', { timeoutMs: 8000 })
   }
+  // send every waiting message in the order it arrived, including any that queue while these go
+  while (pending.length) await resend($, pending.shift())
+  pending = null
+}
+
+async function resend($, msg) {
   const send = { text: msg.text, ...(msg.attachments ? { attachments: msg.attachments } : {}) }
   // A plugin can't submit a "/" line: those go back in the prompt box
   if (!msg.slash) {
-    for (const asUser of unattended ? [true, false] : [true]) {
+    for (const asUser of msg.unattended ? [true, false] : [true]) {
       try {
         await $.prompt.submit({ ...send, asUser })
         return
@@ -1014,6 +1046,12 @@ export function register(on, options = {}) {
     const isCold = rotated || reopened || (left !== null && left <= 0)
     // These run locally or start afresh: a cold cache costs them nothing
     const local = e.command && ['compact', 'clear', names.cache, names.keepwarm, names.board, names.handoff].includes(e.command.name)
+    // A compaction is under way: anything else waits behind it and goes after, in order, with no dialog
+    if (pending && !ownPrompt($, e) && !local && !e.turnId && !e.command && !(Array.isArray(e.attachments) && e.attachments.length)) {
+      const kind = (e.origin && e.origin.kind) || 'none'
+      await coldLog($, { origin: kind, action: 'queued-behind-compact' })
+      return compactThenSend($, e, !fromUser, fromUser ? '' : kind)
+    }
     if (!settings.guard || !isCold || local || justCompacted || S.ctx < settings.bigTokens || e.turnId) {
       // Why a big (or unmeasured) prompt went through unasked: the evidence for a cold send nobody was asked about
       if (!e.turnId && (!S.ctx || S.ctx >= settings.bigTokens)) await coldLog($, { event: 'guard-pass', origin: (e.origin && e.origin.kind) || 'none', isCold, leftMin: left === null ? null : Math.round(left / MIN), idleMin: S.lastActivity ? Math.round((now - S.lastActivity) / MIN) : null, rotated, reopened, justCompacted, local: !!local, guard: settings.guard })
@@ -1028,9 +1066,9 @@ export function register(on, options = {}) {
     // resend included), not a slash command (a plugin can't resubmit one), not an attachment.
     if (!fromUser) {
       const kind = (e.origin && e.origin.kind) || 'none'
-      const skip = kind === 'plugin' ? 'plugin' : e.command ? 'slash' : media ? 'media' : !worthCompacting() ? 'floor' : now - compactTriedAt < 2 * MIN ? 'just-tried' : ''
+      const skip = ownPrompt($, e) ? 'plugin' : e.command ? 'slash' : media ? 'media' : !worthCompacting() ? 'floor' : now - compactTriedAt < 2 * MIN ? 'just-tried' : ''
       await coldLog($, { origin: kind, coldMin: Math.round((rotated ? now - S.seatChangedAt : reopened ? now - S.lastActivity : -left) / MIN), ...(reopened ? { reopened: true } : {}), action: skip ? 'skip-' + skip : 'compact-first' })
-      return skip ? next(e) : compactThenSend($, e, true)
+      return skip ? next(e) : compactThenSend($, e, true, kind)
     }
     const cost = money(rewriteCost(S.ctx, S.model, ttl))
     const why = rotated ? `The account rotated to ${S.seat || 'another seat'} ${minutes(now - S.seatChangedAt)} ago, so the cache is cold.` : reopened ? `This chat was reopened ${minutes(now - S.lastActivity)} after its last reply, and a reopened chat starts on a cold cache.` : `Cache went cold ${minutes(-left)} ago.`
