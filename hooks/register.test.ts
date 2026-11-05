@@ -25,6 +25,7 @@ function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unkno
   on('session.cwd', () => ({ value: '/repo' }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
   on('session.surface', () => ({ value: 'terminal' }))
+  on('session.surfaces', () => ({ value: headlessRun ? [] : ['terminal'] }))
   on('session.messages', () => ({ value: [] }))
   on('command.register', (_: unknown, e: any) => ({ value: { command: e.name } }))
   on('agent.list', () => ({ value: [] }))
@@ -64,6 +65,8 @@ let duringSubmit: ((e: any) => Promise<void>) | null = null
 let hangCompact = false
 // no ~/.claude-shared/state folder: the cold-compact log is not written, and the folder is not made
 let noStateDir = false
+// a plain -p run: the session draws on no surface
+let headlessRun = false
 
 function answer(on: any, seen: { asks: number; options?: string[] }, label: string | null) {
   on('tool.call', (_: unknown, e: any) => {
@@ -448,7 +451,7 @@ async function settle(clock: any, done: () => boolean) {
 
 // Owner 2026-11-02: a cold, big, idle chat woken by another session compacts BEFORE the message is processed
 const PEER = { kind: 'peer' } as never
-async function coldPeer($: any, on: any, idleMin: number, ctx = 300000) {
+async function coldPeer($: any, on: any, idleMin: number, ctx = 300000, origin: unknown = PEER) {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)
   answer(on, seen, null) // nobody is there to answer a dialog
@@ -456,7 +459,7 @@ async function coldPeer($: any, on: any, idleMin: number, ctx = 300000) {
   kept.set('last:sid-test', { ctx, at: await clock.now(), model: 'claude-opus-5-5' })
   await clock.advance(idleMin * 60000)
   await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
-  const r = await $.prompt.submit({ text: 'PR 12 merged; pick up the next one', origin: PEER, wait: false } as never)
+  const r = await $.prompt.submit({ text: 'PR 12 merged; pick up the next one', origin, wait: false } as never)
   await clock.advance(100)
   await settle(clock, () => seen.submits.length + seen.fills.length >= 1)
   return { r, seen }
@@ -625,6 +628,21 @@ async function unknownOrigin($: any, on: any, origin: unknown) {
 }
 test('a prompt with an unclassified origin is asked, not auto-compacted', ($, on) => unknownOrigin($, on, { kind: 'unclassified' }))
 test('a prompt with no origin is asked, not auto-compacted', ($, on) => unknownOrigin($, on, undefined))
+// A plain -p run's prompt is the person's: dropping it to compact could end the run
+test('an sdk prompt in a plain -p run is asked, not auto-compacted', async ($, on) => {
+  headlessRun = true
+  try {
+    await unknownOrigin($, on, { kind: 'sdk' })
+  } finally {
+    headlessRun = false
+  }
+})
+// while the desktop app's own sdk turn, drawn on a surface, still compacts first
+test("the desktop app's own sdk turn compacts first", async ($, on) => {
+  const { r, seen } = await coldPeer($, on, 77, 300000, { kind: 'sdk' })
+  expect('drop' in (r as object)).toBe(true)
+  expect(seen.compacts).toBe(1)
+})
 test("an auto-continuation prompt (after the person's own click) is asked, not auto-compacted", ($, on) => unknownOrigin($, on, { kind: 'auto-continuation' }))
 
 // A plugin's resend leaves an @ mention unexpanded: the person's prompt with one does not join the queue

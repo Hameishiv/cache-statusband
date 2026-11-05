@@ -72,11 +72,11 @@ let paneOpen = false
 let justCompacted = false
 let compactedCold = false
 let compactRuns = 0 // cold compactions this mod has started: a dialog answered after one started must not start another
-let compactLive = false // one is still running, waited on or not (past its deadline too)
+let compactLive = false // the latest is still running, waited on or not: past its deadline too, for as long again
 let compactTriedAt = 0 // when a cold compact last failed or was refused: no retry for 2 minutes
 let pending = null // messages waiting on the compaction under way, in arrival order
 let draining = false // the compaction is over and the queue is being resent: the person's own prompts no longer wait
-let liveHb = null // this session's heartbeat as the mod found it on loading: under two beats old means a reload in a live process, not a reopen
+let liveHb = null // this session's heartbeat as the mod found it on loading: under three beats old means a reload in a live process, not a reopen
 let logDir = null // whether the cold-compact log's folder exists (checked once): $.fs.write would make it
 let refusedAt = 0 // the context size a compaction was last refused at: no cold compact until it grows 100k past it
 let logChain = Promise.resolve() // one log write at a time in this process
@@ -393,14 +393,14 @@ function compactThenSend($, e, unattended, from = '') {
   return drop
 }
 
-// The host never runs this plugin's own hook for its own submit, so this is defensive only: for another
-// copy of this mod, or a host version that does. Such a resend must pass, never queue or compact again
 // Who sent a prompt, for the resend's first line and the log: the kind, and a plugin's or server's name
 const sender = (e) => {
   const o = e.origin || {}
   return [o.kind || 'none', o.name || o.server || ''].filter(Boolean).join(' ')
 }
 
+// The host never runs this plugin's own hook for its own submit, so this is defensive only: for another
+// copy of this mod, or a host version that does. Such a resend must pass, never queue or compact again
 const ownPrompt = ($, e) => !!e.origin && e.origin.kind === 'plugin' && (!e.origin.name || e.origin.name === $.plugin.name)
 
 // Local wall-clock time with its offset (owner rule: log times are local, not UTC)
@@ -444,8 +444,10 @@ async function runCompactThenSend($) {
     compactLive = true
     // async, so a synchronous throw rejects here rather than skipping the reset below
     const run = (async () => $.command.run({ command: 'compact', args: '' }))()
+    const gen = compactRuns
+    // only the latest run's end clears the flag: an older one settling late must not
     const settled = () => {
-      compactLive = false
+      if (compactRuns === gen) compactLive = false
     }
     run.then(settled, settled)
     let late = false
@@ -1034,7 +1036,7 @@ export function register(on, options = {}) {
     logDir = null // look again: the folder may have been made since
     try {
       // a reload of this mod (or a worker respawn) fires session.start again in a live process: its last beat is
-      // fresh. A chat closed and reopened within a minute reads the same way and is taken for a reload; an enable
+      // fresh. A chat closed and reopened within about 90 seconds reads the same way and is taken for a reload; an enable
       // after the mod was off for longer finds a stale beat and is taken for a reopen.
       const hb = S.id ? await $.store.get('hb:' + S.id) : null
       liveHb = hb && now - (hb.updatedAt || 0) < 3 * HEARTBEAT_EVERY ? hb : null // a beat can run late
@@ -1143,7 +1145,10 @@ export function register(on, options = {}) {
     const fromUser = e.origin && (e.origin.kind === 'composer' || e.origin.kind === 'bridge')
     // no origin, or one the host could not classify, may be the person at the prompt: it gets the dialog, never the silent compact
     // (an isMeta prompt is an engine notice, never the person; auto-continuation follows the person's own click)
-    const maybePerson = !e.isMeta && (!e.origin || fromUser || e.origin.kind === 'unclassified' || e.origin.kind === 'auto-continuation')
+    // and an sdk prompt with no surface is a plain -p run: its prompt is the person's, and dropping it could end the run.
+    // (The desktop app's own sdk turns draw on a surface: those still compact first.)
+    const headless = !!e.origin && e.origin.kind === 'sdk' && !(await $.session.surfaces().catch(() => [])).length
+    const maybePerson = !e.isMeta && (!e.origin || fromUser || headless || e.origin.kind === 'unclassified' || e.origin.kind === 'auto-continuation')
     const wake = fromUser && !!cfg.rotatorWake && cfg.rotatorWake.test(String(e.text || ''))
     if (wake) {
       // The wake-up is the rotation reaching this session: take the new seat now
