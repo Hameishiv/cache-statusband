@@ -658,16 +658,21 @@ async function drain($, epoch = chatEpoch) {
         continue
       }
       if (msg.mention) {
-        // the person's @ prompt: back in the box after whatever they typed, and the rest still go
+        // the person's @ prompt: back in the box after whatever they typed, and the rest still go.
+        // The chat changed first: it goes back marked as meant for the previous chat
+        if (epoch !== chatEpoch) return handBack($, [msg], epoch)
         const ok = await putBack($, [msg])
-        $.ui.toast(ok ? 'Your message is back in the prompt box (a resend would not attach its @ files): press Enter to send it.' : 'Your message could not be put back (logged if ~/.claude-shared/state exists).', { timeoutMs: 15000 })
+        $.ui.toast(ok && epoch !== chatEpoch ? 'Your message, meant for the previous chat, is in the prompt box: send it only if it still applies.' : ok ? 'Your message is back in the prompt box (a resend would not attach its @ files): press Enter to send it.' : 'Your message could not be put back (logged if ~/.claude-shared/state exists).', { timeoutMs: 15000 })
         continue
       }
       if (msg.slash) {
         // never over the person's draft: a slash line after text would be a broken command, so it is logged instead
         // read and fill inside the box lock, so a put-back from elsewhere cannot land between them
         let typed = ''
-        draft = await boxSerial($, async () => ((typed = (await boxText($)).trim()) ? false : fillBox($, msg.text, 'append')))
+        let moved = false
+        // the chat changed before the box was read: the previous chat's command is never one Enter away in the new one
+        draft = await boxSerial($, async () => (epoch !== chatEpoch ? ((moved = true), false) : (typed = (await boxText($)).trim()) ? false : fillBox($, msg.text, 'append')))
+        if (moved) return handBack($, [msg], epoch)
         if (!draft) lose(msg)
         else coldLog($, { action: 'put-back', text: msg.text, sid: msg.sid })
         $.ui.toast(draft ? 'Your message is back in the prompt box: press Enter to send it.' : typed ? `${clip(msg.text, 80)} was not put back over what you typed (logged if ~/.claude-shared/state exists).` : 'The message could not be sent again: ' + clip(msg.text, 80), { timeoutMs: 15000 })
@@ -1300,7 +1305,7 @@ export function register(on, options = {}) {
     // not awaited: the new chat's start does not wait on the prompt box
     else if (back.length) handBack($, back, -1).catch(() => {})
     try {
-      S.id = (await $.session.id()) || S.id
+      S.id = e.session_id || (await $.session.id()) || S.id
     } catch {
       // keep the old id
     }
@@ -1397,6 +1402,13 @@ export function register(on, options = {}) {
     // the chat this prompt was typed in: a /clear, /resume or /fork while the dialog is up must not take it
     const askedIn = chatEpoch
     const askedSid = S.id
+    // the prompt goes back to the box marked as meant for the previous chat (a slash command is logged);
+    // an attachment cannot travel with it, so the person is told to attach it again
+    const handOld = () => {
+      handBack($, [{ text: e.text, slash: !!e.command, sid: askedSid }], -1).catch(() => {})
+      if (media) $.ui.toast('The attachment on that message was not kept: attach it again if you send it.', { timeoutMs: 15000 })
+      return { drop: 'cache-keeper: the chat changed while asking; the message is back in the prompt box' }
+    }
     const cost = money(rewriteCost(S.ctx, S.model, ttl))
     const why = rotated ? `The account rotated to ${S.seat || 'another seat'} ${minutes(now - S.seatChangedAt)} ago, so the cache is cold.` : reopened ? `This chat was reopened ${minutes(now - S.lastActivity)} after its last reply, and a reopened chat starts on a cold cache.` : `Cache went cold ${minutes(-left)} ago.`
     const floor = S.floor ? ` Compacting last left ${tokens(S.floor)}.` : ''
@@ -1409,15 +1421,14 @@ export function register(on, options = {}) {
       )
     } catch (err) {
       // nobody to ask (a -p run, or the dialog was dismissed): send as typed
-      coldLog($, { event: 'ask-failed', origin: (e.origin && e.origin.kind) || 'none', error: String((err && err.message) || err).slice(0, 120) })
+      coldLog($, { event: 'ask-failed', origin: (e.origin && e.origin.kind) || 'none', error: String((err && err.message) || err).slice(0, 120), sid: askedSid })
+      // dismissed after the chat changed (Esc on a stale dialog): never sent into the new chat
+      if (askedIn !== chatEpoch) return handOld()
       return next(e)
     }
-    coldLog($, { event: 'asked', origin: (e.origin && e.origin.kind) || 'none', reopened, rotated, answer })
+    coldLog($, { event: 'asked', origin: (e.origin && e.origin.kind) || 'none', reopened, rotated, answer, sid: askedSid })
     // the chat changed while the dialog was up: the prompt goes back marked as meant for the previous chat
-    if (askedIn !== chatEpoch && answer !== 'Cancel') {
-      handBack($, [{ text: e.text, slash: !!e.command, sid: askedSid }], -1).catch(() => {})
-      return { drop: 'cache-keeper: the chat changed while asking; the message is back in the prompt box' }
-    }
+    if (askedIn !== chatEpoch && answer !== 'Cancel') return handOld()
     // $.session.compact() is refused on SDK hosts (the desktop app), so this queues /compact
     // the dialog waited on the person: a compaction may have run or started meanwhile
     if (answer === 'Compact first, then send') {
