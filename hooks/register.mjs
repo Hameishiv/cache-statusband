@@ -398,7 +398,8 @@ function compactThenSend($, e, unattended, from = '', logged = false, mention = 
   const msg = { text: from ? `[${from} message, resent by cache-keeper after /compact]\n${e.text}` : e.text, attachments: e.attachments, slash: !!e.command, mention, unattended, logged: logged || unattended, modes, sid: S.id }
   const drop = { drop: 'cache-keeper: compacting first on a cold cache; the message is sent again once that finishes' }
   // a compaction is already under way: this message waits behind the ones before it
-  if (pending) return pending.push(msg), drop
+  // every message that joins a queue is logged with its text: it has been dropped, so a reload would leave no other copy
+  if (pending) return coldLog($, { origin: (e.origin && e.origin.kind) || 'none', action: 'queued-behind-compact', text: e.text, sid: S.id }), pending.push(msg), drop
   pending = [msg]
   // the head is the one message no other line records: it has already been dropped, so its text is logged
   coldLog($, { action: 'queued-head', text: e.text, sid: S.id })
@@ -446,7 +447,8 @@ function coldLog($, fields) {
       if (logDir === null) logDir = await $.fs.exists(path.slice(0, path.lastIndexOf('/')))
       if (!logDir) return
       // a message neither resent nor put back has the log as its only copy: its whole text goes first to a
-      // file of its own, never trimmed, so a clipped line or a failed log write cannot take it
+      // file of its own, never trimmed, so a clipped line or a failed log write cannot take it.
+      // A queued message too long for the log line gets one as well, when queued, in case a reload drops the queue
       if (fields.action === 'not-resent' || (text.textLen && /^queued/.test(String(fields.action || '')))) {
         try {
           await $.fs.write(`${home.replace(/\\/g, '/')}/.claude-shared/state/cache-keeper-lost-${sid || 'unknown'}-${now}-${++lostSeq}.txt`, fields.text)
@@ -1264,6 +1266,8 @@ export function register(on, options = {}) {
     justCompacted = false
     compactedCold = false
     S.floor = 0
+    // a cleared chat is empty: the last chat's size would make it look worth compacting until a turn measures it
+    if (e.source === 'clear') S.ctx = 0
     compactTriedAt = 0 // nor does its failed or refused compact hold back this one's
     refusedAt = 0
     S.coldRestarts = [] // the new chat's own, from its record below
@@ -1347,8 +1351,6 @@ export function register(on, options = {}) {
     // not an engine notice (a resend would lose isMeta), nor the person's @-mention (a plugin's resend leaves it unexpanded)
     if (pending && !(draining && maybePerson) && !headless && !e.isMeta && !(maybePerson && /(^|\s)@\S/.test(String(e.text || ''))) && !ownPrompt($, e) && !local && !e.turnId && !e.command && !(Array.isArray(e.attachments) && e.attachments.length)) {
       const kind = sender(e)
-      // not awaited: the queue could drain during the write, and this message would start a second compact
-      coldLog($, { origin: kind, action: 'queued-behind-compact', text: e.text })
       // a rotator wake keeps its unattended fallback: nobody is at the prompt after a rotation
       return compactThenSend($, e, (!fromUser && !asPerson) || wake || (!!e.origin && e.origin.kind === 'slack-ping'), maybePerson || asPerson ? '' : kind)
     }

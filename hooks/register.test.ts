@@ -1526,3 +1526,24 @@ test('a /clear during a compaction logs the previous chat slash command and puts
     hangCompact = false
   }
 })
+
+// Opus 2026-11-05 r8: a /clear after a rotation leaves an empty chat, which a peer message must not compact
+test('after a rotation and /clear, a peer message does not compact the empty new chat', SETUP, async ($, on) => {
+  const seat = { label: 'A' }
+  const { clock, seen } = engine($, on, seat)
+  answer(on, seen, null)
+  on('classic.SessionStart', () => ({}))
+  await start($, 300000, clock)
+  seat.label = 'G'
+  await clock.advance(5 * 60000)
+  await $.prompt.submit({ text: 'Usage reset: the weekly limit capped, so the CLI account was rotated to G. Go on.', origin: COMPOSER, wait: false } as never)
+  await clock.advance(100)
+  await settle(clock, () => seen.submits.length >= 1)
+  expect(seen.compacts).toBe(1)
+  await ($ as any).classic.SessionStart({ source: 'clear', transcript_path: '' })
+  await clock.advance(100)
+  const r = await $.prompt.submit({ text: 'a note from a peer', origin: PEER, wait: false } as never)
+  await clock.advance(200)
+  expect('drop' in (r as object)).toBe(false)
+  expect(seen.compacts).toBe(1)
+})
