@@ -614,13 +614,24 @@ async function handBack($, first, epoch) {
   else $.ui.toast(note.trim(), { timeoutMs: 15000 })
 }
 
+// the count of messages a drain could neither resend nor put back reaches the person on every exit,
+// including the early ones taken when the chat changes
 async function drain($, epoch = chatEpoch) {
+  const tally = { lost: 0 }
+  try {
+    return await drainQueue($, epoch, tally)
+  } finally {
+    if (tally.lost) $.ui.toast(`${tally.lost} message(s) could not be sent again (logged if ~/.claude-shared/state exists).`, { timeoutMs: 15000 })
+  }
+}
+
+async function drainQueue($, epoch, tally) {
   // the chat the queue was made for: if it changed, the queue was handed back and a later chat's is never this drain's
   if (epoch !== chatEpoch) return
   draining = true
   let draft = false // a slash line sits in the prompt box
-  let lost = 0 // not sent again and not put back
-  const lose = (m) => (lost++, coldLog($, { action: 'not-resent', text: m.text, sid: m.sid }))
+  // not sent again and not put back
+  const lose = (m) => (tally.lost++, coldLog($, { action: 'not-resent', text: m.text, sid: m.sid }))
   try {
     while (epoch === chatEpoch && pending && pending.length) {
       const msg = pending.shift()
@@ -702,7 +713,6 @@ async function drain($, epoch = chatEpoch) {
     pending = null
     draining = false
   }
-  if (lost) $.ui.toast(`${lost} message(s) could not be sent again (logged if ~/.claude-shared/state exists).`, { timeoutMs: 15000 })
 }
 
 // true once the message is submitted; false when it was refused or could not be (the caller puts it back)
@@ -1405,9 +1415,10 @@ export function register(on, options = {}) {
     // the prompt goes back to the box marked as meant for the previous chat (a slash command is logged);
     // an attachment cannot travel with it, so the person is told to attach it again
     const handOld = () => {
-      handBack($, [{ text: e.text, slash: !!e.command, sid: askedSid }], -1).catch(() => {})
+      // an image-only prompt has no text to put back: it is reported as not kept
+      if (String(e.text || '').trim()) handBack($, [{ text: e.text, slash: !!e.command, sid: askedSid }], -1).catch(() => {})
       if (media) $.ui.toast('The attachment on that message was not kept: attach it again if you send it.', { timeoutMs: 15000 })
-      return { drop: 'cache-keeper: the chat changed while asking; the message is back in the prompt box' }
+      return { drop: 'cache-keeper: the chat changed while asking; see the note on what happened to the message' }
     }
     const cost = money(rewriteCost(S.ctx, S.model, ttl))
     const why = rotated ? `The account rotated to ${S.seat || 'another seat'} ${minutes(now - S.seatChangedAt)} ago, so the cache is cold.` : reopened ? `This chat was reopened ${minutes(now - S.lastActivity)} after its last reply, and a reopened chat starts on a cold cache.` : `Cache went cold ${minutes(-left)} ago.`
