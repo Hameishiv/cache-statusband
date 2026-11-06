@@ -1090,19 +1090,22 @@ test('an unclassified engine notice (isMeta) goes through as is, unasked', async
   expect(seen.log).toContain('skip-meta')
 })
 
-// Final review 2026-11-06: auto-continuation follows the person's own click, so it is asked even when queued isMeta
-test('an auto-continuation the engine marks isMeta still gets the dialog, not a silent pass', async ($, on) => {
+// Final review 2026-11-06: the engine's timed resume after a usage limit is an isMeta auto-continuation that nobody
+// clicked: on a cold big chat it compacts first with no dialog, which would otherwise wait with nobody to answer it
+test("the engine's own resume after a usage limit (isMeta auto-continuation) compacts first, with no dialog", async ($, on) => {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)
-  answer(on, seen, 'Send anyway')
+  answer(on, seen, null)
   await clock.advance(60000)
   kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
   await clock.advance(77 * 60000)
-  await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
-  await $.prompt.submit({ text: 'continue', origin: { kind: 'auto-continuation' }, isMeta: true, wait: false } as never)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  const r = await $.prompt.submit({ text: 'Your claude.ai usage limit has reset. Continue the task you were working on.', origin: { kind: 'auto-continuation' }, isMeta: true, wait: false } as never)
   await clock.advance(100)
-  expect(seen.asks).toBe(1)
-  expect(seen.log).not.toContain('skip-meta')
+  await settle(clock, () => seen.submits.length + seen.fills.length >= 1)
+  expect('drop' in (r as object)).toBe(true)
+  expect(seen.asks).toBe(0)
+  expect(seen.order).toEqual(['compact', 'send:[auto-continuation message, resent by cache-keeper]\nYour claude.ai usage limit has reset. Continue the task you were working on.'])
 })
 
 // A compaction that never settles must not hold the queue forever

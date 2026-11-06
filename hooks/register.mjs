@@ -1372,12 +1372,13 @@ export function register(on, options = {}) {
     // no origin, or one the host could not classify, may be the person at the prompt: it gets the dialog, never the silent compact
     // (an engine notice, never the person, is a prompt queued isMeta with no stamp or an unclassified one: an idle notice or a
     // delivery receipt. Another session's message is queued isMeta too, but stamped peer, so it is a sender like any other.
-    // auto-continuation follows the person's own click)
+    // An auto-continuation a click queues (leaving plan mode, an approved goal) may have the person there; one queued isMeta
+    // is the engine's own, chiefly its timed resume once a usage limit resets, with nobody at the prompt: it compacts first)
     // and an sdk prompt outside the desktop app with no surface is a plain -p run: its prompt is the person's, and
     // dropping it could end the run. The app's own sdk turns still compact first, whether or not it has attached yet.
     const headless = !!e.origin && e.origin.kind === 'sdk' && entry !== 'claude-desktop' && !(await $.session.surfaces().catch(() => [])).length
     const notice = !!e.isMeta && (!e.origin || e.origin.kind === 'unclassified')
-    const maybePerson = !notice && (!e.origin || fromUser || headless || e.origin.kind === 'unclassified' || e.origin.kind === 'auto-continuation')
+    const maybePerson = !notice && (!e.origin || fromUser || headless || e.origin.kind === 'unclassified' || (e.origin.kind === 'auto-continuation' && !e.isMeta))
     const wake = fromUser && !!cfg.rotatorWake && cfg.rotatorWake.test(String(e.text || ''))
     // another plugin submitting the person's own words (asUser): still compacted first, but resent as the person's, never framed as the plugin's
     // (likewise the session's owner pinging it from Slack: not at the prompt, but the person's own words)
