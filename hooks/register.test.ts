@@ -1598,3 +1598,25 @@ test('a fork made right after a compaction is not compacted again for a peer', S
   await clock.advance(200)
   expect(seen.compacts).toBe(1)
 })
+
+test('a fork of a big chat idle past its cache lifetime compacts first for a peer', SETUP, async ($, on) => {
+  const { clock, seen } = engine($, on)
+  answer(on, seen, null)
+  on('classic.SessionStart', () => ({}))
+  on('turn.step', async function* () {
+    return { answer: '', toolUses: [], usage: usage({ cache_read_input_tokens: 290000 }) }
+  })
+  on('turn.complete', () => ({ text: '' }))
+  on('session.usage', () => ({ value: {} }))
+  await start($, 300000, clock)
+  const it = ($ as any).turn.step({ model: 'claude-opus-5-5', messages: [] })
+  if (it && typeof it[Symbol.asyncIterator] === 'function') for await (const _ of it) void _
+  else await it
+  await clock.advance(3 * 60 * 60000)
+  await ($ as any).classic.SessionStart({ source: 'fork', transcript_path: '' })
+  await clock.advance(100)
+  const r = await $.prompt.submit({ text: 'a note from a peer', origin: PEER, wait: false } as never)
+  expect('drop' in (r as object)).toBe(true)
+  await settle(clock, () => seen.compacts >= 1)
+  expect(seen.compacts).toBe(1)
+})

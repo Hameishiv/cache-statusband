@@ -376,7 +376,7 @@ async function resumeStep($) {
   $.ui.invalidate('ui.render')
   // a queue waiting on a compaction takes it in turn, never ahead of the messages already there
   if (pending || (worthCompacting() && !compacting())) {
-    compactThenSend($, { text: 'Resume' }, true)
+    compactThenSend($, { text: 'Resume', origin: { kind: 'plugin', name: 'cache-keeper auto-resume' } }, true)
     return
   }
   for (const asUser of [true, false]) {
@@ -653,8 +653,11 @@ async function drain($, epoch = chatEpoch) {
       if (sent) continue
       // the chat changed while that resend was refused: it goes back ahead of the rest, in arrival order
       if (epoch !== chatEpoch) return handBack($, [msg], epoch)
-      if (msg.mention && draft) lose(msg)
-      else if (msg.mention) {
+      if (msg.mention && draft) {
+        lose(msg)
+        continue
+      }
+      if (msg.mention) {
         // the person's @ prompt: back in the box after whatever they typed, and the rest still go
         const ok = await putBack($, [msg])
         $.ui.toast(ok ? 'Your message is back in the prompt box (a resend would not attach its @ files): press Enter to send it.' : 'Your message could not be put back (logged if ~/.claude-shared/state exists).', { timeoutMs: 15000 })
@@ -1262,12 +1265,13 @@ export function register(on, options = {}) {
     // a rotation the last chat already worked past says nothing about this one: lastActivity going to 0
     // would otherwise make it look like a rotation this chat has not used yet
     if (S.seatChangedAt <= S.lastActivity) S.seatChangedAt = 0
-    S.lastActivity = 0
+    // a fork is a copy: its cache is as old as the chat it copied, so it keeps that age
+    const fork = e.source === 'fork'
+    if (!fork) S.lastActivity = 0
     S.keepWarm = false
     H.armed = false
     // the last chat's compaction says nothing about this one, and would mute its cold-send guard.
     // A fork is a copy: what it was compacted to, or refused at, is still true of it
-    const fork = e.source === 'fork'
     if (!fork) {
       justCompacted = false
       compactedCold = false
