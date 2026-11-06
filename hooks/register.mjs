@@ -399,7 +399,7 @@ function compactThenSend($, e, unattended, from = '', logged = false, mention = 
   const drop = { drop: 'cache-keeper: compacting first on a cold cache; the message is sent again once that finishes' }
   // a compaction is already under way: this message waits behind the ones before it
   // every message that joins a queue is logged with its text: it has been dropped, so a reload would leave no other copy
-  if (pending) return coldLog($, { origin: (e.origin && e.origin.kind) || 'none', action: 'queued-behind-compact', text: e.text, sid: S.id }), pending.push(msg), drop
+  if (pending) return coldLog($, { origin: sender(e), action: 'queued-behind-compact', text: e.text, sid: S.id }), pending.push(msg), drop
   pending = [msg]
   // the head is the one message no other line records: it has already been dropped, so its text is logged
   coldLog($, { action: 'queued-head', text: e.text, sid: S.id })
@@ -1259,6 +1259,9 @@ export function register(on, options = {}) {
   // /clear, /resume and /branch start from an unknown cache. The process goes
   // on under a new session id, and no session.start fires for it.
   on('classic.SessionStart', { source: ['clear', 'resume', 'fork'] }, async ($, e, next) => {
+    // a rotation the last chat already worked past says nothing about this one: lastActivity going to 0
+    // would otherwise make it look like a rotation this chat has not used yet
+    if (S.seatChangedAt <= S.lastActivity) S.seatChangedAt = 0
     S.lastActivity = 0
     S.keepWarm = false
     H.armed = false
@@ -1266,8 +1269,9 @@ export function register(on, options = {}) {
     justCompacted = false
     compactedCold = false
     S.floor = 0
-    // a cleared chat is empty: the last chat's size would make it look worth compacting until a turn measures it
-    if (e.source === 'clear') S.ctx = 0
+    // a cleared chat is empty, and a resumed one is measured from its own record below: the last chat's
+    // size would make either look worth compacting until a turn measures it. A fork is a copy, so it keeps it
+    if (e.source !== 'fork') S.ctx = 0
     compactTriedAt = 0 // nor does its failed or refused compact hold back this one's
     refusedAt = 0
     S.coldRestarts = [] // the new chat's own, from its record below

@@ -1547,3 +1547,34 @@ test('after a rotation and /clear, a peer message does not compact the empty new
   expect('drop' in (r as object)).toBe(false)
   expect(seen.compacts).toBe(1)
 })
+
+test('after a rotation the chat has used, /fork leaves the forked chat uncompacted for a peer', SETUP, async ($, on) => {
+  const seat = { label: 'A' }
+  const { clock, seen } = engine($, on, seat)
+  answer(on, seen, null)
+  on('classic.SessionStart', () => ({}))
+  on('turn.step', async function* () {
+    return { answer: '', toolUses: [], usage: usage({ cache_read_input_tokens: 290000 }) }
+  })
+  on('turn.complete', () => ({ text: '' }))
+  on('session.usage', () => ({ value: {} }))
+  await start($, 300000, clock)
+  seat.label = 'G'
+  await clock.advance(5 * 60000)
+  await $.prompt.submit({ text: 'Usage reset: the weekly limit capped, so the CLI account was rotated to G. Go on.', origin: COMPOSER, wait: false } as never)
+  await clock.advance(100)
+  await settle(clock, () => seen.submits.length >= 1)
+  expect(seen.compacts).toBe(1)
+  // the resumed turn runs on the new account, so the cache there is written
+  await clock.advance(1000)
+  const it = ($ as any).turn.step({ model: 'claude-opus-5-5', messages: [] })
+  if (it && typeof it[Symbol.asyncIterator] === 'function') for await (const _ of it) void _
+  else await it
+  await clock.advance(1000)
+  await ($ as any).classic.SessionStart({ source: 'fork', transcript_path: '' })
+  await clock.advance(100)
+  const r = await $.prompt.submit({ text: 'a note from a peer', origin: PEER, wait: false } as never)
+  await clock.advance(200)
+  expect('drop' in (r as object)).toBe(false)
+  expect(seen.compacts).toBe(1)
+})
