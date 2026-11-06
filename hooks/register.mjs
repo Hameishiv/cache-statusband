@@ -416,8 +416,8 @@ const sender = (e) => {
   return [o.kind || 'none', o.name || o.server || ''].filter(Boolean).join(' ')
 }
 
-// The host never runs this plugin's own hook for its own submit, so this is defensive only: for another
-// copy of this mod, or a host version that does. Such a resend must pass, never queue or compact again
+// The host skips only the calling hook, so a resend made from a timer (auto-resume, a drain) can reach this
+// plugin's own prompt.submit hook: this is required, not defensive. Such a resend must pass, never queue or compact again
 const ownPrompt = ($, e) => !!e.origin && e.origin.kind === 'plugin' && (!e.origin.name || e.origin.name === $.plugin.name)
 
 // Local wall-clock time with its offset (owner rule: log times are local, not UTC)
@@ -496,7 +496,8 @@ async function runCompactThenSend($) {
     }
     run.then(settled, settled)
     let late = false
-    // this mod's own /compact never reaches its own command.run hook (the host runs a command "through every hook but the calling one"): a compaction that ends after the deadline is marked here
+    // this mod's own /compact may or may not reach its own command.run hook (the host skips only the calling hook,
+    // and this call comes from a timer); marking twice is harmless, so a compaction that ends after the deadline is marked here
     // a refusal after the deadline is recorded too, or the next cold wake would try the same size again
     run.then((r) => {
       if (!late || epoch !== chatEpoch) return
@@ -529,7 +530,7 @@ async function runCompactThenSend($) {
   } catch (err) {
     if (epoch !== chatEpoch) return
     compactTriedAt = now
-    if (unattended) coldLog($, { action: 'compact-failed', error: String((err && err.message) || err) })
+    if (unattended) coldLog($, { action: 'compact-failed', error: clip(String((err && err.message) || err), 200) })
     $.ui.toast('Could not compact (' + clip(String((err && err.message) || err), 80) + '), so the message goes as typed.', { timeoutMs: 8000 })
   }
   // what waited during the compaction goes now, in order; anything arriving meanwhile joins the queue
@@ -1023,7 +1024,8 @@ async function seedFromTranscript($, path) {
   S.reopenedAt = liveHb ? liveHb.reopenedAt || 0 : await $.clock.now()
   if (found.compacted) {
     // the next request writes the compacted context whatever happens: nothing to ask.
-    // A real reopen (no live heartbeat) writes it cold; markCompacted cannot tell, since lastActivity is 0 here
+    // A real reopen (no live heartbeat) writes it cold; markCompacted cannot tell, since lastActivity is 0 here.
+    // That write is booked as the reopen's cold rewrite, though most of it would be paid after any compaction
     S.floor = found.ctx
     if (!liveHb) compactedCold = true
     markCompacted()
@@ -1408,8 +1410,8 @@ export function register(on, options = {}) {
     if (wake) return worthCompacting() && !media && !e.command && !compacting() ? compactThenSend($, e, true) : next(e)
     // Owner 2026-11-02: an idle chat woken cold by anything but the person at the prompt (another
     // session's message, a task notification, a schedule, the desktop app's own turn) compacts
-    // first, with no dialog: nobody may be there to answer it. Not this mod's own prompt (defensive:
-    // the host does not send it here), not a slash command (a plugin can't resubmit one), not an attachment.
+    // first, with no dialog: nobody may be there to answer it. Not this mod's own prompt (a resend from a
+    // timer can come back through this hook), not a slash command (a plugin can't resubmit one), not an attachment.
     if (!maybePerson) {
       const kind = sender(e)
       const skip = ownPrompt($, e) ? 'plugin' : e.isMeta ? 'meta' : e.command ? 'slash' : media ? 'media' : !worthCompacting() ? 'floor' : compacting() ? 'running' : now - compactTriedAt < 2 * MIN ? 'just-tried' : ''
@@ -1434,7 +1436,7 @@ export function register(on, options = {}) {
       return { drop: 'cache-keeper: the chat changed while asking; see the note on what happened to the message' }
     }
     const cost = money(rewriteCost(S.ctx, S.model, ttl))
-    const why = rotated ? `The account rotated to ${S.seat || 'another seat'} ${minutes(now - S.seatChangedAt)} ago, so the cache is cold.` : reopened ? `This chat was reopened ${minutes(now - S.lastActivity)} after its last reply, and a reopened chat starts on a cold cache.` : `Cache went cold ${minutes(-left)} ago.`
+    const why = rotated ? `The account rotated to ${S.seat || 'another seat'} ${minutes(now - S.seatChangedAt)} ago, so the cache is cold.` : reopened ? `This chat was reopened ${minutes((S.reopenedAt || now) - S.lastActivity)} after its last reply, and a reopened chat starts on a cold cache.` : `Cache went cold ${minutes(-left)} ago.`
     const floor = S.floor ? ` Compacting last left ${tokens(S.floor)}.` : ''
     let answer = 'Send anyway'
     try {
