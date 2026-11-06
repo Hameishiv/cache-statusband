@@ -1494,3 +1494,29 @@ test('"Compact first" on a slash command with an @ word never puts it after the 
     boxDraft = ''
   }
 })
+
+// Opus 2026-11-05: a /clear while a slash head waits never joins the queued messages to that slash line
+test('a /clear during a compaction never joins queued messages to a slash command', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, 'Compact first, then send')
+  on('classic.SessionStart', () => ({}))
+  hangCompact = true
+  try {
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+    await $.prompt.submit({ text: '/merge-pr 123', command: { name: 'merge-pr', args: '123' }, origin: COMPOSER, wait: false } as never)
+    await clock.advance(100)
+    await settle(clock, () => seen.compacts >= 1)
+    await $.prompt.submit({ text: 'peer note', origin: PEER, wait: false } as never)
+    await clock.advance(100)
+    await ($ as any).classic.SessionStart({ source: 'clear', transcript_path: '' })
+    await settle(clock, () => seen.toasts.some((t) => /meant for the previous chat/.test(t)))
+    expect(seen.fills.some((f) => f.text.includes('/merge-pr 123'))).toBe(true)
+    expect(seen.fills.some((f) => f.text.includes('/merge-pr 123') && f.text.includes('peer note'))).toBe(false)
+  } finally {
+    hangCompact = false
+  }
+})

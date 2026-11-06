@@ -210,7 +210,9 @@ async function clearAndContinue($) {
   H.text = ''
   H.path = ''
   try {
-    await $.prompt.submit({ text, asUser: true })
+    const r = await $.prompt.submit({ text, asUser: true })
+    // refused by the host (a Stop, a limit, another hook): treat it like a failure, not a send
+    if (r && r.drop !== undefined) throw new Error(String(r.drop))
   } catch {
     // Not sent: leave it in the prompt box for one Enter
     let filled = false
@@ -567,6 +569,10 @@ function putBack($, back) {
 }
 async function putBackNow($, back, log = true) {
   const box = await boxText($)
+  // nothing is ever joined to a slash line: text after it would become the command's arguments.
+  // So never append to a box that starts with one, and a slash message goes back only alone, into an empty box
+  if (box.trim().startsWith('/')) return false
+  if (back.some((m) => m.slash) && (box.trim() || back.length > 1)) return false
   const sep = !box || /\n\s*\n\s*$/.test(box) ? '' : /\n\s*$/.test(box) ? '\n' : '\n\n'
   if (await fillBox($, sep + back.map((m) => m.text).join('\n\n'), 'append')) {
     // parked in the box, not sent: the log says so, or it would read as resent
@@ -591,7 +597,8 @@ async function handBack($, first, epoch) {
   const back = [...first, ...(orphans.get(epoch) || [])]
   orphans.delete(epoch)
   if (!back.length) return
-  const ok = await putBack($, back)
+  // a slash head goes back alone (putBackNow never joins text to one); the rest are then logged, not appended to it
+  const ok = back.length > 1 && back[0].slash ? (await putBack($, [back[0]])) && (await putBack($, back.slice(1))) : await putBack($, back)
   $.ui.toast(ok ? `${back.length} message(s) meant for the previous chat are in the prompt box: send them only if they still apply.` : `${back.length} message(s) meant for the previous chat could not be sent (logged if ~/.claude-shared/state exists).`, { timeoutMs: 15000 })
 }
 
