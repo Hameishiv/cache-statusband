@@ -1620,3 +1620,29 @@ test('a fork of a big chat idle past its cache lifetime compacts first for a pee
   await settle(clock, () => seen.compacts >= 1)
   expect(seen.compacts).toBe(1)
 })
+
+test('a /clear while the cold-send dialog is up puts the prompt back as meant for the previous chat', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  on('classic.SessionStart', () => ({}))
+  on('tool.call', async (_: unknown, e: any) => {
+    if (e.tool !== 'AskUserQuestion') return { result: {} }
+    seen.asks++
+    // the chat changes while the person is looking at the dialog
+    await ($ as any).classic.SessionStart({ source: 'clear', transcript_path: '' })
+    const q = e.questions?.[0]?.question ?? ''
+    return { result: { questions: e.questions, answers: { [q]: 'Compact first, then send' } } }
+  })
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+  await clock.advance(77 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  const r = await $.prompt.submit({ text: 'approve, B', origin: COMPOSER, wait: false } as never)
+  expect(seen.asks).toBe(1)
+  expect('drop' in (r as object)).toBe(true)
+  await settle(clock, () => seen.fills.length >= 1)
+  expect(seen.compacts).toBe(0)
+  expect(seen.submits).toEqual([])
+  expect(JSON.stringify(seen.fills)).toMatch(/approve, B/)
+  expect(seen.toasts.join('\n')).toMatch(/meant for the previous chat/)
+})

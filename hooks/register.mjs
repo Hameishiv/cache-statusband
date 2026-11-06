@@ -678,7 +678,9 @@ async function drain($, epoch = chatEpoch) {
         pending = null
         draining = false
         if (await putBack($, back)) {
-          $.ui.toast(back.length === 1 ? 'The message is back in the prompt box: press Enter to send it.' : `${back.length} messages are back in the prompt box: press Enter to send them.`, { timeoutMs: 15000 })
+          // a /clear, /resume or /fork during the put-back: they landed in the new chat's box, so say whose they are
+          if (epoch !== chatEpoch) $.ui.toast(`${back.length} message(s) meant for the previous chat are in the prompt box: send them only if they still apply.`, { timeoutMs: 15000 })
+          else $.ui.toast(back.length === 1 ? 'The message is back in the prompt box: press Enter to send it.' : `${back.length} messages are back in the prompt box: press Enter to send them.`, { timeoutMs: 15000 })
         } else {
           $.ui.toast(`${back.length} message(s) could not be sent again (logged if ~/.claude-shared/state exists).`, { timeoutMs: 15000 })
         }
@@ -1392,6 +1394,9 @@ export function register(on, options = {}) {
       return next(e)
     }
     const runs = compactRuns
+    // the chat this prompt was typed in: a /clear, /resume or /fork while the dialog is up must not take it
+    const askedIn = chatEpoch
+    const askedSid = S.id
     const cost = money(rewriteCost(S.ctx, S.model, ttl))
     const why = rotated ? `The account rotated to ${S.seat || 'another seat'} ${minutes(now - S.seatChangedAt)} ago, so the cache is cold.` : reopened ? `This chat was reopened ${minutes(now - S.lastActivity)} after its last reply, and a reopened chat starts on a cold cache.` : `Cache went cold ${minutes(-left)} ago.`
     const floor = S.floor ? ` Compacting last left ${tokens(S.floor)}.` : ''
@@ -1408,6 +1413,11 @@ export function register(on, options = {}) {
       return next(e)
     }
     coldLog($, { event: 'asked', origin: (e.origin && e.origin.kind) || 'none', reopened, rotated, answer })
+    // the chat changed while the dialog was up: the prompt goes back marked as meant for the previous chat
+    if (askedIn !== chatEpoch && answer !== 'Cancel') {
+      handBack($, [{ text: e.text, slash: !!e.command, sid: askedSid }], -1).catch(() => {})
+      return { drop: 'cache-keeper: the chat changed while asking; the message is back in the prompt box' }
+    }
     // $.session.compact() is refused on SDK hosts (the desktop app), so this queues /compact
     // the dialog waited on the person: a compaction may have run or started meanwhile
     if (answer === 'Compact first, then send') {
