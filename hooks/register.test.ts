@@ -1244,7 +1244,7 @@ test('a slash line from "Compact first" is not filled over a draft typed during 
 })
 
 // Fable 2026-11-05: the per-session log keeps its newest lines and never grows toward the host's read limit
-test('the cold-compact log drops its oldest lines once past 1 MiB', async ($, on) => {
+test('the cold-compact log drops its oldest lines once past 512 Ki characters', async ($, on) => {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)
   answer(on, seen, null)

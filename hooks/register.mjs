@@ -429,10 +429,11 @@ function localStamp(ms) {
 
 // The cold-compact decisions, on disk, so a session's own behaviour can be checked afterwards
 // One file per session, so sessions never overwrite each other's lines; writes in this process run one at a time.
-// shortcut: $.fs has no append, so read + rewrite; the file keeps only its newest ~512 KiB once it passes
-// 1 MiB, so it never nears the host's 4 MiB read limit (past which every later line would be lost)
-const LOG_KEEP = 512 * 1024
-const LOG_MAX = 1024 * 1024
+// shortcut: $.fs has no append, so read + rewrite; the file keeps only its newest ~256 Ki characters once it passes
+// 512 Ki, so it never nears the host's 4 MiB read limit (past which every later line would be lost)
+// counted in characters: a character can take up to 4 bytes, so 1 Mi characters stays under the host's 4 MiB read
+const LOG_KEEP = 256 * 1024
+const LOG_MAX = 512 * 1024
 // LOG_TEXT bounds one line's message text far below LOG_KEEP, so a trim can never take a whole log with one line;
 // `fields.sid` files a line under the chat a queued message belonged to, not the one current when it was logged
 const LOG_TEXT = 64 * 1024
@@ -494,7 +495,7 @@ async function runCompactThenSend($) {
     }
     run.then(settled, settled)
     let late = false
-    // this mod's own /compact never reaches its own command.run hook: a compaction that ends after the deadline is marked here
+    // this mod's own /compact may or may not reach its own command.run hook; marking twice is harmless, so a compaction that ends after the deadline is marked here
     // a refusal after the deadline is recorded too, or the next cold wake would try the same size again
     run.then((r) => {
       if (!late || epoch !== chatEpoch) return
@@ -1017,6 +1018,8 @@ async function seedFromTranscript($, path) {
   S.ctx = found.ctx
   if (found.model && !S.model) S.model = found.model // the session's own model wins: it may have been switched
   if (found.effort) S.effort = found.effort
+  // a reload keeps what the process knew; a real reopen starts on a cold cache (set first: markCompacted reads it)
+  S.reopenedAt = liveHb ? liveHb.reopenedAt || 0 : await $.clock.now()
   if (found.compacted) {
     // the next request writes the compacted context whatever happens: nothing to ask
     S.floor = found.ctx
@@ -1025,7 +1028,6 @@ async function seedFromTranscript($, path) {
     // the cache's real age: the band and the cold-send guard read it. A reload keeps what the process knew,
     // keep-warm's pings included (they are no transcript rows); a real reopen starts on a cold cache
     S.lastActivity = liveHb ? Math.max(found.at || 0, liveHb.lastActivity || 0) : found.at
-    S.reopenedAt = liveHb ? liveHb.reopenedAt || 0 : await $.clock.now()
   }
   $.ui.invalidate('ui.render')
 }
