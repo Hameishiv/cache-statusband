@@ -653,7 +653,10 @@ async function drainQueue($, epoch, tally) {
           const where = prev ? ' (meant for the previous chat: send it only if it still applies)' : behind ? `, after the ${behind} that followed it` : ''
           $.ui.toast(back ? `A held message was refused by Claude Code: it is back in the prompt box${where}.` : 'A held message was refused by Claude Code and could not be put back (logged if ~/.claude-shared/state exists).', { timeoutMs: 15000 })
         })
-        if (epoch !== chatEpoch) return handBack($, [], epoch)
+        if (epoch !== chatEpoch) {
+          $.ui.toast('A resend meant for the previous chat is still held by Claude Code and may still be delivered.', { timeoutMs: 15000 })
+          return handBack($, [], epoch)
+        }
         const back = [...(pending || [])]
         pending = null
         draining = false
@@ -688,7 +691,9 @@ async function drainQueue($, epoch, tally) {
         if (moved) return handBack($, [msg], epoch)
         // logged here, not counted: the toast below already says what happened to this one
         coldLog($, { action: draft ? 'put-back' : 'not-resent', text: msg.text, sid: msg.sid })
-        $.ui.toast(draft ? 'Your message is back in the prompt box: press Enter to send it.' : typed ? `${clip(msg.text, 80)} was not put back over what you typed (logged if ~/.claude-shared/state exists).` : 'The message could not be sent again: ' + clip(msg.text, 80), { timeoutMs: 15000 })
+        // the chat changed while the box was read or filled: the command landed in the new chat's box, so say whose it is
+        const late = draft && epoch !== chatEpoch
+        $.ui.toast(late ? `${clip(msg.text, 80)}, meant for the previous chat, is in the prompt box: run it only if it still applies.` : draft ? 'Your message is back in the prompt box: press Enter to send it.' : typed ? `${clip(msg.text, 80)} was not put back over what you typed (logged if ~/.claude-shared/state exists).` : 'The message could not be sent again: ' + clip(msg.text, 80), { timeoutMs: 15000 })
       } else if (draft) lose(msg)
       else {
         // this one and all behind it; the queue closes in the same tick, so nothing slips in unseen
