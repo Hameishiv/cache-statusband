@@ -1444,8 +1444,9 @@ test('a long message that could not be resent or put back is kept whole in a los
     await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
     await $.prompt.submit({ text: big, origin: PEER, wait: false } as never)
     await clock.advance(100)
-    await settle(clock, () => seen.lost.length >= 1)
-    expect(seen.lost.length).toBe(1)
+    await settle(clock, () => seen.lost.length >= 2)
+    // one whole copy when it was queued (a reload during the compaction would drop it), one when it could not be resent
+    expect(seen.lost.length).toBe(2)
     expect(seen.lost[0].len).toBeGreaterThan(100 * 1024)
     expect(seen.log).toContain('"textLen"')
   } finally {
@@ -1517,7 +1518,8 @@ test('a /clear during a compaction logs the previous chat slash command and puts
     // the previous chat's command is logged, never one Enter away in the new chat; the peer note goes back
     expect(seen.fills.some((f) => f.text.includes('/merge-pr 123'))).toBe(false)
     expect(seen.fills.some((f) => f.text.includes('peer note'))).toBe(true)
-    expect(seen.toasts.some((t) => /1 command\(s\) were not put back/.test(t))).toBe(true)
+    expect(seen.toasts.some((t) => t.includes('Not put back') && t.includes('/merge-pr 123'))).toBe(true)
+    expect(seen.log).toContain('queued-head')
     await settle(clock, () => seen.log.includes('not-resent'))
     expect(seen.log).toContain('/merge-pr 123')
   } finally {

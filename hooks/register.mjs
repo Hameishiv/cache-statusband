@@ -447,7 +447,7 @@ function coldLog($, fields) {
       if (!logDir) return
       // a message neither resent nor put back has the log as its only copy: its whole text goes first to a
       // file of its own, never trimmed, so a clipped line or a failed log write cannot take it
-      if (fields.action === 'not-resent') {
+      if (fields.action === 'not-resent' || (text.textLen && /^queued/.test(String(fields.action || '')))) {
         try {
           await $.fs.write(`${home.replace(/\\/g, '/')}/.claude-shared/state/cache-keeper-lost-${sid || 'unknown'}-${now}-${++lostSeq}.txt`, fields.text)
         } catch {
@@ -607,7 +607,7 @@ async function handBack($, first, epoch) {
   cmds.forEach((m) => coldLog($, { action: 'not-resent', text: m.text, sid: m.sid }))
   const rest = back.filter((m) => !m.slash)
   const ok = rest.length ? await putBack($, rest) : true
-  const note = cmds.length ? ` ${cmds.length} command(s) were not put back (logged if ~/.claude-shared/state exists).` : ''
+  const note = cmds.length ? ` Not put back (logged if ~/.claude-shared/state exists): ${cmds.map((m) => clip(m.text, 80)).join(', ')}.` : ''
   if (rest.length) $.ui.toast((ok ? `${rest.length} message(s) meant for the previous chat are in the prompt box: send them only if they still apply.` : `${rest.length} message(s) meant for the previous chat could not be sent (logged if ~/.claude-shared/state exists).`) + note, { timeoutMs: 15000 })
   else $.ui.toast(note.trim(), { timeoutMs: 15000 })
 }
