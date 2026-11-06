@@ -1356,22 +1356,23 @@ test('a message put back in the prompt box is logged as put back', async ($, on)
   }
 })
 
-// Fable 2026-11-05 r2: one line longer than the kept window must not stop the trim
-test('the cold-compact log is trimmed even when its newest part has no line break', async ($, on) => {
+// Opus 2026-11-05: a message longer than the kept window is clipped in the log, so the next trim cannot empty it
+test('a huge message is clipped in the cold-compact log, so a trim keeps it and the lines before it', async ($, on) => {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)
   answer(on, seen, null)
-  seen.log = 'z'.repeat(1200 * 1024)
+  seen.log = '{"event":"old"}\n'.repeat(70000) // ~1.1 MB of real, newline-terminated lines
   await clock.advance(60000)
   kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
   await clock.advance(77 * 60000)
   await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
-  await $.prompt.submit({ text: 'PR 12 merged', origin: PEER, wait: false } as never)
+  await $.prompt.submit({ text: 'H'.repeat(700 * 1024), origin: PEER, wait: false } as never)
   await clock.advance(100)
   await settle(clock, () => seen.log.includes('compact-first'))
   expect(seen.log).toContain('compact-first')
-  expect(seen.log.startsWith('z')).toBe(true)
-  expect(seen.log.length).toBeLessThan(600 * 1024)
+  expect(seen.log).toContain('"textLen":716800')
+  expect(seen.log).toContain('{"event":"old"}') // the trim kept older lines, not just the newest
+  expect(seen.log.length).toBeLessThan(700 * 1024)
 })
 
 // Fable 2026-11-05 r2: a held resend refused after /clear goes back marked as meant for the previous chat

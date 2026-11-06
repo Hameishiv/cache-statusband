@@ -390,7 +390,7 @@ async function resumeStep($) {
 function compactThenSend($, e, unattended, from = '', logged = false) {
   // the ways to submit it, in order: `true` is asUser, `false` omits it
   const modes = from ? [false] : unattended ? [true, false] : [true]
-  const msg = { text: from ? `[${from} message, resent by cache-keeper after /compact]\n${e.text}` : e.text, attachments: e.attachments, slash: !!e.command, unattended, logged: logged || unattended, modes }
+  const msg = { text: from ? `[${from} message, resent by cache-keeper after /compact]\n${e.text}` : e.text, attachments: e.attachments, slash: !!e.command, unattended, logged: logged || unattended, modes, sid: S.id }
   const drop = { drop: 'cache-keeper: compacting first on a cold cache; the message is sent again once that finishes' }
   // a compaction is already under way: this message waits behind the ones before it
   if (pending) return pending.push(msg), drop
@@ -425,9 +425,14 @@ function localStamp(ms) {
 // 1 MiB, so it never nears the host's 4 MiB read limit (past which every later line would be lost)
 const LOG_KEEP = 512 * 1024
 const LOG_MAX = 1024 * 1024
+// LOG_TEXT bounds one line's message text far below LOG_KEEP, so a trim can never take a whole log with one line;
+// `fields.sid` files a line under the chat a queued message belonged to, not the one current when it was logged
+const LOG_TEXT = 64 * 1024
 function coldLog($, fields) {
-  const line = `${JSON.stringify({ t: localStamp(now), sid: S.id, ctx: S.ctx, ...fields })}\n`
-  const path = `${home.replace(/\\/g, '/')}/.claude-shared/state/cache-keeper-cold-compact-log-${S.id || 'unknown'}.txt` // an existing folder: $.fs.write makes none
+  const text = typeof fields.text === 'string' && fields.text.length > LOG_TEXT ? { text: fields.text.slice(0, LOG_TEXT), textLen: fields.text.length } : {}
+  const sid = fields.sid || S.id
+  const line = `${JSON.stringify({ t: localStamp(now), sid, ctx: S.ctx, ...fields, ...text })}\n`
+  const path = `${home.replace(/\\/g, '/')}/.claude-shared/state/cache-keeper-cold-compact-log-${sid || 'unknown'}.txt` // an existing folder: $.fs.write makes none
   logChain = logChain.then(async () => {
     try {
       if (logDir === null) logDir = await $.fs.exists(path.slice(0, path.lastIndexOf('/')))
@@ -530,15 +535,22 @@ async function boxText($) {
 
 // Messages that cannot be sent go back to the prompt box after whatever the person has typed, a blank
 // line between, so neither runs into the other; if the box will not take them, each is logged in full.
-async function putBack($, back) {
+// one at a time: two callers reading the box before either fills it would compute stale separators
+let boxChain = Promise.resolve()
+function putBack($, back) {
+  const p = boxChain.then(() => putBackNow($, back))
+  boxChain = p.catch(() => {})
+  return p
+}
+async function putBackNow($, back) {
   const box = await boxText($)
   const sep = !box || /\n\s*\n\s*$/.test(box) ? '' : /\n\s*$/.test(box) ? '\n' : '\n\n'
   if (await fillBox($, sep + back.map((m) => m.text).join('\n\n'), 'append')) {
     // parked in the box, not sent: the log says so, or it would read as resent
-    back.forEach((m) => coldLog($, { action: 'put-back', text: m.text }))
+    back.forEach((m) => coldLog($, { action: 'put-back', text: m.text, sid: m.sid }))
     return true
   }
-  back.forEach((m) => coldLog($, { action: 'not-resent', text: m.text }))
+  back.forEach((m) => coldLog($, { action: 'not-resent', text: m.text, sid: m.sid }))
   return false
 }
 
@@ -566,7 +578,7 @@ async function drain($, epoch = chatEpoch) {
   draining = true
   let draft = false // a slash line sits in the prompt box
   let lost = 0 // not sent again and not put back
-  const lose = (m) => (lost++, coldLog($, { action: 'not-resent', text: m.text }))
+  const lose = (m) => (lost++, coldLog($, { action: 'not-resent', text: m.text, sid: m.sid }))
   try {
     while (epoch === chatEpoch && pending && pending.length) {
       const msg = pending.shift()
@@ -575,22 +587,24 @@ async function drain($, epoch = chatEpoch) {
       const sent = await Promise.race([attempt, new Promise((res) => $.clock.after(COMPACT_DEADLINE, () => res(TIMED_OUT)))])
       if (sent === TIMED_OUT) {
         // the host still holds this one, so it is the host's to deliver: putting it back now could send it twice
-        coldLog($, { action: 'resend-held', text: msg.text })
+        coldLog($, { action: 'resend-held', text: msg.text, sid: msg.sid })
         // a later refusal means it was never sent: then it goes back to the prompt box, not lost
         // (after a /clear, /resume or /fork it goes back marked as meant for the previous chat)
-        const behind = (pending || []).length
+        // (it never takes another drain's held-back messages: it puts back only itself)
+        let behind = 0 // set below once the ones behind it are really back in the box
         attempt.then(async (ok) => {
           if (ok) return
-          if (epoch !== chatEpoch) return handBack($, [msg], epoch)
+          const prev = epoch !== chatEpoch
           const back = await putBack($, [msg])
-          // it lands after the ones that were behind it, which went back at the deadline: say so
-          $.ui.toast(back ? `A held message was refused by Claude Code: it is back in the prompt box${behind ? `, after the ${behind} that followed it` : ''}.` : 'A held message was refused by Claude Code and could not be put back (logged if ~/.claude-shared/state exists).', { timeoutMs: 15000 })
+          const where = prev ? ' (meant for the previous chat: send it only if it still applies)' : behind ? `, after the ${behind} that followed it` : ''
+          $.ui.toast(back ? `A held message was refused by Claude Code: it is back in the prompt box${where}.` : 'A held message was refused by Claude Code and could not be put back (logged if ~/.claude-shared/state exists).', { timeoutMs: 15000 })
         })
         if (epoch !== chatEpoch) return handBack($, [], epoch)
         const back = [...(pending || [])]
         pending = null
         draining = false
         const ok = !back.length || (await putBack($, back))
+        if (ok) behind = back.length
         $.ui.toast(`A resent message is still held by Claude Code${back.length ? (ok ? `; the ${back.length} behind it are back in the prompt box` : `; the ${back.length} behind it could not be sent again (logged if ~/.claude-shared/state exists)`) : ''}.`, { timeoutMs: 15000 })
         return
       }
@@ -1429,7 +1443,9 @@ export function register(on, options = {}) {
   // the desktop host running it inside a turn); each one marks it
   on('session.compact', async ($, e, next) => {
     now = await $.clock.now()
+    const epoch = chatEpoch // a compaction that ends after /resume or /clear is the old chat's, not the new one's
     const r = await next(e)
+    if (epoch !== chatEpoch) return r
     // precompute installs nothing: only a compaction that replaced the conversation counts
     if (!e.agentId && e.trigger !== 'precompute' && !(r && r.skip)) markCompacted()
     return r
@@ -1459,8 +1475,9 @@ export function register(on, options = {}) {
     } finally {
       end()
     }
-    if (!refused(r)) markCompacted()
-    else if (epoch === chatEpoch) {
+    if (!refused(r)) {
+      if (epoch === chatEpoch) markCompacted()
+    } else if (epoch === chatEpoch) {
       // a typed /compact the compactor refused: the cold-wake path must not try the same size again
       refusedAt = S.ctx
       compactTriedAt = await $.clock.now()
