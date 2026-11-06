@@ -45,6 +45,7 @@ const S = {
   rateLimits: [],
   seat: '', // the signed-in account label the rotator last wrote
   seatChangedAt: 0, // when that label last changed: the new account's cache is empty
+  reopenedAt: 0, // when this process picked the chat up from its record: a reopened chat's cache is gone
   floor: 0, // context size right after the last compaction: what compacting can't shrink
   autoWarm: true, // false once keep warm is turned off by hand in this session
   pr: 0, // a merge-pr session's PR: keep warm stops once it merges or closes
@@ -70,6 +71,20 @@ const alerted = new Map() // sessionId -> state or warning key already announced
 let paneOpen = false
 let justCompacted = false
 let compactedCold = false
+let compactRuns = 0 // cold compactions this mod has started: a dialog answered after one started must not start another
+let compactLive = false // the latest is still running, waited on or not: past its deadline too, for as long again
+let manualLive = 0 // /compact runs the person (or another plugin) started, still under way (each for 20 minutes at most)
+const orphans = new Map() // chat epoch -> that chat's queue, held while its drain's resend is out, so it goes back in arrival order
+const compacting = () => compactLive || manualLive > 0
+let compactTriedAt = 0 // when a cold compact last failed or was refused: no retry for 2 minutes
+let pending = null // messages waiting on the compaction under way, in arrival order
+let chatEpoch = 0 // raised on /clear, /resume and /fork: a compaction started for one chat leaves the next one alone
+let draining = false // the compaction is over and the queue is being resent: the person's own prompts no longer wait
+let liveHb = null // this session's heartbeat as the mod found it on loading: under three beats old means a reload in a live process, not a reopen
+let entry = '' // CLAUDE_CODE_ENTRYPOINT: 'claude-desktop' for the app, 'sdk-cli' for a -p run, 'cli' for the REPL
+let logDir = null // whether the cold-compact log's folder exists (checked once): $.fs.write would make it
+let refusedAt = 0 // the context size a compaction was last refused at: no cold compact until it grows 100k past it
+let logChain = Promise.resolve() // one log write at a time in this process
 let handoffPending = false
 let seatFile = ''
 let onTerminal = false
@@ -195,16 +210,21 @@ async function clearAndContinue($) {
   H.text = ''
   H.path = ''
   try {
-    await $.prompt.submit({ text, asUser: true })
+    const r = await $.prompt.submit({ text, asUser: true })
+    // refused by the host (a Stop, a limit, another hook): treat it like a failure, not a send
+    if (r && r.drop !== undefined) throw new Error(String(r.drop))
   } catch {
     // Not sent: leave it in the prompt box for one Enter
     let filled = false
     try {
-      filled = !!(await $.prompt.fill({ text })).isFilled
+      // append after a blank line, through the box lock: messages /clear just put back must not be replaced or run into
+      filled = !!(await boxSerial($, () => putBackNow($, [{ text }], false)))
     } catch {
       filled = false
     }
-    $.ui.toast(filled ? 'Cleared. The handoff is in the prompt box: press Enter to send it.' : `Cleared, but the handoff could not be sent.${path ? ` It's saved at ${path}.` : ''}`, { timeoutMs: 10000 })
+    // not in the box either: the log (and its lost-message file) is then the handoff's only copy
+    if (!filled) coldLog($, { action: 'not-resent', text })
+    $.ui.toast(filled ? 'Cleared. The handoff is in the prompt box, after anything already there: check it, then press Enter.' : `Cleared, but the handoff could not be sent.${path ? ` It's saved at ${path}.` : ''}`, { timeoutMs: 10000 })
   } finally {
     H.continuing = false
     $.ui.invalidate('ui.render')
@@ -250,12 +270,24 @@ function rotatedCold() {
   return S.seatChangedAt > S.lastActivity
 }
 
+// A chat reopened in a new process misses its cache whatever the clock says (45 of 48 reopens
+// measured 2026-11-03, inside the hour too: the new process's system prompt differs). Its first
+// request settles it.
+function reopenedCold() {
+  return !!S.lastActivity && S.reopenedAt > S.lastActivity
+}
+
+// A /compact the compactor refuses still returns, its output line saying so ("Not compacted · fast-jev: below 5% minimum")
+const REFUSED = /\bnot compacted\b/i
+const refused = (r) => REFUSED.test(String((r && r.text) || ''))
+
 // The next request writes the shorter context: no TTL evidence and nothing to warn about
 function markCompacted() {
   // a compaction of a cold cache (Claude Code auto-compacts a big chat as it is sent) still pays a rewrite
   const left = msLeft(S.lastActivity, ttlMin())
-  compactedCold = compactedCold || (left !== null && left <= 0) || rotatedCold()
+  compactedCold = compactedCold || (left !== null && left <= 0) || rotatedCold() || reopenedCold()
   justCompacted = true
+  refusedAt = 0
   S.lastActivity = 0
 }
 
@@ -298,7 +330,7 @@ async function readSeat($, adopt = false) {
 
 // Compacting on a cold cache pays only when it frees a real share of the context
 function worthCompacting() {
-  return S.ctx >= settings.bigTokens && S.ctx - S.floor >= 100000
+  return S.ctx >= settings.bigTokens && S.ctx - Math.max(S.floor, refusedAt) >= 100000
 }
 
 // Run off the hook: a command started inside a hook the session waits on is refused
@@ -342,8 +374,9 @@ async function resumeStep($) {
   if (!S.resumeAt || now < S.resumeAt || S.working) return
   S.resumeAt = 0
   $.ui.invalidate('ui.render')
-  if (worthCompacting()) {
-    compactThenSend($, { text: 'Resume' }, true)
+  // a queue waiting on a compaction takes it in turn, never ahead of the messages already there
+  if (pending || (worthCompacting() && !compacting())) {
+    compactThenSend($, { text: 'Resume', origin: { kind: 'plugin', name: 'cache-keeper auto-resume' } }, true)
     return
   }
   for (const asUser of [true, false]) {
@@ -356,38 +389,362 @@ async function resumeStep($) {
   }
 }
 
-function compactThenSend($, e, unattended) {
-  const msg = { text: e.text, attachments: e.attachments, slash: !!e.command }
-  $.clock.after(50, () => runCompactThenSend($, msg, unattended).catch(() => {}))
-  return { drop: 'cache-keeper: compacting first on a cold cache; the message is sent again once that finishes' }
+// `from` names a sender other than the person (a peer, a task notification): the resend says so,
+// and goes in without `asUser`, so the model reads it as the mod's message, not the person's own words
+// `logged` writes the compaction's outcome to the log, as for an unattended message, whatever the modes
+function compactThenSend($, e, unattended, from = '', logged = false, mention = false) {
+  // the ways to submit it, in order: `true` is asUser, `false` omits it
+  const modes = from ? [false] : unattended ? [true, false] : [true]
+  const msg = { text: from ? `[${from} message, resent by cache-keeper]\n${e.text}` : e.text, attachments: e.attachments, slash: !!e.command, mention, unattended, logged: logged || unattended, modes, sid: S.id }
+  const drop = { drop: 'cache-keeper: compacting first on a cold cache; the message is sent again once that finishes' }
+  // Claude Code tracks its own timed continue and, dropped, reports that it did not run: say that it still will
+  if (e.isMeta && e.origin && e.origin.kind === 'auto-continuation') $.ui.toast("Claude Code may say its automatic continue did not run: cache-keeper is compacting this cold chat first and sends the continue after it.", { timeoutMs: 15000 })
+  // a compaction is already under way: this message waits behind the ones before it
+  // every message that joins a queue is logged with its text: it has been dropped, so a reload would leave no other copy
+  if (pending) return coldLog($, { origin: sender(e), action: 'queued-behind-compact', text: e.text, sid: S.id }), pending.push(msg), drop
+  pending = [msg]
+  // the head is the one message no other line records: it has already been dropped, so its text is logged
+  coldLog($, { origin: sender(e), action: 'queued-head', text: e.text, sid: S.id })
+  // the chat this queue belongs to: a /clear before the timer fires hands it back, and this run must not take the next chat's
+  const epoch = chatEpoch
+  // a throw must not leave the queue set, or every later message would wait forever: send what is left as is
+  $.clock.after(50, () => epoch === chatEpoch && runCompactThenSend($).catch(() => epoch === chatEpoch && drain($, epoch).catch(() => {})))
+  return drop
 }
 
-async function runCompactThenSend($, msg, unattended) {
+// Who sent a prompt, for the resend's first line and the log: the kind, and a plugin's or server's name
+const sender = (e) => {
+  const o = e.origin || {}
+  return [o.kind || 'none', o.name || o.server || ''].filter(Boolean).join(' ')
+}
+
+// The host skips only the calling hook, so a resend made from a timer (auto-resume, a drain) can reach this
+// plugin's own prompt.submit hook: this is required, not defensive. Such a resend must pass, never queue or compact again
+const ownPrompt = ($, e) => !!e.origin && e.origin.kind === 'plugin' && (!e.origin.name || e.origin.name === $.plugin.name)
+
+// Local wall-clock time with its offset (owner rule: log times are local, not UTC)
+function localStamp(ms) {
+  const off = -new Date(ms).getTimezoneOffset()
+  const hm = (n) => String(Math.floor(Math.abs(n) / 60)).padStart(2, '0') + ':' + String(Math.abs(n) % 60).padStart(2, '0')
+  return new Date(ms + off * MIN).toISOString().slice(0, -1) + (off < 0 ? '-' : '+') + hm(off)
+}
+
+// The cold-compact decisions, on disk, so a session's own behaviour can be checked afterwards
+// One file per session, so sessions never overwrite each other's lines; writes in this process run one at a time.
+// shortcut: $.fs has no append, so read + rewrite; the file keeps only its newest ~256 Ki characters once it passes
+// 512 Ki, so it never nears the host's 4 MiB read limit (past which every later line would be lost)
+// counted in characters: a character can take up to 4 bytes, so 1 Mi characters stays under the host's 4 MiB read
+const LOG_KEEP = 256 * 1024
+const LOG_MAX = 512 * 1024
+// LOG_TEXT bounds one line's message text far below LOG_KEEP, so a trim can never take a whole log with one line;
+// `fields.sid` files a line under the chat a queued message belonged to, not the one current when it was logged
+// (an eighth of LOG_KEEP: JSON escaping can grow a text up to six times)
+const LOG_TEXT = 32 * 1024
+let lostSeq = 0 // two lost messages in the same millisecond still get files of their own
+function coldLog($, fields) {
+  const text = typeof fields.text === 'string' && fields.text.length > LOG_TEXT ? { text: fields.text.slice(0, LOG_TEXT), textLen: fields.text.length } : {}
+  const sid = fields.sid || S.id
+  const line = `${JSON.stringify({ t: localStamp(now), sid, ctx: S.ctx, ...fields, ...text })}\n`
+  const path = `${home.replace(/\\/g, '/')}/.claude-shared/state/cache-keeper-cold-compact-log-${sid || 'unknown'}.txt` // an existing folder: $.fs.write makes none
+  logChain = logChain.then(async () => {
+    try {
+      if (logDir === null) logDir = await $.fs.exists(path.slice(0, path.lastIndexOf('/')))
+      if (!logDir) return
+      // a message neither resent nor put back has the log as its only copy: its whole text goes first to a
+      // file of its own, never trimmed, so a clipped line or a failed log write cannot take it.
+      // A queued message too long for the log line gets one as well, when queued, in case a reload drops the queue
+      if (fields.action === 'not-resent' || (text.textLen && /^queued/.test(String(fields.action || '')))) {
+        try {
+          await $.fs.write(`${home.replace(/\\/g, '/')}/.claude-shared/state/cache-keeper-lost-${sid || 'unknown'}-${now}-${++lostSeq}.txt`, fields.text)
+        } catch {
+          // the log line below still records it
+        }
+      }
+      let old = ''
+      if (await $.fs.exists(path)) {
+        old = await $.fs.read(path)
+        if (typeof old !== 'string') return // unreadable: lose this line rather than the file
+        // too big: drop the oldest lines, cutting at a line boundary
+        // (no line boundary in the kept window: cut at the window, or one huge line would stop the trim)
+        if (old.length > LOG_MAX) {
+          const cut = old.indexOf('\n', old.length - LOG_KEEP)
+          old = cut < 0 ? old.slice(old.length - LOG_KEEP) : old.slice(cut + 1)
+        }
+      }
+      await $.fs.write(path, `${old}${line}`)
+    } catch {
+      // logging never blocks a send
+    }
+  })
+  return logChain
+}
+
+const COMPACT_DEADLINE = 10 * MIN
+const TIMED_OUT = Symbol('timed out')
+
+async function runCompactThenSend($) {
+  const unattended = pending.some((m) => m.logged)
+  const epoch = chatEpoch
   try {
-    await $.command.run({ command: 'compact', args: '' })
-    markCompacted()
+    const before = S.ctx
+    compactRuns++
+    compactLive = true
+    // async, so a synchronous throw rejects here rather than skipping the reset below
+    const run = (async () => $.command.run({ command: 'compact', args: '' }))()
+    const gen = compactRuns
+    // only the latest run's end clears the flag: an older one settling late must not
+    const settled = () => {
+      if (compactRuns === gen) compactLive = false
+    }
+    run.then(settled, settled)
+    let late = false
+    // this mod's own /compact may or may not reach its own command.run hook (the host skips only the calling hook,
+    // and this call comes from a timer); marking twice is harmless, so a compaction that ends after the deadline is marked here
+    // a refusal after the deadline is recorded too, or the next cold wake would try the same size again
+    run.then((r) => {
+      if (!late || epoch !== chatEpoch) return
+      if (!refused(r)) return markCompacted()
+      refusedAt = S.ctx
+      compactTriedAt = now
+    }, () => {}) // a failure after the deadline has no one waiting
+    const timeout = new Promise((resolve) => $.clock.after(COMPACT_DEADLINE, () => resolve(TIMED_OUT)))
+    const r = await Promise.race([run, timeout])
+    // a /compact that never ends must not hold every later one back, in this chat or the next: give it as long again
+    if (r === TIMED_OUT) $.clock.after(COMPACT_DEADLINE, settled)
+    // the chat changed while it ran: its queue was already handed back, and its outcome is not this chat's
+    if (epoch !== chatEpoch) return
+    if (r === TIMED_OUT) {
+      // stop waiting: the queue goes as typed
+      late = true
+      compactTriedAt = now
+      coldLog($, { action: 'compact-timeout', before }) // not awaited: a stalled log write must never hold the queue
+      $.ui.toast('Compacting took over 10 minutes, so the message goes as typed.', { timeoutMs: 8000 })
+    } else if (refused(r)) {
+      // the context did not shrink: no retry until it has grown 100k more, and the log says so
+      compactTriedAt = now
+      refusedAt = S.ctx
+      if (unattended) coldLog($, { action: 'compact-skipped', before, reason: clip(String(r.text), 160) })
+      $.ui.toast('Not compacted (' + clip(String(r.text), 80) + '), so the message goes as typed.', { timeoutMs: 8000 })
+    } else {
+      markCompacted()
+      if (unattended) coldLog($, { action: 'compacted', before })
+    }
   } catch (err) {
+    if (epoch !== chatEpoch) return
+    compactTriedAt = now
+    if (unattended) coldLog($, { action: 'compact-failed', error: clip(String((err && err.message) || err), 200) })
     $.ui.toast('Could not compact (' + clip(String((err && err.message) || err), 80) + '), so the message goes as typed.', { timeoutMs: 8000 })
   }
-  const send = { text: msg.text, ...(msg.attachments ? { attachments: msg.attachments } : {}) }
-  // A plugin can't submit a "/" line: those go back in the prompt box
-  if (!msg.slash) {
-    for (const asUser of unattended ? [true, false] : [true]) {
-      try {
-        await $.prompt.submit({ ...send, asUser })
+  // what waited during the compaction goes now, in order; anything arriving meanwhile joins the queue
+  await drain($, epoch)
+}
+
+// Fill the prompt box with `text`; false when it was not filled (a dialog is up, or headless)
+async function fillBox($, text, mode) {
+  try {
+    return !!(await $.prompt.fill({ text, ...(mode ? { mode } : {}) })).isFilled
+  } catch {
+    return false
+  }
+}
+
+// What the person has typed in the prompt box; '' when there is none to read
+async function boxText($) {
+  try {
+    return String(((await $.prompt.read()) || {}).text || '')
+  } catch {
+    return ''
+  }
+}
+
+// Messages that cannot be sent go back to the prompt box after whatever the person has typed, a blank
+// line between, so neither runs into the other; if the box will not take them, each is logged
+// (a long one in full in a file of its own: coldLog).
+// one at a time: two callers reading the box before either fills it would compute stale separators
+let boxChain = Promise.resolve()
+// a fill or read that never settles must not hold every later put-back: past the limit it counts as refused.
+// shortcut: this bounds the wait, not the fill, which cannot be cancelled; a fill that lands later still lands
+const BOX_LIMIT = 30 * 1000
+function boxSerial($, job) {
+  const p = boxChain.then(() => Promise.race([job(), new Promise((res) => $.clock.after(BOX_LIMIT, () => res(false)))]))
+  boxChain = p.catch(() => {})
+  return p
+}
+function putBack($, back) {
+  return boxSerial($, () => putBackNow($, back)).then(async (ok) => {
+    if (ok) return true
+    // refused or timed out: nothing went in, so the log holds the only copy
+    back.forEach((m) => coldLog($, { action: 'not-resent', text: m.text, sid: m.sid }))
+    return false
+  })
+}
+async function putBackNow($, back, log = true) {
+  const box = await boxText($)
+  // nothing is ever joined to a slash line: text after it would become the command's arguments.
+  // So never append to a box that starts with one, and a slash message goes back only alone, into an empty box
+  if (box.trim().startsWith('/')) return false
+  if (back.some((m) => m.slash) && (box.trim() || back.length > 1)) return false
+  const sep = !box || /\n\s*\n\s*$/.test(box) ? '' : /\n\s*$/.test(box) ? '\n' : '\n\n'
+  if (await fillBox($, sep + back.map((m) => m.text).join('\n\n'), 'append')) {
+    // parked in the box, not sent: the log says so, or it would read as resent
+    if (log) back.forEach((m) => coldLog($, { action: 'put-back', text: m.text, sid: m.sid }))
+    return true
+  }
+  return false
+}
+
+// Resend the queue in order, with the queue live: a message arriving during the drain is appended
+// by the prompt.submit hook and goes out after the ones before it. The first message that cannot be
+// submitted goes back to the prompt box together with every one behind it, so nothing is dropped and
+// none overtakes it. The person's @-mention prompt goes back in the box and the rest still go.
+// A slash line (only ever the head, from the person's dialog) is filled as the
+// draft when the box is empty (otherwise logged), the rest still go, and a later failure is logged
+// rather than filled over that draft. A resend the host holds past the deadline is left to the host,
+// and the rest go back to the prompt box; if the host later refuses it, it goes back there too.
+// It runs only for the chat its compaction started in: after a /clear, /resume or /fork it stops.
+// The previous chat's messages go back to the prompt box in arrival order: `first` (the drain's own,
+// in flight when the chat changed and not sent) ahead of the rest the session-change handler held.
+async function handBack($, first, epoch) {
+  const back = [...first, ...(orphans.get(epoch) || [])]
+  orphans.delete(epoch)
+  if (!back.length) return
+  // a slash command meant for the previous chat is never one Enter away in the new one: it is logged.
+  // The rest go back as plain messages
+  const cmds = back.filter((m) => m.slash)
+  cmds.forEach((m) => coldLog($, { action: 'not-resent', text: m.text, sid: m.sid }))
+  const rest = back.filter((m) => !m.slash)
+  const ok = rest.length ? await putBack($, rest) : true
+  const note = cmds.length ? ` Not put back (logged if ~/.claude-shared/state exists): ${cmds.map((m) => clip(m.text, 80)).join(', ')}.` : ''
+  if (rest.length) $.ui.toast((ok ? `${rest.length} message(s) meant for the previous chat are in the prompt box: send them only if they still apply.` : `${rest.length} message(s) meant for the previous chat could not be sent (logged if ~/.claude-shared/state exists).`) + note, { timeoutMs: 15000 })
+  else $.ui.toast(note.trim(), { timeoutMs: 15000 })
+}
+
+// the count of messages a drain could neither resend nor put back reaches the person on every exit,
+// including the early ones taken when the chat changes
+async function drain($, epoch = chatEpoch) {
+  const tally = { lost: 0 }
+  try {
+    return await drainQueue($, epoch, tally)
+  } finally {
+    if (tally.lost) $.ui.toast(`${tally.lost} message(s) could not be sent again (logged if ~/.claude-shared/state exists).`, { timeoutMs: 15000 })
+  }
+}
+
+async function drainQueue($, epoch, tally) {
+  // the chat the queue was made for: if it changed, the queue was handed back and a later chat's is never this drain's
+  if (epoch !== chatEpoch) return
+  draining = true
+  let draft = false // a slash line sits in the prompt box
+  // not sent again and not put back
+  const lose = (m) => (tally.lost++, coldLog($, { action: 'not-resent', text: m.text, sid: m.sid }))
+  try {
+    while (epoch === chatEpoch && pending && pending.length) {
+      const msg = pending.shift()
+      // a resend the host holds must not pin the queue: after the deadline the drain stops waiting
+      const attempt = resend($, msg, epoch).catch(() => false)
+      const sent = await Promise.race([attempt, new Promise((res) => $.clock.after(COMPACT_DEADLINE, () => res(TIMED_OUT)))])
+      if (sent === TIMED_OUT) {
+        // the host still holds this one, so it is the host's to deliver: putting it back now could send it twice
+        coldLog($, { action: 'resend-held', text: msg.text, sid: msg.sid })
+        // a later refusal means it was never sent: then it goes back to the prompt box, not lost
+        // (after a /clear, /resume or /fork it goes back marked as meant for the previous chat)
+        // (it never takes another drain's held-back messages: it puts back only itself)
+        let behind = 0 // set below once the ones behind it are really back in the box
+        attempt.then(async (ok) => {
+          if (ok) return
+          const back = await putBack($, [msg])
+          // read after the put-back: it can wait behind other box work, and the chat can change meanwhile
+          const prev = epoch !== chatEpoch
+          const where = prev ? ' (meant for the previous chat: send it only if it still applies)' : behind ? `, after the ${behind} that followed it` : ''
+          $.ui.toast(back ? `A held message was refused by Claude Code: it is back in the prompt box${where}.` : 'A held message was refused by Claude Code and could not be put back (logged if ~/.claude-shared/state exists).', { timeoutMs: 15000 })
+        })
+        if (epoch !== chatEpoch) {
+          $.ui.toast('A resend meant for the previous chat is still held by Claude Code and may still be delivered.', { timeoutMs: 15000 })
+          return handBack($, [], epoch)
+        }
+        const back = [...(pending || [])]
+        pending = null
+        draining = false
+        const ok = !back.length || (await putBack($, back))
+        if (ok) behind = back.length
+        const moved = ok && back.length && epoch !== chatEpoch
+        $.ui.toast(`A resent message is still held by Claude Code${back.length ? (moved ? `; the ${back.length} behind it, meant for the previous chat, are in the prompt box: send them only if they still apply` : ok ? `; the ${back.length} behind it are back in the prompt box` : `; the ${back.length} behind it could not be sent again (logged if ~/.claude-shared/state exists)`) : ''}.`, { timeoutMs: 15000 })
         return
-      } catch {
-        // try the next way, then the prompt box
+      }
+      if (sent) continue
+      // the chat changed while that resend was refused: it goes back ahead of the rest, in arrival order
+      if (epoch !== chatEpoch) return handBack($, [msg], epoch)
+      if (msg.mention && draft) {
+        lose(msg)
+        continue
+      }
+      if (msg.mention) {
+        // the person's @ prompt: back in the box after whatever they typed, and the rest still go
+        // (a chat change before this point already handed it back, above)
+        const ok = await putBack($, [msg])
+        $.ui.toast(ok && epoch !== chatEpoch ? 'Your message, meant for the previous chat, is in the prompt box: send it only if it still applies.' : ok ? 'Your message is back in the prompt box (a resend would not attach its @ files): press Enter to send it.' : 'Your message could not be put back (logged if ~/.claude-shared/state exists).', { timeoutMs: 15000 })
+        continue
+      }
+      if (msg.slash) {
+        // never over the person's draft: a slash line after text would be a broken command, so it is logged instead
+        // read and fill inside the box lock, so a put-back from elsewhere cannot land between them
+        let typed = ''
+        let moved = false
+        // the chat changed before the box was read: the previous chat's command is never one Enter away in the new one
+        draft = await boxSerial($, async () => (epoch !== chatEpoch ? ((moved = true), false) : (typed = (await boxText($)).trim()) ? false : fillBox($, msg.text, 'append')))
+        if (moved) return handBack($, [msg], epoch)
+        // logged here, not counted: the toast below already says what happened to this one
+        coldLog($, { action: draft ? 'put-back' : 'not-resent', text: msg.text, sid: msg.sid })
+        // the chat changed while the box was read or filled: the command landed in the new chat's box, so say whose it is
+        const late = draft && epoch !== chatEpoch
+        $.ui.toast(late ? `${clip(msg.text, 80)}, meant for the previous chat, is in the prompt box: run it only if it still applies.` : draft ? 'Your message is back in the prompt box: press Enter to send it.' : typed ? `${clip(msg.text, 80)} was not put back over what you typed (logged if ~/.claude-shared/state exists).` : 'The message could not be sent again: ' + clip(msg.text, 80), { timeoutMs: 15000 })
+      } else if (draft) lose(msg)
+      else {
+        // this one and all behind it; the queue closes in the same tick, so nothing slips in unseen
+        const back = [msg, ...(pending || [])]
+        pending = null
+        draining = false
+        if (await putBack($, back)) {
+          // a /clear, /resume or /fork during the put-back: they landed in the new chat's box, so say whose they are
+          if (epoch !== chatEpoch) $.ui.toast(`${back.length} message(s) meant for the previous chat are in the prompt box: send them only if they still apply.`, { timeoutMs: 15000 })
+          else $.ui.toast(back.length === 1 ? 'The message is back in the prompt box: press Enter to send it.' : `${back.length} messages are back in the prompt box: press Enter to send them.`, { timeoutMs: 15000 })
+        } else {
+          $.ui.toast(`${back.length} message(s) could not be sent again (logged if ~/.claude-shared/state exists).`, { timeoutMs: 15000 })
+        }
+        return
       }
     }
-  }
-  let filled = false
-  try {
-    filled = !!(await $.prompt.fill({ text: msg.text })).isFilled
   } catch {
-    filled = false
+    // an unexpected throw: what is still queued is logged, never silently dropped
+    if (epoch === chatEpoch) (pending || []).forEach(lose)
   }
-  $.ui.toast(filled ? 'Compacted. Your message is back in the prompt box: press Enter to send it.' : 'Compacted, but the message could not be sent again: ' + clip(msg.text, 80), { timeoutMs: 15000 })
+  // the chat changed while this drain waited on the host: what it held goes back now
+  if (epoch !== chatEpoch) return handBack($, [], epoch)
+  if (epoch === chatEpoch) {
+    pending = null
+    draining = false
+  }
+}
+
+// true once the message is submitted; false when it was refused or could not be (the caller puts it back)
+async function resend($, msg, epoch = chatEpoch) {
+  // A plugin can't submit a "/" line: it goes back in the prompt box
+  if (msg.slash || msg.mention) return false
+  const send = { text: msg.text, ...(msg.attachments ? { attachments: msg.attachments } : {}) }
+  for (const asUser of msg.modes) {
+    // the chat changed while an earlier attempt was out: never try the old chat's message in the new one
+    if (epoch !== chatEpoch) return false
+    let r
+    try {
+      r = await $.prompt.submit(asUser ? { ...send, asUser } : send)
+    } catch {
+      continue // a submit that throws (one the host cannot take this way): try the next way
+    }
+    // a refused submit (Stop, a host limit, another hook) resolves { drop }: never retried under another
+    // identity, which could start a turn the person cancelled; it goes back to the prompt box instead
+    return !(r && r.drop !== undefined)
+  }
+  return false
 }
 
 function findPr(text) {
@@ -447,8 +804,11 @@ function myHeartbeat() {
     window: S.window,
     ttlMin: ttlMin(),
     lastActivity: S.lastActivity,
-    rotated: rotatedCold(),
-    seatChangedAt: S.seatChangedAt,
+    rotated: rotatedCold() || reopenedCold(),
+    // cacheState reads this as when the cache went cold
+    // a reopened chat already past its lifetime went cold when that ran out, not at the reopen
+    seatChangedAt: rotatedCold() || !reopenedCold() ? S.seatChangedAt : Math.min(S.reopenedAt, S.lastActivity + ttlMin() * MIN),
+    reopenedAt: S.reopenedAt, // a reload of this mod takes it back, rather than taking a live cache for a reopened one
     keepWarm: S.keepWarm,
     keepWarmUntil: S.keepWarmUntil,
     pings: S.pings,
@@ -661,12 +1021,19 @@ async function seedFromTranscript($, path) {
   S.ctx = found.ctx
   if (found.model && !S.model) S.model = found.model // the session's own model wins: it may have been switched
   if (found.effort) S.effort = found.effort
+  // a reload keeps what the process knew; a real reopen starts on a cold cache
+  S.reopenedAt = liveHb ? liveHb.reopenedAt || 0 : await $.clock.now()
   if (found.compacted) {
-    // the next request writes the compacted context whatever happens: nothing to ask
+    // the next request writes the compacted context whatever happens: nothing to ask.
+    // A real reopen (no live heartbeat) writes it cold; markCompacted cannot tell, since lastActivity is 0 here.
+    // That write is booked as the reopen's cold rewrite, though most of it would be paid after any compaction
     S.floor = found.ctx
+    if (!liveHb) compactedCold = true
     markCompacted()
   } else {
-    S.lastActivity = found.at // the cache's real age: the band and the cold-send guard read it
+    // the cache's real age: the band and the cold-send guard read it. A reload keeps what the process knew,
+    // keep-warm's pings included (they are no transcript rows); a real reopen starts on a cold cache
+    S.lastActivity = liveHb ? Math.max(found.at || 0, liveHb.lastActivity || 0) : found.at
   }
   $.ui.invalidate('ui.render')
 }
@@ -758,7 +1125,7 @@ async function keepWarmStep($) {
     }
   }
   // After a rotation a ping would pay the whole rewrite: leave that to the next real turn
-  if (S.working || !S.lastActivity || rotatedCold()) return
+  if (S.working || !S.lastActivity || rotatedCold() || reopenedCold()) return
   const ttl = ttlMin()
   const margin = ttl >= 60 ? 8 * MIN : 90000
   if (now - S.lastActivity < ttl * MIN - margin) return
@@ -841,11 +1208,12 @@ function statusText() {
   if (st.kind === 'warm' || st.kind === 'cooling') lines.push(`Cache is warm for about ${minutes(st.left)} more.`)
   if (st.kind === 'cold') lines.push(`Cache went cold ${minutes(-st.left)} ago. The next message rewrites it for about ${money(rewriteCost(S.ctx, S.model, ttl))}.`)
   if (rotatedCold()) lines.push(`The account rotated ${minutes(now - S.seatChangedAt)} ago (now ${S.seat}), so the cache is cold.`)
+  if (reopenedCold()) lines.push('This chat was reopened, so its cache is cold until the next message rewrites it.')
   if (S.keepWarm) lines.push(`Keep warm is on until ${clock(S.keepWarmUntil)}: ${S.pings} ping(s), ${money(S.pingUsd)} so far.`)
   if (S.rateLimits.length) lines.push(`Plan limits used: ${limitsText(S.rateLimits)}.`)
   lines.push(S.fable ? `Fable weekly: ${Math.round(S.fable.percentUsed)}% used.` : `Fable weekly: no reading yet${planWhy && planWhy !== 'ok' ? ` (last check: ${planWhy})` : ''}.`)
   lines.push(`Session cost so far: ${money(S.costUsd)}. Cold restarts this session: ${S.coldRestarts.length} (${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))}).`)
-  lines.push(`Cold-send guard: ${settings.guard ? 'on' : 'off'} for contexts over ${tokens(settings.bigTokens)} tokens. Alerts: ${settings.alerts ? 'on' : 'off'}.`)
+  lines.push(`Cold-send guard: ${settings.guard ? 'on' : 'off'} for contexts over ${tokens(settings.bigTokens)} tokens (asks you; a message from anyone else compacts first). Alerts: ${settings.alerts ? 'on' : 'off'}.`)
   lines.push(`Auto keep warm: ${settings.autoWarmHours ? `on, until ${settings.autoWarmHours}h after the last turn, for contexts over ${tokens(settings.bigTokens)}${S.autoWarm ? '' : ' (off in this session)'}` : 'off'}.`)
   lines.push(`Settings: /${names.cache} ttl 5|60|auto, /${names.cache} guard on|off, /${names.cache} big 150k, /${names.cache} alerts on|off, /${names.cache} autowarm 8|off. Board: /${names.board}.`)
   return lines.join('\n')
@@ -866,7 +1234,18 @@ export function register(on, options = {}) {
   on('session.start', async ($, e, next) => {
     now = await $.clock.now()
     home = (await $.env.get('USERPROFILE')) || (await $.env.get('HOME')) || ''
+    entry = (await $.env.get('CLAUDE_CODE_ENTRYPOINT')) || ''
     S.id = await $.session.id()
+    logDir = null // look again: the folder may have been made since
+    try {
+      // a reload of this mod (or a worker respawn) fires session.start again in a live process: its last beat is
+      // fresh. A chat closed and reopened within about 90 seconds reads the same way and is taken for a reload; an enable
+      // after the mod was off for longer finds a stale beat and is taken for a reopen.
+      const hb = S.id ? await $.store.get('hb:' + S.id) : null
+      liveHb = hb && now - (hb.updatedAt || 0) < 3 * HEARTBEAT_EVERY ? hb : null // a beat can run late
+    } catch {
+      liveHb = null
+    }
     S.cwd = await $.session.cwd()
     S.label = basename(S.cwd)
     S.model = await $.session.model()
@@ -908,6 +1287,7 @@ export function register(on, options = {}) {
     if (!S.ctx && S.id && S.cwd) {
       const config = ((await $.env.get('CLAUDE_CONFIG_DIR')) || `${home}/.claude`).replace(/\\/g, '/')
       await seedFromTranscript($, `${config}/projects/${S.cwd.replace(/[^a-zA-Z0-9]/g, '-')}/${S.id}.jsonl`)
+      await heartbeat($, true) // with what the seed found, so a second reload soon after reads it
     }
     return next(e)
   })
@@ -915,20 +1295,48 @@ export function register(on, options = {}) {
   // /clear, /resume and /branch start from an unknown cache. The process goes
   // on under a new session id, and no session.start fires for it.
   on('classic.SessionStart', { source: ['clear', 'resume', 'fork'] }, async ($, e, next) => {
-    S.lastActivity = 0
+    // a rotation the last chat already worked past says nothing about this one: lastActivity going to 0
+    // would otherwise make it look like a rotation this chat has not used yet
+    if (S.seatChangedAt <= S.lastActivity) S.seatChangedAt = 0
+    // a fork is a copy: its cache is as old as the chat it copied, so it keeps that age
+    const fork = e.source === 'fork'
+    if (!fork) S.lastActivity = 0
     S.keepWarm = false
     H.armed = false
-    // the last chat's compaction says nothing about this one, and would mute its cold-send guard
-    justCompacted = false
-    compactedCold = false
-    S.floor = 0
+    // the last chat's compaction says nothing about this one, and would mute its cold-send guard.
+    // A fork is a copy: what it was compacted to, or refused at, is still true of it
+    if (!fork) {
+      justCompacted = false
+      compactedCold = false
+      S.floor = 0
+    }
+    // a cleared chat is empty, and a resumed one is measured from its own record below: the last chat's
+    // size would make either look worth compacting until a turn measures it. A fork is a copy, so it keeps it
+    if (e.source !== 'fork') S.ctx = 0
+    if (!fork) {
+      compactTriedAt = 0 // nor does its failed or refused compact hold back this one's
+      refusedAt = 0
+    }
     S.coldRestarts = [] // the new chat's own, from its record below
+    // the new chat's id before anything awaits, so a late compaction report for the old one is told apart
+    if (e.session_id) S.id = e.session_id
+    const was = chatEpoch++
+    // what waited on the last chat's compaction was meant for that chat: back to the box, never into this one
+    // an empty queue mid-drain is closed too, or the next chat's messages would wait on a drain that has stopped
+    const back = pending || []
+    const inFlight = draining // a resend is out: the drain hands these back, after its own if that one fails
+    pending = null
+    draining = false
+    if (back.length && inFlight) orphans.set(was, [...(orphans.get(was) || []), ...back])
+    // not awaited: the new chat's start does not wait on the prompt box
+    else if (back.length) handBack($, back, -1).catch(() => {})
     try {
-      S.id = (await $.session.id()) || S.id
+      S.id = e.session_id || (await $.session.id()) || S.id
     } catch {
       // keep the old id
     }
     S.label = basename(S.cwd)
+    liveHb = null
     if (e.source === 'resume') await seedFromTranscript($, e.transcript_path)
     return next(e)
   })
@@ -963,7 +1371,21 @@ export function register(on, options = {}) {
     }
     if (!S.pr) S.pr = findPr(e.command ? `/${e.command.name} ${e.command.args}` : e.text)
     const fromUser = e.origin && (e.origin.kind === 'composer' || e.origin.kind === 'bridge')
+    // no origin, or one the host could not classify, may be the person at the prompt: it gets the dialog, never the silent compact
+    // (an engine notice, never the person, is a prompt queued isMeta with no stamp or an unclassified one: an idle notice or a
+    // delivery receipt. Another session's message is queued isMeta too, but stamped peer, so it is a sender like any other.
+    // An auto-continuation that is not isMeta follows a click (leaving plan mode, an approved goal): maybe the person. One queued
+    // isMeta is the engine's continue after a usage limit: its timed resume, with nobody at the prompt, or the continue after
+    // the person accepts a limit offer. The flag cannot tell them apart, so both compact first, with no dialog to wait on)
+    // and an sdk prompt outside the desktop app with no surface is a plain -p run: its prompt is the person's, and
+    // dropping it could end the run. The app's own sdk turns still compact first, whether or not it has attached yet.
+    const headless = !!e.origin && e.origin.kind === 'sdk' && entry !== 'claude-desktop' && !(await $.session.surfaces().catch(() => [])).length
+    const notice = !!e.isMeta && (!e.origin || e.origin.kind === 'unclassified')
+    const maybePerson = !notice && (!e.origin || fromUser || headless || e.origin.kind === 'unclassified' || (e.origin.kind === 'auto-continuation' && !e.isMeta))
     const wake = fromUser && !!cfg.rotatorWake && cfg.rotatorWake.test(String(e.text || ''))
+    // another plugin submitting the person's own words (asUser): still compacted first, but resent as the person's, never framed as the plugin's
+    // (likewise the session's owner pinging it from Slack: not at the prompt, but the person's own words)
+    const asPerson = !!e.origin && ((e.origin.kind === 'plugin' && e.origin.asUser === true) || e.origin.kind === 'slack-ping')
     if (wake) {
       // The wake-up is the rotation reaching this session: take the new seat now
       await readSeat($, true)
@@ -972,28 +1394,82 @@ export function register(on, options = {}) {
     const ttl = ttlMin()
     const left = msLeft(S.lastActivity, ttl)
     const rotated = rotatedCold()
-    const isCold = rotated || (left !== null && left <= 0)
+    const reopened = !rotated && reopenedCold()
+    const isCold = rotated || reopened || (left !== null && left <= 0)
     // These run locally or start afresh: a cold cache costs them nothing
     const local = e.command && ['compact', 'clear', names.cache, names.keepwarm, names.board, names.handoff].includes(e.command.name)
-    if (!settings.guard || !fromUser || !isCold || local || justCompacted || S.ctx < settings.bigTokens || e.turnId) return next(e)
+    // A compaction is under way: anything else waits behind it and goes after, in order, with no dialog
+    // the person's own prompt waits only while /compact runs: a resend the host holds must never swallow it
+    // not an engine notice (a resend would lose isMeta), nor the person's @-mention (a plugin's resend leaves it unexpanded)
+    if (pending && !(draining && maybePerson) && !headless && !notice && !(maybePerson && /(^|\s)@\S/.test(String(e.text || ''))) && !ownPrompt($, e) && !local && !e.turnId && !e.command && !(Array.isArray(e.attachments) && e.attachments.length)) {
+      const kind = sender(e)
+      // a rotator wake keeps its unattended fallback: nobody is at the prompt after a rotation
+      return compactThenSend($, e, (!fromUser && !asPerson) || wake || (!!e.origin && e.origin.kind === 'slack-ping'), maybePerson || asPerson ? '' : kind)
+    }
+    if (!settings.guard || !isCold || local || justCompacted || S.ctx < settings.bigTokens || e.turnId) {
+      // Why a big (or unmeasured) prompt went through unasked: the evidence for a cold send nobody was asked about
+      if (!e.turnId && (!S.ctx || S.ctx >= settings.bigTokens)) coldLog($, { event: 'guard-pass', origin: (e.origin && e.origin.kind) || 'none', isCold, leftMin: left === null ? null : Math.round(left / MIN), idleMin: S.lastActivity ? Math.round((now - S.lastActivity) / MIN) : null, rotated, reopened, justCompacted, local: !!local, guard: settings.guard })
+      return next(e)
+    }
     // an attachment's handle lives only while this submit is in flight: a resend after compacting would drop it
     const media = Array.isArray(e.attachments) && e.attachments.length > 0
-    if (wake) return worthCompacting() && !media ? compactThenSend($, e, true) : next(e)
+    if (wake) return worthCompacting() && !media && !e.command && !compacting() ? compactThenSend($, e, true) : next(e)
+    // Owner 2026-11-02: an idle chat woken cold by anything but the person at the prompt (another
+    // session's message, a task notification, a schedule, the desktop app's own turn) compacts
+    // first, with no dialog: nobody may be there to answer it. Not this mod's own prompt (a resend from a
+    // timer can come back through this hook), not a slash command (a plugin can't resubmit one), not an attachment.
+    if (!maybePerson) {
+      const kind = sender(e)
+      const skip = ownPrompt($, e) ? 'plugin' : notice ? 'meta' : e.command ? 'slash' : media ? 'media' : !worthCompacting() ? 'floor' : compacting() ? 'running' : now - compactTriedAt < 2 * MIN ? 'just-tried' : ''
+      coldLog($, { origin: kind, coldMin: Math.round((rotated ? now - S.seatChangedAt : reopened ? now - Math.min(S.reopenedAt || now, S.lastActivity + ttl * MIN) : -left) / MIN), ...(reopened ? { reopened: true } : {}), action: skip ? 'skip-' + skip : 'compact-first', ...(skip ? {} : { text: e.text }) })
+      return skip ? next(e) : asPerson ? compactThenSend($, e, e.origin.kind === 'slack-ping', '', true) : compactThenSend($, e, true, kind)
+    }
+    // a compaction just ran or is running: asking again would only queue behind it, or compact twice
+    if (pending || compacting()) {
+      coldLog($, { event: 'pass-during-compact', origin: sender(e) })
+      return next(e)
+    }
+    const runs = compactRuns
+    // the chat this prompt was typed in: a /clear, /resume or /fork while the dialog is up must not take it
+    const askedIn = chatEpoch
+    const askedSid = S.id
+    // the prompt goes back to the box marked as meant for the previous chat (a slash command is logged);
+    // an attachment cannot travel with it, so the person is told to attach it again
+    const handOld = () => {
+      // an image-only prompt has no text to put back: it is reported as not kept
+      if (String(e.text || '').trim()) handBack($, [{ text: e.text, slash: !!e.command, sid: askedSid }], -1).catch(() => {})
+      if (media) $.ui.toast('The attachment on that message was not kept: attach it again if you send it.', { timeoutMs: 15000 })
+      return { drop: 'cache-keeper: the chat changed while asking; see the note on what happened to the message' }
+    }
     const cost = money(rewriteCost(S.ctx, S.model, ttl))
-    const why = rotated ? `The account rotated to ${S.seat || 'another seat'} ${minutes(now - S.seatChangedAt)} ago, so the cache is cold.` : `Cache went cold ${minutes(-left)} ago.`
+    const why = rotated ? `The account rotated to ${S.seat || 'another seat'} ${minutes(now - S.seatChangedAt)} ago, so the cache is cold.` : reopened ? `This chat was reopened ${minutes((S.reopenedAt || now) - S.lastActivity)} after its last reply, and a reopened chat starts on a cold cache.` : `Cache went cold ${minutes(-left)} ago.`
     const floor = S.floor ? ` Compacting last left ${tokens(S.floor)}.` : ''
     let answer = 'Send anyway'
     try {
       answer = await $.ui.ask(
         `${why} Sending now rewrites ${tokens(S.ctx)} tokens of context (about ${cost}).${floor}${media ? ' (Compacting first would drop the attachment: run /compact yourself, then send again.)' : ''} What should happen?`,
-        media ? ['Send anyway', 'Cancel'] : ['Send anyway', 'Compact first, then send', 'Cancel'],
+        // Owner 2026-11-03: compacting is the default, so it goes first (the dialog preselects it)
+        media ? ['Send anyway', 'Cancel'] : ['Compact first, then send', 'Send anyway', 'Cancel'],
       )
-    } catch {
+    } catch (err) {
       // nobody to ask (a -p run, or the dialog was dismissed): send as typed
+      coldLog($, { event: 'ask-failed', origin: (e.origin && e.origin.kind) || 'none', error: String((err && err.message) || err).slice(0, 120), sid: askedSid })
+      // dismissed after the chat changed (Esc on a stale dialog): never sent into the new chat
+      if (askedIn !== chatEpoch) return handOld()
       return next(e)
     }
+    coldLog($, { event: 'asked', origin: (e.origin && e.origin.kind) || 'none', reopened, rotated, answer, sid: askedSid })
+    // the chat changed while the dialog was up: the prompt goes back marked as meant for the previous chat
+    if (askedIn !== chatEpoch && answer !== 'Cancel') return handOld()
     // $.session.compact() is refused on SDK hosts (the desktop app), so this queues /compact
-    if (answer === 'Compact first, then send') return compactThenSend($, e, false)
+    // the dialog waited on the person: a compaction may have run or started meanwhile
+    if (answer === 'Compact first, then send') {
+      // one started meanwhile and is still queueing: wait behind it, in order, rather than overtake it
+      // the person's @-mention prompt is put back after compacting: a plugin's resend would not attach the file
+      const at = !e.command && /(^|\s)@\S/.test(String(e.text || ''))
+      if (pending && !e.command) return compactThenSend($, e, false, '', false, at)
+      return compactRuns !== runs || compacting() || justCompacted || pending ? next(e) : compactThenSend($, e, false, '', false, at)
+    }
     if (answer === 'Send anyway') return next(e)
     $.ui.toast('Not sent. A fresh session with a short handoff avoids the rewrite entirely.', { timeoutMs: 8000 })
     return { drop: 'Cancelled by cache-keeper before a cold cache rewrite' }
@@ -1089,21 +1565,47 @@ export function register(on, options = {}) {
   // the desktop host running it inside a turn); each one marks it
   on('session.compact', async ($, e, next) => {
     now = await $.clock.now()
+    const epoch = chatEpoch // a compaction that ends after /resume or /clear is the old chat's, not the new one's
     const r = await next(e)
-    if (!e.agentId) markCompacted()
+    if (epoch !== chatEpoch) return r
+    // precompute installs nothing: only a compaction that replaced the conversation counts
+    if (!e.agentId && e.trigger !== 'precompute' && !(r && r.skip)) markCompacted()
     return r
   })
+  // a compaction reported for another session (one that settled after /clear or /resume) is not this chat's
+  const thisChat = (e) => !e.session_id || !S.id || e.session_id === S.id
   on('classic.PostCompact', async ($, e, next) => {
-    markCompacted()
+    if (thisChat(e)) markCompacted()
     return next(e)
   })
   on('classic.SessionStart', { source: ['compact'] }, async ($, e, next) => {
-    markCompacted()
+    if (thisChat(e)) markCompacted()
     return next(e)
   })
   on('command.run', { command: ['compact'] }, async ($, e, next) => {
-    const r = await next(e)
-    markCompacted()
+    // under way: a cold wake meanwhile waits for it rather than starting a second one
+    manualLive++
+    let done = false
+    // once, whichever comes first: the command ending, or 20 minutes (a /compact that never ends must
+    // not switch the cold-send guard off for good)
+    const end = () => {
+      if (!done) (done = true), manualLive--
+    }
+    $.clock.after(2 * COMPACT_DEADLINE, end)
+    const epoch = chatEpoch // a refusal is the chat's it was typed in, not the one a /resume switched to
+    let r
+    try {
+      r = await next(e)
+    } finally {
+      end()
+    }
+    if (!refused(r)) {
+      if (epoch === chatEpoch) markCompacted()
+    } else if (epoch === chatEpoch) {
+      // a typed /compact the compactor refused: the cold-wake path must not try the same size again
+      refusedAt = S.ctx
+      compactTriedAt = await $.clock.now()
+    }
     return r
   })
 
