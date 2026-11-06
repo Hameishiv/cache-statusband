@@ -647,8 +647,9 @@ async function drainQueue($, epoch, tally) {
         let behind = 0 // set below once the ones behind it are really back in the box
         attempt.then(async (ok) => {
           if (ok) return
-          const prev = epoch !== chatEpoch
           const back = await putBack($, [msg])
+          // read after the put-back: it can wait behind other box work, and the chat can change meanwhile
+          const prev = epoch !== chatEpoch
           const where = prev ? ' (meant for the previous chat: send it only if it still applies)' : behind ? `, after the ${behind} that followed it` : ''
           $.ui.toast(back ? `A held message was refused by Claude Code: it is back in the prompt box${where}.` : 'A held message was refused by Claude Code and could not be put back (logged if ~/.claude-shared/state exists).', { timeoutMs: 15000 })
         })
@@ -658,7 +659,8 @@ async function drainQueue($, epoch, tally) {
         draining = false
         const ok = !back.length || (await putBack($, back))
         if (ok) behind = back.length
-        $.ui.toast(`A resent message is still held by Claude Code${back.length ? (ok ? `; the ${back.length} behind it are back in the prompt box` : `; the ${back.length} behind it could not be sent again (logged if ~/.claude-shared/state exists)`) : ''}.`, { timeoutMs: 15000 })
+        const moved = ok && back.length && epoch !== chatEpoch
+        $.ui.toast(`A resent message is still held by Claude Code${back.length ? (moved ? `; the ${back.length} behind it, meant for the previous chat, are in the prompt box: send them only if they still apply` : ok ? `; the ${back.length} behind it are back in the prompt box` : `; the ${back.length} behind it could not be sent again (logged if ~/.claude-shared/state exists)`) : ''}.`, { timeoutMs: 15000 })
         return
       }
       if (sent) continue
@@ -684,8 +686,8 @@ async function drainQueue($, epoch, tally) {
         // the chat changed before the box was read: the previous chat's command is never one Enter away in the new one
         draft = await boxSerial($, async () => (epoch !== chatEpoch ? ((moved = true), false) : (typed = (await boxText($)).trim()) ? false : fillBox($, msg.text, 'append')))
         if (moved) return handBack($, [msg], epoch)
-        if (!draft) lose(msg)
-        else coldLog($, { action: 'put-back', text: msg.text, sid: msg.sid })
+        // logged here, not counted: the toast below already says what happened to this one
+        coldLog($, { action: draft ? 'put-back' : 'not-resent', text: msg.text, sid: msg.sid })
         $.ui.toast(draft ? 'Your message is back in the prompt box: press Enter to send it.' : typed ? `${clip(msg.text, 80)} was not put back over what you typed (logged if ~/.claude-shared/state exists).` : 'The message could not be sent again: ' + clip(msg.text, 80), { timeoutMs: 15000 })
       } else if (draft) lose(msg)
       else {
@@ -795,7 +797,8 @@ function myHeartbeat() {
     lastActivity: S.lastActivity,
     rotated: rotatedCold() || reopenedCold(),
     // cacheState reads this as when the cache went cold
-    seatChangedAt: rotatedCold() || !reopenedCold() ? S.seatChangedAt : S.reopenedAt,
+    // a reopened chat already past its lifetime went cold when that ran out, not at the reopen
+    seatChangedAt: rotatedCold() || !reopenedCold() ? S.seatChangedAt : Math.min(S.reopenedAt, S.lastActivity + ttlMin() * MIN),
     reopenedAt: S.reopenedAt, // a reload of this mod takes it back, rather than taking a live cache for a reopened one
     keepWarm: S.keepWarm,
     keepWarmUntil: S.keepWarmUntil,
