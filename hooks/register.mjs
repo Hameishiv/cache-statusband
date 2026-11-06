@@ -222,6 +222,8 @@ async function clearAndContinue($) {
     } catch {
       filled = false
     }
+    // not in the box either: the log (and its lost-message file) is then the handoff's only copy
+    if (!filled) coldLog($, { action: 'not-resent', text })
     $.ui.toast(filled ? 'Cleared. The handoff is in the prompt box, after anything already there: check it, then press Enter.' : `Cleared, but the handoff could not be sent.${path ? ` It's saved at ${path}.` : ''}`, { timeoutMs: 10000 })
   } finally {
     H.continuing = false
@@ -398,6 +400,8 @@ function compactThenSend($, e, unattended, from = '', logged = false, mention = 
   // a compaction is already under way: this message waits behind the ones before it
   if (pending) return pending.push(msg), drop
   pending = [msg]
+  // the head is the one message no other line records: it has already been dropped, so its text is logged
+  coldLog($, { action: 'queued-head', text: e.text, sid: S.id })
   // the chat this queue belongs to: a /clear before the timer fires hands it back, and this run must not take the next chat's
   const epoch = chatEpoch
   // a throw must not leave the queue set, or every later message would wait forever: send what is left as is
@@ -597,9 +601,15 @@ async function handBack($, first, epoch) {
   const back = [...first, ...(orphans.get(epoch) || [])]
   orphans.delete(epoch)
   if (!back.length) return
-  // a slash head goes back alone (putBackNow never joins text to one); the rest are then logged, not appended to it
-  const ok = back.length > 1 && back[0].slash ? (await putBack($, [back[0]])) && (await putBack($, back.slice(1))) : await putBack($, back)
-  $.ui.toast(ok ? `${back.length} message(s) meant for the previous chat are in the prompt box: send them only if they still apply.` : `${back.length} message(s) meant for the previous chat could not be sent (logged if ~/.claude-shared/state exists).`, { timeoutMs: 15000 })
+  // a slash command meant for the previous chat is never one Enter away in the new one: it is logged.
+  // The rest go back as plain messages
+  const cmds = back.filter((m) => m.slash)
+  cmds.forEach((m) => coldLog($, { action: 'not-resent', text: m.text, sid: m.sid }))
+  const rest = back.filter((m) => !m.slash)
+  const ok = rest.length ? await putBack($, rest) : true
+  const note = cmds.length ? ` ${cmds.length} command(s) were not put back (logged if ~/.claude-shared/state exists).` : ''
+  if (rest.length) $.ui.toast((ok ? `${rest.length} message(s) meant for the previous chat are in the prompt box: send them only if they still apply.` : `${rest.length} message(s) meant for the previous chat could not be sent (logged if ~/.claude-shared/state exists).`) + note, { timeoutMs: 15000 })
+  else $.ui.toast(note.trim(), { timeoutMs: 15000 })
 }
 
 async function drain($, epoch = chatEpoch) {
@@ -1349,7 +1359,7 @@ export function register(on, options = {}) {
     }
     // an attachment's handle lives only while this submit is in flight: a resend after compacting would drop it
     const media = Array.isArray(e.attachments) && e.attachments.length > 0
-    if (wake) return worthCompacting() && !media && !compacting() ? compactThenSend($, e, true) : next(e)
+    if (wake) return worthCompacting() && !media && !e.command && !compacting() ? compactThenSend($, e, true) : next(e)
     // Owner 2026-11-02: an idle chat woken cold by anything but the person at the prompt (another
     // session's message, a task notification, a schedule, the desktop app's own turn) compacts
     // first, with no dialog: nobody may be there to answer it. Not this mod's own prompt (defensive:

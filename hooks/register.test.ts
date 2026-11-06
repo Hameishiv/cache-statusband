@@ -1496,7 +1496,7 @@ test('"Compact first" on a slash command with an @ word never puts it after the 
 })
 
 // Opus 2026-11-05: a /clear while a slash head waits never joins the queued messages to that slash line
-test('a /clear during a compaction never joins queued messages to a slash command', SETUP, async ($, on) => {
+test('a /clear during a compaction logs the previous chat slash command and puts the rest back', SETUP, async ($, on) => {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)
   answer(on, seen, 'Compact first, then send')
@@ -1514,8 +1514,12 @@ test('a /clear during a compaction never joins queued messages to a slash comman
     await clock.advance(100)
     await ($ as any).classic.SessionStart({ source: 'clear', transcript_path: '' })
     await settle(clock, () => seen.toasts.some((t) => /meant for the previous chat/.test(t)))
-    expect(seen.fills.some((f) => f.text.includes('/merge-pr 123'))).toBe(true)
-    expect(seen.fills.some((f) => f.text.includes('/merge-pr 123') && f.text.includes('peer note'))).toBe(false)
+    // the previous chat's command is logged, never one Enter away in the new chat; the peer note goes back
+    expect(seen.fills.some((f) => f.text.includes('/merge-pr 123'))).toBe(false)
+    expect(seen.fills.some((f) => f.text.includes('peer note'))).toBe(true)
+    expect(seen.toasts.some((t) => /1 command\(s\) were not put back/.test(t))).toBe(true)
+    await settle(clock, () => seen.log.includes('not-resent'))
+    expect(seen.log).toContain('/merge-pr 123')
   } finally {
     hangCompact = false
   }
