@@ -512,7 +512,7 @@ test('a cold, large session woken by another session compacts before the message
   const { r, seen } = await coldPeer($, on, 77)
   expect('drop' in (r as object)).toBe(true) // the message did not reach the model on the cold cache
   expect(seen.asks).toBe(0)
-  expect(seen.order).toEqual(['compact', 'send:[peer message, resent by cache-keeper after /compact]\nPR 12 merged; pick up the next one'])
+  expect(seen.order).toEqual(['compact', 'send:[peer message, resent by cache-keeper]\nPR 12 merged; pick up the next one'])
   expect(seen.asUsers).toEqual([undefined]) // a peer's message is framed as the mod's, never the person's own words
 })
 
@@ -523,7 +523,7 @@ test('a cold compact the compactor refuses is logged as skipped, not as compacte
     const { seen } = await coldPeer($, on, 77)
     expect(seen.log).toContain('"action":"compact-skipped"')
     expect(seen.log).not.toContain('"action":"compacted"')
-    expect(seen.order).toEqual(['compact', 'send:[peer message, resent by cache-keeper after /compact]\nPR 12 merged; pick up the next one'])
+    expect(seen.order).toEqual(['compact', 'send:[peer message, resent by cache-keeper]\nPR 12 merged; pick up the next one'])
   } finally {
     compactOutput = ''
   }
@@ -545,7 +545,7 @@ test('a message that arrives while the cold compact runs goes after the first on
   expect('drop' in (a as object)).toBe(true)
   expect('drop' in (b as object)).toBe(true)
   expect(seen.compacts).toBe(1)
-  expect(seen.order).toEqual(['compact', 'send:[peer message, resent by cache-keeper after /compact]\nfirst', 'send:[task-notification message, resent by cache-keeper after /compact]\nsecond'])
+  expect(seen.order).toEqual(['compact', 'send:[peer message, resent by cache-keeper]\nfirst', 'send:[task-notification message, resent by cache-keeper]\nsecond'])
 })
 
 // Pre-push review round 2: a resend that cannot be submitted stops the rest, so none overtakes or overwrites it
@@ -565,7 +565,7 @@ test('when a queued resend cannot be submitted, it goes back to the prompt box w
     await settle(clock, () => seen.fills.length >= 1)
     expect(seen.order).toEqual(['compact'])
     // both go back in the prompt box, the failed one first, appended to whatever is there
-    expect(seen.fills).toEqual([{ text: '[peer message, resent by cache-keeper after /compact]\nfirst\n\n[peer message, resent by cache-keeper after /compact]\nsecond', mode: 'append' }])
+    expect(seen.fills).toEqual([{ text: '[peer message, resent by cache-keeper]\nfirst\n\n[peer message, resent by cache-keeper]\nsecond', mode: 'append' }])
     expect(seen.toasts.some((t) => /2 messages are back in the prompt box/.test(t))).toBe(true)
   } finally {
     failSubmit = null
@@ -866,7 +866,7 @@ test('"Compact first" answered during a running compaction queues behind it', as
     releaseCompact()
     await settle(clock, () => seen.submits.length >= 2)
     expect(seen.compacts).toBe(1)
-    expect(seen.order).toEqual(['compact', 'send:[peer message, resent by cache-keeper after /compact]\nfrom a peer', 'send:mine'])
+    expect(seen.order).toEqual(['compact', 'send:[peer message, resent by cache-keeper]\nfrom a peer', 'send:mine'])
   } finally {
     holdCompact = false
   }

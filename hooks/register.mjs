@@ -395,7 +395,7 @@ async function resumeStep($) {
 function compactThenSend($, e, unattended, from = '', logged = false, mention = false) {
   // the ways to submit it, in order: `true` is asUser, `false` omits it
   const modes = from ? [false] : unattended ? [true, false] : [true]
-  const msg = { text: from ? `[${from} message, resent by cache-keeper after /compact]\n${e.text}` : e.text, attachments: e.attachments, slash: !!e.command, mention, unattended, logged: logged || unattended, modes, sid: S.id }
+  const msg = { text: from ? `[${from} message, resent by cache-keeper]\n${e.text}` : e.text, attachments: e.attachments, slash: !!e.command, mention, unattended, logged: logged || unattended, modes, sid: S.id }
   const drop = { drop: 'cache-keeper: compacting first on a cold cache; the message is sent again once that finishes' }
   // a compaction is already under way: this message waits behind the ones before it
   // every message that joins a queue is logged with its text: it has been dropped, so a reload would leave no other copy
@@ -1415,7 +1415,7 @@ export function register(on, options = {}) {
     if (!maybePerson) {
       const kind = sender(e)
       const skip = ownPrompt($, e) ? 'plugin' : e.isMeta ? 'meta' : e.command ? 'slash' : media ? 'media' : !worthCompacting() ? 'floor' : compacting() ? 'running' : now - compactTriedAt < 2 * MIN ? 'just-tried' : ''
-      coldLog($, { origin: kind, coldMin: Math.round((rotated ? now - S.seatChangedAt : reopened ? now - S.lastActivity : -left) / MIN), ...(reopened ? { reopened: true } : {}), action: skip ? 'skip-' + skip : 'compact-first', ...(skip ? {} : { text: e.text }) })
+      coldLog($, { origin: kind, coldMin: Math.round((rotated ? now - S.seatChangedAt : reopened ? now - Math.min(S.reopenedAt || now, S.lastActivity + ttl * MIN) : -left) / MIN), ...(reopened ? { reopened: true } : {}), action: skip ? 'skip-' + skip : 'compact-first', ...(skip ? {} : { text: e.text }) })
       return skip ? next(e) : asPerson ? compactThenSend($, e, e.origin.kind === 'slack-ping', '', true) : compactThenSend($, e, true, kind)
     }
     // a compaction just ran or is running: asking again would only queue behind it, or compact twice
