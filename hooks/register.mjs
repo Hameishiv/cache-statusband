@@ -402,7 +402,7 @@ function compactThenSend($, e, unattended, from = '', logged = false, mention = 
   if (pending) return coldLog($, { origin: sender(e), action: 'queued-behind-compact', text: e.text, sid: S.id }), pending.push(msg), drop
   pending = [msg]
   // the head is the one message no other line records: it has already been dropped, so its text is logged
-  coldLog($, { action: 'queued-head', text: e.text, sid: S.id })
+  coldLog($, { origin: sender(e), action: 'queued-head', text: e.text, sid: S.id })
   // the chat this queue belongs to: a /clear before the timer fires hands it back, and this run must not take the next chat's
   const epoch = chatEpoch
   // a throw must not leave the queue set, or every later message would wait forever: send what is left as is
@@ -1265,15 +1265,21 @@ export function register(on, options = {}) {
     S.lastActivity = 0
     S.keepWarm = false
     H.armed = false
-    // the last chat's compaction says nothing about this one, and would mute its cold-send guard
-    justCompacted = false
-    compactedCold = false
-    S.floor = 0
+    // the last chat's compaction says nothing about this one, and would mute its cold-send guard.
+    // A fork is a copy: what it was compacted to, or refused at, is still true of it
+    const fork = e.source === 'fork'
+    if (!fork) {
+      justCompacted = false
+      compactedCold = false
+      S.floor = 0
+    }
     // a cleared chat is empty, and a resumed one is measured from its own record below: the last chat's
     // size would make either look worth compacting until a turn measures it. A fork is a copy, so it keeps it
     if (e.source !== 'fork') S.ctx = 0
-    compactTriedAt = 0 // nor does its failed or refused compact hold back this one's
-    refusedAt = 0
+    if (!fork) {
+      compactTriedAt = 0 // nor does its failed or refused compact hold back this one's
+      refusedAt = 0
+    }
     S.coldRestarts = [] // the new chat's own, from its record below
     // the new chat's id before anything awaits, so a late compaction report for the old one is told apart
     if (e.session_id) S.id = e.session_id

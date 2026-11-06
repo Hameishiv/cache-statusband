@@ -1578,3 +1578,23 @@ test('after a rotation the chat has used, /fork leaves the forked chat uncompact
   expect('drop' in (r as object)).toBe(false)
   expect(seen.compacts).toBe(1)
 })
+
+test('a fork made right after a compaction is not compacted again for a peer', SETUP, async ($, on) => {
+  const seat = { label: 'A' }
+  const { clock, seen } = engine($, on, seat)
+  answer(on, seen, null)
+  on('classic.SessionStart', () => ({}))
+  await start($, 300000, clock)
+  seat.label = 'G'
+  await clock.advance(5 * 60000)
+  await $.prompt.submit({ text: 'Usage reset: the weekly limit capped, so the CLI account was rotated to G. Go on.', origin: COMPOSER, wait: false } as never)
+  await clock.advance(100)
+  await settle(clock, () => seen.submits.length >= 1)
+  expect(seen.compacts).toBe(1)
+  // no request runs between the compaction and the fork
+  await ($ as any).classic.SessionStart({ source: 'fork', transcript_path: '' })
+  await clock.advance(100)
+  await $.prompt.submit({ text: 'a note from a peer', origin: PEER, wait: false } as never)
+  await clock.advance(200)
+  expect(seen.compacts).toBe(1)
+})
