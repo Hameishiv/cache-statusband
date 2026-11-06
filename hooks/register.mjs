@@ -215,12 +215,12 @@ async function clearAndContinue($) {
     // Not sent: leave it in the prompt box for one Enter
     let filled = false
     try {
-      // append, through the box lock: messages /clear just put back must not be replaced
-      filled = !!(await boxSerial($, () => fillBox($, text, 'append')))
+      // append after a blank line, through the box lock: messages /clear just put back must not be replaced or run into
+      filled = !!(await boxSerial($, () => putBackNow($, [{ text }], false)))
     } catch {
       filled = false
     }
-    $.ui.toast(filled ? 'Cleared. The handoff is in the prompt box: press Enter to send it.' : `Cleared, but the handoff could not be sent.${path ? ` It's saved at ${path}.` : ''}`, { timeoutMs: 10000 })
+    $.ui.toast(filled ? 'Cleared. The handoff is in the prompt box, after anything already there: check it, then press Enter.' : `Cleared, but the handoff could not be sent.${path ? ` It's saved at ${path}.` : ''}`, { timeoutMs: 10000 })
   } finally {
     H.continuing = false
     $.ui.invalidate('ui.render')
@@ -439,13 +439,13 @@ function coldLog($, fields) {
     try {
       if (logDir === null) logDir = await $.fs.exists(path.slice(0, path.lastIndexOf('/')))
       if (!logDir) return
-      // a message neither resent nor put back has the log as its only copy: when its line is clipped, the
-      // whole text goes first to a file of its own, never trimmed, so a failed log write cannot take it
-      if (fields.action === 'not-resent' && text.textLen) {
+      // a message neither resent nor put back has the log as its only copy: its whole text goes first to a
+      // file of its own, never trimmed, so a clipped line or a failed log write cannot take it
+      if (fields.action === 'not-resent') {
         try {
           await $.fs.write(`${home.replace(/\\/g, '/')}/.claude-shared/state/cache-keeper-lost-${sid || 'unknown'}-${now}-${++lostSeq}.txt`, fields.text)
         } catch {
-          // the log line below still records it, clipped
+          // the log line below still records it
         }
       }
       let old = ''
@@ -565,12 +565,12 @@ function putBack($, back) {
     return false
   })
 }
-async function putBackNow($, back) {
+async function putBackNow($, back, log = true) {
   const box = await boxText($)
   const sep = !box || /\n\s*\n\s*$/.test(box) ? '' : /\n\s*$/.test(box) ? '\n' : '\n\n'
   if (await fillBox($, sep + back.map((m) => m.text).join('\n\n'), 'append')) {
     // parked in the box, not sent: the log says so, or it would read as resent
-    back.forEach((m) => coldLog($, { action: 'put-back', text: m.text, sid: m.sid }))
+    if (log) back.forEach((m) => coldLog($, { action: 'put-back', text: m.text, sid: m.sid }))
     return true
   }
   return false
@@ -634,10 +634,11 @@ async function drain($, epoch = chatEpoch) {
       if (sent) continue
       // the chat changed while that resend was refused: it goes back ahead of the rest, in arrival order
       if (epoch !== chatEpoch) return handBack($, [msg], epoch)
-      if (msg.mention) {
+      if (msg.mention && draft) lose(msg)
+      else if (msg.mention) {
         // the person's @ prompt: back in the box after whatever they typed, and the rest still go
         const ok = await putBack($, [msg])
-        $.ui.toast(ok ? 'Compacted. Your message is back in the prompt box (a resend would not attach its @ files): press Enter to send it.' : 'Compacted, but your message could not be put back (logged if ~/.claude-shared/state exists).', { timeoutMs: 15000 })
+        $.ui.toast(ok ? 'Your message is back in the prompt box (a resend would not attach its @ files): press Enter to send it.' : 'Your message could not be put back (logged if ~/.claude-shared/state exists).', { timeoutMs: 15000 })
         continue
       }
       if (msg.slash) {
@@ -647,7 +648,7 @@ async function drain($, epoch = chatEpoch) {
         draft = await boxSerial($, async () => ((typed = (await boxText($)).trim()) ? false : fillBox($, msg.text, 'append')))
         if (!draft) lose(msg)
         else coldLog($, { action: 'put-back', text: msg.text, sid: msg.sid })
-        $.ui.toast(draft ? 'Compacted. Your message is back in the prompt box: press Enter to send it.' : typed ? `Compacted. ${clip(msg.text, 80)} was not put back over what you typed (logged if ~/.claude-shared/state exists).` : 'Compacted, but the message could not be sent again: ' + clip(msg.text, 80), { timeoutMs: 15000 })
+        $.ui.toast(draft ? 'Your message is back in the prompt box: press Enter to send it.' : typed ? `${clip(msg.text, 80)} was not put back over what you typed (logged if ~/.claude-shared/state exists).` : 'The message could not be sent again: ' + clip(msg.text, 80), { timeoutMs: 15000 })
       } else if (draft) lose(msg)
       else {
         // this one and all behind it; the queue closes in the same tick, so nothing slips in unseen
@@ -1379,7 +1380,7 @@ export function register(on, options = {}) {
     if (answer === 'Compact first, then send') {
       // one started meanwhile and is still queueing: wait behind it, in order, rather than overtake it
       // the person's @-mention prompt is put back after compacting: a plugin's resend would not attach the file
-      const at = /(^|\s)@\S/.test(String(e.text || ''))
+      const at = !e.command && /(^|\s)@\S/.test(String(e.text || ''))
       if (pending && !e.command) return compactThenSend($, e, false, '', false, at)
       return compactRuns !== runs || compacting() || justCompacted || pending ? next(e) : compactThenSend($, e, false, '', false, at)
     }

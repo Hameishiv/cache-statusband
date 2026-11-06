@@ -1474,3 +1474,23 @@ test('"Compact first" on an @ prompt with a draft in the box appends it after th
     boxDraft = ''
   }
 })
+
+test('"Compact first" on a slash command with an @ word never puts it after the draft', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, 'Compact first, then send')
+  boxDraft = 'typed meanwhile'
+  try {
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+    await $.prompt.submit({ text: '/review @src/x.ts', command: { name: 'review', args: '@src/x.ts' }, origin: COMPOSER, wait: false } as never)
+    await clock.advance(100)
+    await settle(clock, () => seen.log.includes('not-resent'))
+    expect(seen.fills).toEqual([])
+    expect(seen.log).toContain('not-resent')
+  } finally {
+    boxDraft = ''
+  }
+})
