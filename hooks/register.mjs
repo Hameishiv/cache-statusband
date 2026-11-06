@@ -215,7 +215,8 @@ async function clearAndContinue($) {
     // Not sent: leave it in the prompt box for one Enter
     let filled = false
     try {
-      filled = !!(await $.prompt.fill({ text })).isFilled
+      // append, through the box lock: messages /clear just put back must not be replaced
+      filled = !!(await boxSerial($, () => fillBox($, text, 'append')))
     } catch {
       filled = false
     }
@@ -387,10 +388,10 @@ async function resumeStep($) {
 // `from` names a sender other than the person (a peer, a task notification): the resend says so,
 // and goes in without `asUser`, so the model reads it as the mod's message, not the person's own words
 // `logged` writes the compaction's outcome to the log, as for an unattended message, whatever the modes
-function compactThenSend($, e, unattended, from = '', logged = false) {
+function compactThenSend($, e, unattended, from = '', logged = false, mention = false) {
   // the ways to submit it, in order: `true` is asUser, `false` omits it
   const modes = from ? [false] : unattended ? [true, false] : [true]
-  const msg = { text: from ? `[${from} message, resent by cache-keeper after /compact]\n${e.text}` : e.text, attachments: e.attachments, slash: !!e.command || (!from && /(^|\s)@\S/.test(String(e.text || ''))), unattended, logged: logged || unattended, modes, sid: S.id }
+  const msg = { text: from ? `[${from} message, resent by cache-keeper after /compact]\n${e.text}` : e.text, attachments: e.attachments, slash: !!e.command, mention, unattended, logged: logged || unattended, modes, sid: S.id }
   const drop = { drop: 'cache-keeper: compacting first on a cold cache; the message is sent again once that finishes' }
   // a compaction is already under way: this message waits behind the ones before it
   if (pending) return pending.push(msg), drop
@@ -438,6 +439,15 @@ function coldLog($, fields) {
     try {
       if (logDir === null) logDir = await $.fs.exists(path.slice(0, path.lastIndexOf('/')))
       if (!logDir) return
+      // a message neither resent nor put back has the log as its only copy: when its line is clipped, the
+      // whole text goes first to a file of its own, never trimmed, so a failed log write cannot take it
+      if (fields.action === 'not-resent' && text.textLen) {
+        try {
+          await $.fs.write(`${home.replace(/\\/g, '/')}/.claude-shared/state/cache-keeper-lost-${sid || 'unknown'}-${now}-${++lostSeq}.txt`, fields.text)
+        } catch {
+          // the log line below still records it, clipped
+        }
+      }
       let old = ''
       if (await $.fs.exists(path)) {
         old = await $.fs.read(path)
@@ -450,12 +460,6 @@ function coldLog($, fields) {
         }
       }
       await $.fs.write(path, `${old}${line}`)
-      // a message neither resent nor put back has the log as its only copy: when its line was clipped,
-      // the whole text goes to a file of its own, which is never trimmed
-      if (fields.action === 'not-resent' && text.textLen) {
-        const lost = `${home.replace(/\\/g, '/')}/.claude-shared/state/cache-keeper-lost-${sid || 'unknown'}-${now}-${++lostSeq}.txt`
-        await $.fs.write(lost, fields.text)
-      }
     } catch {
       // logging never blocks a send
     }
@@ -545,7 +549,8 @@ async function boxText($) {
 // (a long one in full in a file of its own: coldLog).
 // one at a time: two callers reading the box before either fills it would compute stale separators
 let boxChain = Promise.resolve()
-// a fill or read that never settles must not hold every later put-back: past the limit it counts as refused
+// a fill or read that never settles must not hold every later put-back: past the limit it counts as refused.
+// shortcut: this bounds the wait, not the fill, which cannot be cancelled; a fill that lands later still lands
 const BOX_LIMIT = 30 * 1000
 function boxSerial($, job) {
   const p = boxChain.then(() => Promise.race([job(), new Promise((res) => $.clock.after(BOX_LIMIT, () => res(false)))]))
@@ -574,7 +579,8 @@ async function putBackNow($, back) {
 // Resend the queue in order, with the queue live: a message arriving during the drain is appended
 // by the prompt.submit hook and goes out after the ones before it. The first message that cannot be
 // submitted goes back to the prompt box together with every one behind it, so nothing is dropped and
-// none overtakes it. A slash line (only ever the head, from the person's dialog) is filled as the
+// none overtakes it. The person's @-mention prompt goes back in the box and the rest still go.
+// A slash line (only ever the head, from the person's dialog) is filled as the
 // draft when the box is empty (otherwise logged), the rest still go, and a later failure is logged
 // rather than filled over that draft. A resend the host holds past the deadline is left to the host,
 // and the rest go back to the prompt box; if the host later refuses it, it goes back there too.
@@ -628,11 +634,17 @@ async function drain($, epoch = chatEpoch) {
       if (sent) continue
       // the chat changed while that resend was refused: it goes back ahead of the rest, in arrival order
       if (epoch !== chatEpoch) return handBack($, [msg], epoch)
+      if (msg.mention) {
+        // the person's @ prompt: back in the box after whatever they typed, and the rest still go
+        const ok = await putBack($, [msg])
+        $.ui.toast(ok ? 'Compacted. Your message is back in the prompt box (a resend would not attach its @ files): press Enter to send it.' : 'Compacted, but your message could not be put back (logged if ~/.claude-shared/state exists).', { timeoutMs: 15000 })
+        continue
+      }
       if (msg.slash) {
         // never over the person's draft: a slash line after text would be a broken command, so it is logged instead
         // read and fill inside the box lock, so a put-back from elsewhere cannot land between them
         let typed = ''
-        draft = await boxSerial($, async () => ((typed = (await boxText($)).trim()) ? false : fillBox($, msg.text)))
+        draft = await boxSerial($, async () => ((typed = (await boxText($)).trim()) ? false : fillBox($, msg.text, 'append')))
         if (!draft) lose(msg)
         else coldLog($, { action: 'put-back', text: msg.text, sid: msg.sid })
         $.ui.toast(draft ? 'Compacted. Your message is back in the prompt box: press Enter to send it.' : typed ? `Compacted. ${clip(msg.text, 80)} was not put back over what you typed (logged if ~/.claude-shared/state exists).` : 'Compacted, but the message could not be sent again: ' + clip(msg.text, 80), { timeoutMs: 15000 })
@@ -666,7 +678,7 @@ async function drain($, epoch = chatEpoch) {
 // true once the message is submitted; false when it was refused or could not be (the caller puts it back)
 async function resend($, msg, epoch = chatEpoch) {
   // A plugin can't submit a "/" line: it goes back in the prompt box
-  if (msg.slash) return false
+  if (msg.slash || msg.mention) return false
   const send = { text: msg.text, ...(msg.attachments ? { attachments: msg.attachments } : {}) }
   for (const asUser of msg.modes) {
     // the chat changed while an earlier attempt was out: never try the old chat's message in the new one
@@ -1237,6 +1249,8 @@ export function register(on, options = {}) {
     compactTriedAt = 0 // nor does its failed or refused compact hold back this one's
     refusedAt = 0
     S.coldRestarts = [] // the new chat's own, from its record below
+    // the new chat's id before anything awaits, so a late compaction report for the old one is told apart
+    if (e.session_id) S.id = e.session_id
     const was = chatEpoch++
     // what waited on the last chat's compaction was meant for that chat: back to the box, never into this one
     // an empty queue mid-drain is closed too, or the next chat's messages would wait on a drain that has stopped
@@ -1318,7 +1332,7 @@ export function register(on, options = {}) {
       // not awaited: the queue could drain during the write, and this message would start a second compact
       coldLog($, { origin: kind, action: 'queued-behind-compact', text: e.text })
       // a rotator wake keeps its unattended fallback: nobody is at the prompt after a rotation
-      return compactThenSend($, e, (!fromUser && !asPerson) || wake, maybePerson || asPerson ? '' : kind)
+      return compactThenSend($, e, (!fromUser && !asPerson) || wake || (!!e.origin && e.origin.kind === 'slack-ping'), maybePerson || asPerson ? '' : kind)
     }
     if (!settings.guard || !isCold || local || justCompacted || S.ctx < settings.bigTokens || e.turnId) {
       // Why a big (or unmeasured) prompt went through unasked: the evidence for a cold send nobody was asked about
@@ -1336,7 +1350,7 @@ export function register(on, options = {}) {
       const kind = sender(e)
       const skip = ownPrompt($, e) ? 'plugin' : e.isMeta ? 'meta' : e.command ? 'slash' : media ? 'media' : !worthCompacting() ? 'floor' : compacting() ? 'running' : now - compactTriedAt < 2 * MIN ? 'just-tried' : ''
       coldLog($, { origin: kind, coldMin: Math.round((rotated ? now - S.seatChangedAt : reopened ? now - S.lastActivity : -left) / MIN), ...(reopened ? { reopened: true } : {}), action: skip ? 'skip-' + skip : 'compact-first', ...(skip ? {} : { text: e.text }) })
-      return skip ? next(e) : asPerson ? compactThenSend($, e, false, '', true) : compactThenSend($, e, true, kind)
+      return skip ? next(e) : asPerson ? compactThenSend($, e, e.origin.kind === 'slack-ping', '', true) : compactThenSend($, e, true, kind)
     }
     // a compaction just ran or is running: asking again would only queue behind it, or compact twice
     if (pending || compacting()) {
@@ -1364,8 +1378,10 @@ export function register(on, options = {}) {
     // the dialog waited on the person: a compaction may have run or started meanwhile
     if (answer === 'Compact first, then send') {
       // one started meanwhile and is still queueing: wait behind it, in order, rather than overtake it
-      if (pending && !e.command) return compactThenSend($, e, false)
-      return compactRuns !== runs || compacting() || justCompacted || pending ? next(e) : compactThenSend($, e, false)
+      // the person's @-mention prompt is put back after compacting: a plugin's resend would not attach the file
+      const at = /(^|\s)@\S/.test(String(e.text || ''))
+      if (pending && !e.command) return compactThenSend($, e, false, '', false, at)
+      return compactRuns !== runs || compacting() || justCompacted || pending ? next(e) : compactThenSend($, e, false, '', false, at)
     }
     if (answer === 'Send anyway') return next(e)
     $.ui.toast('Not sent. A fresh session with a short handoff avoids the rewrite entirely.', { timeoutMs: 8000 })

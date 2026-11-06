@@ -1453,3 +1453,24 @@ test('a long message that could not be resent or put back is kept whole in a los
     refuseFill = false
   }
 })
+
+// Opus 2026-11-05 r3: an @ prompt put back after compacting goes after the draft, never lost because the box has text
+test('"Compact first" on an @ prompt with a draft in the box appends it after the draft', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, 'Compact first, then send')
+  boxDraft = 'typed meanwhile'
+  try {
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+    await $.prompt.submit({ text: 'look at @src/x.ts', origin: COMPOSER, wait: false } as never)
+    await clock.advance(100)
+    await settle(clock, () => seen.fills.length >= 1)
+    expect(seen.fills).toEqual([{ text: '\n\nlook at @src/x.ts', mode: 'append' }])
+    expect(seen.log).not.toContain('not-resent')
+  } finally {
+    boxDraft = ''
+  }
+})
