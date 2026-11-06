@@ -397,6 +397,8 @@ function compactThenSend($, e, unattended, from = '', logged = false, mention = 
   const modes = from ? [false] : unattended ? [true, false] : [true]
   const msg = { text: from ? `[${from} message, resent by cache-keeper]\n${e.text}` : e.text, attachments: e.attachments, slash: !!e.command, mention, unattended, logged: logged || unattended, modes, sid: S.id }
   const drop = { drop: 'cache-keeper: compacting first on a cold cache; the message is sent again once that finishes' }
+  // Claude Code tracks its own timed continue and, dropped, reports that it did not run: say that it still will
+  if (e.isMeta && e.origin && e.origin.kind === 'auto-continuation') $.ui.toast("Claude Code may say its automatic continue did not run: cache-keeper is compacting this cold chat first and sends the continue after it.", { timeoutMs: 15000 })
   // a compaction is already under way: this message waits behind the ones before it
   // every message that joins a queue is logged with its text: it has been dropped, so a reload would leave no other copy
   if (pending) return coldLog($, { origin: sender(e), action: 'queued-behind-compact', text: e.text, sid: S.id }), pending.push(msg), drop
@@ -1372,8 +1374,9 @@ export function register(on, options = {}) {
     // no origin, or one the host could not classify, may be the person at the prompt: it gets the dialog, never the silent compact
     // (an engine notice, never the person, is a prompt queued isMeta with no stamp or an unclassified one: an idle notice or a
     // delivery receipt. Another session's message is queued isMeta too, but stamped peer, so it is a sender like any other.
-    // An auto-continuation a click queues (leaving plan mode, an approved goal) may have the person there; one queued isMeta
-    // is the engine's own, chiefly its timed resume once a usage limit resets, with nobody at the prompt: it compacts first)
+    // An auto-continuation that is not isMeta follows a click (leaving plan mode, an approved goal): maybe the person. One queued
+    // isMeta is the engine's continue after a usage limit: its timed resume, with nobody at the prompt, or the continue after
+    // the person accepts a limit offer. The flag cannot tell them apart, so both compact first, with no dialog to wait on)
     // and an sdk prompt outside the desktop app with no surface is a plain -p run: its prompt is the person's, and
     // dropping it could end the run. The app's own sdk turns still compact first, whether or not it has attached yet.
     const headless = !!e.origin && e.origin.kind === 'sdk' && entry !== 'claude-desktop' && !(await $.session.surfaces().catch(() => [])).length

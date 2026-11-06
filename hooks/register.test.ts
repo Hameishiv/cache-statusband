@@ -1106,6 +1106,8 @@ test("the engine's own resume after a usage limit (isMeta auto-continuation) com
   expect('drop' in (r as object)).toBe(true)
   expect(seen.asks).toBe(0)
   expect(seen.order).toEqual(['compact', 'send:[auto-continuation message, resent by cache-keeper]\nYour claude.ai usage limit has reset. Continue the task you were working on.'])
+  // Claude Code reports its dropped continue as not run: the toast says it still will
+  expect(seen.toasts.some((t) => /automatic continue did not run/.test(t))).toBe(true)
 })
 
 // A compaction that never settles must not hold the queue forever
