@@ -437,7 +437,11 @@ function coldLog($, fields) {
         old = await $.fs.read(path)
         if (typeof old !== 'string') return // unreadable: lose this line rather than the file
         // too big: drop the oldest lines, cutting at a line boundary
-        if (old.length > LOG_MAX) old = old.slice(old.indexOf('\n', old.length - LOG_KEEP) + 1)
+        // (no line boundary in the kept window: cut at the window, or one huge line would stop the trim)
+        if (old.length > LOG_MAX) {
+          const cut = old.indexOf('\n', old.length - LOG_KEEP)
+          old = cut < 0 ? old.slice(old.length - LOG_KEEP) : old.slice(cut + 1)
+        }
       }
       await $.fs.write(path, `${old}${line}`)
     } catch {
@@ -529,7 +533,11 @@ async function boxText($) {
 async function putBack($, back) {
   const box = await boxText($)
   const sep = !box || /\n\s*\n\s*$/.test(box) ? '' : /\n\s*$/.test(box) ? '\n' : '\n\n'
-  if (await fillBox($, sep + back.map((m) => m.text).join('\n\n'), 'append')) return true
+  if (await fillBox($, sep + back.map((m) => m.text).join('\n\n'), 'append')) {
+    // parked in the box, not sent: the log says so, or it would read as resent
+    back.forEach((m) => coldLog($, { action: 'put-back', text: m.text }))
+    return true
+  }
   back.forEach((m) => coldLog($, { action: 'not-resent', text: m.text }))
   return false
 }
@@ -569,10 +577,14 @@ async function drain($, epoch = chatEpoch) {
         // the host still holds this one, so it is the host's to deliver: putting it back now could send it twice
         coldLog($, { action: 'resend-held', text: msg.text })
         // a later refusal means it was never sent: then it goes back to the prompt box, not lost
+        // (after a /clear, /resume or /fork it goes back marked as meant for the previous chat)
+        const behind = (pending || []).length
         attempt.then(async (ok) => {
           if (ok) return
+          if (epoch !== chatEpoch) return handBack($, [msg], epoch)
           const back = await putBack($, [msg])
-          $.ui.toast(back ? 'A held message was refused by Claude Code: it is back in the prompt box.' : 'A held message was refused by Claude Code and could not be put back (logged if ~/.claude-shared/state exists).', { timeoutMs: 15000 })
+          // it lands after the ones that were behind it, which went back at the deadline: say so
+          $.ui.toast(back ? `A held message was refused by Claude Code: it is back in the prompt box${behind ? `, after the ${behind} that followed it` : ''}.` : 'A held message was refused by Claude Code and could not be put back (logged if ~/.claude-shared/state exists).', { timeoutMs: 15000 })
         })
         if (epoch !== chatEpoch) return handBack($, [], epoch)
         const back = [...(pending || [])]
@@ -590,6 +602,7 @@ async function drain($, epoch = chatEpoch) {
         const typed = (await boxText($)).trim()
         draft = !typed && (await fillBox($, msg.text))
         if (!draft) lose(msg)
+        else coldLog($, { action: 'put-back', text: msg.text })
         $.ui.toast(draft ? 'Compacted. Your message is back in the prompt box: press Enter to send it.' : typed ? `Compacted. ${clip(msg.text, 80)} was not put back over what you typed (logged if ~/.claude-shared/state exists).` : 'Compacted, but the message could not be sent again: ' + clip(msg.text, 80), { timeoutMs: 15000 })
       } else if (draft) lose(msg)
       else {

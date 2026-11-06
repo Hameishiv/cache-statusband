@@ -1334,3 +1334,69 @@ test('a rotator wake queued behind a running compaction still falls back to the 
     failAsUser = null
   }
 })
+
+// Fable 2026-11-05 r2: a message parked in the prompt box is logged as put back, not left to read as resent
+test('a message put back in the prompt box is logged as put back', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, null)
+  dropSubmit = /first/
+  try {
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+    await $.prompt.submit({ text: 'first', origin: PEER, wait: false } as never)
+    await clock.advance(100)
+    await settle(clock, () => seen.log.includes('"put-back"'))
+    expect(seen.fills.length).toBe(1)
+    expect(seen.log).toContain('"put-back"')
+  } finally {
+    dropSubmit = null
+  }
+})
+
+// Fable 2026-11-05 r2: one line longer than the kept window must not stop the trim
+test('the cold-compact log is trimmed even when its newest part has no line break', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, null)
+  seen.log = 'z'.repeat(1200 * 1024)
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+  await clock.advance(77 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+  await $.prompt.submit({ text: 'PR 12 merged', origin: PEER, wait: false } as never)
+  await clock.advance(100)
+  await settle(clock, () => seen.log.includes('compact-first'))
+  expect(seen.log).toContain('compact-first')
+  expect(seen.log.startsWith('z')).toBe(true)
+  expect(seen.log.length).toBeLessThan(600 * 1024)
+})
+
+// Fable 2026-11-05 r2: a held resend refused after /clear goes back marked as meant for the previous chat
+test('a held resend refused after /clear is put back as meant for the previous chat', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, null)
+  on('classic.SessionStart', () => ({}))
+  holdSubmit = /first/
+  try {
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+    await $.prompt.submit({ text: 'first', origin: PEER, wait: false } as never)
+    await clock.advance(100)
+    await clock.advance(11 * 60000)
+    await settle(clock, () => seen.log.includes('resend-held'))
+    await ($ as any).classic.SessionStart({ source: 'clear', transcript_path: '' })
+    heldResolve!({ drop: 'refused' })
+    await settle(clock, () => seen.fills.length >= 1)
+    expect(seen.fills[0].text).toContain('first')
+    expect(seen.toasts.some((t) => t.includes('meant for the previous chat'))).toBe(true)
+  } finally {
+    holdSubmit = null
+    heldResolve = null
+  }
+})
