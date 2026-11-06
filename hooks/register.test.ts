@@ -493,6 +493,7 @@ async function settle(clock: any, done: () => boolean) {
 }
 
 // Owner 2026-11-02: a cold, big, idle chat woken by another session compacts BEFORE the message is processed
+// (the engine queues another session's message isMeta: the fixture carries it, as the real one does)
 const PEER = { kind: 'peer' } as never
 async function coldPeer($: any, on: any, idleMin: number, ctx = 300000, origin: unknown = PEER) {
   const kept = new Map<string, unknown>()
@@ -502,7 +503,7 @@ async function coldPeer($: any, on: any, idleMin: number, ctx = 300000, origin: 
   kept.set('last:sid-test', { ctx, at: await clock.now(), model: 'claude-opus-5-5' })
   await clock.advance(idleMin * 60000)
   await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
-  const r = await $.prompt.submit({ text: 'PR 12 merged; pick up the next one', origin, wait: false } as never)
+  const r = await $.prompt.submit({ text: 'PR 12 merged; pick up the next one', origin, ...(origin === PEER ? { isMeta: true } : {}), wait: false } as never)
   await clock.advance(100)
   await settle(clock, () => seen.submits.length + seen.fills.length >= 1)
   return { r, seen }
@@ -538,14 +539,16 @@ test('a message that arrives while the cold compact runs goes after the first on
   kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
   await clock.advance(77 * 60000)
   await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
-  const a = await $.prompt.submit({ text: 'first', origin: PEER, wait: false } as never)
-  const b = await $.prompt.submit({ text: 'second', origin: { kind: 'task-notification' } as never, wait: false } as never)
+  const a = await $.prompt.submit({ text: 'first', origin: PEER, isMeta: true, wait: false } as never)
+  const b = await $.prompt.submit({ text: 'second', origin: PEER, isMeta: true, wait: false } as never)
+  const c = await $.prompt.submit({ text: 'third', origin: { kind: 'task-notification' } as never, wait: false } as never)
   await clock.advance(100)
-  await settle(clock, () => seen.submits.length >= 2)
+  await settle(clock, () => seen.submits.length >= 3)
   expect('drop' in (a as object)).toBe(true)
   expect('drop' in (b as object)).toBe(true)
+  expect('drop' in (c as object)).toBe(true)
   expect(seen.compacts).toBe(1)
-  expect(seen.order).toEqual(['compact', 'send:[peer message, resent by cache-keeper]\nfirst', 'send:[task-notification message, resent by cache-keeper]\nsecond'])
+  expect(seen.order).toEqual(['compact', 'send:[peer message, resent by cache-keeper]\nfirst', 'send:[peer message, resent by cache-keeper]\nsecond', 'send:[task-notification message, resent by cache-keeper]\nthird'])
 })
 
 // Pre-push review round 2: a resend that cannot be submitted stops the rest, so none overtakes or overwrites it
@@ -1085,6 +1088,21 @@ test('an unclassified engine notice (isMeta) goes through as is, unasked', async
   expect(seen.compacts).toBe(0)
   expect('drop' in (r as object)).toBe(false)
   expect(seen.log).toContain('skip-meta')
+})
+
+// Final review 2026-11-06: auto-continuation follows the person's own click, so it is asked even when queued isMeta
+test('an auto-continuation the engine marks isMeta still gets the dialog, not a silent pass', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, 'Send anyway')
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+  await clock.advance(77 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+  await $.prompt.submit({ text: 'continue', origin: { kind: 'auto-continuation' }, isMeta: true, wait: false } as never)
+  await clock.advance(100)
+  expect(seen.asks).toBe(1)
+  expect(seen.log).not.toContain('skip-meta')
 })
 
 // A compaction that never settles must not hold the queue forever

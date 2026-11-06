@@ -677,9 +677,8 @@ async function drainQueue($, epoch, tally) {
         continue
       }
       if (msg.mention) {
-        // the person's @ prompt: back in the box after whatever they typed, and the rest still go.
-        // The chat changed first: it goes back marked as meant for the previous chat
-        if (epoch !== chatEpoch) return handBack($, [msg], epoch)
+        // the person's @ prompt: back in the box after whatever they typed, and the rest still go
+        // (a chat change before this point already handed it back, above)
         const ok = await putBack($, [msg])
         $.ui.toast(ok && epoch !== chatEpoch ? 'Your message, meant for the previous chat, is in the prompt box: send it only if it still applies.' : ok ? 'Your message is back in the prompt box (a resend would not attach its @ files): press Enter to send it.' : 'Your message could not be put back (logged if ~/.claude-shared/state exists).', { timeoutMs: 15000 })
         continue
@@ -1371,11 +1370,14 @@ export function register(on, options = {}) {
     if (!S.pr) S.pr = findPr(e.command ? `/${e.command.name} ${e.command.args}` : e.text)
     const fromUser = e.origin && (e.origin.kind === 'composer' || e.origin.kind === 'bridge')
     // no origin, or one the host could not classify, may be the person at the prompt: it gets the dialog, never the silent compact
-    // (an isMeta prompt is an engine notice, never the person; auto-continuation follows the person's own click)
+    // (an engine notice, never the person, is a prompt queued isMeta with no stamp or an unclassified one: an idle notice or a
+    // delivery receipt. Another session's message is queued isMeta too, but stamped peer, so it is a sender like any other.
+    // auto-continuation follows the person's own click)
     // and an sdk prompt outside the desktop app with no surface is a plain -p run: its prompt is the person's, and
     // dropping it could end the run. The app's own sdk turns still compact first, whether or not it has attached yet.
     const headless = !!e.origin && e.origin.kind === 'sdk' && entry !== 'claude-desktop' && !(await $.session.surfaces().catch(() => [])).length
-    const maybePerson = !e.isMeta && (!e.origin || fromUser || headless || e.origin.kind === 'unclassified' || e.origin.kind === 'auto-continuation')
+    const notice = !!e.isMeta && (!e.origin || e.origin.kind === 'unclassified')
+    const maybePerson = !notice && (!e.origin || fromUser || headless || e.origin.kind === 'unclassified' || e.origin.kind === 'auto-continuation')
     const wake = fromUser && !!cfg.rotatorWake && cfg.rotatorWake.test(String(e.text || ''))
     // another plugin submitting the person's own words (asUser): still compacted first, but resent as the person's, never framed as the plugin's
     // (likewise the session's owner pinging it from Slack: not at the prompt, but the person's own words)
@@ -1395,7 +1397,7 @@ export function register(on, options = {}) {
     // A compaction is under way: anything else waits behind it and goes after, in order, with no dialog
     // the person's own prompt waits only while /compact runs: a resend the host holds must never swallow it
     // not an engine notice (a resend would lose isMeta), nor the person's @-mention (a plugin's resend leaves it unexpanded)
-    if (pending && !(draining && maybePerson) && !headless && !e.isMeta && !(maybePerson && /(^|\s)@\S/.test(String(e.text || ''))) && !ownPrompt($, e) && !local && !e.turnId && !e.command && !(Array.isArray(e.attachments) && e.attachments.length)) {
+    if (pending && !(draining && maybePerson) && !headless && !notice && !(maybePerson && /(^|\s)@\S/.test(String(e.text || ''))) && !ownPrompt($, e) && !local && !e.turnId && !e.command && !(Array.isArray(e.attachments) && e.attachments.length)) {
       const kind = sender(e)
       // a rotator wake keeps its unattended fallback: nobody is at the prompt after a rotation
       return compactThenSend($, e, (!fromUser && !asPerson) || wake || (!!e.origin && e.origin.kind === 'slack-ping'), maybePerson || asPerson ? '' : kind)
@@ -1414,7 +1416,7 @@ export function register(on, options = {}) {
     // timer can come back through this hook), not a slash command (a plugin can't resubmit one), not an attachment.
     if (!maybePerson) {
       const kind = sender(e)
-      const skip = ownPrompt($, e) ? 'plugin' : e.isMeta ? 'meta' : e.command ? 'slash' : media ? 'media' : !worthCompacting() ? 'floor' : compacting() ? 'running' : now - compactTriedAt < 2 * MIN ? 'just-tried' : ''
+      const skip = ownPrompt($, e) ? 'plugin' : notice ? 'meta' : e.command ? 'slash' : media ? 'media' : !worthCompacting() ? 'floor' : compacting() ? 'running' : now - compactTriedAt < 2 * MIN ? 'just-tried' : ''
       coldLog($, { origin: kind, coldMin: Math.round((rotated ? now - S.seatChangedAt : reopened ? now - Math.min(S.reopenedAt || now, S.lastActivity + ttl * MIN) : -left) / MIN), ...(reopened ? { reopened: true } : {}), action: skip ? 'skip-' + skip : 'compact-first', ...(skip ? {} : { text: e.text }) })
       return skip ? next(e) : asPerson ? compactThenSend($, e, e.origin.kind === 'slack-ping', '', true) : compactThenSend($, e, true, kind)
     }
