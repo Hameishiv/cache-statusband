@@ -390,7 +390,7 @@ async function resumeStep($) {
 function compactThenSend($, e, unattended, from = '', logged = false) {
   // the ways to submit it, in order: `true` is asUser, `false` omits it
   const modes = from ? [false] : unattended ? [true, false] : [true]
-  const msg = { text: from ? `[${from} message, resent by cache-keeper after /compact]\n${e.text}` : e.text, attachments: e.attachments, slash: !!e.command, unattended, logged: logged || unattended, modes, sid: S.id }
+  const msg = { text: from ? `[${from} message, resent by cache-keeper after /compact]\n${e.text}` : e.text, attachments: e.attachments, slash: !!e.command || (!from && /(^|\s)@\S/.test(String(e.text || ''))), unattended, logged: logged || unattended, modes, sid: S.id }
   const drop = { drop: 'cache-keeper: compacting first on a cold cache; the message is sent again once that finishes' }
   // a compaction is already under way: this message waits behind the ones before it
   if (pending) return pending.push(msg), drop
@@ -428,6 +428,7 @@ const LOG_MAX = 1024 * 1024
 // LOG_TEXT bounds one line's message text far below LOG_KEEP, so a trim can never take a whole log with one line;
 // `fields.sid` files a line under the chat a queued message belonged to, not the one current when it was logged
 const LOG_TEXT = 64 * 1024
+let lostSeq = 0 // two lost messages in the same millisecond still get files of their own
 function coldLog($, fields) {
   const text = typeof fields.text === 'string' && fields.text.length > LOG_TEXT ? { text: fields.text.slice(0, LOG_TEXT), textLen: fields.text.length } : {}
   const sid = fields.sid || S.id
@@ -449,6 +450,12 @@ function coldLog($, fields) {
         }
       }
       await $.fs.write(path, `${old}${line}`)
+      // a message neither resent nor put back has the log as its only copy: when its line was clipped,
+      // the whole text goes to a file of its own, which is never trimmed
+      if (fields.action === 'not-resent' && text.textLen) {
+        const lost = `${home.replace(/\\/g, '/')}/.claude-shared/state/cache-keeper-lost-${sid || 'unknown'}-${now}-${++lostSeq}.txt`
+        await $.fs.write(lost, fields.text)
+      }
     } catch {
       // logging never blocks a send
     }
@@ -493,22 +500,22 @@ async function runCompactThenSend($) {
       // stop waiting: the queue goes as typed
       late = true
       compactTriedAt = now
-      await coldLog($, { action: 'compact-timeout', before })
+      coldLog($, { action: 'compact-timeout', before }) // not awaited: a stalled log write must never hold the queue
       $.ui.toast('Compacting took over 10 minutes, so the message goes as typed.', { timeoutMs: 8000 })
     } else if (refused(r)) {
       // the context did not shrink: no retry until it has grown 100k more, and the log says so
       compactTriedAt = now
       refusedAt = S.ctx
-      if (unattended) await coldLog($, { action: 'compact-skipped', before, reason: clip(String(r.text), 160) })
+      if (unattended) coldLog($, { action: 'compact-skipped', before, reason: clip(String(r.text), 160) })
       $.ui.toast('Not compacted (' + clip(String(r.text), 80) + '), so the message goes as typed.', { timeoutMs: 8000 })
     } else {
       markCompacted()
-      if (unattended) await coldLog($, { action: 'compacted', before })
+      if (unattended) coldLog($, { action: 'compacted', before })
     }
   } catch (err) {
     if (epoch !== chatEpoch) return
     compactTriedAt = now
-    if (unattended) await coldLog($, { action: 'compact-failed', error: String((err && err.message) || err) })
+    if (unattended) coldLog($, { action: 'compact-failed', error: String((err && err.message) || err) })
     $.ui.toast('Could not compact (' + clip(String((err && err.message) || err), 80) + '), so the message goes as typed.', { timeoutMs: 8000 })
   }
   // what waited during the compaction goes now, in order; anything arriving meanwhile joins the queue
@@ -534,13 +541,24 @@ async function boxText($) {
 }
 
 // Messages that cannot be sent go back to the prompt box after whatever the person has typed, a blank
-// line between, so neither runs into the other; if the box will not take them, each is logged in full.
+// line between, so neither runs into the other; if the box will not take them, each is logged
+// (a long one in full in a file of its own: coldLog).
 // one at a time: two callers reading the box before either fills it would compute stale separators
 let boxChain = Promise.resolve()
-function putBack($, back) {
-  const p = boxChain.then(() => putBackNow($, back))
+// a fill or read that never settles must not hold every later put-back: past the limit it counts as refused
+const BOX_LIMIT = 30 * 1000
+function boxSerial($, job) {
+  const p = boxChain.then(() => Promise.race([job(), new Promise((res) => $.clock.after(BOX_LIMIT, () => res(false)))]))
   boxChain = p.catch(() => {})
   return p
+}
+function putBack($, back) {
+  return boxSerial($, () => putBackNow($, back)).then(async (ok) => {
+    if (ok) return true
+    // refused or timed out: nothing went in, so the log holds the only copy
+    back.forEach((m) => coldLog($, { action: 'not-resent', text: m.text, sid: m.sid }))
+    return false
+  })
 }
 async function putBackNow($, back) {
   const box = await boxText($)
@@ -550,7 +568,6 @@ async function putBackNow($, back) {
     back.forEach((m) => coldLog($, { action: 'put-back', text: m.text, sid: m.sid }))
     return true
   }
-  back.forEach((m) => coldLog($, { action: 'not-resent', text: m.text, sid: m.sid }))
   return false
 }
 
@@ -613,10 +630,11 @@ async function drain($, epoch = chatEpoch) {
       if (epoch !== chatEpoch) return handBack($, [msg], epoch)
       if (msg.slash) {
         // never over the person's draft: a slash line after text would be a broken command, so it is logged instead
-        const typed = (await boxText($)).trim()
-        draft = !typed && (await fillBox($, msg.text))
+        // read and fill inside the box lock, so a put-back from elsewhere cannot land between them
+        let typed = ''
+        draft = await boxSerial($, async () => ((typed = (await boxText($)).trim()) ? false : fillBox($, msg.text)))
         if (!draft) lose(msg)
-        else coldLog($, { action: 'put-back', text: msg.text })
+        else coldLog($, { action: 'put-back', text: msg.text, sid: msg.sid })
         $.ui.toast(draft ? 'Compacted. Your message is back in the prompt box: press Enter to send it.' : typed ? `Compacted. ${clip(msg.text, 80)} was not put back over what you typed (logged if ~/.claude-shared/state exists).` : 'Compacted, but the message could not be sent again: ' + clip(msg.text, 80), { timeoutMs: 15000 })
       } else if (draft) lose(msg)
       else {
@@ -1278,7 +1296,8 @@ export function register(on, options = {}) {
     const maybePerson = !e.isMeta && (!e.origin || fromUser || headless || e.origin.kind === 'unclassified' || e.origin.kind === 'auto-continuation')
     const wake = fromUser && !!cfg.rotatorWake && cfg.rotatorWake.test(String(e.text || ''))
     // another plugin submitting the person's own words (asUser): still compacted first, but resent as the person's, never framed as the plugin's
-    const asPerson = !!e.origin && e.origin.kind === 'plugin' && e.origin.asUser === true
+    // (likewise the session's owner pinging it from Slack: not at the prompt, but the person's own words)
+    const asPerson = !!e.origin && ((e.origin.kind === 'plugin' && e.origin.asUser === true) || e.origin.kind === 'slack-ping')
     if (wake) {
       // The wake-up is the rotation reaching this session: take the new seat now
       await readSeat($, true)
@@ -1450,12 +1469,14 @@ export function register(on, options = {}) {
     if (!e.agentId && e.trigger !== 'precompute' && !(r && r.skip)) markCompacted()
     return r
   })
+  // a compaction reported for another session (one that settled after /clear or /resume) is not this chat's
+  const thisChat = (e) => !e.session_id || !S.id || e.session_id === S.id
   on('classic.PostCompact', async ($, e, next) => {
-    markCompacted()
+    if (thisChat(e)) markCompacted()
     return next(e)
   })
   on('classic.SessionStart', { source: ['compact'] }, async ($, e, next) => {
-    markCompacted()
+    if (thisChat(e)) markCompacted()
     return next(e)
   })
   on('command.run', { command: ['compact'] }, async ($, e, next) => {

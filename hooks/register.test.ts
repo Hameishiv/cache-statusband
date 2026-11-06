@@ -20,7 +20,7 @@ function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unkno
     on('store.keys', () => ({ value: [...kept.keys()] }))
   } else mock.store(on)
   mock.env(on, { USERPROFILE: 'C:/Users/T', ...(desktopEntry ? { CLAUDE_CODE_ENTRYPOINT: 'claude-desktop' } : {}) })
-  const seen = { compacts: 0, submits: [] as string[], asUsers: [] as unknown[], fills: [] as { text: string; mode?: string }[], asks: 0, toasts: [] as string[], order: [] as string[], attempts: [] as string[], log: '', logPath: '' }
+  const seen = { compacts: 0, submits: [] as string[], asUsers: [] as unknown[], fills: [] as { text: string; mode?: string }[], asks: 0, toasts: [] as string[], order: [] as string[], attempts: [] as string[], log: '', logPath: '', lost: [] as { path: string; len: number }[] }
   on('session.id', () => ({ value: 'sid-test' }))
   on('session.cwd', () => ({ value: '/repo' }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
@@ -51,12 +51,12 @@ function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unkno
     if (e.origin?.kind === 'plugin' && duringSubmit) await duringSubmit(e)
     return { text: e.text }
   })
-  on('prompt.fill', (_: unknown, e: any) => (seen.fills.push({ text: e.text, mode: e.mode }), { isFilled: true }))
+  on('prompt.fill', (_: unknown, e: any) => (refuseFill ? { isFilled: false } : (seen.fills.push({ text: e.text, mode: e.mode }), { isFilled: true })))
   on('prompt.read', () => ({ value: { text: boxDraft, cursor: boxDraft.length } }))
   on('session.start', (_: unknown, e: any) => ({ cwd: e.cwd }))
   on('session.measure', () => ({ changed: [] }))
   on('ui.toast', (_: unknown, e: unknown) => (seen.toasts.push(JSON.stringify(e)), { value: undefined }))
-  on('fs.write', (_: unknown, e: any) => ((seen.log = String(e.text)), (seen.logPath = String(e.path)), { value: undefined }))
+  on('fs.write', (_: unknown, e: any) => (String(e.path).includes('cache-keeper-lost-') ? seen.lost.push({ path: String(e.path), len: String(e.text).length }) : ((seen.log = String(e.text)), (seen.logPath = String(e.path))), { value: undefined }))
   return { clock, seen }
 }
 
@@ -67,6 +67,8 @@ let failSubmit: RegExp | null = null
 let dropSubmit: RegExp | null = null
 // a plugin resend whose text matches this never settles, as a host holding it would
 let holdSubmit: RegExp | null = null
+// the prompt box refuses every fill, as under a dialog
+let refuseFill = false
 let heldResolve: ((v: unknown) => void) | null = null
 // a plugin resend sent asUser whose text matches this throws; without asUser it goes through
 let failAsUser: RegExp | null = null
@@ -1399,5 +1401,55 @@ test('a held resend refused after /clear is put back as meant for the previous c
   } finally {
     holdSubmit = null
     heldResolve = null
+  }
+})
+
+// Opus 2026-11-05 r2: the owner's Slack ping is the person's words: compacted first, resent as theirs
+test("the owner's Slack ping is compacted first and resent as the person's words", async ($, on) => {
+  const { r, seen } = await coldPeer($, on, 77, 300000, { kind: 'slack-ping' })
+  expect('drop' in (r as object)).toBe(true)
+  expect(seen.order).toEqual(['compact', 'send:PR 12 merged; pick up the next one'])
+  expect(seen.asUsers).toEqual([true])
+})
+
+// Opus 2026-11-05 r2: a resend would not attach an @-mentioned file, so after "Compact first" it goes back in the box
+test('"Compact first" on a prompt with an @ mention puts it back in the prompt box, not resent', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, 'Compact first, then send')
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+  await clock.advance(77 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  await $.prompt.submit({ text: 'look at @src/x.ts', origin: COMPOSER, wait: false } as never)
+  await clock.advance(100)
+  await settle(clock, () => seen.fills.length >= 1)
+  expect(seen.compacts).toBe(1)
+  expect(seen.submits).toEqual([])
+  expect(seen.fills[0].text).toBe('look at @src/x.ts')
+})
+
+// Opus 2026-11-05 r2: a long message that is neither resent nor put back keeps its whole text in a file of its own
+test('a long message that could not be resent or put back is kept whole in a lost file', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, null)
+  refuseFill = true
+  dropSubmit = /HUGE/
+  const big = 'HUGE' + 'h'.repeat(100 * 1024)
+  try {
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+    await $.prompt.submit({ text: big, origin: PEER, wait: false } as never)
+    await clock.advance(100)
+    await settle(clock, () => seen.lost.length >= 1)
+    expect(seen.lost.length).toBe(1)
+    expect(seen.lost[0].len).toBeGreaterThan(100 * 1024)
+    expect(seen.log).toContain('"textLen"')
+  } finally {
+    dropSubmit = null
+    refuseFill = false
   }
 })
