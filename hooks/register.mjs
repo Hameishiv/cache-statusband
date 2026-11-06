@@ -436,7 +436,8 @@ const LOG_KEEP = 256 * 1024
 const LOG_MAX = 512 * 1024
 // LOG_TEXT bounds one line's message text far below LOG_KEEP, so a trim can never take a whole log with one line;
 // `fields.sid` files a line under the chat a queued message belonged to, not the one current when it was logged
-const LOG_TEXT = 64 * 1024
+// (an eighth of LOG_KEEP: JSON escaping can grow a text up to six times)
+const LOG_TEXT = 32 * 1024
 let lostSeq = 0 // two lost messages in the same millisecond still get files of their own
 function coldLog($, fields) {
   const text = typeof fields.text === 'string' && fields.text.length > LOG_TEXT ? { text: fields.text.slice(0, LOG_TEXT), textLen: fields.text.length } : {}
@@ -495,7 +496,7 @@ async function runCompactThenSend($) {
     }
     run.then(settled, settled)
     let late = false
-    // this mod's own /compact may or may not reach its own command.run hook; marking twice is harmless, so a compaction that ends after the deadline is marked here
+    // this mod's own /compact never reaches its own command.run hook (the host runs a command "through every hook but the calling one"): a compaction that ends after the deadline is marked here
     // a refusal after the deadline is recorded too, or the next cold wake would try the same size again
     run.then((r) => {
       if (!late || epoch !== chatEpoch) return
@@ -1018,11 +1019,13 @@ async function seedFromTranscript($, path) {
   S.ctx = found.ctx
   if (found.model && !S.model) S.model = found.model // the session's own model wins: it may have been switched
   if (found.effort) S.effort = found.effort
-  // a reload keeps what the process knew; a real reopen starts on a cold cache (set first: markCompacted reads it)
+  // a reload keeps what the process knew; a real reopen starts on a cold cache
   S.reopenedAt = liveHb ? liveHb.reopenedAt || 0 : await $.clock.now()
   if (found.compacted) {
-    // the next request writes the compacted context whatever happens: nothing to ask
+    // the next request writes the compacted context whatever happens: nothing to ask.
+    // A real reopen (no live heartbeat) writes it cold; markCompacted cannot tell, since lastActivity is 0 here
     S.floor = found.ctx
+    if (!liveHb) compactedCold = true
     markCompacted()
   } else {
     // the cache's real age: the band and the cold-send guard read it. A reload keeps what the process knew,

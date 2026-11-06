@@ -466,6 +466,27 @@ test('a cold send that Claude Code auto-compacts still counts as a cold rewrite,
   expect(rec.cold.length).toBe(1)
 })
 
+test('a reopened chat whose record ends in a compaction counts its first big write as a cold rewrite', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock } = engine($, on, { label: 'A' }, kept)
+  let next: unknown = null
+  on('turn.step', async function* () {
+    return { answer: '', toolUses: [], usage: next }
+  })
+  on('turn.complete', () => ({ text: '' }))
+  on('session.usage', () => ({ value: {} }))
+  // an `at` of 0 is the record written between a compaction and the next request
+  kept.set('last:sid-test', { ctx: 160000, at: 0, model: 'claude-opus-5-5' })
+  await clock.advance(31 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+  next = usage({ cache_creation_input_tokens: 160000, cache_creation: { ephemeral_1h_input_tokens: 160000, ephemeral_5m_input_tokens: 0 } })
+  const it = ($ as any).turn.step({ model: 'claude-opus-5-5', messages: [] })
+  if (it && typeof it[Symbol.asyncIterator] === 'function') for await (const _ of it) void _
+  else await it
+  const rec = kept.get('last:sid-test') as { cold: unknown[] }
+  expect(rec.cold.length).toBe(1)
+})
+
 // The resend runs through several host round trips after the timer fires: wait for it, a few ticks at a time
 async function settle(clock: any, done: () => boolean) {
   for (let i = 0; i < 100 && !done(); i++) await clock.advance(10)
