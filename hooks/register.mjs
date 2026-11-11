@@ -71,7 +71,7 @@ const alerted = new Map() // sessionId -> state or warning key already announced
 let paneOpen = false
 let justCompacted = false
 let compactedCold = false
-let compactRuns = 0 // cold compactions this mod has started: a dialog answered after one started must not start another
+let compactRuns = 0 // cold compactions this mod has started: only the latest run clears compactLive
 let compactLive = false // the latest is still running, waited on or not: past its deadline too, for as long again
 let manualLive = 0 // /compact runs the person (or another plugin) started, still under way (each for 20 minutes at most)
 const orphans = new Map() // chat epoch -> that chat's queue, held while its drain's resend is out, so it goes back in arrival order
@@ -1424,55 +1424,23 @@ export function register(on, options = {}) {
       coldLog($, { origin: kind, coldMin: Math.round((rotated ? now - S.seatChangedAt : reopened ? now - Math.min(S.reopenedAt || now, S.lastActivity + ttl * MIN) : -left) / MIN), ...(reopened ? { reopened: true } : {}), action: skip ? 'skip-' + skip : 'compact-first', ...(skip ? {} : { text: e.text }) })
       return skip ? next(e) : asPerson ? compactThenSend($, e, e.origin.kind === 'slack-ping', '', true) : compactThenSend($, e, true, kind)
     }
-    // a compaction just ran or is running: asking again would only queue behind it, or compact twice
+    // a compaction just ran or is running: compacting again would only queue behind it, or compact twice
     if (pending || compacting()) {
       coldLog($, { event: 'pass-during-compact', origin: sender(e) })
       return next(e)
     }
-    const runs = compactRuns
-    // the chat this prompt was typed in: a /clear, /resume or /fork while the dialog is up must not take it
-    const askedIn = chatEpoch
-    const askedSid = S.id
-    // the prompt goes back to the box marked as meant for the previous chat (a slash command is logged);
-    // an attachment cannot travel with it, so the person is told to attach it again
-    const handOld = () => {
-      // an image-only prompt has no text to put back: it is reported as not kept
-      if (String(e.text || '').trim()) handBack($, [{ text: e.text, slash: !!e.command, sid: askedSid }], -1).catch(() => {})
-      if (media) $.ui.toast('The attachment on that message was not kept: attach it again if you send it.', { timeoutMs: 15000 })
-      return { drop: 'cache-keeper: the chat changed while asking; see the note on what happened to the message' }
-    }
-    const cost = money(rewriteCost(S.ctx, S.model, ttl))
-    const why = rotated ? `The account rotated to ${S.seat || 'another seat'} ${minutes(now - S.seatChangedAt)} ago, so the cache is cold.` : reopened ? `This chat was reopened ${minutes((S.reopenedAt || now) - S.lastActivity)} after its last reply, and a reopened chat starts on a cold cache.` : `Cache went cold ${minutes(-left)} ago.`
-    const floor = S.floor ? ` Compacting last left ${tokens(S.floor)}.` : ''
-    let answer = 'Send anyway'
-    try {
-      answer = await $.ui.ask(
-        `${why} Sending now rewrites ${tokens(S.ctx)} tokens of context (about ${cost}).${floor}${media ? ' (Compacting first would drop the attachment: run /compact yourself, then send again.)' : ''} What should happen?`,
-        // Owner 2026-11-03: compacting is the default, so it goes first (the dialog preselects it)
-        media ? ['Send anyway', 'Cancel'] : ['Compact first, then send', 'Send anyway', 'Cancel'],
-      )
-    } catch (err) {
-      // nobody to ask (a -p run, or the dialog was dismissed): send as typed
-      coldLog($, { event: 'ask-failed', origin: (e.origin && e.origin.kind) || 'none', error: String((err && err.message) || err).slice(0, 120), sid: askedSid })
-      // dismissed after the chat changed (Esc on a stale dialog): never sent into the new chat
-      if (askedIn !== chatEpoch) return handOld()
+    // Owner 2026-11-11: the person's own cold send compacts first too, with no dialog.
+    // A plain -p run is not dropped (dropping it could end the run), and an attachment cannot survive a resend: both go as typed,
+    // as does a chat the compactor would refuse again (grown too little since, or a try that just failed).
+    const skip = headless ? 'headless' : media ? 'media' : !worthCompacting() ? 'floor' : now - compactTriedAt < 2 * MIN ? 'just-tried' : ''
+    coldLog($, { event: 'auto-compact', origin: (e.origin && e.origin.kind) || 'none', reopened, rotated, action: skip ? 'skip-' + skip : 'compact-first' })
+    if (skip) {
+      if (media) $.ui.toast(`Cache was cold, but compacting first would drop the attachment, so this sends as typed (about ${money(rewriteCost(S.ctx, S.model, ttl))}).`, { timeoutMs: 8000 })
       return next(e)
     }
-    coldLog($, { event: 'asked', origin: (e.origin && e.origin.kind) || 'none', reopened, rotated, answer, sid: askedSid })
-    // the chat changed while the dialog was up: the prompt goes back marked as meant for the previous chat
-    if (askedIn !== chatEpoch && answer !== 'Cancel') return handOld()
     // $.session.compact() is refused on SDK hosts (the desktop app), so this queues /compact
-    // the dialog waited on the person: a compaction may have run or started meanwhile
-    if (answer === 'Compact first, then send') {
-      // one started meanwhile and is still queueing: wait behind it, in order, rather than overtake it
-      // the person's @-mention prompt is put back after compacting: a plugin's resend would not attach the file
-      const at = !e.command && /(^|\s)@\S/.test(String(e.text || ''))
-      if (pending && !e.command) return compactThenSend($, e, false, '', false, at)
-      return compactRuns !== runs || compacting() || justCompacted || pending ? next(e) : compactThenSend($, e, false, '', false, at)
-    }
-    if (answer === 'Send anyway') return next(e)
-    $.ui.toast('Not sent. A fresh session with a short handoff avoids the rewrite entirely.', { timeoutMs: 8000 })
-    return { drop: 'Cancelled by cache-keeper before a cold cache rewrite' }
+    // the person's @-mention prompt is put back after compacting: a plugin's resend would not attach the file
+    return compactThenSend($, e, false, '', false, !e.command && /(^|\s)@\S/.test(String(e.text || '')))
   })
 
   on('turn.start', async ($, e, next) => {
