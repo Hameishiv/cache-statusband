@@ -1434,10 +1434,34 @@ export function register(on, options = {}) {
     // as does a chat the compactor would refuse again (grown too little since, or a try that just failed).
     const skip = headless ? 'headless' : media ? 'media' : !worthCompacting() ? 'floor' : now - compactTriedAt < 2 * MIN ? 'just-tried' : ''
     coldLog($, { event: 'auto-compact', origin: (e.origin && e.origin.kind) || 'none', reopened, rotated, action: skip ? 'skip-' + skip : 'compact-first' })
-    if (skip) {
-      if (media) $.ui.toast(`Cache was cold, but compacting first would drop the attachment, so this sends as typed (about ${money(rewriteCost(S.ctx, S.model, ttl))}).`, { timeoutMs: 8000 })
+    if (media) {
+      // Owner 2026-11-11: an attachment keeps the choice to cancel (a toast has no buttons, so this is the dialog)
+      const askedIn = chatEpoch
+      const askedSid = S.id
+      let answer = 'Send anyway'
+      try {
+        answer = await $.ui.ask(`Cache is cold, and compacting first would drop the attachment. Sending now rewrites ${tokens(S.ctx)} tokens of context (about ${money(rewriteCost(S.ctx, S.model, ttl))}). Cancel puts your text back in the prompt box: run /compact, then attach the file and send again.`, ['Send anyway', 'Cancel'])
+      } catch {
+        // nobody to ask (the dialog was dismissed): send as typed
+      }
+      coldLog($, { event: 'asked', origin: (e.origin && e.origin.kind) || 'none', answer, sid: askedSid })
+      const text = String(e.text || '').trim() ? [{ text: e.text, slash: !!e.command, sid: askedSid }] : []
+      // the chat changed while the dialog was up: never sent into the new chat
+      if (askedIn !== chatEpoch) {
+        handBack($, text, -1).catch(() => {})
+        $.ui.toast('The attachment on that message was not kept: attach it again if you send it.', { timeoutMs: 15000 })
+        return { drop: 'cache-keeper: the chat changed while asking; see the note on what happened to the message' }
+      }
+      if (answer === 'Cancel') {
+        // not awaited, as handBack is: the box fills once this submit has been dropped
+        ;(text.length ? putBack($, text) : Promise.resolve(false))
+          .catch(() => false)
+          .then((ok) => $.ui.toast(`Not sent. ${ok ? 'Your text is back in the prompt box: run' : 'Run'} /compact, then attach the file and send again.`, { timeoutMs: 15000 }))
+        return { drop: 'Cancelled by cache-keeper before a cold cache rewrite' }
+      }
       return next(e)
     }
+    if (skip) return next(e)
     // $.session.compact() is refused on SDK hosts (the desktop app), so this queues /compact
     // the person's @-mention prompt is put back after compacting: a plugin's resend would not attach the file
     return compactThenSend($, e, false, '', false, !e.command && /(^|\s)@\S/.test(String(e.text || '')))

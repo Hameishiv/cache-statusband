@@ -151,22 +151,35 @@ test("the person's cold send compacts, then sends the message, without asking", 
   expect(seen.log).toContain('"action":"compact-first"')
 })
 
-test("the person's cold send with an attachment goes as typed, since a resend would drop it", SETUP, async ($, on) => {
+// owner 2026-11-11: an attachment cannot survive a resend, so its cold send keeps the choice to cancel
+async function coldAttachment($: any, on: any, label: string) {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)
-  answer(on, seen, null)
+  answer(on, seen, label)
   await clock.advance(60000)
   kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
   await clock.advance(77 * 60000)
   await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
   const r = await $.prompt.submit({ text: 'what is this', origin: COMPOSER, attachments: [{ kind: 'image', path: '/repo/a.png' }], wait: false } as never)
   await clock.advance(100)
-  expect(seen.asks).toBe(0)
+  expect(seen.asks).toBe(1)
+  expect(seen.options).toEqual(['Send anyway', 'Cancel'])
   expect(seen.compacts).toBe(0)
-  expect('drop' in (r as object)).toBe(false)
-  expect(seen.toasts.join('\n')).toMatch(/drop the attachment/)
-  await settle(clock, () => seen.log.includes('skip-media'))
+  await settle(clock, () => seen.log.includes('skip-media') && seen.log.includes('"event":"asked"'))
   expect(seen.log).toContain('"action":"skip-media"')
+  return { r, seen, clock }
+}
+test("the person's cold send with an attachment asks, and Send anyway sends it as typed", SETUP, async ($, on) => {
+  const { r } = await coldAttachment($, on, 'Send anyway')
+  expect('drop' in (r as object)).toBe(false)
+})
+test("the person's cold send with an attachment asks, and Cancel puts the text back unsent", SETUP, async ($, on) => {
+  const { r, seen, clock } = await coldAttachment($, on, 'Cancel')
+  expect('drop' in (r as object)).toBe(true)
+  await settle(clock, () => seen.toasts.some((t) => /Not sent/.test(t)))
+  expect(seen.submits).toEqual([])
+  expect(JSON.stringify(seen.fills)).toMatch(/what is this/)
+  expect(seen.toasts.join(' ')).toMatch(/back in the prompt box/)
 })
 
 test('the rotator changing the seat file leaves a running chat alone: only its wake-up moves it', SETUP, async ($, on) => {
