@@ -1397,7 +1397,7 @@ export function register(on, options = {}) {
     const skip = headless ? 'headless' : e.command ? 'slash' : /(^|\s)@\S/.test(String(e.text || '')) ? 'mention' : !worthCompacting() ? 'floor' : now - compactTriedAt < 2 * MIN ? 'just-tried' : media ? 'media' : ''
     coldLog($, { event: 'auto-compact', origin: (e.origin && e.origin.kind) || 'none', reopened, rotated, action: skip ? 'skip-' + skip : 'compact-first' })
     if (skip === 'media') {
-      // An attachment keeps the choice to cancel (a toast has no buttons, so this is the dialog)
+      // Owner 2026-11-11: an attachment keeps the choice to cancel (a toast has no buttons, so this is the dialog)
       const askedIn = chatEpoch
       const askedSid = S.id
       let answer = 'Send anyway'

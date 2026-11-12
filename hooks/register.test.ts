@@ -133,7 +133,7 @@ test('a small context woken by the rotator is sent as is', SETUP, async ($, on) 
   expect(seen.compacts).toBe(0)
 })
 
-// the person's cold send compacts first too, with no dialog
+// owner 2026-11-11: the person's cold send compacts first too, with no dialog
 test("the person's cold send compacts, then sends the message, without asking", SETUP, async ($, on) => {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)
@@ -155,7 +155,7 @@ test("the person's cold send compacts, then sends the message, without asking", 
   expect(seen.log).toContain('"action":"compact-first"')
 })
 
-// an attachment cannot survive a resend, so its cold send keeps the choice to cancel
+// owner 2026-11-11: an attachment cannot survive a resend, so its cold send keeps the choice to cancel
 async function coldAttachment($: any, on: any, label: string) {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)
