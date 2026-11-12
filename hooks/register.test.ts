@@ -1914,6 +1914,44 @@ test('a message shown in a failure toast is masked while recording', async ($, o
   }
 })
 
+// A message over 20000 characters is cut before it is masked (the masker takes seconds on 4 MiB), the partial word at the cut dropped
+async function maskedLostToast($: any, on: any, text: string) {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, null)
+  refuseFill = true
+  recordingOn = true
+  dropSubmit = /deploy/
+  try {
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+    await $.prompt.submit({ text, origin: PEER, isMeta: true, wait: false } as never)
+    await clock.advance(100)
+    await settle(clock, () => seen.toasts.some((t) => /could not be sent again/.test(t)))
+    return seen.toasts.filter((t) => /could not be sent again/.test(t)).join(' ')
+  } finally {
+    dropSubmit = null
+    refuseFill = false
+    recordingOn = false
+  }
+}
+test('a JWT crossing the cut of a long lost message is never shown, not even its start', async ($, on) => {
+  // header and payload run past 20000 characters, so the signature is beyond the cut and the JWT pattern could never match there
+  const jwt = 'ey' + 'J' + 'A'.repeat(12000) + '.' + 'B'.repeat(12000) + '.' + 'C'.repeat(20)
+  const toast = await maskedLostToast($, on, `deploy with ${jwt} now`)
+  expect(toast).toContain('deploy with')
+  expect(toast).not.toContain(jwt.slice(0, 20))
+})
+test('a short key at the start of a message over 20000 characters is still masked', async ($, on) => {
+  const key = 'sk-' + 'ant-' + 'abcdefghijklmnopqrstuvwx'
+  const toast = await maskedLostToast($, on, `deploy with ${key} now ` + 'word '.repeat(5000))
+  expect(toast).toContain('deploy with')
+  expect(toast).toContain('•')
+  expect(toast).not.toContain(key.slice(0, 19))
+})
+
 // a held resend the host later refuses, with the box refusing the put-back too: the toast shows the words
 test('a held message refused later and not put back is shown in the toast', async ($, on) => {
   const kept = new Map<string, unknown>()
