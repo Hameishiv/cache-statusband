@@ -1,5 +1,5 @@
 // Cache Keeper: watches this session's prompt cache, keeps big caches warm on
-// request, refuses a cold send without asking first, and shows every local
+// request, compacts a big chat before a cold send, and shows every local
 // session on one board (/board).
 //
 // Why: each request re-reads the whole context. From the cache that costs about
@@ -1213,7 +1213,7 @@ function statusText() {
   if (S.rateLimits.length) lines.push(`Plan limits used: ${limitsText(S.rateLimits)}.`)
   lines.push(S.fable ? `Fable weekly: ${Math.round(S.fable.percentUsed)}% used.` : `Fable weekly: no reading yet${planWhy && planWhy !== 'ok' ? ` (last check: ${planWhy})` : ''}.`)
   lines.push(`Session cost so far: ${money(S.costUsd)}. Cold restarts this session: ${S.coldRestarts.length} (${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))}).`)
-  lines.push(`Cold-send guard: ${settings.guard ? 'on' : 'off'} for contexts over ${tokens(settings.bigTokens)} tokens (asks you; a message from anyone else compacts first). Alerts: ${settings.alerts ? 'on' : 'off'}.`)
+  lines.push(`Cold-send guard: ${settings.guard ? 'on' : 'off'} for contexts over ${tokens(settings.bigTokens)} tokens (compacts first, yours included; asks only when an attachment would be dropped). Alerts: ${settings.alerts ? 'on' : 'off'}.`)
   lines.push(`Auto keep warm: ${settings.autoWarmHours ? `on, until ${settings.autoWarmHours}h after the last turn, for contexts over ${tokens(settings.bigTokens)}${S.autoWarm ? '' : ' (off in this session)'}` : 'off'}.`)
   lines.push(`Settings: /${names.cache} ttl 5|60|auto, /${names.cache} guard on|off, /${names.cache} big 150k, /${names.cache} alerts on|off, /${names.cache} autowarm 8|off. Board: /${names.board}.`)
   return lines.join('\n')
@@ -1371,7 +1371,7 @@ export function register(on, options = {}) {
     }
     if (!S.pr) S.pr = findPr(e.command ? `/${e.command.name} ${e.command.args}` : e.text)
     const fromUser = e.origin && (e.origin.kind === 'composer' || e.origin.kind === 'bridge')
-    // no origin, or one the host could not classify, may be the person at the prompt: it gets the dialog, never the silent compact
+    // no origin, or one the host could not classify, may be the person at the prompt: it compacts first as the person (resent as their own words), never framed as a plugin
     // (an engine notice, never the person, is a prompt queued isMeta with no stamp or an unclassified one: an idle notice or a
     // delivery receipt. Another session's message is queued isMeta too, but stamped peer, so it is a sender like any other.
     // An auto-continuation that is not isMeta follows a click (leaving plan mode, an approved goal): maybe the person. One queued
