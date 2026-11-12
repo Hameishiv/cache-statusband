@@ -1964,6 +1964,11 @@ test('a lost message that is one long word shows its length, not an empty quote'
   const toast = await maskedLostToast($, on, 'deploy' + 'x'.repeat(5000))
   expect(toast).toContain('(5006 characters)')
 })
+test("a lost message's own bidi controls are removed, so they cannot break the toast's isolate", async ($, on) => {
+  const toast = await maskedLostToast($, on, 'deploy ' + String.fromCharCode(0x2067) + 'now')
+  expect(toast).toContain('deploy now')
+  expect(toast).not.toContain(String.fromCharCode(0x2067))
+})
 
 // a held resend the host later refuses, with the box refusing the put-back too: the toast shows the words
 test('a held message refused later and not put back is shown in the toast', async ($, on) => {

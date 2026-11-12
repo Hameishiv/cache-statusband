@@ -598,12 +598,13 @@ function lostText(msgs) {
   const shown = msgs.slice(0, 3).map((m) => {
     const s = String(m.raw ?? m.text)
     // Only the first 200 characters are masked: the toast shows 80, and the masker is slow on long text. The cut
-    // steps back to the last whitespace, so a word cut in half is not shown. Masking sees only those 200 characters:
-    // a name it would learn from later text, or the first word of a value spread over several words, can show.
-    // Each quote is a bidi isolate, so right-to-left messages keep their order.
+    // steps back to the last whitespace, so a word cut in half is not shown; text with no whitespace in those 200
+    // (a long URL, Chinese or Japanese prose) shows only its length. Masking sees only those 200 characters, so
+    // anything it would hide only because of text past them can show. Each quote is a bidi isolate, with the
+    // message's own bidi controls removed so they cannot break it, so right-to-left messages keep their order.
     let i = s.length > 200 ? 200 : s.length
     if (i < s.length && !/\s/.test(s[i])) while (i > 0 && !/\s/.test(s[i - 1])) i--
-    const words = s.slice(0, i).trim()
+    const words = s.slice(0, i).replace(/[\u202A-\u202E\u2066-\u2069]/g, '').trim()
     return words ? `"\u2068${clip(mask(words), 80)}\u2069"` : `(${s.length} characters)`
   })
   return shown.join(', ') + (msgs.length > 3 ? ` and ${msgs.length - 3} more` : '')
