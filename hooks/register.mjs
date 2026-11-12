@@ -1001,7 +1001,7 @@ async function seedFromTranscript($, path) {
   // a reload keeps what the process knew; a real reopen starts on a cold cache
   S.reopenedAt = liveHb ? liveHb.reopenedAt || 0 : await $.clock.now()
   if (found.compacted) {
-    // the next request writes the compacted context whatever happens: nothing to ask.
+    // the next request writes the compacted context whatever happens: nothing to compact first.
     // A real reopen (no live heartbeat) writes it cold; markCompacted cannot tell, since lastActivity is 0 here.
     // That write is booked as the reopen's cold rewrite, though most of it would be paid after any compaction
     S.floor = found.ctx
@@ -1348,7 +1348,7 @@ export function register(on, options = {}) {
     }
     if (!S.pr) S.pr = findPr(e.command ? `/${e.command.name} ${e.command.args}` : e.text)
     const fromUser = e.origin && (e.origin.kind === 'composer' || e.origin.kind === 'bridge')
-    // no origin, or one the host could not classify, may be the person at the prompt: a cold send of its own compacts first as the person (resent as their own words); one queued behind a compaction keeps the queued path's framed fallback
+    // no origin, or one the host could not classify, may be the person at the prompt: a cold send of its own compacts first as the person (with no origin, resent as their own words; unclassified, resent marked as such); one with no origin queued behind a compaction keeps the queued path's framed fallback
     // (an engine notice, never the person, is a prompt queued isMeta with no stamp or an unclassified one: an idle notice or a
     // delivery receipt. Another session's message is queued isMeta too, but stamped peer, so it is a sender like any other.
     // An auto-continuation that is not isMeta follows a click (leaving plan mode, an approved goal): maybe the person. One queued
@@ -1359,6 +1359,9 @@ export function register(on, options = {}) {
     const headless = !!e.origin && e.origin.kind === 'sdk' && entry !== 'claude-desktop' && !(await $.session.surfaces().catch(() => [])).length
     const notice = !!e.isMeta && (!e.origin || e.origin.kind === 'unclassified')
     const maybePerson = !notice && (!e.origin || fromUser || headless || e.origin.kind === 'unclassified' || (e.origin.kind === 'auto-continuation' && !e.isMeta))
+    // an unclassified prompt may be the person, or a teammate's message (its drain stamps none): compacted first like the
+    // person's, but resent marked as unclassified and not as the person's own words, since nothing vouches for it
+    const unvouched = !!e.origin && e.origin.kind === 'unclassified'
     const wake = fromUser && !!cfg.rotatorWake && cfg.rotatorWake.test(String(e.text || ''))
     // another plugin submitting the person's own words (asUser): still compacted first, but resent as the person's, never framed as the plugin's
     // (likewise the session's owner pinging it from Slack: not at the prompt, but the person's own words)
@@ -1382,7 +1385,7 @@ export function register(on, options = {}) {
     if (pending && !(draining && maybePerson) && !headless && !notice && !(maybePerson && /(^|\s)@\S/.test(String(e.text || ''))) && !ownPrompt($, e) && !local && !e.turnId && !e.command && !(Array.isArray(e.attachments) && e.attachments.length)) {
       const kind = sender(e)
       // a rotator wake keeps its unattended fallback: nobody is at the prompt after a rotation
-      return compactThenSend($, e, (!fromUser && !asPerson) || wake || (!!e.origin && e.origin.kind === 'slack-ping'), maybePerson || asPerson ? '' : kind)
+      return compactThenSend($, e, (!fromUser && !asPerson) || wake || (!!e.origin && e.origin.kind === 'slack-ping'), (maybePerson && !unvouched) || asPerson ? '' : kind)
     }
     if (!settings.guard || !isCold || local || justCompacted || S.ctx < settings.bigTokens || e.turnId) {
       // Why a big (or unmeasured) prompt passed without being considered for a cold compaction
@@ -1463,7 +1466,7 @@ export function register(on, options = {}) {
     }
     if (skip) return next(e)
     // $.session.compact() is refused on SDK hosts (the desktop app), so this queues /compact
-    return compactThenSend($, e, false, '', true)
+    return compactThenSend($, e, false, unvouched ? sender(e) : '', true)
   })
 
   on('turn.start', async ($, e, next) => {

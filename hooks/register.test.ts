@@ -1244,7 +1244,7 @@ test('a compaction refused after its deadline still sets the floor', async ($, o
 })
 
 // Anything the host could not classify may be the person at the prompt: it compacts first as the person, never framed as a plugin
-async function unknownOrigin($: any, on: any, origin: unknown, headless = false) {
+async function unknownOrigin($: any, on: any, origin: unknown, headless = false, framed = false) {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)
   answer(on, seen, null)
@@ -1265,10 +1265,12 @@ async function unknownOrigin($: any, on: any, origin: unknown, headless = false)
     expect(seen.compacts).toBe(1)
     expect('drop' in (r as object)).toBe(true)
     await settle(clock, () => seen.submits.length >= 1)
-    expect(seen.asUsers).toEqual([true]) // maybe the person: resent as the person's, never framed as a plugin's
+    // maybe the person: with no origin, resent as the person's; unclassified, which a teammate's also is, resent marked
+    expect(seen.asUsers).toEqual([framed ? undefined : true])
+    if (framed) expect(seen.submits[0]).toContain('[unclassified message, resent by cache-keeper]')
   }
 }
-test("a prompt with an unclassified origin is compacted first as the person's", ($, on) => unknownOrigin($, on, { kind: 'unclassified' }))
+test("a prompt with an unclassified origin is compacted first and resent marked, not as the person's own words", ($, on) => unknownOrigin($, on, { kind: 'unclassified' }, false, true))
 test("a prompt with no origin is compacted first as the person's", ($, on) => unknownOrigin($, on, undefined))
 // A plain -p run's prompt is the person's: dropping it to compact could end the run
 test('an sdk prompt in a plain -p run goes as typed, not compacted', async ($, on) => {
