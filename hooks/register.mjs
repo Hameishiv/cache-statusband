@@ -392,10 +392,10 @@ async function resumeStep($) {
 // `from` names a sender other than the person (a peer, a task notification): the resend says so,
 // and goes in without `asUser`, so the model reads it as the mod's message, not the person's own words
 // `logged` writes the compaction's outcome to the log, as for an unattended message, whatever the modes
-function compactThenSend($, e, unattended, from = '', logged = false, mention = false) {
+function compactThenSend($, e, unattended, from = '', logged = false) {
   // the ways to submit it, in order: `true` is asUser, `false` omits it
   const modes = from ? [false] : unattended ? [true, false] : [true]
-  const msg = { text: from ? `[${from} message, resent by cache-keeper]\n${e.text}` : e.text, attachments: e.attachments, slash: !!e.command, mention, unattended, logged: logged || unattended, modes, sid: S.id }
+  const msg = { text: from ? `[${from} message, resent by cache-keeper]\n${e.text}` : e.text, attachments: e.attachments, unattended, logged: logged || unattended, modes, sid: S.id }
   const drop = { drop: 'cache-keeper: compacting first on a cold cache; the message is sent again once that finishes' }
   // Claude Code tracks its own timed continue and, dropped, reports that it did not run: say that it still will
   if (e.isMeta && e.origin && e.origin.kind === 'auto-continuation') $.ui.toast("Claude Code may say its automatic continue did not run: cache-keeper is compacting this cold chat first and sends the continue after it.", { timeoutMs: 15000 })
@@ -570,9 +570,8 @@ function boxSerial($, job) {
   boxChain = p.catch(() => {})
   return p
 }
-function putBack($, back, epoch) {
-  // a previous chat's slash command is never one Enter away in the new chat (as handBack): refused, and logged below
-  return boxSerial($, () => (epoch !== undefined && epoch !== chatEpoch && back.some((m) => m.slash) ? false : putBackNow($, back))).then(async (ok) => {
+function putBack($, back) {
+  return boxSerial($, () => putBackNow($, back)).then(async (ok) => {
     if (ok) return true
     // refused or timed out: nothing went in, so the log holds the only copy
     back.forEach((m) => coldLog($, { action: 'not-resent', text: m.text, sid: m.sid }))
@@ -581,10 +580,8 @@ function putBack($, back, epoch) {
 }
 async function putBackNow($, back, log = true) {
   const box = await boxText($)
-  // nothing is ever joined to a slash line: text after it would become the command's arguments.
-  // So never append to a box that starts with one, and a slash message goes back only alone, into an empty box
+  // nothing is ever joined to a slash line the person typed: text after it would become the command's arguments
   if (box.trim().startsWith('/')) return false
-  if (back.some((m) => m.slash) && (box.trim() || back.length > 1)) return false
   const sep = !box || /\n\s*\n\s*$/.test(box) ? '' : /\n\s*$/.test(box) ? '\n' : '\n\n'
   if (await fillBox($, sep + back.map((m) => m.text).join('\n\n'), 'append')) {
     // parked in the box, not sent: the log says so, or it would read as resent
@@ -597,10 +594,7 @@ async function putBackNow($, back, log = true) {
 // Resend the queue in order, with the queue live: a message arriving during the drain is appended
 // by the prompt.submit hook and goes out after the ones before it. The first message that cannot be
 // submitted goes back to the prompt box together with every one behind it, so nothing is dropped and
-// none overtakes it. The person's @-mention prompt goes back in the box and the rest still go.
-// A slash line (only ever the head, from the person's own cold send being compacted) is filled as the
-// draft when the box is empty (otherwise logged), the rest still go, and a later failure is logged
-// rather than filled over that draft. A resend the host holds past the deadline is left to the host,
+// none overtakes it. A resend the host holds past the deadline is left to the host,
 // and the rest go back to the prompt box; if the host later refuses it, it goes back there too.
 // It runs only for the chat its compaction started in: after a /clear, /resume or /fork it stops.
 // The previous chat's messages go back to the prompt box in arrival order: `first` (the drain's own,
@@ -609,15 +603,8 @@ async function handBack($, first, epoch) {
   const back = [...first, ...(orphans.get(epoch) || [])]
   orphans.delete(epoch)
   if (!back.length) return
-  // a slash command meant for the previous chat is never one Enter away in the new one: it is logged.
-  // The rest go back as plain messages
-  const cmds = back.filter((m) => m.slash)
-  cmds.forEach((m) => coldLog($, { action: 'not-resent', text: m.text, sid: m.sid }))
-  const rest = back.filter((m) => !m.slash)
-  const ok = rest.length ? await putBack($, rest) : true
-  const note = cmds.length ? ` Not put back (logged if ~/.claude-shared/state exists): ${cmds.map((m) => clip(m.text, 80)).join(', ')}.` : ''
-  if (rest.length) $.ui.toast((ok ? `${rest.length} message(s) meant for the previous chat are in the prompt box: send them only if they still apply.` : `${rest.length} message(s) meant for the previous chat could not be sent (logged if ~/.claude-shared/state exists).`) + note, { timeoutMs: 15000 })
-  else $.ui.toast(note.trim(), { timeoutMs: 15000 })
+  const ok = await putBack($, back)
+  $.ui.toast(ok ? `${back.length} message(s) meant for the previous chat are in the prompt box: send them only if they still apply.` : `${back.length} message(s) meant for the previous chat could not be sent (logged if ~/.claude-shared/state exists).`, { timeoutMs: 15000 })
 }
 
 // the count of messages a drain could neither resend nor put back reaches the person on every exit,
@@ -635,7 +622,6 @@ async function drainQueue($, epoch, tally) {
   // the chat the queue was made for: if it changed, the queue was handed back and a later chat's is never this drain's
   if (epoch !== chatEpoch) return
   draining = true
-  let draft = false // a slash line sits in the prompt box
   // not sent again and not put back
   const lose = (m) => (tally.lost++, coldLog($, { action: 'not-resent', text: m.text, sid: m.sid }))
   try {
@@ -675,45 +661,18 @@ async function drainQueue($, epoch, tally) {
       if (sent) continue
       // the chat changed while that resend was refused: it goes back ahead of the rest, in arrival order
       if (epoch !== chatEpoch) return handBack($, [msg], epoch)
-      if (msg.mention && draft) {
-        lose(msg)
-        continue
+      // this one and all behind it; the queue closes in the same tick, so nothing slips in unseen
+      const back = [msg, ...(pending || [])]
+      pending = null
+      draining = false
+      if (await putBack($, back)) {
+        // a /clear, /resume or /fork during the put-back: they landed in the new chat's box, so say whose they are
+        if (epoch !== chatEpoch) $.ui.toast(`${back.length} message(s) meant for the previous chat are in the prompt box: send them only if they still apply.`, { timeoutMs: 15000 })
+        else $.ui.toast(back.length === 1 ? 'The message is back in the prompt box: press Enter to send it.' : `${back.length} messages are back in the prompt box: press Enter to send them.`, { timeoutMs: 15000 })
+      } else {
+        $.ui.toast(`${back.length} message(s) could not be sent again (logged if ~/.claude-shared/state exists).`, { timeoutMs: 15000 })
       }
-      if (msg.mention) {
-        // the person's @ prompt: back in the box after whatever they typed, and the rest still go
-        // (a chat change before this point already handed it back, above)
-        const ok = await putBack($, [msg])
-        $.ui.toast(ok && epoch !== chatEpoch ? 'Your message, meant for the previous chat, is in the prompt box: send it only if it still applies.' : ok ? 'Your message is back in the prompt box (a resend would not attach its @ files): press Enter to send it.' : 'Your message could not be put back (logged if ~/.claude-shared/state exists).', { timeoutMs: 15000 })
-        continue
-      }
-      if (msg.slash) {
-        // never over the person's draft: a slash line after text would be a broken command, so it is logged instead
-        // read and fill inside the box lock, so a put-back from elsewhere cannot land between them
-        let typed = ''
-        let moved = false
-        // the chat changed before the box was read: the previous chat's command is never one Enter away in the new one
-        draft = await boxSerial($, async () => (epoch !== chatEpoch ? ((moved = true), false) : (typed = (await boxText($)).trim()) ? false : fillBox($, msg.text, 'append')))
-        if (moved) return handBack($, [msg], epoch)
-        // logged here, not counted: the toast below already says what happened to this one
-        coldLog($, { action: draft ? 'put-back' : 'not-resent', text: msg.text, sid: msg.sid })
-        // the chat changed while the box was read or filled: the command landed in the new chat's box, so say whose it is
-        const late = draft && epoch !== chatEpoch
-        $.ui.toast(late ? `${clip(msg.text, 80)}, meant for the previous chat, is in the prompt box: run it only if it still applies.` : draft ? 'Your message is back in the prompt box: press Enter to send it.' : typed ? `${clip(msg.text, 80)} was not put back over what you typed (logged if ~/.claude-shared/state exists).` : 'The message could not be sent again: ' + clip(msg.text, 80), { timeoutMs: 15000 })
-      } else if (draft) lose(msg)
-      else {
-        // this one and all behind it; the queue closes in the same tick, so nothing slips in unseen
-        const back = [msg, ...(pending || [])]
-        pending = null
-        draining = false
-        if (await putBack($, back)) {
-          // a /clear, /resume or /fork during the put-back: they landed in the new chat's box, so say whose they are
-          if (epoch !== chatEpoch) $.ui.toast(`${back.length} message(s) meant for the previous chat are in the prompt box: send them only if they still apply.`, { timeoutMs: 15000 })
-          else $.ui.toast(back.length === 1 ? 'The message is back in the prompt box: press Enter to send it.' : `${back.length} messages are back in the prompt box: press Enter to send them.`, { timeoutMs: 15000 })
-        } else {
-          $.ui.toast(`${back.length} message(s) could not be sent again (logged if ~/.claude-shared/state exists).`, { timeoutMs: 15000 })
-        }
-        return
-      }
+      return
     }
   } catch {
     // an unexpected throw: what is still queued is logged, never silently dropped
@@ -729,8 +688,6 @@ async function drainQueue($, epoch, tally) {
 
 // true once the message is submitted; false when it was refused or could not be (the caller puts it back)
 async function resend($, msg, epoch = chatEpoch) {
-  // A plugin can't submit a "/" line: it goes back in the prompt box
-  if (msg.slash || msg.mention) return false
   const send = { text: msg.text, ...(msg.attachments ? { attachments: msg.attachments } : {}) }
   for (const asUser of msg.modes) {
     // the chat changed while an earlier attempt was out: never try the old chat's message in the new one
@@ -1452,7 +1409,7 @@ export function register(on, options = {}) {
         failed = true
         coldLog($, { event: 'ask-failed', origin: (e.origin && e.origin.kind) || 'none', error: String((err && err.message) || err).slice(0, 120), sid: askedSid })
       }
-      const text = String(e.text || '').trim() ? [{ text: e.text, slash: !!e.command, sid: askedSid }] : []
+      const text = String(e.text || '').trim() ? [{ text: e.text, sid: askedSid }] : []
       // the chat changed while the dialog was up: never sent into the new chat
       if (askedIn !== chatEpoch) {
         // the outcome of a failed ask is logged once it is decided: this message is handed back, never sent
@@ -1464,7 +1421,7 @@ export function register(on, options = {}) {
       // anything but "Send anyway" cancels: free text typed under "Other" never sends
       if (answer !== 'Send anyway') {
         // not awaited, as handBack is: the box fills once this submit has been dropped
-        ;(text.length ? putBack($, text, askedIn) : Promise.resolve(false))
+        ;(text.length ? putBack($, text) : Promise.resolve(false))
           .catch(() => false)
           .then((ok) => {
             // the chat changed while the put-back waited its turn: the text is meant for the previous chat
