@@ -93,11 +93,12 @@ let desktopEntry = false
 // what the person has typed in the prompt box
 let boxDraft = ''
 
-function answer(on: any, seen: { asks: number; options?: string[] }, label: string | null) {
+function answer(on: any, seen: { asks: number; options?: string[]; question?: string }, label: string | null) {
   on('tool.call', (_: unknown, e: any) => {
     if (e.tool !== 'AskUserQuestion') return { result: {} }
     seen.asks++
     ;(seen as any).options = (e.questions?.[0]?.options ?? []).map((o: any) => o.label ?? o)
+    ;(seen as any).question = String(e.questions?.[0]?.question ?? '')
     if (label === null) throw new Error('asked')
     const q = e.questions?.[0]?.question ?? ''
     return { result: { questions: e.questions, answers: { [q]: label } } }
@@ -185,6 +186,30 @@ test("the person's cold send with an attachment asks, and Cancel puts the text b
   expect(seen.toasts.join(' ')).toMatch(/back in the prompt box/)
 })
 
+// a dialog is a question: it ends in a question mark
+test('the attachment dialog question ends in a question mark', SETUP, async ($, on) => {
+  const { seen } = await coldAttachment($, on, 'Send anyway')
+  expect(seen.question).toMatch(/\?\s*$/)
+})
+// a dialog that cannot be answered (dismissed, or not shown) must not block the send
+test('an attachment dialog that rejects logs ask-failed and sends the message as typed', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, null) // the ask rejects
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+  await clock.advance(77 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  const r = await $.prompt.submit({ text: 'what is this', origin: COMPOSER, attachments: [{ kind: 'image', path: '/repo/a.png' }], wait: false } as never)
+  await clock.advance(100)
+  await settle(clock, () => seen.log.includes('ask-failed'))
+  expect(seen.asks).toBe(1)
+  expect('drop' in (r as object)).toBe(false) // goes through as typed
+  expect(seen.log).toContain('"event":"ask-failed"')
+  expect(seen.log).toContain('"action":"sent-as-typed"')
+  expect(seen.log).not.toContain('"event":"asked"')
+  expect(seen.compacts).toBe(0)
+})
 // an answer that is neither label (free text typed under "Other") is a cancel, never a send
 test('free text typed under Other in the attachment dialog does not send', SETUP, async ($, on) => {
   const { r, seen, clock } = await coldAttachment($, on, 'send it, but with the other file')
@@ -966,6 +991,34 @@ test("a failed compaction holds back the person's next cold send for 2 minutes",
   }
 })
 
+// a try that just failed holds an attachment back too: it goes as typed, with no dialog about a compaction that would not run
+test("a failed compaction sends the person's next attachment as typed, with no dialog", async ($, on) => {
+  failCompact = true
+  try {
+    const kept = new Map<string, unknown>()
+    const { clock, seen } = engine($, on, { label: 'A' }, kept)
+    answer(on, seen, null)
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+    await $.prompt.submit({ text: 'one', origin: COMPOSER, wait: false } as never)
+    await clock.advance(100)
+    await settle(clock, () => seen.submits.length >= 1)
+    expect(seen.compacts).toBe(1)
+    await clock.advance(60000)
+    const r = await $.prompt.submit({ text: 'what is this', origin: COMPOSER, attachments: [{ kind: 'image', path: '/repo/a.png' }], wait: false } as never)
+    await clock.advance(100)
+    await settle(clock, () => seen.log.includes('skip-just-tried'))
+    expect('drop' in (r as object)).toBe(false)
+    expect(seen.asks).toBe(0)
+    expect(seen.compacts).toBe(1)
+    expect(seen.log).not.toContain('skip-media')
+  } finally {
+    failCompact = false
+  }
+})
+
 // a typed /session-handoff reads the whole conversation: compacting first would hand over a summary
 test('a typed /session-handoff on a cold big chat is not compacted', async ($, on) => {
   const kept = new Map<string, unknown>()
@@ -1271,6 +1324,13 @@ test('the cold-compact log is one file per session, stamped in local time', asyn
 
 test('a cold compact that went through is logged as compacted', async ($, on) => {
   const { seen } = await coldPeer($, on, 77)
+  expect(seen.log).toContain('"action":"compacted"')
+})
+
+// the person's own automatic compaction logs its outcome too, as a peer's does
+test("a cold compact of the person's own message is logged as compacted", async ($, on) => {
+  const { seen } = await coldPeer($, on, 77, 300000, COMPOSER)
+  expect(seen.compacts).toBe(1)
   expect(seen.log).toContain('"action":"compacted"')
 })
 

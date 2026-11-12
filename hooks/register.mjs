@@ -1446,8 +1446,8 @@ export function register(on, options = {}) {
         answer = await $.ui.ask(`Cache is cold, and compacting first would drop the attachment. Sending now rewrites ${tokens(S.ctx)} tokens of context (about ${money(rewriteCost(S.ctx, S.model, ttl))}). Cancel puts your text back in the prompt box: run /compact, then attach the file and send again. Send it anyway?`, ['Send anyway', 'Cancel'])
         coldLog($, { event: 'asked', origin: (e.origin && e.origin.kind) || 'none', answer, sid: askedSid })
       } catch (err) {
-        // nobody to ask (a -p run, or the dialog was dismissed): send as typed
-        coldLog($, { event: 'ask-failed', origin: (e.origin && e.origin.kind) || 'none', error: String((err && err.message) || err).slice(0, 120), sid: askedSid })
+        // dismissed (Esc), or the dialog could not be shown: send as typed
+        coldLog($, { event: 'ask-failed', action: 'sent-as-typed', origin: (e.origin && e.origin.kind) || 'none', error: String((err && err.message) || err).slice(0, 120), sid: askedSid })
       }
       const text = String(e.text || '').trim() ? [{ text: e.text, slash: !!e.command, sid: askedSid }] : []
       // the chat changed while the dialog was up: never sent into the new chat
@@ -1467,6 +1467,7 @@ export function register(on, options = {}) {
             $.ui.toast(
               ok && prev ? 'Not sent. Your text is in the prompt box, meant for the previous chat: send it only if it still applies, with the file attached again.'
                 : ok ? 'Not sent. Your text is back in the prompt box: run /compact, then attach the file and send again.'
+                : text.length && prev ? 'Not sent. The chat changed before your text could go back in the prompt box, so it was not put there (logged if ~/.claude-shared/state exists).'
                 : text.length ? 'Not sent, and your text could not be put back in the prompt box (logged if ~/.claude-shared/state exists). Run /compact, then attach the file and send again.'
                 : 'Not sent. Run /compact, then attach the file and send again.',
               { timeoutMs: 15000 },
