@@ -1348,7 +1348,7 @@ export function register(on, options = {}) {
     }
     if (!S.pr) S.pr = findPr(e.command ? `/${e.command.name} ${e.command.args}` : e.text)
     const fromUser = e.origin && (e.origin.kind === 'composer' || e.origin.kind === 'bridge')
-    // no origin, or one the host could not classify, may be the person at the prompt: a cold send of its own compacts first as the person (with no origin, resent as their own words; unclassified, resent marked as such); one with no origin queued behind a compaction keeps the queued path's framed fallback
+    // no origin, or one the host could not classify, may be the person at the prompt: with no origin, a cold send of its own compacts first as the person (resent as their own words), while one queued behind a compaction keeps the queued path's framed fallback; an unclassified one goes as typed (see `unvouched`)
     // (an engine notice, never the person, is a prompt queued isMeta with no stamp or an unclassified one: an idle notice or a
     // delivery receipt. Another session's message is queued isMeta too, but stamped peer, so it is a sender like any other.
     // An auto-continuation that is not isMeta follows a click (leaving plan mode, an approved goal): maybe the person. One queued
@@ -1359,8 +1359,8 @@ export function register(on, options = {}) {
     const headless = !!e.origin && e.origin.kind === 'sdk' && entry !== 'claude-desktop' && !(await $.session.surfaces().catch(() => [])).length
     const notice = !!e.isMeta && (!e.origin || e.origin.kind === 'unclassified')
     const maybePerson = !notice && (!e.origin || fromUser || headless || e.origin.kind === 'unclassified' || (e.origin.kind === 'auto-continuation' && !e.isMeta))
-    // an unclassified prompt may be the person, or a teammate's message (its drain stamps none): compacted first like the
-    // person's, but resent marked as unclassified and not as the person's own words, since nothing vouches for it
+    // an unclassified prompt may be the person's (through a channel the engine cannot attest) or a teammate's (its drain
+    // stamps none): a resend could carry neither its provenance nor the person's, so it goes as typed and never waits
     const unvouched = !!e.origin && e.origin.kind === 'unclassified'
     const wake = fromUser && !!cfg.rotatorWake && cfg.rotatorWake.test(String(e.text || ''))
     // another plugin submitting the person's own words (asUser): still compacted first, but resent as the person's, never framed as the plugin's
@@ -1382,10 +1382,10 @@ export function register(on, options = {}) {
     // A compaction is under way: anything else waits behind it and goes after, in order, with no dialog
     // the person's own prompt waits only while /compact runs: a resend the host holds must never swallow it
     // not an engine notice (a resend would lose isMeta), nor the person's @-mention (a plugin's resend leaves it unexpanded)
-    if (pending && !(draining && maybePerson) && !headless && !notice && !(maybePerson && /(^|\s)@\S/.test(String(e.text || ''))) && !ownPrompt($, e) && !local && !e.turnId && !e.command && !(Array.isArray(e.attachments) && e.attachments.length)) {
+    if (pending && !(draining && maybePerson) && !headless && !notice && !(maybePerson && /(^|\s)@\S/.test(String(e.text || ''))) && !ownPrompt($, e) && !unvouched && !local && !e.turnId && !e.command && !(Array.isArray(e.attachments) && e.attachments.length)) {
       const kind = sender(e)
       // a rotator wake keeps its unattended fallback: nobody is at the prompt after a rotation
-      return compactThenSend($, e, (!fromUser && !asPerson) || wake || (!!e.origin && e.origin.kind === 'slack-ping'), (maybePerson && !unvouched) || asPerson ? '' : kind)
+      return compactThenSend($, e, (!fromUser && !asPerson) || wake || (!!e.origin && e.origin.kind === 'slack-ping'), maybePerson || asPerson ? '' : kind)
     }
     if (!settings.guard || !isCold || local || justCompacted || S.ctx < settings.bigTokens || e.turnId) {
       // Why a big (or unmeasured) prompt passed without being considered for a cold compaction
@@ -1416,7 +1416,7 @@ export function register(on, options = {}) {
     // either (a resend could not run the command, or attach the file, and parking it in the prompt box would let a later
     // message overtake it); a chat the compactor would refuse again (grown too little since, or a try that just failed) goes
     // as typed; an attachment cannot survive a resend, so it asks, but only when a compaction would otherwise have run.
-    const skip = headless ? 'headless' : Array.isArray(e.context) && e.context.length ? 'context' : e.command ? 'slash' : /(^|\s)@\S/.test(String(e.text || '')) ? 'mention' : !worthCompacting() ? 'floor' : now - compactTriedAt < 2 * MIN ? 'just-tried' : media ? 'media' : ''
+    const skip = headless ? 'headless' : unvouched ? 'unclassified' : Array.isArray(e.context) && e.context.length ? 'context' : e.command ? 'slash' : /(^|\s)@\S/.test(String(e.text || '')) ? 'mention' : !worthCompacting() ? 'floor' : now - compactTriedAt < 2 * MIN ? 'just-tried' : media ? 'media' : ''
     coldLog($, { event: 'auto-compact', origin: (e.origin && e.origin.kind) || 'none', reopened, rotated, action: skip ? 'skip-' + skip : 'compact-first' })
     if (skip === 'media') {
       // Owner 2026-11-11: an attachment keeps the choice to cancel (a toast has no buttons, so this is the dialog)
@@ -1466,7 +1466,7 @@ export function register(on, options = {}) {
     }
     if (skip) return next(e)
     // $.session.compact() is refused on SDK hosts (the desktop app), so this queues /compact
-    return compactThenSend($, e, false, unvouched ? sender(e) : '', true)
+    return compactThenSend($, e, false, '', true)
   })
 
   on('turn.start', async ($, e, next) => {
