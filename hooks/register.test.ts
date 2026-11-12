@@ -34,6 +34,7 @@ function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unkno
   on('fs.read', (_: unknown, e: any) => ({ value: String(e.path ?? e).includes('cold-compact-log') ? seen.log : seat.label }))
   on('command.run', (_: unknown, e: any) => {
     if (e.command === 'compact') seen.compacts++, seen.order.push('compact')
+    if (e.command === 'compact' && failCompact) throw new Error('compactor down')
     if (e.command === 'compact' && hangCompact) return new Promise(() => {})
     if (e.command === 'compact' && holdCompact) return new Promise((res) => (releaseCompact = () => res({ text: compactOutput })))
     return { text: e.command === 'compact' ? compactOutput : '' }
@@ -76,6 +77,8 @@ let failAsUser: RegExp | null = null
 let beforeDrop: ((e: any) => Promise<void>) | null = null
 // runs inside a plugin resend, while the drain is under way
 let duringSubmit: ((e: any) => Promise<void>) | null = null
+// the engine's /compact throws
+let failCompact = false
 // the engine's /compact never settles
 let hangCompact = false
 // the engine's /compact waits until the test releases it
@@ -180,6 +183,86 @@ test("the person's cold send with an attachment asks, and Cancel puts the text b
   expect(seen.submits).toEqual([])
   expect(JSON.stringify(seen.fills)).toMatch(/what is this/)
   expect(seen.toasts.join(' ')).toMatch(/back in the prompt box/)
+})
+
+// an answer that is neither label (free text typed under "Other") is a cancel, never a send
+test('free text typed under Other in the attachment dialog does not send', SETUP, async ($, on) => {
+  const { r, seen, clock } = await coldAttachment($, on, 'send it, but with the other file')
+  expect('drop' in (r as object)).toBe(true)
+  await settle(clock, () => seen.toasts.some((t) => /Not sent/.test(t)))
+  expect(seen.submits).toEqual([])
+  expect(seen.compacts).toBe(0)
+  expect(JSON.stringify(seen.fills)).toMatch(/what is this/)
+})
+test('Cancel on the attachment dialog says so when the box refuses the text', SETUP, async ($, on) => {
+  refuseFill = true
+  try {
+    const { r, seen, clock } = await coldAttachment($, on, 'Cancel')
+    expect('drop' in (r as object)).toBe(true)
+    await settle(clock, () => seen.toasts.some((t) => /Not sent/.test(t)))
+    expect(seen.fills).toEqual([])
+    expect(seen.toasts.join(' ')).toMatch(/could not be put back/)
+    expect(seen.toasts.join(' ')).not.toMatch(/back in the prompt box:/)
+    expect(seen.log).toContain('what is this') // the log holds the only copy
+  } finally {
+    refuseFill = false
+  }
+})
+// the chat changes while the attachment dialog is up: the message is never sent into the new chat
+async function attachmentDialogAcrossClear($: any, on: any, reply: string | null) {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  on('classic.SessionStart', () => ({}))
+  on('tool.call', async (_: unknown, e: any) => {
+    if (e.tool !== 'AskUserQuestion') return { result: {} }
+    seen.asks++
+    await ($ as any).classic.SessionStart({ source: 'clear', transcript_path: '' })
+    if (reply === null) throw new Error('dismissed') // Esc on the now-stale dialog
+    const q = e.questions?.[0]?.question ?? ''
+    return { result: { questions: e.questions, answers: { [q]: reply } } }
+  })
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+  await clock.advance(77 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  const r = await $.prompt.submit({ text: 'what is this', origin: COMPOSER, attachments: [{ kind: 'image', path: '/repo/a.png' }], wait: false } as never)
+  expect(seen.asks).toBe(1)
+  expect('drop' in (r as object)).toBe(true)
+  await settle(clock, () => seen.fills.length >= 1)
+  expect(seen.compacts).toBe(0)
+  expect(seen.submits).toEqual([])
+  expect(JSON.stringify(seen.fills)).toMatch(/what is this/)
+  expect(seen.toasts.join('\n')).toMatch(/attach it again/)
+}
+test('a /clear while the attachment dialog is up hands the text back instead of sending it into the new chat', SETUP, ($, on) => attachmentDialogAcrossClear($, on, 'Send anyway'))
+test('an attachment dialog dismissed after a /clear does not send the message into the new chat', SETUP, ($, on) => attachmentDialogAcrossClear($, on, null))
+
+// a chat under the compaction floor goes as typed, attachment or not: no dialog about a compaction that would not run
+test("the person's cold send with an attachment on a chat under the compaction floor goes as typed, with no dialog", SETUP, async ($, on) => {
+  compactOutput = 'Not compacted · fast-jev: below 5% minimum: 2% reduction'
+  try {
+    const kept = new Map<string, unknown>()
+    const { clock, seen } = engine($, on, { label: 'A' }, kept)
+    answer(on, seen, null)
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+    await $.prompt.submit({ text: 'one', origin: COMPOSER, wait: false } as never)
+    await clock.advance(100)
+    await settle(clock, () => seen.submits.length >= 1)
+    expect(seen.compacts).toBe(1) // refused: the floor is set
+    await clock.advance(3 * 60000)
+    const r = await $.prompt.submit({ text: 'what is this', origin: COMPOSER, attachments: [{ kind: 'image', path: '/repo/a.png' }], wait: false } as never)
+    await clock.advance(100)
+    await settle(clock, () => seen.log.includes('skip-floor'))
+    expect('drop' in (r as object)).toBe(false)
+    expect(seen.asks).toBe(0)
+    expect(seen.compacts).toBe(1)
+    expect(seen.log).not.toContain('skip-media')
+  } finally {
+    compactOutput = ''
+  }
 })
 
 test('the rotator changing the seat file leaves a running chat alone: only its wake-up moves it', SETUP, async ($, on) => {
@@ -828,6 +911,79 @@ test('a refused compaction sets the floor, so the next cold peer wake is skipped
   }
 })
 
+// the person's own cold send honours the floor too: a chat the compactor would refuse again goes as typed
+test("a refused compaction sets the floor, so the person's next cold send goes as typed", async ($, on) => {
+  compactOutput = 'Not compacted · fast-jev: below 5% minimum: 2% reduction'
+  try {
+    const kept = new Map<string, unknown>()
+    const { clock, seen } = engine($, on, { label: 'A' }, kept)
+    answer(on, seen, null)
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+    await $.prompt.submit({ text: 'one', origin: COMPOSER, wait: false } as never)
+    await clock.advance(100)
+    await settle(clock, () => seen.submits.length >= 1)
+    expect(seen.compacts).toBe(1)
+    await clock.advance(3 * 60000)
+    const r = await $.prompt.submit({ text: 'two', origin: COMPOSER, wait: false } as never)
+    await clock.advance(100)
+    await settle(clock, () => seen.log.includes('skip-floor'))
+    expect('drop' in (r as object)).toBe(false) // goes through as typed
+    expect(seen.compacts).toBe(1)
+    expect(seen.asks).toBe(0)
+    expect(seen.log).toContain('"action":"skip-floor"')
+  } finally {
+    compactOutput = ''
+  }
+})
+
+// a compaction that just failed is not retried for 2 minutes: the person's next cold send goes as typed
+test("a failed compaction holds back the person's next cold send for 2 minutes", async ($, on) => {
+  failCompact = true
+  try {
+    const kept = new Map<string, unknown>()
+    const { clock, seen } = engine($, on, { label: 'A' }, kept)
+    answer(on, seen, null)
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+    await $.prompt.submit({ text: 'one', origin: COMPOSER, wait: false } as never)
+    await clock.advance(100)
+    await settle(clock, () => seen.submits.length >= 1)
+    expect(seen.compacts).toBe(1)
+    await clock.advance(60000)
+    const r = await $.prompt.submit({ text: 'two', origin: COMPOSER, wait: false } as never)
+    await clock.advance(100)
+    await settle(clock, () => seen.log.includes('skip-just-tried'))
+    expect('drop' in (r as object)).toBe(false)
+    expect(seen.compacts).toBe(1)
+    expect(seen.asks).toBe(0)
+  } finally {
+    failCompact = false
+  }
+})
+
+// a typed /session-handoff reads the whole conversation: compacting first would hand over a summary
+test('a typed /session-handoff on a cold big chat is not compacted', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, null)
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+  await clock.advance(77 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+  for (const name of ['session-handoff', 'cache-keeper:session-handoff']) {
+    const r = await $.prompt.submit({ text: '/' + name, command: { name, args: '' }, origin: COMPOSER, wait: false } as never)
+    await clock.advance(100)
+    expect('drop' in (r as object)).toBe(false)
+  }
+  expect(seen.compacts).toBe(0)
+  expect(seen.asks).toBe(0)
+})
+
 // A typed /compact the compactor refused counts too: the next cold wake does not try the same size again
 test('a refused /compact the person typed sets the floor for cold wakes', async ($, on) => {
   compactOutput = 'Not compacted · fast-jev: below 5% minimum: 2% reduction'
@@ -966,7 +1122,7 @@ test('a compaction refused after its deadline still sets the floor', async ($, o
   }
 })
 
-// Anything the host could not classify may be the person at the prompt: it gets the dialog, not the silent compact
+// Anything the host could not classify may be the person at the prompt: it compacts first as the person, never framed as a plugin
 async function unknownOrigin($: any, on: any, origin: unknown, headless = false) {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)
@@ -1047,8 +1203,6 @@ test('a prompt of the person with an @ mention does not wait behind a running co
   }
 })
 
-// The dialog waits on the person: a compaction that ran meanwhile is not followed by a second one. It is
-// refused here, so nothing else (justCompacted) stands in for the guard under test
 // An unclassified prompt the engine marks isMeta is an engine notice, not the person: never asked, and never
 // compacted for, since a resend could not carry isMeta and would turn a receipt into a turn of its own
 test('an unclassified engine notice (isMeta) goes through as is, unasked', async ($, on) => {
@@ -1142,7 +1296,7 @@ test("a warm session takes another session's message as is", async ($, on) => {
 })
 
 // Owner 2026-11-03 ("no longer prompting to compact on cold cache starts"): a reopened chat
-// misses its cache inside the hour too, so the guard asks before its first send
+// misses its cache inside the hour too, so the guard compacts before its first send
 test('a big chat reopened inside the hour compacts before its first send', async ($, on) => {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)

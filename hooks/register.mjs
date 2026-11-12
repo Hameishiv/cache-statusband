@@ -570,8 +570,9 @@ function boxSerial($, job) {
   boxChain = p.catch(() => {})
   return p
 }
-function putBack($, back) {
-  return boxSerial($, () => putBackNow($, back)).then(async (ok) => {
+function putBack($, back, epoch) {
+  // a previous chat's slash command is never one Enter away in the new chat (as handBack): refused, and logged below
+  return boxSerial($, () => (epoch !== undefined && epoch !== chatEpoch && back.some((m) => m.slash) ? false : putBackNow($, back))).then(async (ok) => {
     if (ok) return true
     // refused or timed out: nothing went in, so the log holds the only copy
     back.forEach((m) => coldLog($, { action: 'not-resent', text: m.text, sid: m.sid }))
@@ -597,7 +598,7 @@ async function putBackNow($, back, log = true) {
 // by the prompt.submit hook and goes out after the ones before it. The first message that cannot be
 // submitted goes back to the prompt box together with every one behind it, so nothing is dropped and
 // none overtakes it. The person's @-mention prompt goes back in the box and the rest still go.
-// A slash line (only ever the head, from the person's dialog) is filled as the
+// A slash line (only ever the head, from the person's own cold send being compacted) is filled as the
 // draft when the box is empty (otherwise logged), the rest still go, and a later failure is logged
 // rather than filled over that draft. A resend the host holds past the deadline is left to the host,
 // and the rest go back to the prompt box; if the host later refuses it, it goes back there too.
@@ -1397,7 +1398,8 @@ export function register(on, options = {}) {
     const reopened = !rotated && reopenedCold()
     const isCold = rotated || reopened || (left !== null && left <= 0)
     // These run locally or start afresh: a cold cache costs them nothing
-    const local = e.command && ['compact', 'clear', names.cache, names.keepwarm, names.board, names.handoff].includes(e.command.name)
+    // (and a typed /session-handoff reads the whole conversation: compacting first would hand over a summary)
+    const local = e.command && (['compact', 'clear', names.cache, names.keepwarm, names.board, names.handoff].includes(e.command.name) || HANDOFF_SKILL.test(e.command.name))
     // A compaction is under way: anything else waits behind it and goes after, in order, with no dialog
     // the person's own prompt waits only while /compact runs: a resend the host holds must never swallow it
     // not an engine notice (a resend would lose isMeta), nor the person's @-mention (a plugin's resend leaves it unexpanded)
@@ -1430,21 +1432,23 @@ export function register(on, options = {}) {
       return next(e)
     }
     // Owner 2026-11-11: the person's own cold send compacts first too, with no dialog.
-    // A plain -p run is not dropped (dropping it could end the run), and an attachment cannot survive a resend: both go as typed,
-    // as does a chat the compactor would refuse again (grown too little since, or a try that just failed).
-    const skip = headless ? 'headless' : media ? 'media' : !worthCompacting() ? 'floor' : now - compactTriedAt < 2 * MIN ? 'just-tried' : ''
+    // A plain -p run is not dropped (dropping it could end the run), and a chat the compactor would refuse again (grown too
+    // little since, or a try that just failed) goes as typed; an attachment cannot survive a resend, so it asks, but only
+    // when a compaction would otherwise have run.
+    const skip = headless ? 'headless' : !worthCompacting() ? 'floor' : now - compactTriedAt < 2 * MIN ? 'just-tried' : media ? 'media' : ''
     coldLog($, { event: 'auto-compact', origin: (e.origin && e.origin.kind) || 'none', reopened, rotated, action: skip ? 'skip-' + skip : 'compact-first' })
-    if (media) {
+    if (skip === 'media') {
       // Owner 2026-11-11: an attachment keeps the choice to cancel (a toast has no buttons, so this is the dialog)
       const askedIn = chatEpoch
       const askedSid = S.id
       let answer = 'Send anyway'
       try {
-        answer = await $.ui.ask(`Cache is cold, and compacting first would drop the attachment. Sending now rewrites ${tokens(S.ctx)} tokens of context (about ${money(rewriteCost(S.ctx, S.model, ttl))}). Cancel puts your text back in the prompt box: run /compact, then attach the file and send again.`, ['Send anyway', 'Cancel'])
-      } catch {
-        // nobody to ask (the dialog was dismissed): send as typed
+        answer = await $.ui.ask(`Cache is cold, and compacting first would drop the attachment. Sending now rewrites ${tokens(S.ctx)} tokens of context (about ${money(rewriteCost(S.ctx, S.model, ttl))}). Cancel puts your text back in the prompt box: run /compact, then attach the file and send again. Send it anyway?`, ['Send anyway', 'Cancel'])
+        coldLog($, { event: 'asked', origin: (e.origin && e.origin.kind) || 'none', answer, sid: askedSid })
+      } catch (err) {
+        // nobody to ask (a -p run, or the dialog was dismissed): send as typed
+        coldLog($, { event: 'ask-failed', origin: (e.origin && e.origin.kind) || 'none', error: String((err && err.message) || err).slice(0, 120), sid: askedSid })
       }
-      coldLog($, { event: 'asked', origin: (e.origin && e.origin.kind) || 'none', answer, sid: askedSid })
       const text = String(e.text || '').trim() ? [{ text: e.text, slash: !!e.command, sid: askedSid }] : []
       // the chat changed while the dialog was up: never sent into the new chat
       if (askedIn !== chatEpoch) {
@@ -1452,11 +1456,22 @@ export function register(on, options = {}) {
         $.ui.toast('The attachment on that message was not kept: attach it again if you send it.', { timeoutMs: 15000 })
         return { drop: 'cache-keeper: the chat changed while asking; see the note on what happened to the message' }
       }
-      if (answer === 'Cancel') {
+      // anything but "Send anyway" cancels: free text typed under "Other" never sends
+      if (answer !== 'Send anyway') {
         // not awaited, as handBack is: the box fills once this submit has been dropped
-        ;(text.length ? putBack($, text) : Promise.resolve(false))
+        ;(text.length ? putBack($, text, askedIn) : Promise.resolve(false))
           .catch(() => false)
-          .then((ok) => $.ui.toast(`Not sent. ${ok ? 'Your text is back in the prompt box: run' : 'Run'} /compact, then attach the file and send again.`, { timeoutMs: 15000 }))
+          .then((ok) => {
+            // the chat changed while the put-back waited its turn: the text is meant for the previous chat
+            const prev = askedIn !== chatEpoch
+            $.ui.toast(
+              ok && prev ? 'Not sent. Your text is in the prompt box, meant for the previous chat: send it only if it still applies, with the file attached again.'
+                : ok ? 'Not sent. Your text is back in the prompt box: run /compact, then attach the file and send again.'
+                : text.length ? 'Not sent, and your text could not be put back in the prompt box (logged if ~/.claude-shared/state exists). Run /compact, then attach the file and send again.'
+                : 'Not sent. Run /compact, then attach the file and send again.',
+              { timeoutMs: 15000 },
+            )
+          })
         return { drop: 'Cancelled by cache-keeper before a cold cache rewrite' }
       }
       return next(e)
@@ -1464,7 +1479,7 @@ export function register(on, options = {}) {
     if (skip) return next(e)
     // $.session.compact() is refused on SDK hosts (the desktop app), so this queues /compact
     // the person's @-mention prompt is put back after compacting: a plugin's resend would not attach the file
-    return compactThenSend($, e, false, '', false, !e.command && /(^|\s)@\S/.test(String(e.text || '')))
+    return compactThenSend($, e, false, '', true, !e.command && /(^|\s)@\S/.test(String(e.text || '')))
   })
 
   on('turn.start', async ($, e, next) => {
