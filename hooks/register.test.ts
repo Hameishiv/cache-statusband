@@ -207,6 +207,7 @@ test('an attachment dialog that rejects logs ask-failed and sends the message as
   expect('drop' in (r as object)).toBe(false) // goes through as typed
   expect(seen.log).toContain('"event":"ask-failed"')
   expect(seen.log).toContain('"action":"sent-as-typed"')
+  expect(seen.log).not.toContain('handed-back')
   expect(seen.log).not.toContain('"event":"asked"')
   expect(seen.compacts).toBe(0)
 })
@@ -258,6 +259,11 @@ async function attachmentDialogAcrossClear($: any, on: any, reply: string | null
   expect(seen.submits).toEqual([])
   expect(JSON.stringify(seen.fills)).toMatch(/what is this/)
   expect(seen.toasts.join('\n')).toMatch(/attach it again/)
+  // the outcome of a failed ask is logged once decided: handed back, never also sent
+  if (reply === null) {
+    expect(seen.log).toContain('"action":"handed-back"')
+    expect(seen.log).not.toContain('sent-as-typed')
+  }
 }
 test('a /clear while the attachment dialog is up hands the text back instead of sending it into the new chat', SETUP, ($, on) => attachmentDialogAcrossClear($, on, 'Send anyway'))
 test('an attachment dialog dismissed after a /clear does not send the message into the new chat', SETUP, ($, on) => attachmentDialogAcrossClear($, on, null))
@@ -297,21 +303,31 @@ test('the rotator changing the seat file leaves a running chat alone: only its w
   await start($, 300000, clock)
   seat.label = 'H' // the rotator moved the merge-pr sessions to another account
   await clock.advance(5 * 60000)
-  await $.prompt.submit({ text: 'what would it take?', origin: COMPOSER, wait: false } as never)
+  const r = await $.prompt.submit({ text: 'what would it take?', origin: COMPOSER, wait: false } as never)
+  await clock.advance(100)
+  expect('drop' in (r as object)).toBe(false) // goes as typed: the chat is not taken for cold
+  expect(seen.compacts).toBe(0)
   expect(seen.asks).toBe(0)
 })
 
-test('no compact prompt right after a compaction, nor for /compact itself', async ($, on) => {
+// (with the seat file configured: the seat change is what makes the chat cold again once the compaction has run, and only justCompacted holds the next send back)
+test('no compact prompt right after a compaction, nor for /compact itself', SETUP, async ($, on) => {
   const seat = { label: 'A' }
   const { clock, seen } = engine($, on, seat)
   answer(on, seen, null)
   await start($, 300000, clock)
   seat.label = 'B'
-  await clock.advance(31000)
-  await $.prompt.submit({ text: '/compact', command: { name: 'compact', args: '' }, origin: COMPOSER, wait: false } as never)
-  expect(seen.asks).toBe(0)
+  await clock.advance(2 * 60000)
+  const typed = await $.prompt.submit({ text: '/compact', command: { name: 'compact', args: '' }, origin: COMPOSER, wait: false } as never)
+  await clock.advance(100)
+  expect('drop' in (typed as object)).toBe(false) // /compact itself is never compacted first
+  expect(seen.compacts).toBe(0)
   await $.command.run({ command: 'compact', args: '' })
-  await $.prompt.submit({ text: 'go on', origin: COMPOSER, wait: false } as never)
+  expect(seen.compacts).toBe(1) // its own, run explicitly
+  const r = await $.prompt.submit({ text: 'go on', origin: COMPOSER, wait: false } as never)
+  await clock.advance(100)
+  expect('drop' in (r as object)).toBe(false) // right after a compaction: no second one
+  expect(seen.compacts).toBe(1)
   expect(seen.asks).toBe(0)
 })
 

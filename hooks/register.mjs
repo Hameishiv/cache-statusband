@@ -93,7 +93,7 @@ let onTerminal = false
 const cfg = {
   seatFileTerminal: '', // a file holding the signed-in account's label, as an account rotator writes it
   seatFileDesktop: '',
-  rotatorWake: null, // the prompt an unattended account rotator types after rotating: compact without asking
+  rotatorWake: null, // the prompt an unattended account rotator types after rotating: it takes the new seat at once and compacts even right after a failed try
   prPattern: null, // a first prompt naming a PR: keep warm stops once that PR merges or closes
   autoResume: false, // send "Resume" to a chat cut short by exhausted usage once it renews
 }
@@ -1442,16 +1442,20 @@ export function register(on, options = {}) {
       const askedIn = chatEpoch
       const askedSid = S.id
       let answer = 'Send anyway'
+      let failed = false
       try {
-        answer = await $.ui.ask(`Cache is cold, and compacting first would drop the attachment. Sending now rewrites ${tokens(S.ctx)} tokens of context (about ${money(rewriteCost(S.ctx, S.model, ttl))}). Cancel puts your text back in the prompt box: run /compact, then attach the file and send again. Send it anyway?`, ['Send anyway', 'Cancel'])
+        answer = await $.ui.ask(`Cache is cold, and compacting first would drop the attachment. Sending now rewrites ${tokens(S.ctx)} tokens of context (about ${money(rewriteCost(S.ctx, S.model, ttl))}). Cancel tries to put your text back in the prompt box: run /compact, then attach the file and send again. Send it anyway?`, ['Send anyway', 'Cancel'])
         coldLog($, { event: 'asked', origin: (e.origin && e.origin.kind) || 'none', answer, sid: askedSid })
       } catch (err) {
         // dismissed (Esc), or the dialog could not be shown: send as typed
-        coldLog($, { event: 'ask-failed', action: 'sent-as-typed', origin: (e.origin && e.origin.kind) || 'none', error: String((err && err.message) || err).slice(0, 120), sid: askedSid })
+        failed = true
+        coldLog($, { event: 'ask-failed', origin: (e.origin && e.origin.kind) || 'none', error: String((err && err.message) || err).slice(0, 120), sid: askedSid })
       }
       const text = String(e.text || '').trim() ? [{ text: e.text, slash: !!e.command, sid: askedSid }] : []
       // the chat changed while the dialog was up: never sent into the new chat
       if (askedIn !== chatEpoch) {
+        // the outcome of a failed ask is logged once it is decided: this message is handed back, never sent
+        if (failed) coldLog($, { event: 'ask-failed', action: 'handed-back', origin: (e.origin && e.origin.kind) || 'none', sid: askedSid })
         handBack($, text, -1).catch(() => {})
         $.ui.toast('The attachment on that message was not kept: attach it again if you send it.', { timeoutMs: 15000 })
         return { drop: 'cache-keeper: the chat changed while asking; see the note on what happened to the message' }
@@ -1467,7 +1471,7 @@ export function register(on, options = {}) {
             $.ui.toast(
               ok && prev ? 'Not sent. Your text is in the prompt box, meant for the previous chat: send it only if it still applies, with the file attached again.'
                 : ok ? 'Not sent. Your text is back in the prompt box: run /compact, then attach the file and send again.'
-                : text.length && prev ? 'Not sent. The chat changed before your text could go back in the prompt box, so it was not put there (logged if ~/.claude-shared/state exists).'
+                : text.length && prev ? 'Not sent. Your text could not be put back in the prompt box, and the chat changed meanwhile (logged if ~/.claude-shared/state exists).'
                 : text.length ? 'Not sent, and your text could not be put back in the prompt box (logged if ~/.claude-shared/state exists). Run /compact, then attach the file and send again.'
                 : 'Not sent. Run /compact, then attach the file and send again.',
               { timeoutMs: 15000 },
@@ -1475,6 +1479,7 @@ export function register(on, options = {}) {
           })
         return { drop: 'Cancelled by cache-keeper before a cold cache rewrite' }
       }
+      if (failed) coldLog($, { event: 'ask-failed', action: 'sent-as-typed', origin: (e.origin && e.origin.kind) || 'none', sid: askedSid })
       return next(e)
     }
     if (skip) return next(e)
