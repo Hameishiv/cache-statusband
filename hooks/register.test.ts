@@ -325,7 +325,7 @@ test('right after a compaction on a chat that is still cold, the next message is
   await clock.advance(100)
   await settle(clock, () => seen.submits.length >= 1)
   expect(seen.compacts).toBe(1)
-  // compactTriedAt is set only by a failed or refused compaction, never by a successful one. It starts at 0 and the test clock
+  // compactTriedAt is set only by a compaction that failed, timed out or was refused, never by a successful one. It starts at 0 and the test clock
   // starts near 0, so without this advance 'now - compactTriedAt < 2 minutes' is true and skip-just-tried would mask justCompacted
   await clock.advance(3 * 60000)
   const r = await $.prompt.submit({ text: 'go on', origin: COMPOSER, wait: false } as never)

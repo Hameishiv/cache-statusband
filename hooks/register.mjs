@@ -595,7 +595,16 @@ async function putBackNow($, back, log = true) {
 // them only when ~/.claude-shared/state exists. `raw` is what was typed, since `text` carries the sender's frame
 // for another session's message. Masked as the band's labels are (screen recording), the first three, the rest counted.
 function lostText(msgs) {
-  const shown = msgs.slice(0, 3).map((m) => `"${clip(mask(String(m.raw ?? m.text)), 80)}"`)
+  // cut before masking: a message can be up to 4 MiB and the masker takes seconds on that; the cut sits far past
+  // the 80 characters shown, so no half-key is left visible. A masker that throws must not cost the toast
+  const shown = msgs.slice(0, 3).map((m) => {
+    const words = String(m.raw ?? m.text).slice(0, 2000)
+    try {
+      return `"${clip(mask(words), 80)}"`
+    } catch {
+      return '(a message)'
+    }
+  })
   return shown.join(', ') + (msgs.length > 3 ? ` and ${msgs.length - 3} more` : '')
 }
 
@@ -1179,7 +1188,7 @@ function statusText() {
   if (S.rateLimits.length) lines.push(`Plan limits used: ${limitsText(S.rateLimits)}.`)
   lines.push(S.fable ? `Fable weekly: ${Math.round(S.fable.percentUsed)}% used.` : `Fable weekly: no reading yet${planWhy && planWhy !== 'ok' ? ` (last check: ${planWhy})` : ''}.`)
   lines.push(`Session cost so far: ${money(S.costUsd)}. Cold restarts this session: ${S.coldRestarts.length} (${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))}).`)
-  lines.push(`Cold-send guard: ${settings.guard ? 'on' : 'off'} for contexts over ${tokens(settings.bigTokens)} tokens (a cold send compacts first, yours included, once the chat is 100k tokens past its last compaction; asks only when an attachment would be dropped). Alerts: ${settings.alerts ? 'on' : 'off'}.`)
+  lines.push(`Cold-send guard: ${settings.guard ? 'on' : 'off'} for contexts over ${tokens(settings.bigTokens)} tokens (a cold send compacts first, yours included, once the chat is 100k tokens past its last compaction, or past a refused one; asks only when an attachment would be dropped). Alerts: ${settings.alerts ? 'on' : 'off'}.`)
   lines.push(`Auto keep warm: ${settings.autoWarmHours ? `on, until ${settings.autoWarmHours}h after the last turn, for contexts over ${tokens(settings.bigTokens)}${S.autoWarm ? '' : ' (off in this session)'}` : 'off'}.`)
   lines.push(`Settings: /${names.cache} ttl 5|60|auto, /${names.cache} guard on|off, /${names.cache} big 150k, /${names.cache} alerts on|off, /${names.cache} autowarm 8|off. Board: /${names.board}.`)
   return lines.join('\n')
