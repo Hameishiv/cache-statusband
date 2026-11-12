@@ -604,7 +604,7 @@ async function handBack($, first, epoch) {
   orphans.delete(epoch)
   if (!back.length) return
   const ok = await putBack($, back)
-  $.ui.toast(ok ? `${back.length} message(s) meant for the previous chat are in the prompt box: send them only if they still apply.` : `${back.length} message(s) meant for the previous chat could not be sent (logged if ~/.claude-shared/state exists).`, { timeoutMs: 15000 })
+  $.ui.toast(ok ? `${back.length} message(s) meant for the previous chat are in the prompt box: send them only if they still apply.` : `${back.length} message(s) meant for the previous chat could not be sent (logged if ~/.claude-shared/state exists): ${back.map((m) => clip(m.text, 80)).join(', ')}.`, { timeoutMs: 15000 })
 }
 
 // the count of messages a drain could neither resend nor put back reaches the person on every exit,
@@ -670,7 +670,8 @@ async function drainQueue($, epoch, tally) {
         if (epoch !== chatEpoch) $.ui.toast(`${back.length} message(s) meant for the previous chat are in the prompt box: send them only if they still apply.`, { timeoutMs: 15000 })
         else $.ui.toast(back.length === 1 ? 'The message is back in the prompt box: press Enter to send it.' : `${back.length} messages are back in the prompt box: press Enter to send them.`, { timeoutMs: 15000 })
       } else {
-        $.ui.toast(`${back.length} message(s) could not be sent again (logged if ~/.claude-shared/state exists).`, { timeoutMs: 15000 })
+        // the text is on screen too: the log exists only when ~/.claude-shared/state does
+        $.ui.toast(`${back.length} message(s) could not be sent again (logged if ~/.claude-shared/state exists): ${back.map((m) => clip(m.text, 80)).join(', ')}.`, { timeoutMs: 15000 })
       }
       return
     }
@@ -1396,7 +1397,7 @@ export function register(on, options = {}) {
     const skip = headless ? 'headless' : e.command ? 'slash' : /(^|\s)@\S/.test(String(e.text || '')) ? 'mention' : !worthCompacting() ? 'floor' : now - compactTriedAt < 2 * MIN ? 'just-tried' : media ? 'media' : ''
     coldLog($, { event: 'auto-compact', origin: (e.origin && e.origin.kind) || 'none', reopened, rotated, action: skip ? 'skip-' + skip : 'compact-first' })
     if (skip === 'media') {
-      // Owner 2026-11-11: an attachment keeps the choice to cancel (a toast has no buttons, so this is the dialog)
+      // An attachment keeps the choice to cancel (a toast has no buttons, so this is the dialog)
       const askedIn = chatEpoch
       const askedSid = S.id
       let answer = 'Send anyway'
@@ -1420,7 +1421,8 @@ export function register(on, options = {}) {
       }
       // anything but "Send anyway" cancels: free text typed under "Other" never sends
       if (answer !== 'Send anyway') {
-        // not awaited, as handBack is: the box fills once this submit has been dropped
+        // the put-back is started here and not awaited, so it runs after this hook returns; whether the host touches
+        // the box when it handles the drop is not verified
         ;(text.length ? putBack($, text) : Promise.resolve(false))
           .catch(() => false)
           .then((ok) => {

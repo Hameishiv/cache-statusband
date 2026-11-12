@@ -133,7 +133,7 @@ test('a small context woken by the rotator is sent as is', SETUP, async ($, on) 
   expect(seen.compacts).toBe(0)
 })
 
-// owner 2026-11-11: the person's cold send compacts first too, with no dialog
+// the person's cold send compacts first too, with no dialog
 test("the person's cold send compacts, then sends the message, without asking", SETUP, async ($, on) => {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)
@@ -155,7 +155,7 @@ test("the person's cold send compacts, then sends the message, without asking", 
   expect(seen.log).toContain('"action":"compact-first"')
 })
 
-// owner 2026-11-11: an attachment cannot survive a resend, so its cold send keeps the choice to cancel
+// an attachment cannot survive a resend, so its cold send keeps the choice to cancel
 async function coldAttachment($: any, on: any, label: string) {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)
@@ -1095,6 +1095,10 @@ test('a typed /session-handoff on a cold big chat is not compacted', async ($, o
   }
   expect(seen.compacts).toBe(0)
   expect(seen.asks).toBe(0)
+  // passed as local (not as a slash command to skip), under both names: only HANDOFF_SKILL covers the namespaced one
+  await settle(clock, () => seen.log.includes('guard-pass'))
+  expect(seen.log).toContain('"local":true')
+  expect(seen.log).not.toContain('skip-slash')
 })
 
 // A typed /compact the compactor refused counts too: the next cold wake does not try the same size again
@@ -1504,7 +1508,7 @@ test("another plugin's asUser prompt is resent as the person's words, not framed
   expect(seen.asUsers).toEqual([true])
 })
 
-// Owner 2026-11-11: the person's own slash command is never compacted first: parked in the box it could be overtaken by a later
+// Review round 4: the person's own slash command is never compacted first: parked in the box it could be overtaken by a later
 // message, and there may be no box. It goes as typed, and what the person typed meanwhile is left alone
 test("the person's cold slash command goes as typed, never compacted or put in the box over a draft", SETUP, async ($, on) => {
   const kept = new Map<string, unknown>()
@@ -1697,7 +1701,7 @@ test("the owner's Slack ping is compacted first and resent as the person's words
   expect(seen.asUsers).toEqual([true])
 })
 
-// Owner 2026-11-11: a resend would not attach an @-mentioned file, and parking it in the box lets a later message overtake it: it goes as typed
+// Review round 4: a resend would not attach an @-mentioned file, and parking it in the box lets a later message overtake it: it goes as typed
 test("the person's cold prompt with an @ mention goes as typed, never compacted", SETUP, async ($, on) => {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)
@@ -1827,6 +1831,65 @@ test('a /clear during a compaction puts the waiting message back, while the pers
   } finally {
     hangCompact = false
   }
+})
+
+// A message that could be neither resent nor put back is on screen too: the log exists only when ~/.claude-shared/state does
+test('a message that can be neither resent nor put back is shown in the toast, not only the log', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, null)
+  refuseFill = true
+  dropSubmit = /PR 12 merged/
+  try {
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+    await $.prompt.submit({ text: 'PR 12 merged; pick up the next one', origin: PEER, isMeta: true, wait: false } as never)
+    await clock.advance(100)
+    await settle(clock, () => seen.toasts.some((t) => /could not be sent again/.test(t)))
+    expect(seen.toasts.join(' ')).toContain('PR 12 merged; pick up the next one')
+  } finally {
+    dropSubmit = null
+    refuseFill = false
+  }
+})
+test('a message handed back after a /clear that the box refuses is shown in the toast', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, null)
+  on('classic.SessionStart', () => ({}))
+  hangCompact = true
+  refuseFill = true
+  try {
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+    await $.prompt.submit({ text: 'peer note', origin: PEER, wait: false } as never)
+    await clock.advance(100)
+    await settle(clock, () => seen.compacts >= 1)
+    await ($ as any).classic.SessionStart({ source: 'clear', transcript_path: '' })
+    await settle(clock, () => seen.toasts.some((t) => /could not be sent/.test(t)))
+    expect(seen.toasts.join(' ')).toContain('peer note')
+  } finally {
+    hangCompact = false
+    refuseFill = false
+  }
+})
+
+// no seat files configured: the wake-up still marks the chat cold and compacts it first
+test('a rotator wake-up on a big chat compacts first even with no seat file configured', { options: { rotatorWakePattern: SETUP.options.rotatorWakePattern } }, async ($, on) => {
+  const { clock, seen } = engine($, on)
+  answer(on, seen, null)
+  await start($, 300000, clock)
+  const r = await $.prompt.submit({ text: 'Usage reset: the weekly limit capped, so the CLI account was rotated to G. Go on.', origin: COMPOSER, wait: false } as never)
+  expect('drop' in (r as object)).toBe(true)
+  await clock.advance(100)
+  await settle(clock, () => seen.submits.length >= 1)
+  expect(seen.compacts).toBe(1)
+  expect(seen.submits[0]).toMatch(/^Usage reset:/)
+  expect(seen.asks).toBe(0)
 })
 
 // Opus 2026-11-05 r8: a /clear after a rotation leaves an empty chat, which a peer message must not compact
