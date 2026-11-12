@@ -206,6 +206,7 @@ test('an attachment dialog that rejects logs ask-failed and sends the message as
   expect(seen.asks).toBe(1)
   expect('drop' in (r as object)).toBe(false) // goes through as typed
   expect(seen.log).toContain('"event":"ask-failed"')
+  expect(seen.log).toContain('"event":"ask-outcome"')
   expect(seen.log).toContain('"action":"sent-as-typed"')
   expect(seen.log).not.toContain('handed-back')
   expect(seen.log).not.toContain('"event":"asked"')
@@ -261,6 +262,8 @@ async function attachmentDialogAcrossClear($: any, on: any, reply: string | null
   expect(seen.toasts.join('\n')).toMatch(/attach it again/)
   // the outcome of a failed ask is logged once decided: handed back, never also sent
   if (reply === null) {
+    expect(seen.log).toContain('"event":"ask-failed"')
+    expect(seen.log).toContain('"event":"ask-outcome"')
     expect(seen.log).toContain('"action":"handed-back"')
     expect(seen.log).not.toContain('sent-as-typed')
   }
@@ -310,25 +313,66 @@ test('the rotator changing the seat file leaves a running chat alone: only its w
   expect(seen.asks).toBe(0)
 })
 
-// (with the seat file configured: the seat change is what makes the chat cold again once the compaction has run, and only justCompacted holds the next send back)
-test('no compact prompt right after a compaction, nor for /compact itself', SETUP, async ($, on) => {
-  const seat = { label: 'A' }
-  const { clock, seen } = engine($, on, seat)
+// The wake-up rotates the chat cold, and the compaction it runs leaves it cold (rotatedCold stays true): only justCompacted
+// keeps the next plain message from being compacted a second time (once the 2-minute pause after a compaction has passed)
+test('right after a compaction on a chat that is still cold, the next message is not compacted again', SETUP, async ($, on) => {
+  const { clock, seen } = engine($, on, { label: 'A' })
   answer(on, seen, null)
   await start($, 300000, clock)
-  seat.label = 'B'
-  await clock.advance(2 * 60000)
-  const typed = await $.prompt.submit({ text: '/compact', command: { name: 'compact', args: '' }, origin: COMPOSER, wait: false } as never)
+  await $.prompt.submit({ text: 'Usage reset: the weekly limit capped, so the CLI account was rotated to G. Go on.', origin: COMPOSER, wait: false } as never)
   await clock.advance(100)
-  expect('drop' in (typed as object)).toBe(false) // /compact itself is never compacted first
-  expect(seen.compacts).toBe(0)
-  await $.command.run({ command: 'compact', args: '' })
-  expect(seen.compacts).toBe(1) // its own, run explicitly
+  await settle(clock, () => seen.submits.length >= 1)
+  expect(seen.compacts).toBe(1)
+  await clock.advance(3 * 60000) // past the 2-minute pause after any compaction, which would otherwise hold the next one back
   const r = await $.prompt.submit({ text: 'go on', origin: COMPOSER, wait: false } as never)
   await clock.advance(100)
-  expect('drop' in (r as object)).toBe(false) // right after a compaction: no second one
+  expect('drop' in (r as object)).toBe(false)
   expect(seen.compacts).toBe(1)
   expect(seen.asks).toBe(0)
+})
+
+// A typed /compact is local: on a cold big chat it passes through the guard (logged as local), never compacted first
+test('a typed /compact on a cold big chat passes the guard as local, uncompacted', SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, null)
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+  await clock.advance(77 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  const r = await $.prompt.submit({ text: '/compact', command: { name: 'compact', args: '' }, origin: COMPOSER, wait: false } as never)
+  await clock.advance(100)
+  await settle(clock, () => seen.log.includes('guard-pass'))
+  expect('drop' in (r as object)).toBe(false)
+  expect(seen.compacts).toBe(0)
+  expect(seen.log).toContain('"local":true')
+  expect(seen.log).not.toContain('skip-slash')
+})
+
+// J5: the wake-up is compacted first even within 2 minutes of a try that failed, since the new account may succeed
+test('a rotator wake-up is still compacted within 2 minutes of a failed compaction', SETUP, async ($, on) => {
+  failCompact = true
+  try {
+    const kept = new Map<string, unknown>()
+    const { clock, seen } = engine($, on, { label: 'A' }, kept)
+    answer(on, seen, null)
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+    await $.prompt.submit({ text: 'one', origin: COMPOSER, wait: false } as never)
+    await clock.advance(100)
+    await settle(clock, () => seen.submits.length >= 1)
+    expect(seen.compacts).toBe(1)
+    await clock.advance(60000)
+    const r = await $.prompt.submit({ text: 'Usage reset: the weekly limit capped, so the CLI account was rotated to G. Go on.', origin: COMPOSER, wait: false } as never)
+    await clock.advance(100)
+    await settle(clock, () => seen.compacts >= 2)
+    expect('drop' in (r as object)).toBe(true)
+    expect(seen.compacts).toBe(2)
+  } finally {
+    failCompact = false
+  }
 })
 
 const usage = (o: Record<string, unknown>) => ({ input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, model: 'claude-opus-5-5', ...o })
@@ -1460,8 +1504,9 @@ test("another plugin's asUser prompt is resent as the person's words, not framed
   expect(seen.asUsers).toEqual([true])
 })
 
-// Fable 2026-11-05: the slash head never replaces what the person typed during the compaction
-test('a slash line from an automatic compaction is not filled over a draft typed during the compaction', SETUP, async ($, on) => {
+// Owner 2026-11-11: the person's own slash command is never compacted first: parked in the box it could be overtaken by a later
+// message, and there may be no box. It goes as typed, and what the person typed meanwhile is left alone
+test("the person's cold slash command goes as typed, never compacted or put in the box over a draft", SETUP, async ($, on) => {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)
   answer(on, seen, null)
@@ -1471,12 +1516,13 @@ test('a slash line from an automatic compaction is not filled over a draft typed
     kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
     await clock.advance(77 * 60000)
     await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
-    await $.prompt.submit({ text: '/merge-pr 123', command: { name: 'merge-pr', args: '123' }, origin: COMPOSER, wait: false } as never)
+    const r = await $.prompt.submit({ text: '/merge-pr 123', command: { name: 'merge-pr', args: '123' }, origin: COMPOSER, wait: false } as never)
     await clock.advance(100)
-    await settle(clock, () => seen.toasts.some((t) => t.includes('not put back')))
-    expect(seen.compacts).toBe(1)
+    await settle(clock, () => seen.log.includes('skip-slash'))
+    expect('drop' in (r as object)).toBe(false)
+    expect(seen.compacts).toBe(0)
     expect(seen.fills).toEqual([])
-    expect(seen.toasts.some((t) => t.includes('not put back over what you typed'))).toBe(true)
+    expect(seen.log).toContain('"action":"skip-slash"')
   } finally {
     boxDraft = ''
   }
@@ -1651,8 +1697,8 @@ test("the owner's Slack ping is compacted first and resent as the person's words
   expect(seen.asUsers).toEqual([true])
 })
 
-// Opus 2026-11-05 r2: a resend would not attach an @-mentioned file, so after compacting first it goes back in the box
-test('an automatic compaction of a prompt with an @ mention puts it back in the prompt box, not resent', SETUP, async ($, on) => {
+// Owner 2026-11-11: a resend would not attach an @-mentioned file, and parking it in the box lets a later message overtake it: it goes as typed
+test("the person's cold prompt with an @ mention goes as typed, never compacted", SETUP, async ($, on) => {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)
   answer(on, seen, null)
@@ -1660,12 +1706,29 @@ test('an automatic compaction of a prompt with an @ mention puts it back in the 
   kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
   await clock.advance(77 * 60000)
   await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
-  await $.prompt.submit({ text: 'look at @src/x.ts', origin: COMPOSER, wait: false } as never)
+  const r = await $.prompt.submit({ text: 'look at @src/x.ts', origin: COMPOSER, wait: false } as never)
   await clock.advance(100)
-  await settle(clock, () => seen.fills.length >= 1)
-  expect(seen.compacts).toBe(1)
-  expect(seen.submits).toEqual([])
-  expect(seen.fills[0].text).toBe('look at @src/x.ts')
+  await settle(clock, () => seen.log.includes('skip-mention'))
+  expect('drop' in (r as object)).toBe(false)
+  expect(seen.compacts).toBe(0)
+  expect(seen.fills).toEqual([])
+  expect(seen.log).toContain('"action":"skip-mention"')
+})
+// the same with an attachment on it: not dropped, so no dialog either
+test("the person's cold @ prompt with an attachment goes as typed, with no dialog", SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, null)
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+  await clock.advance(77 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  const r = await $.prompt.submit({ text: 'look at @src/x.ts', origin: COMPOSER, attachments: [{ kind: 'image', path: '/repo/a.png' }], wait: false } as never)
+  await clock.advance(100)
+  await settle(clock, () => seen.log.includes('skip-mention'))
+  expect('drop' in (r as object)).toBe(false)
+  expect(seen.asks).toBe(0)
+  expect(seen.compacts).toBe(0)
 })
 
 // Opus 2026-11-05 r2: a long message that is neither resent nor put back keeps its whole text in a file of its own
@@ -1694,8 +1757,8 @@ test('a long message that could not be resent or put back is kept whole in a los
   }
 })
 
-// Opus 2026-11-05 r3: an @ prompt put back after compacting goes after the draft, never lost because the box has text
-test('an automatic compaction of an @ prompt with a draft in the box appends it after the draft', SETUP, async ($, on) => {
+// Opus 2026-11-05 r3, now that the person's @ prompt goes as typed: the box and what is typed in it are left alone
+test("the person's cold @ prompt leaves a draft in the box alone", SETUP, async ($, on) => {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)
   answer(on, seen, null)
@@ -1705,17 +1768,18 @@ test('an automatic compaction of an @ prompt with a draft in the box appends it 
     kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
     await clock.advance(77 * 60000)
     await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
-    await $.prompt.submit({ text: 'look at @src/x.ts', origin: COMPOSER, wait: false } as never)
+    const r = await $.prompt.submit({ text: 'look at @src/x.ts', origin: COMPOSER, wait: false } as never)
     await clock.advance(100)
-    await settle(clock, () => seen.fills.length >= 1)
-    expect(seen.fills).toEqual([{ text: '\n\nlook at @src/x.ts', mode: 'append' }])
+    await settle(clock, () => seen.log.includes('skip-mention'))
+    expect('drop' in (r as object)).toBe(false)
+    expect(seen.fills).toEqual([])
     expect(seen.log).not.toContain('not-resent')
   } finally {
     boxDraft = ''
   }
 })
 
-test('an automatic compaction of a slash command with an @ word never puts it after the draft', SETUP, async ($, on) => {
+test("the person's cold slash command with an @ word is a slash command: as typed, nothing put in the box", SETUP, async ($, on) => {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)
   answer(on, seen, null)
@@ -1725,18 +1789,20 @@ test('an automatic compaction of a slash command with an @ word never puts it af
     kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
     await clock.advance(77 * 60000)
     await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
-    await $.prompt.submit({ text: '/review @src/x.ts', command: { name: 'review', args: '@src/x.ts' }, origin: COMPOSER, wait: false } as never)
+    const r = await $.prompt.submit({ text: '/review @src/x.ts', command: { name: 'review', args: '@src/x.ts' }, origin: COMPOSER, wait: false } as never)
     await clock.advance(100)
-    await settle(clock, () => seen.log.includes('not-resent'))
+    await settle(clock, () => seen.log.includes('skip-slash'))
+    expect('drop' in (r as object)).toBe(false)
     expect(seen.fills).toEqual([])
-    expect(seen.log).toContain('not-resent')
+    expect(seen.log).not.toContain('skip-mention')
   } finally {
     boxDraft = ''
   }
 })
 
-// Opus 2026-11-05: a /clear while a slash head waits never joins the queued messages to that slash line
-test('a /clear during a compaction logs the previous chat slash command and puts the rest back', SETUP, async ($, on) => {
+// Opus 2026-11-05, reworked 2026-11-11: the person's own slash command never waits behind a compaction (it goes as typed, so it is
+// never a head that a /clear could strand), and a /clear still hands the messages that did wait back, marked as meant for the previous chat
+test('a /clear during a compaction puts the waiting message back, while the person slash command went as typed', SETUP, async ($, on) => {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)
   answer(on, seen, null)
@@ -1747,20 +1813,17 @@ test('a /clear during a compaction logs the previous chat slash command and puts
     kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
     await clock.advance(77 * 60000)
     await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
-    await $.prompt.submit({ text: '/merge-pr 123', command: { name: 'merge-pr', args: '123' }, origin: COMPOSER, wait: false } as never)
+    await $.prompt.submit({ text: 'peer note', origin: PEER, wait: false } as never)
     await clock.advance(100)
     await settle(clock, () => seen.compacts >= 1)
-    await $.prompt.submit({ text: 'peer note', origin: PEER, wait: false } as never)
+    const cmd = await $.prompt.submit({ text: '/merge-pr 123', command: { name: 'merge-pr', args: '123' }, origin: COMPOSER, wait: false } as never)
+    expect('drop' in (cmd as object)).toBe(false) // not queued behind the compaction
     await clock.advance(100)
     await ($ as any).classic.SessionStart({ source: 'clear', transcript_path: '' })
     await settle(clock, () => seen.toasts.some((t) => /meant for the previous chat/.test(t)))
-    // the previous chat's command is logged, never one Enter away in the new chat; the peer note goes back
     expect(seen.fills.some((f) => f.text.includes('/merge-pr 123'))).toBe(false)
     expect(seen.fills.some((f) => f.text.includes('peer note'))).toBe(true)
-    expect(seen.toasts.some((t) => t.includes('Not put back') && t.includes('/merge-pr 123'))).toBe(true)
     expect(seen.log).toContain('queued-head')
-    await settle(clock, () => seen.log.includes('not-resent'))
-    expect(seen.log).toContain('/merge-pr 123')
   } finally {
     hangCompact = false
   }

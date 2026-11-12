@@ -93,7 +93,7 @@ let onTerminal = false
 const cfg = {
   seatFileTerminal: '', // a file holding the signed-in account's label, as an account rotator writes it
   seatFileDesktop: '',
-  rotatorWake: null, // the prompt an unattended account rotator types after rotating: it takes the new seat at once and compacts even right after a failed try
+  rotatorWake: null, // the prompt an unattended account rotator types after rotating: with a seat file set it takes the new seat at once, and it compacts even right after a failed try
   prPattern: null, // a first prompt naming a PR: keep warm stops once that PR merges or closes
   autoResume: false, // send "Resume" to a chat cut short by exhausted usage once it renews
 }
@@ -1432,10 +1432,11 @@ export function register(on, options = {}) {
       return next(e)
     }
     // Owner 2026-11-11: the person's own cold send compacts first too, with no dialog.
-    // A plain -p run is not dropped (dropping it could end the run), and a chat the compactor would refuse again (grown too
-    // little since, or a try that just failed) goes as typed; an attachment cannot survive a resend, so it asks, but only
-    // when a compaction would otherwise have run.
-    const skip = headless ? 'headless' : !worthCompacting() ? 'floor' : now - compactTriedAt < 2 * MIN ? 'just-tried' : media ? 'media' : ''
+    // A plain -p run is not dropped (dropping it could end the run); a slash command or an @-mention prompt is not dropped
+    // either (a resend could not run the command, or attach the file, and parking it in the prompt box would let a later
+    // message overtake it); a chat the compactor would refuse again (grown too little since, or a try that just failed) goes
+    // as typed; an attachment cannot survive a resend, so it asks, but only when a compaction would otherwise have run.
+    const skip = headless ? 'headless' : e.command ? 'slash' : /(^|\s)@\S/.test(String(e.text || '')) ? 'mention' : !worthCompacting() ? 'floor' : now - compactTriedAt < 2 * MIN ? 'just-tried' : media ? 'media' : ''
     coldLog($, { event: 'auto-compact', origin: (e.origin && e.origin.kind) || 'none', reopened, rotated, action: skip ? 'skip-' + skip : 'compact-first' })
     if (skip === 'media') {
       // Owner 2026-11-11: an attachment keeps the choice to cancel (a toast has no buttons, so this is the dialog)
@@ -1447,7 +1448,7 @@ export function register(on, options = {}) {
         answer = await $.ui.ask(`Cache is cold, and compacting first would drop the attachment. Sending now rewrites ${tokens(S.ctx)} tokens of context (about ${money(rewriteCost(S.ctx, S.model, ttl))}). Cancel tries to put your text back in the prompt box: run /compact, then attach the file and send again. Send it anyway?`, ['Send anyway', 'Cancel'])
         coldLog($, { event: 'asked', origin: (e.origin && e.origin.kind) || 'none', answer, sid: askedSid })
       } catch (err) {
-        // dismissed (Esc), or the dialog could not be shown: send as typed
+        // dismissed (Esc), or the dialog could not be shown: sent as typed unless the chat changed (outcome logged below)
         failed = true
         coldLog($, { event: 'ask-failed', origin: (e.origin && e.origin.kind) || 'none', error: String((err && err.message) || err).slice(0, 120), sid: askedSid })
       }
@@ -1455,7 +1456,7 @@ export function register(on, options = {}) {
       // the chat changed while the dialog was up: never sent into the new chat
       if (askedIn !== chatEpoch) {
         // the outcome of a failed ask is logged once it is decided: this message is handed back, never sent
-        if (failed) coldLog($, { event: 'ask-failed', action: 'handed-back', origin: (e.origin && e.origin.kind) || 'none', sid: askedSid })
+        if (failed) coldLog($, { event: 'ask-outcome', action: 'handed-back', origin: (e.origin && e.origin.kind) || 'none', sid: askedSid })
         handBack($, text, -1).catch(() => {})
         $.ui.toast('The attachment on that message was not kept: attach it again if you send it.', { timeoutMs: 15000 })
         return { drop: 'cache-keeper: the chat changed while asking; see the note on what happened to the message' }
@@ -1479,13 +1480,12 @@ export function register(on, options = {}) {
           })
         return { drop: 'Cancelled by cache-keeper before a cold cache rewrite' }
       }
-      if (failed) coldLog($, { event: 'ask-failed', action: 'sent-as-typed', origin: (e.origin && e.origin.kind) || 'none', sid: askedSid })
+      if (failed) coldLog($, { event: 'ask-outcome', action: 'sent-as-typed', origin: (e.origin && e.origin.kind) || 'none', sid: askedSid })
       return next(e)
     }
     if (skip) return next(e)
     // $.session.compact() is refused on SDK hosts (the desktop app), so this queues /compact
-    // the person's @-mention prompt is put back after compacting: a plugin's resend would not attach the file
-    return compactThenSend($, e, false, '', true, !e.command && /(^|\s)@\S/.test(String(e.text || '')))
+    return compactThenSend($, e, false, '', true)
   })
 
   on('turn.start', async ($, e, next) => {
