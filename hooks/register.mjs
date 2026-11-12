@@ -395,7 +395,7 @@ async function resumeStep($) {
 function compactThenSend($, e, unattended, from = '', logged = false) {
   // the ways to submit it, in order: `true` is asUser, `false` omits it
   const modes = from ? [false] : unattended ? [true, false] : [true]
-  const msg = { text: from ? `[${from} message, resent by cache-keeper]\n${e.text}` : e.text, attachments: e.attachments, unattended, logged: logged || unattended, modes, sid: S.id }
+  const msg = { text: from ? `[${from} message, resent by cache-keeper]\n${e.text}` : e.text, raw: e.text, attachments: e.attachments, unattended, logged: logged || unattended, modes, sid: S.id }
   const drop = { drop: 'cache-keeper: compacting first on a cold cache; the message is sent again once that finishes' }
   // Claude Code tracks its own timed continue and, dropped, reports that it did not run: say that it still will
   if (e.isMeta && e.origin && e.origin.kind === 'auto-continuation') $.ui.toast("Claude Code may say its automatic continue did not run: cache-keeper is compacting this cold chat first and sends the continue after it.", { timeoutMs: 15000 })
@@ -591,6 +591,14 @@ async function putBackNow($, back, log = true) {
   return false
 }
 
+// The words of messages that could be neither resent nor put back, for the toast that says so: the log holds
+// them only when ~/.claude-shared/state exists. `raw` is what was typed, since `text` carries the sender's frame
+// for another session's message. Masked as the band's labels are (screen recording), the first three, the rest counted.
+function lostText(msgs) {
+  const shown = msgs.slice(0, 3).map((m) => `"${clip(mask(String(m.raw ?? m.text)), 80)}"`)
+  return shown.join(', ') + (msgs.length > 3 ? ` and ${msgs.length - 3} more` : '')
+}
+
 // Resend the queue in order, with the queue live: a message arriving during the drain is appended
 // by the prompt.submit hook and goes out after the ones before it. The first message that cannot be
 // submitted goes back to the prompt box together with every one behind it, so nothing is dropped and
@@ -604,17 +612,17 @@ async function handBack($, first, epoch) {
   orphans.delete(epoch)
   if (!back.length) return
   const ok = await putBack($, back)
-  $.ui.toast(ok ? `${back.length} message(s) meant for the previous chat are in the prompt box: send them only if they still apply.` : `${back.length} message(s) meant for the previous chat could not be sent (logged if ~/.claude-shared/state exists): ${back.map((m) => clip(m.text, 80)).join(', ')}.`, { timeoutMs: 15000 })
+  $.ui.toast(ok ? `${back.length} message(s) meant for the previous chat are in the prompt box: send them only if they still apply.` : `${back.length} message(s) meant for the previous chat could not be sent (logged if ~/.claude-shared/state exists): ${lostText(back)}.`, { timeoutMs: 15000 })
 }
 
 // the count of messages a drain could neither resend nor put back reaches the person on every exit,
 // including the early ones taken when the chat changes
 async function drain($, epoch = chatEpoch) {
-  const tally = { lost: 0 }
+  const tally = { lost: [] }
   try {
     return await drainQueue($, epoch, tally)
   } finally {
-    if (tally.lost) $.ui.toast(`${tally.lost} message(s) could not be sent again (logged if ~/.claude-shared/state exists).`, { timeoutMs: 15000 })
+    if (tally.lost.length) $.ui.toast(`${tally.lost.length} message(s) could not be sent again (logged if ~/.claude-shared/state exists): ${lostText(tally.lost)}.`, { timeoutMs: 15000 })
   }
 }
 
@@ -623,7 +631,7 @@ async function drainQueue($, epoch, tally) {
   if (epoch !== chatEpoch) return
   draining = true
   // not sent again and not put back
-  const lose = (m) => (tally.lost++, coldLog($, { action: 'not-resent', text: m.text, sid: m.sid }))
+  const lose = (m) => (tally.lost.push(m), coldLog($, { action: 'not-resent', text: m.text, sid: m.sid }))
   try {
     while (epoch === chatEpoch && pending && pending.length) {
       const msg = pending.shift()
@@ -643,7 +651,7 @@ async function drainQueue($, epoch, tally) {
           // read after the put-back: it can wait behind other box work, and the chat can change meanwhile
           const prev = epoch !== chatEpoch
           const where = prev ? ' (meant for the previous chat: send it only if it still applies)' : behind ? `, after the ${behind} that followed it` : ''
-          $.ui.toast(back ? `A held message was refused by Claude Code: it is back in the prompt box${where}.` : 'A held message was refused by Claude Code and could not be put back (logged if ~/.claude-shared/state exists).', { timeoutMs: 15000 })
+          $.ui.toast(back ? `A held message was refused by Claude Code: it is back in the prompt box${where}.` : `A held message was refused by Claude Code and could not be put back (logged if ~/.claude-shared/state exists): ${lostText([msg])}.`, { timeoutMs: 15000 })
         })
         if (epoch !== chatEpoch) {
           $.ui.toast('A resend meant for the previous chat is still held by Claude Code and may still be delivered.', { timeoutMs: 15000 })
@@ -655,7 +663,7 @@ async function drainQueue($, epoch, tally) {
         const ok = !back.length || (await putBack($, back))
         if (ok) behind = back.length
         const moved = ok && back.length && epoch !== chatEpoch
-        $.ui.toast(`A resent message is still held by Claude Code${back.length ? (moved ? `; the ${back.length} behind it, meant for the previous chat, are in the prompt box: send them only if they still apply` : ok ? `; the ${back.length} behind it are back in the prompt box` : `; the ${back.length} behind it could not be sent again (logged if ~/.claude-shared/state exists)`) : ''}.`, { timeoutMs: 15000 })
+        $.ui.toast(`A resent message is still held by Claude Code${back.length ? (moved ? `; the ${back.length} behind it, meant for the previous chat, are in the prompt box: send them only if they still apply` : ok ? `; the ${back.length} behind it are back in the prompt box` : `; the ${back.length} behind it could not be sent again (logged if ~/.claude-shared/state exists): ${lostText(back)}`) : ''}.`, { timeoutMs: 15000 })
         return
       }
       if (sent) continue
@@ -670,8 +678,7 @@ async function drainQueue($, epoch, tally) {
         if (epoch !== chatEpoch) $.ui.toast(`${back.length} message(s) meant for the previous chat are in the prompt box: send them only if they still apply.`, { timeoutMs: 15000 })
         else $.ui.toast(back.length === 1 ? 'The message is back in the prompt box: press Enter to send it.' : `${back.length} messages are back in the prompt box: press Enter to send them.`, { timeoutMs: 15000 })
       } else {
-        // the text is on screen too: the log exists only when ~/.claude-shared/state does
-        $.ui.toast(`${back.length} message(s) could not be sent again (logged if ~/.claude-shared/state exists): ${back.map((m) => clip(m.text, 80)).join(', ')}.`, { timeoutMs: 15000 })
+        $.ui.toast(`${back.length} message(s) could not be sent again (logged if ~/.claude-shared/state exists): ${lostText(back)}.`, { timeoutMs: 15000 })
       }
       return
     }
@@ -1172,7 +1179,7 @@ function statusText() {
   if (S.rateLimits.length) lines.push(`Plan limits used: ${limitsText(S.rateLimits)}.`)
   lines.push(S.fable ? `Fable weekly: ${Math.round(S.fable.percentUsed)}% used.` : `Fable weekly: no reading yet${planWhy && planWhy !== 'ok' ? ` (last check: ${planWhy})` : ''}.`)
   lines.push(`Session cost so far: ${money(S.costUsd)}. Cold restarts this session: ${S.coldRestarts.length} (${money(S.coldRestarts.reduce((a, c) => a + c.usd, 0))}).`)
-  lines.push(`Cold-send guard: ${settings.guard ? 'on' : 'off'} for contexts over ${tokens(settings.bigTokens)} tokens (compacts first, yours included; asks only when an attachment would be dropped). Alerts: ${settings.alerts ? 'on' : 'off'}.`)
+  lines.push(`Cold-send guard: ${settings.guard ? 'on' : 'off'} for contexts over ${tokens(settings.bigTokens)} tokens (a cold send compacts first, yours included, once the chat is 100k tokens past its last compaction; asks only when an attachment would be dropped). Alerts: ${settings.alerts ? 'on' : 'off'}.`)
   lines.push(`Auto keep warm: ${settings.autoWarmHours ? `on, until ${settings.autoWarmHours}h after the last turn, for contexts over ${tokens(settings.bigTokens)}${S.autoWarm ? '' : ' (off in this session)'}` : 'off'}.`)
   lines.push(`Settings: /${names.cache} ttl 5|60|auto, /${names.cache} guard on|off, /${names.cache} big 150k, /${names.cache} alerts on|off, /${names.cache} autowarm 8|off. Board: /${names.board}.`)
   return lines.join('\n')
@@ -1390,11 +1397,12 @@ export function register(on, options = {}) {
       return next(e)
     }
     // Owner 2026-11-11: the person's own cold send compacts first too, with no dialog.
-    // A plain -p run is not dropped (dropping it could end the run); a slash command or an @-mention prompt is not dropped
+    // A plain -p run is not dropped (dropping it could end the run); a prompt carrying context another plugin added
+    // goes as typed too (a resend cannot carry it); a slash command or an @-mention prompt is not dropped
     // either (a resend could not run the command, or attach the file, and parking it in the prompt box would let a later
     // message overtake it); a chat the compactor would refuse again (grown too little since, or a try that just failed) goes
     // as typed; an attachment cannot survive a resend, so it asks, but only when a compaction would otherwise have run.
-    const skip = headless ? 'headless' : e.command ? 'slash' : /(^|\s)@\S/.test(String(e.text || '')) ? 'mention' : !worthCompacting() ? 'floor' : now - compactTriedAt < 2 * MIN ? 'just-tried' : media ? 'media' : ''
+    const skip = headless ? 'headless' : Array.isArray(e.context) && e.context.length ? 'context' : e.command ? 'slash' : /(^|\s)@\S/.test(String(e.text || '')) ? 'mention' : !worthCompacting() ? 'floor' : now - compactTriedAt < 2 * MIN ? 'just-tried' : media ? 'media' : ''
     coldLog($, { event: 'auto-compact', origin: (e.origin && e.origin.kind) || 'none', reopened, rotated, action: skip ? 'skip-' + skip : 'compact-first' })
     if (skip === 'media') {
       // Owner 2026-11-11: an attachment keeps the choice to cancel (a toast has no buttons, so this is the dialog)
@@ -1431,8 +1439,8 @@ export function register(on, options = {}) {
             $.ui.toast(
               ok && prev ? 'Not sent. Your text is in the prompt box, meant for the previous chat: send it only if it still applies, with the file attached again.'
                 : ok ? 'Not sent. Your text is back in the prompt box: run /compact, then attach the file and send again.'
-                : text.length && prev ? 'Not sent. Your text could not be put back in the prompt box, and the chat changed meanwhile (logged if ~/.claude-shared/state exists).'
-                : text.length ? 'Not sent, and your text could not be put back in the prompt box (logged if ~/.claude-shared/state exists). Run /compact, then attach the file and send again.'
+                : text.length && prev ? 'Not sent. Your text could not be put back in the prompt box, and the chat changed meanwhile (logged if ~/.claude-shared/state exists): ' + lostText(text) + '.'
+                : text.length ? 'Not sent, and your text could not be put back in the prompt box (logged if ~/.claude-shared/state exists): ' + lostText(text) + '. Run /compact, then attach the file and send again.'
                 : 'Not sent. Run /compact, then attach the file and send again.',
               { timeoutMs: 15000 },
             )

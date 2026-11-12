@@ -30,8 +30,8 @@ function engine($: any, on: any, seat = { label: 'A' }, kept?: Map<string, unkno
   on('command.register', (_: unknown, e: any) => ({ value: { command: e.name } }))
   on('agent.list', () => ({ value: [] }))
   // the cold-compact log is a file that exists once something has been written to it
-  on('fs.exists', (_: unknown, e: any) => ({ value: String(e.path ?? e).includes('.active') || (String(e.path ?? e).split(String.fromCharCode(92)).join('/').endsWith('/.claude-shared/state') && !noStateDir) || (String(e.path ?? e).includes('cold-compact-log') && seen.log !== '') }))
-  on('fs.read', (_: unknown, e: any) => ({ value: String(e.path ?? e).includes('cold-compact-log') ? seen.log : seat.label }))
+  on('fs.exists', (_: unknown, e: any) => ({ value: String(e.path ?? e).includes('.active') || (recordingOn && String(e.path ?? e).includes('recording.json')) || (String(e.path ?? e).split(String.fromCharCode(92)).join('/').endsWith('/.claude-shared/state') && !noStateDir) || (String(e.path ?? e).includes('cold-compact-log') && seen.log !== '') }))
+  on('fs.read', (_: unknown, e: any) => ({ value: String(e.path ?? e).includes('cold-compact-log') ? seen.log : String(e.path ?? e).includes('recording.json') ? '{"on":true}' : seat.label }))
   on('command.run', (_: unknown, e: any) => {
     if (e.command === 'compact') seen.compacts++, seen.order.push('compact')
     if (e.command === 'compact' && failCompact) throw new Error('compactor down')
@@ -77,6 +77,8 @@ let failAsUser: RegExp | null = null
 let beforeDrop: ((e: any) => Promise<void>) | null = null
 // runs inside a plugin resend, while the drain is under way
 let duringSubmit: ((e: any) => Promise<void>) | null = null
+// screen recording is on: names and secrets are masked in what the mod shows
+let recordingOn = false
 // the engine's /compact throws
 let failCompact = false
 // the engine's /compact never settles
@@ -314,7 +316,7 @@ test('the rotator changing the seat file leaves a running chat alone: only its w
 })
 
 // The wake-up rotates the chat cold, and the compaction it runs leaves it cold (rotatedCold stays true): only justCompacted
-// keeps the next plain message from being compacted a second time (once the 2-minute pause after a compaction has passed)
+// keeps the next plain message from being compacted a second time
 test('right after a compaction on a chat that is still cold, the next message is not compacted again', SETUP, async ($, on) => {
   const { clock, seen } = engine($, on, { label: 'A' })
   answer(on, seen, null)
@@ -323,7 +325,9 @@ test('right after a compaction on a chat that is still cold, the next message is
   await clock.advance(100)
   await settle(clock, () => seen.submits.length >= 1)
   expect(seen.compacts).toBe(1)
-  await clock.advance(3 * 60000) // past the 2-minute pause after any compaction, which would otherwise hold the next one back
+  // compactTriedAt is set only by a failed or refused compaction, never by a successful one. It starts at 0 and the test clock
+  // starts near 0, so without this advance 'now - compactTriedAt < 2 minutes' is true and skip-just-tried would mask justCompacted
+  await clock.advance(3 * 60000)
   const r = await $.prompt.submit({ text: 'go on', origin: COMPOSER, wait: false } as never)
   await clock.advance(100)
   expect('drop' in (r as object)).toBe(false)
@@ -1095,9 +1099,9 @@ test('a typed /session-handoff on a cold big chat is not compacted', async ($, o
   }
   expect(seen.compacts).toBe(0)
   expect(seen.asks).toBe(0)
-  // passed as local (not as a slash command to skip), under both names: only HANDOFF_SKILL covers the namespaced one
-  await settle(clock, () => seen.log.includes('guard-pass'))
-  expect(seen.log).toContain('"local":true')
+  // passed as local (not as a slash command to skip), under both names: both depend on HANDOFF_SKILL
+  await settle(clock, () => (seen.log.match(/"local":true/g) || []).length >= 2)
+  expect((seen.log.match(/"local":true/g) || []).length).toBe(2)
   expect(seen.log).not.toContain('skip-slash')
 })
 
@@ -1834,6 +1838,7 @@ test('a /clear during a compaction puts the waiting message back, while the pers
 })
 
 // A message that could be neither resent nor put back is on screen too: the log exists only when ~/.claude-shared/state does
+const PEER_WORDS = 'PR 12 merged and the release branch is green again; please pick up the next one on the list and tell me what you find'
 test('a message that can be neither resent nor put back is shown in the toast, not only the log', async ($, on) => {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)
@@ -1845,10 +1850,12 @@ test('a message that can be neither resent nor put back is shown in the toast, n
     kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
     await clock.advance(77 * 60000)
     await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
-    await $.prompt.submit({ text: 'PR 12 merged; pick up the next one', origin: PEER, isMeta: true, wait: false } as never)
+    await $.prompt.submit({ text: PEER_WORDS, origin: PEER, isMeta: true, wait: false } as never)
     await clock.advance(100)
     await settle(clock, () => seen.toasts.some((t) => /could not be sent again/.test(t)))
-    expect(seen.toasts.join(' ')).toContain('PR 12 merged; pick up the next one')
+    // the words that were sent, not the sender's frame, and cut to 80 characters
+    expect(seen.toasts.join(' ')).toContain(PEER_WORDS.slice(0, 60))
+    expect(seen.toasts.join(' ')).not.toContain('resent by cache-keeper')
   } finally {
     dropSubmit = null
     refuseFill = false
@@ -1866,16 +1873,89 @@ test('a message handed back after a /clear that the box refuses is shown in the 
     kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
     await clock.advance(77 * 60000)
     await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
-    await $.prompt.submit({ text: 'peer note', origin: PEER, wait: false } as never)
+    await $.prompt.submit({ text: PEER_WORDS, origin: PEER, wait: false } as never)
     await clock.advance(100)
     await settle(clock, () => seen.compacts >= 1)
     await ($ as any).classic.SessionStart({ source: 'clear', transcript_path: '' })
     await settle(clock, () => seen.toasts.some((t) => /could not be sent/.test(t)))
-    expect(seen.toasts.join(' ')).toContain('peer note')
+    expect(seen.toasts.join(' ')).toContain(PEER_WORDS.slice(0, 60))
+    expect(seen.toasts.join(' ')).not.toContain('resent by cache-keeper')
   } finally {
     hangCompact = false
     refuseFill = false
   }
+})
+
+// the words in that toast are masked as the band's labels are while the screen is being recorded
+test('a message shown in a failure toast is masked while recording', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, null)
+  refuseFill = true
+  recordingOn = true
+  dropSubmit = /deploy/
+  try {
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+    await $.prompt.submit({ text: 'deploy with sk-ant-abcdefghijklmnopqrstuvwx now', origin: PEER, isMeta: true, wait: false } as never)
+    await clock.advance(100)
+    await settle(clock, () => seen.toasts.some((t) => /could not be sent again/.test(t)))
+    const toast = seen.toasts.filter((t) => /could not be sent again/.test(t)).join(' ')
+    expect(toast).toContain('deploy with')
+    expect(toast).not.toContain('sk-ant-abcdefghijkl')
+  } finally {
+    dropSubmit = null
+    refuseFill = false
+    recordingOn = false
+  }
+})
+
+// a held resend the host later refuses, with the box refusing the put-back too: the toast shows the words
+test('a held message refused later and not put back is shown in the toast', async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, null)
+  holdSubmit = /PR 12 merged/
+  refuseFill = true
+  try {
+    await clock.advance(60000)
+    kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+    await clock.advance(77 * 60000)
+    await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
+    await $.prompt.submit({ text: PEER_WORDS, origin: PEER, isMeta: true, wait: false } as never)
+    await clock.advance(100)
+    await clock.advance(11 * 60000)
+    await settle(clock, () => seen.log.includes('resend-held'))
+    heldResolve!({ drop: 'refused' })
+    await settle(clock, () => seen.toasts.some((t) => t.includes('could not be put back')))
+    const toast = seen.toasts.filter((t) => t.includes('could not be put back')).join(' ')
+    expect(toast).toContain(PEER_WORDS.slice(0, 60))
+    expect(toast).not.toContain('resent by cache-keeper')
+  } finally {
+    holdSubmit = null
+    heldResolve = null
+    refuseFill = false
+  }
+})
+
+// another plugin's context rides on the prompt, and a resend could not carry it: it goes as typed
+test("the person's cold send carrying context another plugin added goes as typed, never compacted", SETUP, async ($, on) => {
+  const kept = new Map<string, unknown>()
+  const { clock, seen } = engine($, on, { label: 'A' }, kept)
+  answer(on, seen, null)
+  await clock.advance(60000)
+  kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
+  await clock.advance(77 * 60000)
+  await $.session.start({ cwd: '/repo', surface: 'terminal', isInteractive: true })
+  const r = await $.prompt.submit({ text: 'approve, B', origin: COMPOSER, context: ['a reminder from another plugin'], wait: false } as never)
+  await clock.advance(100)
+  await settle(clock, () => seen.log.includes('skip-context'))
+  expect('drop' in (r as object)).toBe(false)
+  expect(seen.compacts).toBe(0)
+  expect(seen.asks).toBe(0)
+  expect(seen.log).toContain('"action":"skip-context"')
 })
 
 // no seat files configured: the wake-up still marks the chat cold and compacts it first
