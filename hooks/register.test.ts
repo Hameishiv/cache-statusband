@@ -1899,12 +1899,14 @@ test('a message shown in a failure toast is masked while recording', async ($, o
     kept.set('last:sid-test', { ctx: 300000, at: await clock.now(), model: 'claude-opus-5-5' })
     await clock.advance(77 * 60000)
     await $.session.start({ cwd: '/repo', surface: 'desktop', isInteractive: true })
-    await $.prompt.submit({ text: 'deploy with sk-ant-abcdefghijklmnopqrstuvwx now', origin: PEER, isMeta: true, wait: false } as never)
+    // the fake key is built at runtime: a whole key literal in source trips secret scanners on every copy of this file
+    const key = 'sk-' + 'ant-' + 'abcdefghijklmnopqrstuvwx'
+    await $.prompt.submit({ text: `deploy with ${key} now`, origin: PEER, isMeta: true, wait: false } as never)
     await clock.advance(100)
     await settle(clock, () => seen.toasts.some((t) => /could not be sent again/.test(t)))
     const toast = seen.toasts.filter((t) => /could not be sent again/.test(t)).join(' ')
     expect(toast).toContain('deploy with')
-    expect(toast).not.toContain('sk-ant-abcdefghijkl')
+    expect(toast).not.toContain(key.slice(0, 19))
   } finally {
     dropSubmit = null
     refuseFill = false
