@@ -1184,7 +1184,7 @@ function statusText() {
   if (st.kind === 'unknown') lines.push('No request yet this session, so the cache state is unknown.')
   if (st.kind === 'warm' || st.kind === 'cooling') lines.push(`Cache is warm for about ${minutes(st.left)} more.`)
   if (st.kind === 'cold') lines.push(`Cache went cold ${minutes(-st.left)} ago. The next message rewrites it for about ${money(rewriteCost(S.ctx, S.model, ttl))}.`)
-  if (rotatedCold()) lines.push(`The account rotated ${minutes(now - S.seatChangedAt)} ago (now ${S.seat}), so the cache is cold.`)
+  if (rotatedCold()) lines.push(`The account rotated ${minutes(now - S.seatChangedAt)} ago${S.seat ? ` (now ${S.seat})` : ''}, so the cache is cold.`)
   if (reopenedCold()) lines.push('This chat was reopened, so its cache is cold until the next message rewrites it.')
   if (S.keepWarm) lines.push(`Keep warm is on until ${clock(S.keepWarmUntil)}: ${S.pings} ping(s), ${money(S.pingUsd)} so far.`)
   if (S.rateLimits.length) lines.push(`Plan limits used: ${limitsText(S.rateLimits)}.`)
@@ -1348,7 +1348,7 @@ export function register(on, options = {}) {
     }
     if (!S.pr) S.pr = findPr(e.command ? `/${e.command.name} ${e.command.args}` : e.text)
     const fromUser = e.origin && (e.origin.kind === 'composer' || e.origin.kind === 'bridge')
-    // no origin, or one the host could not classify, may be the person at the prompt: it compacts first as the person (resent as their own words), never framed as a plugin
+    // no origin, or one the host could not classify, may be the person at the prompt: a cold send of its own compacts first as the person (resent as their own words); one queued behind a compaction keeps the queued path's framed fallback
     // (an engine notice, never the person, is a prompt queued isMeta with no stamp or an unclassified one: an idle notice or a
     // delivery receipt. Another session's message is queued isMeta too, but stamped peer, so it is a sender like any other.
     // An auto-continuation that is not isMeta follows a click (leaving plan mode, an approved goal): maybe the person. One queued
@@ -1385,7 +1385,7 @@ export function register(on, options = {}) {
       return compactThenSend($, e, (!fromUser && !asPerson) || wake || (!!e.origin && e.origin.kind === 'slack-ping'), maybePerson || asPerson ? '' : kind)
     }
     if (!settings.guard || !isCold || local || justCompacted || S.ctx < settings.bigTokens || e.turnId) {
-      // Why a big (or unmeasured) prompt went through unasked: the evidence for a cold send nobody was asked about
+      // Why a big (or unmeasured) prompt passed without being considered for a cold compaction
       if (!e.turnId && (!S.ctx || S.ctx >= settings.bigTokens)) coldLog($, { event: 'guard-pass', origin: (e.origin && e.origin.kind) || 'none', isCold, leftMin: left === null ? null : Math.round(left / MIN), idleMin: S.lastActivity ? Math.round((now - S.lastActivity) / MIN) : null, rotated, reopened, justCompacted, local: !!local, guard: settings.guard })
       return next(e)
     }
