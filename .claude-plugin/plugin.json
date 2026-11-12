@@ -23,7 +23,7 @@
     "rotatorWakePattern": {
       "type": "string",
       "title": "Rotator wake-up pattern",
-      "description": "A regular expression matching the prompt an unattended account rotator types after rotating. Such a prompt is compacted first without asking, since nobody is there to answer. Leave empty to turn off.",
+      "description": "A regular expression matching the prompt an unattended account rotator types after rotating. Such a prompt marks the cache cold and, when the seat file for the session's own surface is set (seatFileTerminal in the terminal, seatFileDesktop in the app), takes up the new account's seat at once; it is compacted first even within 2 minutes of a failed try, since the new account may succeed. Leave empty to turn off.",
       "default": ""
     },
     "prPattern": {
