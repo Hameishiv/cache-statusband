@@ -1914,7 +1914,7 @@ test('a message shown in a failure toast is masked while recording', async ($, o
   }
 })
 
-// A message over 20000 characters is cut before it is masked (the masker takes seconds on 4 MiB), the partial word at the cut dropped
+// Only a lost message's first 200 characters are masked (the masker is slow on long text); the word the cut falls in is dropped
 async function maskedLostToast($: any, on: any, text: string) {
   const kept = new Map<string, unknown>()
   const { clock, seen } = engine($, on, { label: 'A' }, kept)
@@ -1938,18 +1938,31 @@ async function maskedLostToast($: any, on: any, text: string) {
   }
 }
 test('a JWT crossing the cut of a long lost message is never shown, not even its start', async ($, on) => {
-  // header and payload run past 20000 characters, so the signature is beyond the cut and the JWT pattern could never match there
-  const jwt = 'ey' + 'J' + 'A'.repeat(12000) + '.' + 'B'.repeat(12000) + '.' + 'C'.repeat(20)
+  // the signature is beyond the cut, so the JWT pattern could never match there: the whole token must be dropped
+  const jwt = 'ey' + 'J' + 'A'.repeat(150) + '.' + 'B'.repeat(150) + '.' + 'C'.repeat(20)
   const toast = await maskedLostToast($, on, `deploy with ${jwt} now`)
   expect(toast).toContain('deploy with')
   expect(toast).not.toContain(jwt.slice(0, 20))
 })
-test('a short key at the start of a message over 20000 characters is still masked', async ($, on) => {
+test('a short key at the start of a long lost message is still masked', async ($, on) => {
   const key = 'sk-' + 'ant-' + 'abcdefghijklmnopqrstuvwx'
   const toast = await maskedLostToast($, on, `deploy with ${key} now ` + 'word '.repeat(5000))
   expect(toast).toContain('deploy with')
   expect(toast).toContain('•')
   expect(toast).not.toContain(key.slice(0, 19))
+})
+
+test('a long key word pulled into view by masking never shows the cut-off token after it', async ($, on) => {
+  // the first word masks down to a few characters, so what follows it would be on screen: the token the cut falls in is dropped
+  const key = 'sk-' + 'ant-' + 'a'.repeat(180)
+  const gh = 'gh' + 'p_' + 'b'.repeat(36)
+  const toast = await maskedLostToast($, on, `deploy ${key} ${gh} now`)
+  expect(toast).toContain('deploy')
+  expect(toast).not.toContain('gh' + 'p_')
+})
+test('a lost message that is one long word shows its length, not an empty quote', async ($, on) => {
+  const toast = await maskedLostToast($, on, 'deploy' + 'x'.repeat(5000))
+  expect(toast).toContain('(5006 characters)')
 })
 
 // a held resend the host later refuses, with the box refusing the put-back too: the toast shows the words

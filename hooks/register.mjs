@@ -595,13 +595,16 @@ async function putBackNow($, back, log = true) {
 // them only when ~/.claude-shared/state exists. `raw` is what was typed, since `text` carries the sender's frame
 // for another session's message. Masked as the band's labels are (screen recording), the first three, the rest counted.
 function lostText(msgs) {
-  // cut before masking: a message can be up to 4 MiB and the masker takes seconds on that (about 3 ms on 20000 characters).
-  // The partial word at the cut is dropped, so a token cut in half is never shown. A name the masker would learn
-  // only from an email past 20000 characters is not hidden in the text before it.
   const shown = msgs.slice(0, 3).map((m) => {
     const s = String(m.raw ?? m.text)
-    const words = s.length > 20000 ? s.slice(0, 20000).replace(/\S*$/, '') : s
-    return `"${clip(mask(words), 80)}"`
+    // Only the first 200 characters are masked: the toast shows 80, and the masker is slow on long text. The cut
+    // steps back to the last whitespace, so a word cut in half is not shown. Masking sees only those 200 characters:
+    // a name it would learn from later text, or the first word of a value spread over several words, can show.
+    // Each quote is a bidi isolate, so right-to-left messages keep their order.
+    let i = s.length > 200 ? 200 : s.length
+    if (i < s.length && !/\s/.test(s[i])) while (i > 0 && !/\s/.test(s[i - 1])) i--
+    const words = s.slice(0, i).trim()
+    return words ? `"\u2068${clip(mask(words), 80)}\u2069"` : `(${s.length} characters)`
   })
   return shown.join(', ') + (msgs.length > 3 ? ` and ${msgs.length - 3} more` : '')
 }
