@@ -561,6 +561,40 @@ exit /b 0
     if ($lateDangleMessage -notmatch "is a symbolic link to .*gone-target\.toml, which does not exist" -or $lateDangleMessage -notmatch "run the installer again") { throw "The dangling-link refusal after registration lost its reason or advice: $lateDangleMessage" }
   }
 
+  # Codex leaves config.toml as a circular chain of symbolic links, or as a link to a folder.
+  # Neither can be read or replaced; each is refused after registration with the same lead-in,
+  # never a raw read error. (Skipped where symbolic links cannot be created.)
+  if ($danglingLinksWork) {
+    $oddLinkCases = @(
+      @{ Name = "circular"; Make = "mklink `"%CODEX_HOME%\loop-a`" `"%CODEX_HOME%\loop-b`" >nul`r`n  mklink `"%CODEX_HOME%\loop-b`" `"%CODEX_HOME%\loop-a`" >nul`r`n  mklink `"%CODEX_HOME%\config.toml`" `"%CODEX_HOME%\loop-a`" >nul"; Reason = "is a symbolic link that cannot be followed" },
+      @{ Name = "folder"; Make = "mkdir `"%CODEX_HOME%\a-folder`"`r`n  mklink /D `"%CODEX_HOME%\config.toml`" `"%CODEX_HOME%\a-folder`" >nul"; Reason = "is a symbolic link to the folder .*a-folder, not to a file" }
+    )
+    foreach ($case in $oddLinkCases) {
+      $oddBin = Join-Path $testHome "late-$($case.Name)-bin"
+      New-Item -ItemType Directory -Path $oddBin | Out-Null
+      $oddCodex = "@echo off`r`nif `"%1`"==`"app-server`" exit /b 0`r`nif `"%1`"==`"plugin`" if `"%2`"==`"marketplace`" if `"%3`"==`"add`" (`r`n  del /f /q `"%CODEX_HOME%\config.toml`" >nul`r`n  $($case.Make)`r`n  exit /b 0`r`n)`r`nexit /b 0`r`n"
+      [IO.File]::WriteAllText((Join-Path $oddBin "codex.cmd"), $oddCodex, [Text.Encoding]::ASCII)
+      $oddHome = Join-Path $testHome "late-$($case.Name)-home"
+      New-Item -ItemType Directory -Path $oddHome | Out-Null
+      [IO.File]::WriteAllText((Join-Path $oddHome "config.toml"), $original, [Text.UTF8Encoding]::new($false))
+      $oddMessage = ""
+      $previousPath = $env:PATH
+      try {
+        $env:PATH = "$oddBin$([IO.Path]::PathSeparator)$previousPath"
+        try {
+          & (Join-Path $root "install.ps1") -CodexHome $oddHome -SkipCliLink 3>$null | Out-Null
+        } catch {
+          $oddMessage = $_.Exception.Message
+        }
+      } finally {
+        $env:PATH = $previousPath
+      }
+      if (-not $oddMessage) { throw "A config.toml turned into a $($case.Name) symbolic link by Codex's registration did not fail the install" }
+      if (-not $oddMessage.StartsWith("Codex had already registered the plugin when this was found, so the install stopped part-way; see the warning above for what was done with config.toml.")) { throw "The $($case.Name)-link refusal after registration did not lead with the fact that Codex had registered (a raw error?): $oddMessage" }
+      if ($oddMessage -notmatch $case.Reason -or $oddMessage -notmatch "run the installer again") { throw "The $($case.Name)-link refusal after registration lost its reason or advice: $oddMessage" }
+    }
+  }
+
   # When npm cannot even be run (not on PATH), the failure is still reported as only the link
   # step failing, and the hooks-review and restart lines were already printed before it.
   $noNpmBin = Join-Path $testHome "no-npm-bin"
@@ -607,6 +641,32 @@ exit /b 0
   if ($npmMessage -match "settings.json") { throw "The npm link message mentioned settings.json although -SeatFile was not used: $npmMessage" }
   $npmConfig = [IO.File]::ReadAllText((Join-Path $npmHome "config.toml"))
   if ($npmConfig -notmatch '(?m)^hooks = true$' -or $npmConfig -notmatch '(?m)^enabled\s*=\s*true\s*$') { throw "A failed npm link rolled back config.toml or the plugin" }
+
+  # The link step enters the plugin folder by its literal path: a checkout whose path holds
+  # wildcard characters (here "[1]") is not a pattern. A function named npm records where it ran.
+  $bracketRoot = Join-Path $testHome "checkout[1]\codex"
+  New-Item -ItemType Directory -Path (Split-Path -Parent $bracketRoot) | Out-Null
+  Copy-Item -LiteralPath $root -Destination $bracketRoot -Recurse
+  $global:CacheStatusbandTestLinkDir = Join-Path $testHome "bracket-link-dir.txt"
+  function global:npm {
+    if ($args[0] -eq "root") { $global:LASTEXITCODE = 0; return (Join-Path $env:TEMP "no-global-root") }
+    [IO.File]::WriteAllText($global:CacheStatusbandTestLinkDir, (Get-Location).ProviderPath)
+    $global:LASTEXITCODE = 0
+  }
+  $bracketMessage = ""
+  try {
+    try {
+      & (Join-Path $bracketRoot "install.ps1") -CodexHome (Join-Path $testHome "bracket-home") 3>$null | Out-Null
+    } catch {
+      $bracketMessage = $_.Exception.Message
+    }
+  } finally {
+    Remove-Item -Path Function:npm -ErrorAction SilentlyContinue
+  }
+  if ($bracketMessage) { throw "A checkout path with wildcard characters failed the install: $bracketMessage" }
+  $bracketRan = [IO.File]::ReadAllText($global:CacheStatusbandTestLinkDir)
+  if ($bracketRan -ne (Join-Path $bracketRoot "plugins\cache-statusband-codex")) { throw "npm link ran in '$bracketRan', not in the plugin folder of the wildcard-named checkout" }
+  Remove-Variable -Name CacheStatusbandTestLinkDir -Scope Global -ErrorAction SilentlyContinue
 
   # An error while running `npm link` that is not "npm was not found" may have come from npm
   # itself, so it is reported as a failure with its message; only a missing command is "could

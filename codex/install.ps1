@@ -89,8 +89,20 @@ function Resolve-ReplaceTarget([string]$Path, [string]$What) {
   $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
   if (-not $item) { return $Path }
   $final = $Path
+  if ($item.PSIsContainer -and $item.LinkType -ne "SymbolicLink") {
+    throw (New-ReplaceRefusal "$What ($Path) is a folder, not a file." "Remove or rename the folder and run the installer again.")
+  }
   if ($item.LinkType -eq "SymbolicLink") {
-    $target = [IO.File]::ResolveLinkTarget($Path, $true)
+    $target = $null
+    try {
+      $target = [IO.File]::ResolveLinkTarget($Path, $true)
+    } catch {
+      # A circular chain of links (or one that cannot be followed) has no final target.
+      throw (New-ReplaceRefusal "$What ($Path) is a symbolic link that cannot be followed ($($_.Exception.Message))." "Fix or remove the link and run the installer again.")
+    }
+    if ($target -and (Test-Path -LiteralPath $target.FullName -PathType Container)) {
+      throw (New-ReplaceRefusal "$What ($Path) is a symbolic link to the folder $($target.FullName), not to a file." "Fix or remove the link and run the installer again.")
+    }
     if ($target) {
       if (-not $target.Exists) {
         throw (New-ReplaceRefusal "$What ($Path) is a symbolic link to $($target.FullName), which does not exist." "Fix or remove the link and run the installer again.")
@@ -139,13 +151,20 @@ function Get-RegisteredMarketplaceSource([AllowNull()][string]$Text, [string]$Na
 }
 
 # The text of a file, or $null when there is none; and whether two such readings are the same.
-# A symbolic link whose target is missing holds no text either: it reads as $null here, and
-# Resolve-ReplaceTarget gives it its own refusal when the install reaches a replace.
+# A symbolic link whose target is missing, a circular chain of links, and a folder (or a link
+# to one) hold no text either: they read as $null here, and Resolve-ReplaceTarget gives each its
+# own refusal when the install reaches a replace.
 function Read-TextOrNull([string]$Path) {
   if (-not (Test-Path -LiteralPath $Path)) { return $null }
   $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+  if ($item -and $item.PSIsContainer -and $item.LinkType -ne "SymbolicLink") { return $null }
   if ($item -and $item.LinkType -eq "SymbolicLink") {
-    $target = [IO.File]::ResolveLinkTarget($Path, $true)
+    try {
+      $target = [IO.File]::ResolveLinkTarget($Path, $true)
+    } catch {
+      return $null
+    }
+    if ($target -and (Test-Path -LiteralPath $target.FullName -PathType Container)) { return $null }
     if ($target -and -not $target.Exists) { return $null }
   }
   return [IO.File]::ReadAllText($Path)
@@ -675,8 +694,10 @@ if (-not $SkipCliLink) {
     Write-Host "CLI link already points to this checkout; keeping it."
   } else {
     $linkExit = $null
-    Push-Location $pluginRoot
+    $pushedLocation = $false
     try {
+      Push-Location -LiteralPath $pluginRoot
+      $pushedLocation = $true
       & npm link
       $linkExit = $LASTEXITCODE
     } catch {
@@ -688,7 +709,7 @@ if (-not $SkipCliLink) {
       }
       throw (& $linkFailure "npm link failed ($($_.Exception.Message))")
     } finally {
-      Pop-Location
+      if ($pushedLocation) { Pop-Location }
     }
     if ($linkExit -ne 0) { throw (& $linkFailure "npm link failed ($linkExit)") }
   }
