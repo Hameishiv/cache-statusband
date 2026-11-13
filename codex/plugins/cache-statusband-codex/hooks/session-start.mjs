@@ -71,8 +71,17 @@ export async function handleSessionStart(input, {
       const usage = await usageGetter({ codexHome: home, now, identity, timeoutMs, ...(cacheOnly ? { cacheOnly: true } : {}) });
       const presented = await usagePresentation(usage, { codexHome: home, identity });
       const built = [];
-      if (Number.isFinite(presented.snapshot.availableCount)) built.push(formatUsageLines(presented.snapshot, now)[0]);
-      if (presented.identity) built.push(presented.identity.startsWith("Seat ") ? `${presented.identity}.` : `Account: ${presented.identity}.`);
+      // A resumed session's identity is the one it STARTED under, which may no longer be the
+      // login in use, so on a resume the wording says so rather than naming a current account.
+      const resumed = source === "resume";
+      if (Number.isFinite(presented.snapshot.availableCount)) {
+        const banked = formatUsageLines(presented.snapshot, now)[0];
+        built.push(resumed ? banked.replace(/^Banked resets/, "Banked resets (starting account)") : banked);
+      }
+      if (presented.identity) {
+        if (resumed) built.push(`Started as ${presented.identity}.`);
+        else built.push(presented.identity.startsWith("Seat ") ? `${presented.identity}.` : `Account: ${presented.identity}.`);
+      }
       usageMessages.push(...built);
     } catch {}
   })();

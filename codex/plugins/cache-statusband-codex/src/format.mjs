@@ -98,7 +98,7 @@ export function formatUsageLines(snapshot, now = Date.now(), {
 export function cacheUnwritableLine(snapshot) {
   if (snapshot?.cacheUnwritable !== true) return null;
   const directory = typeof snapshot.cacheDir === "string" ? stripControls(snapshot.cacheDir).slice(0, 500) : "";
-  return `Usage not read: cannot write ${directory || "the cache directory"}`;
+  return directory ? `Usage not read: cannot update the cache in ${directory}` : "Usage not read: cannot update the cache";
 }
 
 // Match the original mod: capitalize the first word past leading symbols/spacing.

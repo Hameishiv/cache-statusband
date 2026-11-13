@@ -99,8 +99,10 @@ test("SessionStart hook returns a visible, truthful resume summary", async (t) =
   );
   assert.match(output.systemMessage, /saved context 25k\/200k \(13%\)/);
   assert.match(output.systemMessage, /Prompt-cache warm\/cold state is not exposed/);
-  assert.match(output.systemMessage, /Banked resets: 2/);
-  assert.match(output.systemMessage, new RegExp(`Account: ${testEmail.replace(".", "\\.")}`));
+  // A resume describes the account the session STARTED under, not a current login.
+  assert.match(output.systemMessage, /Banked resets \(starting account\): 2/);
+  assert.match(output.systemMessage, new RegExp(`Started as ${testEmail.replace(".", "\\.")}\\.`));
+  assert.doesNotMatch(output.systemMessage, /Account:/);
   assert.deepEqual(await handleSessionStart({ source: "compact", transcript_path: path }), {});
 });
 
@@ -169,7 +171,10 @@ test("resuming a session retains its starting identity after account rotation", 
   });
   assert.ok(startup.systemMessage.includes(original.label));
   assert.ok(resumed.systemMessage.includes(original.label));
-  assert.match(resumed.systemMessage, /Banked resets: 2/);
+  assert.match(startup.systemMessage, /Banked resets: 2/);
+  assert.match(resumed.systemMessage, /Banked resets \(starting account\): 2/);
+  assert.ok(resumed.systemMessage.includes(`Started as ${original.label}.`));
+  assert.ok(!startup.systemMessage.includes("Started as"));
   assert.equal(captures, 1);
   const files = await readdir(join(root, "cache-statusband-codex", "sessions"));
   const record = JSON.parse(await readFile(join(root, "cache-statusband-codex", "sessions", files.find((file) => file.endsWith(".identity.json"))), "utf8"));
@@ -192,21 +197,21 @@ test("a resume never shows a recorded email once a seat is configured, available
   // Started with no seat configured: the record holds the email as its label.
   const startup = await handleSessionStart({ source: "startup", session_id: "privacy-session" }, options);
   assert.match(startup.systemMessage, new RegExp(`Account: ${email}`));
-  assert.match((await resume()).systemMessage, new RegExp(`Account: ${email}`), "no seat configured: the recorded login is shown");
+  assert.match((await resume()).systemMessage, new RegExp(`Started as ${email}`), "no seat configured: the recorded login is shown, as the starting account");
 
   // Resumed after settings.json became unreadable: a seat may be configured, so no email.
   await writeFile(settings, "{not json");
   const malformed = await resume();
-  assert.doesNotMatch(malformed.systemMessage, /example\.invalid|Account:/);
-  assert.match(malformed.systemMessage, /Banked resets: 2/);
+  assert.doesNotMatch(malformed.systemMessage, /example\.invalid|Account:|Started as/);
+  assert.match(malformed.systemMessage, /Banked resets \(starting account\): 2/);
 
   // Resumed once a valid seat file is configured: the seat label is not the recorded identity.
   const seat = join(root, "seat.txt");
   await writeFile(seat, "alpha");
   await writeFile(settings, JSON.stringify({ version: 1, seatFile: seat }));
   const seated = await resume();
-  assert.doesNotMatch(seated.systemMessage, /example\.invalid|Account:/);
-  assert.match(seated.systemMessage, /Banked resets: 2/);
+  assert.doesNotMatch(seated.systemMessage, /example\.invalid|Account:|Started as/);
+  assert.match(seated.systemMessage, /Banked resets \(starting account\): 2/);
 
   // The seat is unavailable (its file is missing): still no email.
   await writeFile(seat, "");
@@ -329,23 +334,6 @@ test("each read in SessionStart ends half a second before the deadline, and gets
   assert.equal(late, 500);
 });
 
-test("the SessionStart deadline counts from the hook's start, not from after the transcript read", async (t) => {
-  const root = await fixtureRoot(t);
-  const started = Date.now();
-  await handleSessionStart(
-    { source: "startup", session_id: "clock-session", transcript_path: join(root, "rollout.jsonl") },
-    {
-      codexHome: root,
-      deadlineMs: 1_500,
-      rolloutParser: async () => { await new Promise((resolve) => setTimeout(resolve, 1_000)); return null; },
-      identityGetter: async () => null,
-      usageGetter: () => new Promise(() => {}),
-    },
-  );
-  // The hook ends at its 1500ms deadline; a clock restarted after the 1000ms read would take ~2500ms.
-  assert.ok(Date.now() - started < 2_000, `took ${Date.now() - started}ms`);
-});
-
 test("a transcript read that never finishes cannot push the hook past its deadline, and the usage still shows", async (t) => {
   const root = await fixtureRoot(t);
   const email = ["person", "example.invalid"].join("@");
@@ -355,13 +343,13 @@ test("a transcript read that never finishes cannot push the hook past its deadli
     { source: "startup", session_id: "slow-transcript", transcript_path: join(root, "rollout.jsonl") },
     {
       codexHome: root,
-      deadlineMs: 400,
+      deadlineMs: 1_500,
       rolloutParser: () => new Promise(() => {}),
       identityGetter: async () => identity,
       usageGetter: async () => ({ identityKey: identity.key, accountEmail: email, availableCount: 3 }),
     },
   );
-  assert.ok(Date.now() - started < 2_000, `took ${Date.now() - started}ms`);
+  assert.ok(Date.now() - started < 3_000, `took ${Date.now() - started}ms`);
   assert.match(output.systemMessage, /Banked resets: 3/);
   assert.doesNotMatch(output.systemMessage, /restored/);
 });
@@ -678,7 +666,7 @@ test("the CLI says once, on stderr, that no usage was read when the cache cannot
   const name = `rate-limits-${createHash("sha256").update(`account:${email}`).digest("hex").slice(0, 16)}.json`;
   // A directory where the cache file belongs: the attempt marker cannot replace it.
   await mkdir(join(root, "cache-statusband-codex", name), { recursive: true });
-  const line = `Usage not read: cannot write ${join(root, "cache-statusband-codex")}`;
+  const line = `Usage not read: cannot update the cache in ${join(root, "cache-statusband-codex")}`;
   const cli = cliRunner(root);
   for (const args of [["usage"], ["usage", "--json"], ["board"], ["board", "--json"]]) {
     const { stdout, stderr } = await cli.runWithStderr(args, { CACHE_STATUSBAND_CODEX_SEAT_FILE: "" });

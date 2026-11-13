@@ -88,7 +88,7 @@ test("a cache that can never be written sends no rate-limit request and leaves n
   const dataDir = join(root, "cache-statusband-codex");
   assert.equal(snapshot.cacheUnwritable, true);
   assert.equal(snapshot.cacheDir, dataDir);
-  assert.deepEqual(formatUsageLines(snapshot, Date.now()), ["Banked resets: unavailable", `Usage not read: cannot write ${dataDir}`]);
+  assert.deepEqual(formatUsageLines(snapshot, Date.now()), ["Banked resets: unavailable", `Usage not read: cannot update the cache in ${dataDir}`]);
   const files = await readdir(join(root, "cache-statusband-codex"));
   assert.ok(!files.some((name) => name.endsWith(".tmp")), files.join(","));
   assert.ok(!files.some((name) => /^rate-limits-.*\.json$/.test(name)));
@@ -96,9 +96,9 @@ test("a cache that can never be written sends no rate-limit request and leaves n
 
 test("the unwritable-cache line strips control characters from the path and is absent otherwise", () => {
   const line = formatUsageLines({ cacheUnwritable: true, cacheDir: "C:\\codex\u001b[31m\u0007\u202ehome" }, Date.now()).at(-1);
-  assert.match(line, /^Usage not read: cannot write C:\\codex/);
+  assert.match(line, /^Usage not read: cannot update the cache in C:\\codex/);
   assert.doesNotMatch(line, /[\u0000-\u001f\u007f-\u009f\u202a-\u202e]/);
-  assert.equal(formatUsageLines({ cacheUnwritable: true }, Date.now()).at(-1), "Usage not read: cannot write the cache directory");
+  assert.equal(formatUsageLines({ cacheUnwritable: true }, Date.now()).at(-1), "Usage not read: cannot update the cache");
   assert.ok(!formatUsageLines({ availableCount: 1, source: "live", fetchedAt: Date.now() }, Date.now()).some((text) => text.startsWith("Usage not read")));
 });
 
