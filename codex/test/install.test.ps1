@@ -496,6 +496,33 @@ exit /b 0
     if (-not ($lateWarnings | Where-Object { "$_" -match "restored the original config.toml" })) { throw "[$($case.Name)] No warning said config.toml was restored after a refusal found after registration: $($lateWarnings -join ' | ')" }
   }
 
+  # Codex registers the plugin and leaves config.toml as a hard link (a second name for the
+  # same file). Resolve-ReplaceTarget refuses that after registration, so like the refusals above
+  # it leads with that fact and does not say that nothing was changed.
+  $linkBin = Join-Path $testHome "late-link-bin"
+  New-Item -ItemType Directory -Path $linkBin | Out-Null
+  $linkCodex = "@echo off`r`nif `"%1`"==`"app-server`" exit /b 0`r`nif `"%1`"==`"plugin`" if `"%2`"==`"marketplace`" if `"%3`"==`"add`" (`r`n  move /y `"%CODEX_HOME%\config.toml`" `"%CODEX_HOME%\shared.toml`" >nul`r`n  mklink /H `"%CODEX_HOME%\config.toml`" `"%CODEX_HOME%\shared.toml`" >nul`r`n  exit /b 0`r`n)`r`nexit /b 0`r`n"
+  [IO.File]::WriteAllText((Join-Path $linkBin "codex.cmd"), $linkCodex, [Text.Encoding]::ASCII)
+  $lateLinkHome = Join-Path $testHome "late-link-home"
+  New-Item -ItemType Directory -Path $lateLinkHome | Out-Null
+  [IO.File]::WriteAllText((Join-Path $lateLinkHome "config.toml"), $original, [Text.UTF8Encoding]::new($false))
+  $lateLinkMessage = ""
+  $previousPath = $env:PATH
+  try {
+    $env:PATH = "$linkBin$([IO.Path]::PathSeparator)$previousPath"
+    try {
+      & (Join-Path $root "install.ps1") -CodexHome $lateLinkHome -SkipCliLink 3>$null | Out-Null
+    } catch {
+      $lateLinkMessage = $_.Exception.Message
+    }
+  } finally {
+    $env:PATH = $previousPath
+  }
+  if (-not $lateLinkMessage) { throw "A config.toml turned into a hard link by Codex's registration did not fail the install" }
+  if ($lateLinkMessage -match "Nothing was changed" -or $lateLinkMessage -match "Nothing was installed") { throw "The hard-link refusal after registration still claimed nothing was changed: $lateLinkMessage" }
+  if (-not $lateLinkMessage.StartsWith("Codex had already registered the plugin when this was found, so the install stopped part-way; see the warning above for what was done with config.toml.")) { throw "The hard-link refusal after registration did not lead with the fact that Codex had registered: $lateLinkMessage" }
+  if ($lateLinkMessage -notmatch "is a hard link, so it has more than one name" -or $lateLinkMessage -notmatch "run the installer again") { throw "The hard-link refusal after registration lost its reason or advice: $lateLinkMessage" }
+
   # When npm cannot even be run (not on PATH), the failure is still reported as only the link
   # step failing, and the hooks-review and restart lines were already printed before it.
   $noNpmBin = Join-Path $testHome "no-npm-bin"

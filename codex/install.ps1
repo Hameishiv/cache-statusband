@@ -72,6 +72,13 @@ public static void Replace(string source, string destination) {
   [CacheStatusband.NativeMove]::Replace($Source, $Destination)
 }
 
+# A refusal from Resolve-ReplaceTarget. Before Codex has registered the plugin nothing has been
+# changed; found after registration it must say that fact first instead (see New-ConfigRefusal).
+function New-ReplaceRefusal([string]$Problem, [string]$Advice) {
+  if ($script:ConfigRefusalAfterRegistration) { return "$afterRegistrationNotice $Problem $Advice" }
+  return "$Problem Nothing was changed. $Advice"
+}
+
 # The path a replacement of $Path must be made at. A plain file is itself. A symbolic link
 # resolves to the file it points at, so the replacement lands on that file and the link stays
 # a link (replacing the link itself would turn it into a regular file and leave the original
@@ -86,14 +93,14 @@ function Resolve-ReplaceTarget([string]$Path, [string]$What) {
     $target = [IO.File]::ResolveLinkTarget($Path, $true)
     if ($target) {
       if (-not $target.Exists) {
-        throw "$What ($Path) is a symbolic link to $($target.FullName), which does not exist. Nothing was changed. Fix or remove the link and run the installer again."
+        throw (New-ReplaceRefusal "$What ($Path) is a symbolic link to $($target.FullName), which does not exist." "Fix or remove the link and run the installer again.")
       }
       $final = $target.FullName
       $item = Get-Item -LiteralPath $final -Force -ErrorAction SilentlyContinue
     }
   }
   if ($item -and $item.LinkType -eq "HardLink") {
-    throw "$What ($final) is a hard link, so it has more than one name. Replacing it would leave the other names with the old content. Nothing was changed. Replace it with a regular file (or keep only the name you edit) and run the installer again."
+    throw (New-ReplaceRefusal "$What ($final) is a hard link, so it has more than one name. Replacing it would leave the other names with the old content." "Replace it with a regular file (or keep only the name you edit) and run the installer again.")
   }
   return $final
 }
