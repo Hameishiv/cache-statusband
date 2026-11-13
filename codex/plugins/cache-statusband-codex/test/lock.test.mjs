@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdtemp, open, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -47,4 +47,58 @@ test("a lock refreshed within the stale window is not reclaimed", async (t) => {
   await writeFile(path, "live-holder");
   assert.equal(await acquireLock(path, { staleMs: 30_000 }), null);
   assert.equal(await readFile(path, "utf8"), "live-holder");
+});
+
+function failing(code, { except } = {}) {
+  const calls = [];
+  const impl = async (path, ...rest) => {
+    calls.push(path);
+    if (except && except(path)) return open(path, ...rest);
+    throw Object.assign(new Error(`${code}: simulated`), { code });
+  };
+  return { impl, calls };
+}
+
+test("a lock file refused once or twice with EPERM is created on a retry", async (t) => {
+  const path = join(await fixtureRoot(t), "retry.lock");
+  let calls = 0;
+  const flaky = async (...args) => {
+    calls += 1;
+    if (calls <= 2) throw Object.assign(new Error("EPERM: simulated"), { code: "EPERM" });
+    return open(...args);
+  };
+  const lock = await acquireLock(path, { openImpl: flaky, retryDelaysMs: [1, 1, 1] });
+  assert.ok(lock);
+  assert.equal(calls, 3);
+  assert.equal(await readFile(path, "utf8"), lock.token);
+  await lock.release();
+});
+
+test("a lock file that keeps being refused in a folder that accepts files is busy, not an error", async (t) => {
+  const root = await fixtureRoot(t);
+  const path = join(root, "busy.lock");
+  // Only the lock file itself is refused; a probe file beside it can be created.
+  for (const code of ["EPERM", "EACCES", "EBUSY"]) {
+    const { impl, calls } = failing(code, { except: (p) => p.includes(".probe.") });
+    assert.equal(await acquireLock(path, { openImpl: impl, retryDelaysMs: [1, 1, 1] }), null, code);
+    assert.ok(calls.filter((p) => p === path).length >= 4, `${code}: tried again before giving up`);
+  }
+  assert.deepEqual(await readdir(root), [], "the probe file is removed again");
+});
+
+test("a lock file refused in a folder that accepts no new files throws, so the cache is reported unwritable", async (t) => {
+  const path = join(await fixtureRoot(t), "denied.lock");
+  for (const code of ["EPERM", "EACCES"]) {
+    const { impl } = failing(code);
+    await assert.rejects(acquireLock(path, { openImpl: impl, retryDelaysMs: [1, 1, 1] }), { code });
+  }
+});
+
+test("a lock file that fails with a missing or read-only folder is not retried or treated as busy", async (t) => {
+  const path = join(await fixtureRoot(t), "gone.lock");
+  for (const code of ["ENOENT", "EROFS", "ENOTDIR"]) {
+    const { impl, calls } = failing(code);
+    await assert.rejects(acquireLock(path, { openImpl: impl, retryDelaysMs: [1, 1, 1] }), { code });
+    assert.equal(calls.length, 1, code);
+  }
 });

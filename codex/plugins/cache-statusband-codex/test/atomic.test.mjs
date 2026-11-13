@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, open, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -199,4 +199,31 @@ test("a session-state save retries a transient rename failure and cleans up when
   const dir = join(root, "cache-statusband-codex", "sessions");
   const files = await readdir(dir);
   assert.ok(!files.some((name) => name.endsWith(".tmp")), files.join(","));
+});
+
+test("a lock file refused with EPERM in a folder that still accepts files is busy: stored reading shown, no 'cannot update the cache' line", async (t) => {
+  const root = await fixtureRoot(t);
+  const dataDir = join(root, "cache-statusband-codex");
+  await mkdir(dataDir, { recursive: true });
+  const name = `rate-limits-${createHash("sha256").update(IDENTITY.key).digest("hex").slice(0, 16)}.json`;
+  await writeFile(join(dataDir, name), `${JSON.stringify({
+    version: 3, attemptedAt: 1, fetchedAt: 1, nextAllowedAt: 2, lastErrorAt: null, identityKey: IDENTITY.key,
+    accountEmail: TEST_EMAIL, availableCount: 3, credits: [], primary: null, secondary: null,
+  })}\n`);
+  // Only the lock file is refused (a scanner holding it); a probe file beside it is created.
+  const refusingLock = async (path, ...rest) => {
+    if (String(path).endsWith(".lock")) throw Object.assign(new Error("EPERM: simulated"), { code: "EPERM" });
+    return open(path, ...rest);
+  };
+  let requests = 0;
+  const snapshot = await getUsageSnapshot({
+    codexHome: root, now: Date.parse("2026-10-29T12:00:00.000Z"), identity: IDENTITY,
+    fetcher: async () => { requests += 1; return RAW; }, lockOpenImpl: refusingLock,
+  });
+  assert.equal(requests, 0);
+  assert.equal(snapshot.source, "cache-busy");
+  assert.equal(snapshot.availableCount, 3);
+  assert.equal(snapshot.cacheUnwritable, undefined);
+  assert.ok(!formatUsageLines(snapshot, Date.now()).some((text) => text.startsWith("Usage not read")));
+  assert.deepEqual((await readdir(dataDir)).filter((file) => file.includes(".probe.")), []);
 });

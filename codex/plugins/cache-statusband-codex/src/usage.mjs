@@ -25,6 +25,7 @@ export async function getUsageSnapshot({
   timeoutMs,
   cacheOnly = false,
   renameImpl,
+  lockOpenImpl,
 } = {}) {
   if (!codexHome) throw new Error("codexHome is required");
   const dataDir = join(codexHome, "cache-statusband-codex");
@@ -58,15 +59,18 @@ export async function getUsageSnapshot({
     return present(cached ? stored : null, aligned.mismatch ? "identity-changed" : "stale");
   }
 
-  // Only a lock held by someone else is "busy" (acquireLock answers null). Any other failure
-  // (a folder that cannot be created or written, a denied lock file) means the cache cannot be
-  // used to throttle, so no live read is made: the stored reading is returned, marked the same
-  // way as an attempt marker that cannot be written.
+  // A lock held by someone else, or one that could not be created for a moment (EPERM/EACCES/
+  // EBUSY, tried again first) in a folder that still accepts new files, is "busy" (acquireLock
+  // answers null): the stored reading is shown and nothing is said about the cache. Only when
+  // the folder itself cannot be used (it cannot be created, a probe file cannot be created in
+  // it either, or the lock fails some other way) is the cache unwritable: no live read is
+  // made, and the stored reading is returned marked the same way as an attempt marker that
+  // cannot be written.
   let lock = null;
   let lockFailed = !dataDirReady;
   if (dataDirReady) {
     try {
-      lock = await acquireLock(lockPath, { now, staleMs: LOCK_STALE_MS });
+      lock = await acquireLock(lockPath, { now, staleMs: LOCK_STALE_MS, openImpl: lockOpenImpl });
     } catch {
       lockFailed = true;
     }
