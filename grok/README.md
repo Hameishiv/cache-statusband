@@ -22,7 +22,7 @@ Grok Build 1.0.70 can run a script as the bottom row (`[ui.status_line]` `type =
 | Context measured from a reopened transcript | Not ported. The line uses `context_window.context_tokens` when Grok sends it. It does not parse the transcript. |
 | `/board` of every local session | Not ported. Grok already lists sessions with `grok sessions list` and `/dashboard`. |
 
-The script never reads, prints, or stores an auth token. It does not call a usage endpoint. Each readable log is re-read at most once every five minutes, even when it has no credits line (if the cache file cannot be written, every run re-reads it), and the result is kept per log in `cache-statusband-grok/usage.json` (under `%LOCALAPPDATA%` on Windows, under `$XDG_CACHE_HOME` or `~/.cache` elsewhere; a relative `XDG_CACHE_HOME` or `GROK_HOME` is ignored, since the script runs in the repository Grok has open). A cache file that exists but cannot be read is left as it is. If the newest complete credits line lacks the percent or the period, no weekly segment is shown. A log that cannot be read is not throttled: it keeps the last reading and is tried again on the next run. A reset that has already passed drops the weekly segment until Grok logs a new one.
+The script never reads, prints, or stores an auth token. It does not call a usage endpoint. Each readable log is re-read at most once every five minutes, even when it has no credits line (if the cache file cannot be read or written, every run re-reads it), and the result is kept per log in `cache-statusband-grok/usage.json` (under `%LOCALAPPDATA%` on Windows, under `$XDG_CACHE_HOME` or `~/.cache` elsewhere; a relative `XDG_CACHE_HOME`, `LOCALAPPDATA`, `CSB_USAGE_CACHE` or `GROK_HOME` is ignored, since the script runs in the repository Grok has open, and a relative `CSB_BILLING_LOG` shows no weekly segment). A cache file that exists but cannot be read is left as it is, and every run then re-reads the log. If the newest complete credits line lacks the percent or the period, no weekly segment is shown. A log that cannot be read is not throttled: it keeps the last reading and is tried again on the next run. A reset that has already passed drops the weekly segment until Grok logs a new one.
 
 ## Credits
 
@@ -45,7 +45,7 @@ command = "C:/path/to/cache-statusband/grok/statusline.cmd"
 refresh_interval = 300
 ```
 
-The command is the `.cmd` file alone. With grok 1.0.70 on Windows, a command string that joins `node` and a `C:/...` path is one filename, and starting it fails with `os error 123`. `statusline.cmd` moves to the `grok` folder, starts the `node` on your `PATH`, and forwards the payload. It never runs a `node` program from the repository Grok has open, which is the folder Grok starts it in.
+The command is the `.cmd` file alone. With grok 1.0.70 on Windows, a command string that joins `node` and a `C:/...` path is one filename, and starting it fails with `os error 123`. `statusline.cmd` moves to the `grok` folder (with `pushd`, which also works from a network path, and stops if that fails), starts the `node` on your `PATH`, and forwards the payload. It never runs a `node` program from the repository Grok has open, which is the folder Grok starts it in.
 
 This port was run only on Windows. On macOS or Linux, where a `.cmd` file cannot run, set `command` to `node /path/to/cache-statusband/grok/statusline.mjs` instead, quoting a path that contains spaces as you would at a prompt; that setup is untested.
 

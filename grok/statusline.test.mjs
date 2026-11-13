@@ -298,6 +298,40 @@ describe("weekly usage", () => {
     assert.deepEqual(readdirSync(dir).sort(), ["unified.jsonl", "usage.json"]);
   });
 
+  it("does not rewrite a cache file it could not read, and does not use its entries", () => {
+    const dir = tempDir(join(tmpdir(), "csb-week-"));
+    const logPath = join(dir, "unified.jsonl");
+    const cachePath = join(dir, "usage.json");
+    // a fresh entry for this very log: read normally, it would be shown
+    const planted = { scannedAt: now, record: { percent: 99, periodType: "USAGE_PERIOD_TYPE_WEEKLY", periodEnd: "2026-11-02T22:57:09.651Z", fetchedAt: "2026-10-29T11:37:35.772Z" } };
+    const body = JSON.stringify({ v: 2, sources: { [logPath]: planted } });
+    writeFileSync(cachePath, body);
+    writeFileSync(logPath, "{}\n");
+    assert.equal(loadWeekly(logPath, cachePath, now).percent, 99);
+    // the read fails (a lock, a permission error): the file on disk must be left exactly as it was
+    assert.equal(loadWeekly(logPath, cachePath, now, () => null), null);
+    assert.equal(readFileSync(cachePath, "utf8"), body);
+    writeFileSync(logPath, `${creditsLine(23)}\n`);
+    assert.equal(loadWeekly(logPath, cachePath, now, () => null).percent, 23);
+    assert.equal(readFileSync(cachePath, "utf8"), body);
+  });
+
+  it("does not open a named pipe as the log", { skip: process.platform === "win32" }, (t) => {
+    const dir = tempDir(join(tmpdir(), "csb-week-"));
+    const logPath = join(dir, "unified.jsonl");
+    if (spawnSync("mkfifo", [logPath]).status !== 0) return t.skip("mkfifo is not available");
+    // run in a child with a time limit: opening a pipe with no writer would hang, not fail
+    const run = spawnSync(process.execPath, [join(import.meta.dirname, "statusline.mjs")], {
+      env: { ...process.env, CSB_BILLING_LOG: logPath, CSB_USAGE_CACHE: join(dir, "usage.json") },
+      input: JSON.stringify({ model: { display_name: "Grok 4.7" } }),
+      encoding: "utf8",
+      timeout: 10000,
+    });
+    assert.equal(run.signal, null);
+    assert.equal(run.status, 0);
+    assert.doesNotMatch(run.stdout, /Week/);
+  });
+
   it("tells a missing cache from one it cannot read", () => {
     const dir = tempDir(join(tmpdir(), "csb-week-"));
     assert.deepEqual(readSources(join(dir, "missing.json")), {});
@@ -393,11 +427,14 @@ describe("billingLogPath", () => {
       delete process.env.GROK_HOME;
       const fallback = billingLogPath();
       assert.equal(isAbsolute(fallback), true);
+      // a log that was asked for by a relative path shows nothing, never the default log's reading
       process.env.CSB_BILLING_LOG = join("rel", "unified.jsonl");
-      assert.equal(billingLogPath(), fallback);
+      assert.equal(billingLogPath(), null);
+      process.env.CSB_BILLING_LOG = join(tmpdir(), "a", "..", "b.jsonl");
+      assert.equal(billingLogPath(), join(tmpdir(), "b.jsonl"));
       delete process.env.CSB_BILLING_LOG;
       process.env.GROK_HOME = "relhome";
-      assert.equal(billingLogPath(), fallback);
+      assert.equal(billingLogPath(), null);
       const abs = join(tmpdir(), "grok-home");
       process.env.GROK_HOME = abs;
       assert.equal(billingLogPath(), join(abs, "logs", "unified.jsonl"));
@@ -416,6 +453,17 @@ describe("billingLogPath", () => {
       assert.equal(isAbsolute(fallback), true);
       process.env.CSB_USAGE_CACHE = join("rel", "usage.json");
       assert.equal(usageCachePath(), fallback);
+      delete process.env.CSB_USAGE_CACHE;
+      const baseVar = process.platform === "win32" ? "LOCALAPPDATA" : "XDG_CACHE_HOME";
+      const keepBase = process.env[baseVar];
+      try {
+        process.env[baseVar] = "relbase";
+        assert.equal(isAbsolute(usageCachePath()), true);
+        assert.equal(usageCachePath().startsWith("relbase"), false);
+      } finally {
+        if (keepBase === undefined) delete process.env[baseVar];
+        else process.env[baseVar] = keepBase;
+      }
     } finally {
       if (keepCache === undefined) delete process.env.CSB_USAGE_CACHE;
       else process.env.CSB_USAGE_CACHE = keepCache;
@@ -590,19 +638,23 @@ describe("cli", () => {
     const dir = tempDir(join(tmpdir(), "csb-cwd-"));
     writeFileSync(join(dir, "node.cmd"), "@echo HIJACKED-FROM-CWD\r\n");
     writeFileSync(join(dir, "node.bat"), "@echo HIJACKED-FROM-CWD\r\n");
-    const env = { ...process.env, CSB_BILLING_LOG: "" };
-    for (const key of Object.keys(env)) {
-      if (key.toLowerCase() === "nodefaultcurrentdirectoryinexepath") delete env[key];
+    const base = { ...process.env, CSB_BILLING_LOG: "" };
+    for (const key of Object.keys(base)) {
+      if (key.toLowerCase() === "nodefaultcurrentdirectoryinexepath") delete base[key];
     }
-    const run = spawnSync(process.env.ComSpec || "cmd.exe", ["/d", "/c", join(import.meta.dirname, "statusline.cmd")], {
-      cwd: dir,
-      env,
-      input: JSON.stringify({ model: { display_name: "Grok 4.7" } }),
-      encoding: "utf8",
-    });
-    assert.equal(run.stdout.includes("HIJACKED"), false);
-    assert.equal(run.status, 0);
-    assert.match(run.stdout, /Grok 4\.7/);
+    const pathKey = Object.keys(base).find((key) => key.toLowerCase() === "path") || "PATH";
+    // the second case puts a relative folder first on PATH, which only leaving the folder blocks
+    for (const env of [base, { ...base, [pathKey]: `.;${base[pathKey]}` }]) {
+      const run = spawnSync(process.env.ComSpec || "cmd.exe", ["/d", "/c", join(import.meta.dirname, "statusline.cmd")], {
+        cwd: dir,
+        env,
+        input: JSON.stringify({ model: { display_name: "Grok 4.7" } }),
+        encoding: "utf8",
+      });
+      assert.equal(run.stdout.includes("HIJACKED"), false);
+      assert.equal(run.status, 0);
+      assert.match(run.stdout, /Grok 4\.7/);
+    }
   });
 
   it("prints the band when started through a junction or symlink to the folder", () => {

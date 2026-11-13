@@ -12,7 +12,7 @@
 
 import { closeSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /** Each family is [dark, light], the same pairs the Claude Code band already checked. */
@@ -235,18 +235,22 @@ export function render(payload, extras) {
  */
 function absoluteSetting(name) {
   const value = process.env[name];
-  return value && isAbsolute(value) ? value : null;
+  return value && isAbsolute(value) ? normalize(value) : null;
 }
 
 /**
  * Grok's billing log as a full path, or null when CSB_BILLING_LOG is set to an
- * empty string. A relative CSB_BILLING_LOG or GROK_HOME is ignored.
+ * empty string or to a relative path: a log that was asked for and cannot be
+ * found shows no weekly segment, never another log's reading. The same holds
+ * for a relative GROK_HOME: it may be another account's home.
  */
 export function billingLogPath() {
-  if (process.env.CSB_BILLING_LOG === "") return null;
-  const log = absoluteSetting("CSB_BILLING_LOG");
-  if (log) return log;
-  const home = absoluteSetting("GROK_HOME") || join(homedir(), ".grok");
+  if (process.env.CSB_BILLING_LOG !== undefined) return absoluteSetting("CSB_BILLING_LOG");
+  if (process.env.GROK_HOME) {
+    const home = absoluteSetting("GROK_HOME");
+    return home ? join(home, "logs", "unified.jsonl") : null;
+  }
+  const home = join(homedir(), ".grok");
   return join(home, "logs", "unified.jsonl");
 }
 
@@ -412,17 +416,17 @@ function writeSources(cachePath, sources) {
 /**
  * Last weekly reading. Re-reads each readable log at most once per five
  * minutes, even when it has no credits line, as long as the cache can be
- * written. A re-read that finds no credits line keeps the last good record
+ * read and written; otherwise every run re-reads it. A re-read that finds no credits line keeps the last good record
  * and only moves the next check. A re-read whose newest
  * credits line cannot be used drops it. A log that cannot be read keeps the
  * last good record and is tried again on the next run. A cache file that
- * exists but cannot be read is left as it is.
+ * exists but cannot be read is left as it is, and its entries are not used.
  * The cache holds one entry per log: the log's size and time, when it was read,
  * and the percent, period type, period end, and fetch time.
  */
-export function loadWeekly(logPath, cachePath, nowMs = Date.now()) {
+export function loadWeekly(logPath, cachePath, nowMs = Date.now(), readCache = readSources) {
   // one cache file serves every log: a reading from another log (another GROK_HOME) is not this one's
-  const read = readSources(cachePath);
+  const read = readCache(cachePath);
   // a cache that cannot be read is not rewritten: that would drop every entry in it
   const canWrite = read !== null;
   const sources = read || {};
