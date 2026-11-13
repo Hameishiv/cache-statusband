@@ -10,7 +10,7 @@
  * weekly and still open. It does not use the network and does not read a token.
  */
 
-import { closeSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, fstatSync, fsyncSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -119,8 +119,15 @@ export function contextLabel(window) {
   }
   if (used !== null) {
     label += pct !== null ? " · " : " ";
-    label += formatTokens(used);
-    if (size !== null) label += `/${formatTokens(size)}`;
+    let usedText = formatTokens(used);
+    if (size !== null) {
+      const sizeText = formatTokens(size);
+      // rounded apart, the two can print the same while the window is not exactly full
+      if (usedText === sizeText && used !== size) usedText = (used < size ? "<" : ">") + usedText;
+      label += `${usedText}/${sizeText}`;
+    } else {
+      label += usedText;
+    }
   }
   return label;
 }
@@ -310,7 +317,9 @@ function absoluteSetting(name) {
  * Grok's billing log as a full path, or null when CSB_BILLING_LOG is set to an
  * empty string or to a relative path: a log that was asked for and cannot be
  * found shows no weekly segment, never another log's reading. The same holds
- * for a relative GROK_HOME: it may be another account's home.
+ * for a relative GROK_HOME: it may be another account's home. With neither set,
+ * the log is under the home folder, and an unknown or relative home folder
+ * gives null too.
  */
 export function billingLogPath() {
   if (process.env.CSB_BILLING_LOG !== undefined) return absoluteSetting("CSB_BILLING_LOG");
@@ -482,7 +491,9 @@ export function readSources(cachePath) {
     if (body && typeof body === "object" && "source" in body && "record" in body) return {};
     return null;
   } catch {
-    // not JSON at all: not a file this script wrote (its writes are atomic)
+    // empty or NUL-filled: what a crash right after a write can leave; this cache, so replace it
+    if (/^[\s\0]*$/.test(text)) return {};
+    // not JSON at all: not a file this script wrote
     return null;
   }
 }
@@ -493,7 +504,14 @@ function writeSources(cachePath, sources) {
   const tmp = `${cachePath}.${process.pid}.tmp`;
   try {
     mkdirSync(dirname(cachePath), { recursive: true });
-    writeFileSync(tmp, JSON.stringify({ v: 2, sources }));
+    const fd = openSync(tmp, "w");
+    try {
+      writeFileSync(fd, JSON.stringify({ v: 2, sources }));
+      // on disk before the rename, so a crash cannot leave the name pointing at nothing
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
     renameSync(tmp, cachePath);
   } catch {
     // This run can still show the reading it already has.
@@ -512,8 +530,8 @@ function writeSources(cachePath, sources) {
  * and only moves the next check. A re-read whose newest
  * credits line cannot be used drops it. A log that cannot be read keeps the
  * last good record and is tried again on the next run. A cache file that
- * exists but cannot be read, or is in a newer format, is left as it is, and
- * its entries are not used.
+ * exists but cannot be read, is in a newer format, or is not this cache (not
+ * JSON, or JSON of another shape) is left as it is, and its entries are not used.
  * The cache holds one entry per log: the log's size and time, when it was read,
  * and the percent, period type, period end, and fetch time.
  */

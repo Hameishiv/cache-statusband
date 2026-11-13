@@ -120,8 +120,10 @@ describe("segments", () => {
     // Grok rounds to whole percents; the token counts say whether 0 or 100 is exact
     assert.equal(contextLabel({ used_percentage: 0, context_tokens: 3000, context_window_size: 2e6 }), "ctx <1% · 3k/2M");
     assert.equal(contextLabel({ used_percentage: 0, context_tokens: 0, context_window_size: 2e6 }), "ctx 0% · 0/2M");
-    assert.equal(contextLabel({ used_percentage: 100, context_tokens: 1992000, context_window_size: 2e6 }), "ctx >99% · 2M/2M");
+    assert.equal(contextLabel({ used_percentage: 100, context_tokens: 1992000, context_window_size: 2e6 }), "ctx >99% · <2M/2M");
     assert.equal(contextLabel({ used_percentage: 100, context_tokens: 2e6, context_window_size: 2e6 }), "ctx 100% · 2M/2M");
+    assert.equal(contextLabel({ used_percentage: 99, context_tokens: 999600, context_window_size: 1e6 }), "ctx 99% · <1M/1M");
+    assert.equal(contextLabel({ used_percentage: 100, context_tokens: 1000400, context_window_size: 1e6 }), "ctx >100% · >1M/1M");
     assert.equal(contextLabel({ used_percentage: 100, context_tokens: 300000, context_window_size: 256000 }), "ctx >100% · 300k/256k");
   });
 
@@ -386,6 +388,11 @@ describe("weekly usage", () => {
     // a file of some other shape, say from a mistyped CSB_USAGE_CACHE, is not ours to rewrite
     writeFileSync(join(dir, "other.json"), '{"name":"something else"}');
     assert.equal(readSources(join(dir, "other.json")), null);
+    // what a crash right after a write can leave is this cache, and is replaced
+    writeFileSync(join(dir, "empty.json"), "");
+    assert.deepEqual(readSources(join(dir, "empty.json")), {});
+    writeFileSync(join(dir, "nul.json"), Buffer.alloc(16));
+    assert.deepEqual(readSources(join(dir, "nul.json")), {});
     mkdirSync(join(dir, "folder.json"));
     assert.equal(readSources(join(dir, "folder.json")), null);
   });
