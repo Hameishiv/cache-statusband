@@ -132,11 +132,17 @@ export function costLabel(usd) {
   return `session $${v.toFixed(0)}`;
 }
 
-/** Whole percents stay whole. A tenth is kept. Non-finite input returns null. */
+/**
+ * Whole percents stay whole. A tenth is kept. Non-finite input returns null.
+ * Rounding never shows a figure the input is not: above 0 is never "0", below
+ * 100 is never "100".
+ */
 export function percentText(value) {
   const v = finite(value);
   if (v === null) return null;
   const tenths = Math.round(v * 10) / 10;
+  if (v > 0 && tenths === 0) return "<0.1";
+  if (v < 100 && tenths === 100) return ">99.9";
   return Number.isInteger(tenths) ? String(tenths) : tenths.toFixed(1);
 }
 
@@ -264,7 +270,10 @@ export function render(payload, extras) {
 function homeDir() {
   try {
     const home = homedir();
-    return home && isAbsolute(home) ? home : null;
+    if (!home || !isAbsolute(home)) return null;
+    // on Windows "\x" is relative to the current drive, as in absoluteSetting
+    if (process.platform === "win32" && !/^([a-zA-Z]:[\\/]|[\\/]{2}[^\\/])/.test(home)) return null;
+    return home;
   } catch {
     return null;
   }

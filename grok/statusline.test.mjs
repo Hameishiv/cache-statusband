@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { after, describe, it } from "node:test";
@@ -14,6 +14,7 @@ import {
   formatTokens,
   HUES,
   loadWeekly,
+  percentText,
   readLastBilling,
   readSources,
   remaining,
@@ -358,6 +359,8 @@ describe("weekly usage", () => {
     });
     assert.equal(run.signal, null);
     assert.equal(run.status, 0);
+    // left in place, not replaced by a cache file
+    assert.ok(statSync(cachePath).isFIFO());
   });
 
   it("tells a missing cache from one it cannot read", () => {
@@ -450,6 +453,11 @@ describe("home folder", () => {
       process.env.HOME = "relhome";
       assert.equal(billingLogPath(), null);
       assert.equal(usageCachePath(), null);
+      if (process.platform === "win32") {
+        process.env.USERPROFILE = String.raw`\relhome`;
+        assert.equal(billingLogPath(), null);
+        assert.equal(usageCachePath(), null);
+      }
     } finally {
       for (const name of names) {
         if (saved[name] === undefined) delete process.env[name];
@@ -817,5 +825,18 @@ describe("cli", () => {
     assert.notEqual(run.status, 0);
     assert.equal(run.stdout, "");
     assert.match(run.stderr, /not a JSON object/);
+  });
+});
+
+describe("percentText", () => {
+  it("never rounds a figure into one it is not", () => {
+    assert.equal(percentText(24), "24");
+    assert.equal(percentText(28.7), "28.7");
+    assert.equal(percentText(0), "0");
+    assert.equal(percentText(0.04), "<0.1");
+    assert.equal(percentText(0.05), "0.1");
+    assert.equal(percentText(99.94), "99.9");
+    assert.equal(percentText(99.96), ">99.9");
+    assert.equal(percentText(100), "100");
   });
 });
