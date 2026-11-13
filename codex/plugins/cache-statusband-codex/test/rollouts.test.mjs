@@ -602,7 +602,8 @@ test("a startup in a cache folder that refuses new files still shows the stored 
       identityGetter: async () => ({ key: `account:${email}`, label: email, unavailable: false }),
     });
   } finally {
-    for (const lift of undo) await lift();
+    // Every lift is tried, even if an earlier one fails (or the deny it undoes never applied).
+    for (const lift of undo) await lift().catch(() => {});
   }
   assert.match(output.systemMessage, /Banked resets: 7/);
   assert.ok(output.systemMessage.includes(`Account: ${email}.`), output.systemMessage);

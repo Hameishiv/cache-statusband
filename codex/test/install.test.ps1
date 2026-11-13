@@ -543,6 +543,7 @@ exit /b 0
     $env:PATH = $previousPath
   }
   if ($noNpmMessage -notmatch "only the terminal command link was not made" -or $noNpmMessage -notmatch "nothing is rolled back") { throw "A missing npm was not described as only the link step failing: '$noNpmMessage'" }
+  if ($noNpmMessage -notmatch "Could not check for an existing terminal command link") { throw "A missing npm was not reported as the check for an existing link failing: '$noNpmMessage'" }
   if ($noNpmMessage -match "settings.json") { throw "The link-step message mentioned settings.json although -SeatFile was not used: $noNpmMessage" }
   if (-not (($noNpmOutput -join "`n") -match "open /hooks in Codex to review and trust them") -or -not (($noNpmOutput -join "`n") -match "Restart Codex to load the plugin")) { throw "The hooks-review and restart lines were not printed before the link step: $($noNpmOutput -join ' | ')" }
 
