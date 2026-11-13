@@ -10,7 +10,7 @@
  * weekly and still open. It does not use the network and does not read a token.
  */
 
-import { closeSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -153,8 +153,8 @@ export function remaining(ms) {
  * Weekly percent and reset, or null.
  * `record` is `{ percent, periodType, periodEnd, fetchedAt }`. A monthly period,
  * a missing percent, or a reset that has already passed is left out.
- * Grok logs the reading only when the user runs /usage, so once it is an hour
- * old the age is shown. A missing or unreadable fetch time shows no age.
+ * The reading is as old as the credits line Grok last logged, so once it is an
+ * hour old the age is shown. A missing or unreadable fetch time shows no age.
  */
 export function weeklyLabel(record, nowMs) {
   if (!record || typeof record !== "object") return null;
@@ -232,7 +232,7 @@ export function billingLogPath() {
   return join(home, "logs", "unified.jsonl");
 }
 
-/** Shared cache of the last weekly reading. Never holds a token or the raw line. */
+/** Cache of the last weekly reading, one entry per log. Never holds a token or the raw line. */
 export function usageCachePath() {
   if (process.env.CSB_USAGE_CACHE) return process.env.CSB_USAGE_CACHE;
   let base;
@@ -347,11 +347,19 @@ function readSources(cachePath) {
 
 function writeSources(cachePath, sources) {
   if (!cachePath) return;
+  // write then rename, so a reader never sees a half-written file
+  const tmp = `${cachePath}.${process.pid}.tmp`;
   try {
     mkdirSync(dirname(cachePath), { recursive: true });
-    writeFileSync(cachePath, JSON.stringify({ v: 2, sources }));
+    writeFileSync(tmp, JSON.stringify({ v: 2, sources }));
+    renameSync(tmp, cachePath);
   } catch {
     // This run can still show the reading it already has.
+    try {
+      unlinkSync(tmp);
+    } catch {
+      // nothing was left behind
+    }
   }
 }
 
@@ -369,7 +377,9 @@ export function loadWeekly(logPath, cachePath, nowMs = Date.now()) {
   const raw = logPath && Object.hasOwn(sources, logPath) ? sources[logPath] : null;
   const entry = raw && typeof raw === "object" ? raw : null;
   const prior = storedRecord(entry);
-  if (entry && finite(entry.scannedAt) !== null && nowMs - entry.scannedAt < RESCAN_MS) return prior;
+  // a scan time in the future (the clock went back) does not hold the throttle
+  const age = entry && finite(entry.scannedAt) !== null ? nowMs - entry.scannedAt : null;
+  if (age !== null && age >= 0 && age < RESCAN_MS) return prior;
 
   let st = null;
   if (logPath) {

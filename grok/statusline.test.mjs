@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -220,6 +220,20 @@ ${noPercent}
     ageCache(cachePath, logPath);
     assert.equal(loadWeekly(logPath, cachePath, now + 1000), null);
     assert.equal(JSON.parse(readFileSync(cachePath, "utf8")).sources[logPath].record, null);
+  });
+
+  it("re-reads when the cached scan time is in the future", () => {
+    const dir = mkdtempSync(join(tmpdir(), "csb-week-"));
+    const logPath = join(dir, "unified.jsonl");
+    const cachePath = join(dir, "usage.json");
+    writeFileSync(logPath, "no credits line
+");
+    assert.equal(loadWeekly(logPath, cachePath, now + 60 * 60 * 1000), null);
+    writeFileSync(logPath, `${creditsLine(61)}
+`);
+    // the clock went back an hour: the stored scan time must not hold the throttle
+    assert.equal(loadWeekly(logPath, cachePath, now).percent, 61);
+    assert.deepEqual(readdirSync(dir).sort(), ["unified.jsonl", "usage.json"]);
   });
 
   it("does not re-read an unchanged log with no credits line after the window", () => {
