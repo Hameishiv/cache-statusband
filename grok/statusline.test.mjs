@@ -96,6 +96,11 @@ describe("segments", () => {
   it("keeps a real zero", () => {
     assert.equal(contextLabel({ used_percentage: 0, context_tokens: 0 }), "ctx 0% · 0");
     assert.equal(cacheLabel({ cache_read_input_tokens: 0 }), "cache read 0");
+    // rounding never carries a figure into the next unit
+    assert.equal(formatTokens(999949), "1M");
+    assert.equal(formatTokens(999.6), "1k");
+    assert.equal(costLabel(9.999), "session $10");
+    assert.equal(costLabel(9.994), "session $9.99");
     // a write count alone still says it is a cache figure
     assert.equal(cacheLabel({ cache_creation_input_tokens: 1500 }), "cache write 1.5k");
     assert.equal(costLabel(0), "session $0");
@@ -222,7 +227,7 @@ describe("weekly usage", () => {
     assert.equal(loadWeekly(logPath, cachePath, now + 2000).percent, 40);
   });
 
-  it("scans a log with no credits line once per five minutes", () => {
+  it("scans a log with no credits line once per re-read interval", () => {
     const dir = tempDir(join(tmpdir(), "csb-week-"));
     const logPath = join(dir, "unified.jsonl");
     const cachePath = join(dir, "usage.json");

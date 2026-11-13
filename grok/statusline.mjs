@@ -74,12 +74,13 @@ export function formatTokens(value) {
   if (v === null) return null;
   const sign = v < 0 ? "-" : "";
   const abs = Math.abs(v);
-  if (abs >= 1e6) {
+  // the unit thresholds sit where rounding would carry into the next unit ("1000k" -> "1M")
+  if (abs >= 999500) {
     const millions = abs / 1e6;
     const body = millions >= 10 ? millions.toFixed(0) : trimFixed(millions.toFixed(1));
     return `${sign}${body}M`;
   }
-  if (abs >= 1000) {
+  if (abs >= 999.5) {
     const thousands = abs / 1000;
     const body = thousands >= 100 ? thousands.toFixed(0) : trimFixed(thousands.toFixed(1));
     return `${sign}${body}k`;
@@ -125,7 +126,8 @@ export function costLabel(usd) {
   const abs = Math.abs(v);
   if (abs === 0) return "session $0";
   if (abs < 0.01) return v < 0 ? "session >-$0.01" : "session <$0.01";
-  if (abs < 10) return `session $${v.toFixed(2)}`;
+  // compare the amount as it will print, so $9.999 shows as "$10", not "$10.00"
+  if (Math.round(abs * 100) < 1000) return `session $${v.toFixed(2)}`;
   return `session $${v.toFixed(0)}`;
 }
 
@@ -446,8 +448,8 @@ function writeSources(cachePath, sources) {
 }
 
 /**
- * Last weekly reading. Re-reads each readable log at most once per five
- * minutes, even when it has no credits line, as long as the cache can be
+ * Last weekly reading. Re-reads each readable log at most once per 290
+ * seconds, even when it has no credits line, as long as the cache can be
  * read and written; otherwise every run re-reads it. A re-read that finds no credits line keeps the last good record
  * and only moves the next check. A re-read whose newest
  * credits line cannot be used drops it. A log that cannot be read keeps the
