@@ -485,6 +485,49 @@ test("a failed identity capture records nothing, so a later start can still bind
   assert.deepEqual(await getSessionIdentity(root, "flaky-session", async () => identity), identity);
 });
 
+test("a startup in a cache folder that refuses new files still shows the stored reading and the login", async (t) => {
+  const root = await fixtureRoot(t);
+  const email = ["test", "example.invalid"].join("@");
+  const dataDir = join(root, "cache-statusband-codex");
+  const sessionsDir = join(dataDir, "sessions");
+  await mkdir(sessionsDir, { recursive: true });
+  const name = `rate-limits-${createHash("sha256").update(`account:${email}`).digest("hex").slice(0, 16)}.json`;
+  await writeFile(join(dataDir, name), `${JSON.stringify({
+    version: 3, attemptedAt: 1, fetchedAt: 1, nextAllowedAt: 2, lastErrorAt: null, identityKey: `account:${email}`,
+    accountEmail: email, availableCount: 7, credits: [], primary: null, secondary: null,
+  })}\n`);
+  // Both folders refuse new files (a real deny ACL on Windows, mode 555 elsewhere): the
+  // session's identity record cannot be written, and neither can the usage cache's lock.
+  const folders = [sessionsDir, dataDir];
+  const undo = [];
+  if (process.platform === "win32") {
+    for (const dir of folders) {
+      await promisify(execFile)("icacls", [dir, "/deny", "*S-1-1-0:(WD,AD)"]);
+      undo.push(() => promisify(execFile)("icacls", [dir, "/remove:d", "*S-1-1-0"]));
+    }
+  } else if (process.getuid?.() === 0) {
+    return t.skip("root cannot be denied file creation");
+  } else {
+    for (const dir of folders) {
+      await chmod(dir, 0o555);
+      undo.push(() => chmod(dir, 0o755));
+    }
+  }
+  let output;
+  try {
+    output = await handleSessionStart({ source: "startup", session_id: "unwritable-cache" }, {
+      codexHome: root,
+      identityGetter: async () => ({ key: `account:${email}`, label: email, unavailable: false }),
+    });
+  } finally {
+    for (const lift of undo) await lift();
+  }
+  assert.match(output.systemMessage, /Banked resets: 7/);
+  assert.ok(output.systemMessage.includes(`Account: ${email}.`), output.systemMessage);
+  // Nothing was recorded, so a later start may still bind the login.
+  assert.deepEqual((await readdir(sessionsDir)).filter((file) => file.endsWith(".identity.json") || file.endsWith(".tmp")), []);
+});
+
 test("a startup whose account read fails reports nothing and persists no identity", async (t) => {
   const root = await fixtureRoot(t);
   const output = await handleSessionStart({ source: "startup", session_id: "failing-start" }, {

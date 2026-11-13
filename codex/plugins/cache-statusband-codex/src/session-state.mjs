@@ -31,20 +31,28 @@ export async function getSessionIdentity(codexHome, sessionId, capture) {
   const record = { version: STATE_VERSION, identity };
   // Validate and whitelist the persisted shape; never retain account/read responses.
   const safeIdentity = parseIdentity(JSON.stringify(record));
-  await mkdir(join(codexHome, "cache-statusband-codex", "sessions"), { recursive: true });
   const temporary = `${path}.${randomUUID()}.tmp`;
+  let published = false;
   try {
+    await mkdir(join(codexHome, "cache-statusband-codex", "sessions"), { recursive: true });
     await writeFile(temporary, `${JSON.stringify({ version: STATE_VERSION, identity: safeIdentity })}\n`, { encoding: "utf8", mode: 0o600 });
     try {
       // Publishing a complete file with link is atomic and cannot replace a winner.
       await link(temporary, path);
+      published = true;
     } catch (error) {
       if (error.code !== "EEXIST") throw error;
     }
-    return parseIdentity(await readFile(path, "utf8"));
+  } catch {
+    // The record could not be written (a read-only or protected folder). The login just read
+    // is still this session's login: use it now, unrecorded, rather than lose the whole usage
+    // display. A later resume of this session finds no record and shows it as unknown.
+    return safeIdentity;
   } finally {
     await unlink(temporary).catch(() => {});
   }
+  // Either this call published the record, or another start won and its file is the answer.
+  return published ? safeIdentity : parseIdentity(await readFile(path, "utf8"));
 }
 
 function parseIdentity(text) {
