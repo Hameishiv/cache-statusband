@@ -109,7 +109,13 @@ export function contextLabel(window) {
   const size = rawSize ? rawSize : null;
   if (pct === null && used === null) return null;
   let label = "ctx";
-  if (pct !== null) label += ` ${percentText(pct)}%`;
+  if (pct !== null) {
+    // Grok sends whole percents: its own rounding can say 0 or 100 when the tokens say otherwise
+    let text = percentText(pct);
+    if (pct === 0 && used !== null && used > 0) text = "<1";
+    else if (pct === 100 && used !== null && size !== null && used < size) text = ">99";
+    label += ` ${text}%`;
+  }
   if (used !== null) {
     label += pct !== null ? " · " : " ";
     label += formatTokens(used);

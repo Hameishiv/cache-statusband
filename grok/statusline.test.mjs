@@ -117,6 +117,11 @@ describe("segments", () => {
     assert.equal(contextLabel({ context_tokens: -1500, context_window_size: 1e6 }), null);
     assert.equal(contextLabel({ used_percentage: 29, context_tokens: -1500 }), "ctx 29%");
     assert.equal(contextLabel({ context_tokens: 1500, context_window_size: 0 }), "ctx 1.5k");
+    // Grok rounds to whole percents; the token counts say whether 0 or 100 is exact
+    assert.equal(contextLabel({ used_percentage: 0, context_tokens: 3000, context_window_size: 2e6 }), "ctx <1% · 3k/2M");
+    assert.equal(contextLabel({ used_percentage: 0, context_tokens: 0, context_window_size: 2e6 }), "ctx 0% · 0/2M");
+    assert.equal(contextLabel({ used_percentage: 100, context_tokens: 1992000, context_window_size: 2e6 }), "ctx >99% · 2M/2M");
+    assert.equal(contextLabel({ used_percentage: 100, context_tokens: 2e6, context_window_size: 2e6 }), "ctx 100% · 2M/2M");
   });
 
   it("does not invent rate limits, cache age, or a rewrite price", () => {
