@@ -199,7 +199,8 @@ export function remaining(ms) {
  * a missing percent, or a reset that has already passed is left out.
  * The reading is as old as the credits line Grok last logged, so once it is an
  * hour old the age is shown. A missing or unreadable fetch time, or one more than
- * five minutes in the future, is shown as unknown.
+ * five minutes in the future, is shown as unknown. A period end that does not
+ * name its time-zone offset gives no reading, since it would be read as local time.
  */
 export function weeklyLabel(record, nowMs) {
   if (!record || typeof record !== "object") return null;
