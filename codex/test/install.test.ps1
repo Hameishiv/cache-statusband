@@ -417,8 +417,61 @@ exit /b 0
   if ([IO.File]::ReadAllText((Join-Path $hardHome "config.toml")) -ne $hardOriginal -or [IO.File]::ReadAllText($hardOther) -ne $hardOriginal) { throw "A refused hard-linked config.toml was changed" }
   if (Test-Path -LiteralPath (Join-Path $hardHome "backups")) { throw "A refused hard-linked config.toml still took a backup (something was changed)" }
 
-  # When Windows cannot compile the native replace (Constrained Language Mode refuses
-  # Add-Type), Move-FileOverExisting falls back to Move-Item -Force and warns once.
+  # A symbolic link whose target is a hard-linked file is refused as well: the replacement would
+  # land on the target and leave its other names with the old content.
+  if ($linksMade) {
+    $hardLinkHome = Join-Path $testHome "symlink-to-hard-home"
+    New-Item -ItemType Directory -Path $hardLinkHome | Out-Null
+    $hardLinkTarget = Join-Path $testHome "symlink-to-hard-target.toml"
+    $hardLinkOther = Join-Path $testHome "symlink-to-hard-other.toml"
+    [IO.File]::WriteAllText($hardLinkTarget, $hardOriginal, [Text.UTF8Encoding]::new($false))
+    New-Item -ItemType HardLink -Path $hardLinkOther -Target $hardLinkTarget | Out-Null
+    New-Item -ItemType SymbolicLink -Path (Join-Path $hardLinkHome "config.toml") -Target $hardLinkTarget | Out-Null
+    $hardLinkMessage = ""
+    try {
+      & (Join-Path $root "install.ps1") -CodexHome $hardLinkHome -SkipCliLink 3>$null | Out-Null
+    } catch {
+      $hardLinkMessage = $_.Exception.Message
+    }
+    if ($hardLinkMessage -notmatch "hard link") { throw "A symbolic link to a hard-linked config.toml was not refused with a hard-link message: $hardLinkMessage" }
+    if ([IO.File]::ReadAllText($hardLinkTarget) -ne $hardOriginal -or [IO.File]::ReadAllText($hardLinkOther) -ne $hardOriginal) { throw "A refused symbolic link to a hard-linked file still changed it" }
+    if (Test-Path -LiteralPath (Join-Path $hardLinkHome "backups")) { throw "A refused link to a hard-linked config.toml still took a backup (something was changed)" }
+
+    # A symbolic link whose target does not exist is refused with a clear message before any
+    # change, for config.toml and (with -SeatFile) settings.json, not a raw file-not-found.
+    foreach ($dangling in @("config.toml", "settings.json")) {
+      $danglingHome = Join-Path $testHome "dangling-$dangling-home"
+      New-Item -ItemType Directory -Path (Join-Path $danglingHome "cache-statusband-codex") | Out-Null
+      $danglingLink = if ($dangling -eq "config.toml") { Join-Path $danglingHome "config.toml" } else { Join-Path $danglingHome "cache-statusband-codex\settings.json" }
+      New-Item -ItemType SymbolicLink -Path $danglingLink -Target (Join-Path $testHome "does-not-exist-$dangling") | Out-Null
+      $danglingMessage = ""
+      try {
+        & (Join-Path $root "install.ps1") -CodexHome $danglingHome -SkipCliLink -SeatFile (Join-Path $testHome "seat.txt") 3>$null | Out-Null
+      } catch {
+        $danglingMessage = $_.Exception.Message
+      }
+      if ($danglingMessage -notmatch "symbolic link to .*does-not-exist-$([regex]::Escape($dangling)), which does not exist" -or $danglingMessage -notmatch "Nothing was changed") {
+        throw "A dangling symbolic $dangling was not refused with the missing-target message: $danglingMessage"
+      }
+      if (Test-Path -LiteralPath (Join-Path $danglingHome "backups")) { throw "A refused dangling $dangling still took a backup" }
+      if (Test-Path -LiteralPath (Join-Path $danglingHome "plugins")) { throw "A refused dangling $dangling still installed the plugin" }
+    }
+  }
+
+  # PowerShell's Constrained Language Mode cannot run the installer: it stops before anything
+  # is changed, with one clear message.
+  $clmHome = Join-Path $testHome "clm-home"
+  $clmScript = Join-Path $testHome "run-in-clm.ps1"
+  [IO.File]::WriteAllText($clmScript, @'
+$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'
+try { & $args[0] -CodexHome $args[1] -SkipCliLink } catch { $_.Exception.Message }
+'@)
+  $clmOutput = (& (Get-Process -Id $PID).Path -NoProfile -File $clmScript (Join-Path $root "install.ps1") $clmHome 2>&1 | Out-String)
+  if ($clmOutput -notmatch "needs PowerShell's FullLanguage mode" -or $clmOutput -notmatch "Nothing was changed") { throw "Constrained Language Mode was not refused with the FullLanguage message: $clmOutput" }
+  if (Test-Path -LiteralPath $clmHome) { throw "A refused Constrained Language Mode run still created the Codex home" }
+
+  # When the native replace cannot be compiled, Move-FileOverExisting falls back to
+  # Move-Item -Force and warns once (simulated here by an Add-Type that throws).
   $moveDefinition = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq "Move-FileOverExisting" }, $true)
   $fallbackScript = Join-Path $testHome "move-fallback.ps1"
   [IO.File]::WriteAllText($fallbackScript, "function Add-Type { throw 'simulated: Add-Type is not allowed' }`n" + $moveDefinition.Extent.Text + @'

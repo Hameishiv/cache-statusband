@@ -9,6 +9,12 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# The installer calls .NET methods and compiles a small native call, neither of which
+# PowerShell's Constrained Language Mode allows; stop before anything is touched.
+if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
+  throw "install.ps1 needs PowerShell's FullLanguage mode, but this session is in $($ExecutionContext.SessionState.LanguageMode) mode. Nothing was changed. Run the installer from a session that allows FullLanguage."
+}
+
 # A relative -CodexHome follows the PowerShell location, not the process working
 # directory that Codex and Node would later see.
 $CodexHome = $PSCmdlet.GetUnresolvedProviderPathFromPSPath($CodexHome)
@@ -27,8 +33,8 @@ function New-BackupFolder([string]$Name) {
 # atomic replace (MoveFileEx with MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
 # PowerShell's Move-Item -Force deletes the destination first, and a reader in that gap gets
 # "file not found" (measured). Elsewhere a rename already replaces atomically. When the
-# native call cannot be compiled (PowerShell's Constrained Language Mode refuses Add-Type)
-# it falls back to Move-Item -Force and says once that the replace is then not atomic.
+# native call cannot be compiled it falls back to Move-Item -Force and says once that the
+# replace is then not atomic.
 $script:nativeMoveWarned = $false
 function Move-FileOverExisting([string]$Source, [string]$Destination) {
   if (-not $IsWindows) {
@@ -66,19 +72,27 @@ public static void Replace(string source, string destination) {
 # The path a replacement of $Path must be made at. A plain file is itself. A symbolic link
 # resolves to the file it points at, so the replacement lands on that file and the link stays
 # a link (replacing the link itself would turn it into a regular file and leave the original
-# it pointed at behind). A hard link is refused: a replacement would give this name new
-# content and leave every other name for the old file with the old content.
+# it pointed at behind). A link whose target is missing is refused. A hard link is refused,
+# whether it is the file itself or what a symbolic link points at: a replacement would give
+# this name new content and leave every other name for the old file with the old content.
 function Resolve-ReplaceTarget([string]$Path, [string]$What) {
   $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
   if (-not $item) { return $Path }
-  if ($item.LinkType -eq "HardLink") {
-    throw "$What ($Path) is a hard link, so it has more than one name. Replacing it would leave the other names with the old content. Nothing was changed. Replace it with a regular file (or keep only the name you edit) and run the installer again."
-  }
+  $final = $Path
   if ($item.LinkType -eq "SymbolicLink") {
     $target = [IO.File]::ResolveLinkTarget($Path, $true)
-    if ($target) { return $target.FullName }
+    if ($target) {
+      if (-not $target.Exists) {
+        throw "$What ($Path) is a symbolic link to $($target.FullName), which does not exist. Nothing was changed. Fix or remove the link and run the installer again."
+      }
+      $final = $target.FullName
+      $item = Get-Item -LiteralPath $final -Force -ErrorAction SilentlyContinue
+    }
   }
-  return $Path
+  if ($item -and $item.LinkType -eq "HardLink") {
+    throw "$What ($final) is a hard link, so it has more than one name. Replacing it would leave the other names with the old content. Nothing was changed. Replace it with a regular file (or keep only the name you edit) and run the installer again."
+  }
+  return $final
 }
 
 # The text of a file, or $null when there is none; and whether two such readings are the same.
