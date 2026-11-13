@@ -402,6 +402,16 @@ describe("weekly usage", () => {
     assert.equal(readSources(join(dir, "other-old.json")), null);
     writeFileSync(join(dir, "settings.json"), '{"v":2,"name":"my settings","keep":true}');
     assert.equal(readSources(join(dir, "settings.json")), null);
+    // a file shaped like the cache but carrying other keys is not the cache either
+    writeFileSync(join(dir, "theme.json"), '{"v":2,"sources":{},"keep":"me"}');
+    assert.equal(readSources(join(dir, "theme.json")), null);
+    // under this cache's own name, a v of 2 without its entries is a damaged copy and is replaced
+    mkdirSync(join(dir, "c"));
+    writeFileSync(join(dir, "c", "usage.json"), '{"v":2}');
+    assert.deepEqual(readSources(join(dir, "c", "usage.json")), {});
+    mkdirSync(join(dir, "d"));
+    writeFileSync(join(dir, "d", "usage.json"), '{"v":2,"sources":[]}');
+    assert.deepEqual(readSources(join(dir, "d", "usage.json")), {});
     mkdirSync(join(dir, "folder.json"));
     assert.equal(readSources(join(dir, "folder.json")), null);
   });

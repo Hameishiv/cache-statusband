@@ -468,9 +468,10 @@ function storedRecord(entry) {
  * Per-log entries of the cache file, or null when the file exists but cannot
  * be read (locked, no permission, not a regular file), is in a newer format
  * (v above 2), or is not this cache at all (text that is not JSON, or JSON of
- * another shape, say from a mistyped CSB_USAGE_CACHE): it is then neither used
- * nor rewritten. A missing file counts as empty, and so does a file named
- * usage.json that is empty or NUL-filled (what a crash can leave) or in the old
+ * any shape but exactly {v: 2, sources}, say from a mistyped CSB_USAGE_CACHE):
+ * it is then neither used nor rewritten. A missing file counts as empty, and so
+ * does a file named usage.json that is empty or NUL-filled (what a crash can
+ * leave), has a v of 2 without this cache's entries, or is in the old
  * single-entry format; under any other name such a file is left as it is.
  */
 export function readSources(cachePath) {
@@ -491,8 +492,10 @@ export function readSources(cachePath) {
     if (body && typeof body.v === "number" && body.v > 2) return null;
     if (body && body.v === 2) {
       const sources = body.sources;
-      if (sources && typeof sources === "object" && !Array.isArray(sources)) return sources;
-      // a v of 2 without this cache's entries is some other file, unless it carries this cache's name
+      // exactly what this script writes: {v, sources}, nothing else
+      const exact = Object.keys(body).every((k) => k === "v" || k === "sources");
+      if (exact && sources && typeof sources === "object" && !Array.isArray(sources)) return sources;
+      // any other v of 2 is some other file, unless it carries this cache's name
       return ownName ? {} : null;
     }
     // the old single-entry format of this cache is replaced; any other file is not ours to rewrite
@@ -544,7 +547,8 @@ function writeSources(cachePath, sources) {
  * last good record and is tried again on the next run. A cache file that
  * exists but cannot be read, is in a newer format, or is not this cache (not
  * JSON, or JSON of another shape) is left as it is, and its entries are not used;
- * only a file named usage.json that is empty, NUL-filled or in the old format is replaced.
+ * only a file named usage.json that is empty, NUL-filled, a v of 2 without this
+ * cache's entries, or in the old format is replaced.
  * The cache holds one entry per log: the log's size and time, when it was read,
  * and the percent, period type, period end, and fetch time.
  */
