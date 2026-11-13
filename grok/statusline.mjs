@@ -96,7 +96,9 @@ export function modelLabel(model) {
 
 export function contextLabel(window) {
   if (!window || typeof window !== "object") return null;
-  const pct = finite(window.used_percentage);
+  const raw = finite(window.used_percentage);
+  // a negative percent is not a known figure
+  const pct = raw !== null && raw >= 0 ? raw : null;
   const used = finite(window.context_tokens);
   const size = finite(window.context_window_size);
   if (pct === null && used === null) return null;
@@ -133,13 +135,13 @@ export function costLabel(usd) {
 }
 
 /**
- * Whole percents stay whole. A tenth is kept. Non-finite input returns null.
+ * Whole percents stay whole. A tenth is kept. Non-finite or negative input returns null.
  * Rounding never shows a figure the input is not: above 0 is never "0", below
  * 100 is never "100".
  */
 export function percentText(value) {
   const v = finite(value);
-  if (v === null) return null;
+  if (v === null || v < 0) return null;
   const tenths = Math.round(v * 10) / 10;
   if (v > 0 && tenths === 0) return "<0.1";
   if (v < 100 && tenths === 100) return ">99.9";

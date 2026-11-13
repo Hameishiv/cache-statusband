@@ -92,6 +92,8 @@ describe("segments", () => {
   it("rounds a fractional context percent to a tenth", () => {
     assert.equal(contextLabel({ used_percentage: 28.699999999999996 }), "ctx 28.7%");
     assert.equal(contextLabel({ used_percentage: 29 }), "ctx 29%");
+    assert.equal(contextLabel({ used_percentage: -3 }), null);
+    assert.equal(contextLabel({ used_percentage: -0.04 }), null);
   });
 
   it("keeps a real zero", () => {
@@ -837,6 +839,9 @@ describe("percentText", () => {
     assert.equal(percentText(0.05), "0.1");
     assert.equal(percentText(99.94), "99.9");
     assert.equal(percentText(99.96), ">99.9");
+    assert.equal(percentText(99.95), ">99.9");
     assert.equal(percentText(100), "100");
+    assert.equal(percentText(100.04), "100");
+    assert.equal(percentText(-0.04), null);
   });
 });
