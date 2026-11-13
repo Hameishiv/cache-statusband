@@ -81,6 +81,8 @@ test("a settings.json read that fails once, is caught half-written or is briefly
   };
   const busy = Object.assign(new Error("EBUSY: simulated"), { code: "EBUSY" });
   const fast = { retryMs: 1 };
+  // The installer's temporary file beside settings.json: a replacement may be under way.
+  const swapping = { lister: async () => ["settings.json.bak", ".settings.json.cache-statusband-0123abcd.tmp"] };
 
   const failedOnce = sequence(busy, good);
   assert.equal(await configuredSeatFile("home", { ...fast, reader: failedOnce.reader }), "seat.txt");
@@ -98,18 +100,30 @@ test("a settings.json read that fails once, is caught half-written or is briefly
   await assert.rejects(configuredSeatFile("home", { ...fast, reader: stuck.reader }), /EBUSY/);
   assert.equal(stuck.calls.length, 4);
 
-  // A missing file is retried twice (a delete-and-recreate save leaves a gap), then means no seat.
+  // A missing file is retried twice when a replacement may be under way (see `swapping`), then means no seat.
   const enoent = () => Object.assign(new Error("ENOENT"), { code: "ENOENT" });
   const missing = sequence(enoent());
-  assert.equal(await configuredSeatFile("home", { ...fast, reader: missing.reader }), null);
+  assert.equal(await configuredSeatFile("home", { ...fast, ...swapping, reader: missing.reader }), null);
   assert.equal(missing.calls.length, 3);
   const appears = sequence(enoent(), good);
-  assert.equal(await configuredSeatFile("home", { ...fast, reader: appears.reader }), "seat.txt");
+  assert.equal(await configuredSeatFile("home", { ...fast, ...swapping, reader: appears.reader }), "seat.txt");
   assert.equal(appears.calls.length, 2);
   // The two retries are separate from the failed-read retries.
   const mixed = sequence(enoent(), busy, busy, busy, good);
-  assert.equal(await configuredSeatFile("home", { ...fast, reader: mixed.reader }), "seat.txt");
+  assert.equal(await configuredSeatFile("home", { ...fast, ...swapping, reader: mixed.reader }), "seat.txt");
   assert.equal(mixed.calls.length, 5);
+  // With no temporary file beside it, a missing settings.json is "no seat" at once: no retry.
+  const plain = sequence(enoent());
+  const started = performance.now();
+  assert.equal(await configuredSeatFile("home", { retryMs: 200, lister: async () => ["rate-limits.json"], reader: plain.reader }), null);
+  assert.ok(performance.now() - started < 30, "a plain missing file must not wait");
+  assert.equal(plain.calls.length, 1);
+  // The same when the folder cannot be listed (it does not exist).
+  const noFolder = sequence(enoent());
+  assert.equal(await configuredSeatFile("home", { retryMs: 200, lister: async () => { throw enoent(); }, reader: noFolder.reader }), null);
+  assert.equal(noFolder.calls.length, 1);
+  // A real missing folder, no injection.
+  assert.equal(await configuredSeatFile(join(tmpdir(), "csb-no-such-home-r9")), null);
   // A well-formed file with a bad value is an answer, not a glitch.
   const badValue = sequence(JSON.stringify({ seatFile: 5 }));
   await assert.rejects(configuredSeatFile("home", { ...fast, reader: badValue.reader }), /non-empty string/);

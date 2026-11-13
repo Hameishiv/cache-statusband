@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 import { hasControl, stripControls } from "./sanitize.mjs";
 
@@ -62,10 +62,12 @@ function isSeatLabel(identity) {
 // The installer replaces settings.json while sessions may be starting, and an editor may save
 // it in two steps, so a failed read or parse is tried again (up to SETTINGS_RETRIES more
 // times, SETTINGS_RETRY_MS apart) before it counts as a failure. A missing file is also tried
-// again, but only twice (about 100 ms in all): an editor that saves by deleting and
-// recreating the file leaves a brief gap in which it does not exist, and a gap taken for
-// "no seat" would show the account email. A file still missing after that means no seat. A
-// well-formed file with a bad value is an answer and is not retried.
+// again, but only twice (about 100 ms in all), and only when a replacement may be under way:
+// the installer writes a `.settings.json.<something>.tmp` file beside settings.json and then
+// swaps it in, so such a file in the folder means a missing settings.json may be about to
+// reappear. With no such file a missing file is an immediate answer, "no seat". A file still
+// missing after the retries also means no seat. A well-formed file with a bad value is an
+// answer and is not retried.
 const SETTINGS_RETRIES = 3;
 const SETTINGS_MISSING_RETRIES = 2;
 const SETTINGS_RETRY_MS = 50;
@@ -75,8 +77,10 @@ export async function configuredSeatFile(codexHome, {
   retryMs = SETTINGS_RETRY_MS,
   retries = SETTINGS_RETRIES,
   missingRetries = SETTINGS_MISSING_RETRIES,
+  lister = readdir,
 } = {}) {
-  const path = resolve(codexHome, "cache-statusband-codex", "settings.json");
+  const directory = resolve(codexHome, "cache-statusband-codex");
+  const path = resolve(directory, "settings.json");
   let settings;
   let missing = 0;
   for (let attempt = 0; ; attempt += 1) {
@@ -86,7 +90,7 @@ export async function configuredSeatFile(codexHome, {
       break;
     } catch (error) {
       if (error?.code === "ENOENT") {
-        if (missing >= missingRetries) return null;
+        if (missing >= missingRetries || !await replacementMayBeUnderway(directory, lister)) return null;
         missing += 1;
       } else if (attempt - missing >= retries) {
         throw error;
@@ -99,6 +103,15 @@ export async function configuredSeatFile(codexHome, {
   const value = settings.seatFile;
   if (typeof value !== "string" || !value.trim()) throw new Error("settings.json seatFile is not a non-empty string");
   return value.trim();
+}
+
+// The installer's temporary file for a settings.json it is about to swap in.
+async function replacementMayBeUnderway(directory, lister) {
+  try {
+    return (await lister(directory)).some((name) => /^\.settings\.json\..+\.tmp$/.test(name));
+  } catch {
+    return false;
+  }
 }
 
 export async function readSeatLabel(path) {
