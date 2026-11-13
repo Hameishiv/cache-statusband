@@ -23,6 +23,7 @@ import {
 } from "../src/usage.mjs";
 
 const TEST_EMAIL = ["person", "example.invalid"].join("@");
+const FAKE_EMAIL = ["test", "example.invalid"].join("@");
 const OTHER_EMAIL = ["other", "example.invalid"].join("@");
 const ACCOUNT_IDENTITY = { key: `account:${TEST_EMAIL}`, label: TEST_EMAIL, unavailable: false };
 const SEAT_PREFIX = ["S", "eat"].join("");
@@ -118,6 +119,7 @@ test("speaks the documented app-server protocol", async () => {
     command: process.execPath,
     args: [join(here, "..", "fixtures", "fake-app-server.mjs")],
     timeoutMs: 2_000,
+    expectedEmail: FAKE_EMAIL,
     env: { ...process.env, EXPECT_CODEX_HOME: selectedHome },
   });
   assert.equal(result.rateLimitResetCredits.availableCount, 2);
@@ -325,7 +327,7 @@ test("resolves a runnable Codex command from CODEX_BIN or the Windows PATH", asy
 
   const wrapped = resolveCodexLaunch({ Path: bin, ComSpec }, "win32");
   assert.equal(wrapped.command, ComSpec);
-  assert.deepEqual(wrapped.args, ["/d", "/s", "/c", `""${join(bin, "codex.cmd")}" app-server"`]);
+  assert.deepEqual(wrapped.args, ["/d", "/v:off", "/s", "/c", `""${join(bin, "codex.cmd")}" app-server"`]);
   assert.equal(wrapped.windowsVerbatimArguments, true);
 
   assert.equal(resolveCodexLaunch({ PATH: `${bin}${delimiter}${other}` }, "win32").command, "cmd.exe");
@@ -350,7 +352,7 @@ test("a codex.cmd whose path contains % is refused rather than expanded by cmd.e
   const env = { ...process.env, CODEX_BIN: join(bin, "codex.cmd") };
   const launch = { codexHome: root, env, platform: "win32", timeoutMs: 1000 };
   await assert.rejects(readAccountViaAppServer(launch), /CODEX_BIN/);
-  await assert.rejects(fetchRateLimitsViaAppServer(launch), /CODEX_BIN/);
+  await assert.rejects(fetchRateLimitsViaAppServer({ ...launch, expectedEmail: FAKE_EMAIL }), /CODEX_BIN/);
 });
 
 test("the app-server readers run an npm-style codex.cmd found on PATH", { skip: process.platform !== "win32" }, async (t) => {
@@ -364,7 +366,7 @@ test("the app-server readers run an npm-style codex.cmd found on PATH", { skip: 
   delete env.CODEX_BIN;
   const account = await readAccountViaAppServer({ codexHome: root, env, timeoutMs: 5_000 });
   assert.equal(account.email, ["test", "example.invalid"].join("@"));
-  const limits = await fetchRateLimitsViaAppServer({ codexHome: root, env, timeoutMs: 5_000 });
+  const limits = await fetchRateLimitsViaAppServer({ codexHome: root, env, timeoutMs: 5_000, expectedEmail: FAKE_EMAIL });
   assert.equal(limits.rateLimitResetCredits.availableCount, 2);
 });
 
@@ -411,7 +413,7 @@ for (const npmShape of process.platform === "win32" ? [false, true] : [false]) {
     test(`a timed-out ${name} read leaves no server behind (${shape})`, async (t) => {
       const root = await fixtureRoot(t);
       const { pidFile, env, options } = await hungLaunch(root, { npmShape });
-      await assert.rejects(reader({ codexHome: root, env, timeoutMs: 1500, ...options }), /timed out/);
+      await assert.rejects(reader({ codexHome: root, env, timeoutMs: 1500, expectedEmail: FAKE_EMAIL, ...options }), /timed out/);
       const pid = Number(await readFile(pidFile, "utf8"));
       assert.ok(Number.isInteger(pid) && pid > 0);
       try {
@@ -428,7 +430,7 @@ for (const npmShape of process.platform === "win32" ? [false, true] : [false]) {
     const script = join(root, "call-reader.mjs");
     await writeFile(script, [
       `import { fetchRateLimitsViaAppServer } from ${JSON.stringify(pathToFileURL(USAGE_MODULE).href)};`,
-      `try { await fetchRateLimitsViaAppServer({ codexHome: ${JSON.stringify(root)}, timeoutMs: 800, ...${JSON.stringify(options)} }); } catch {}`,
+      `try { await fetchRateLimitsViaAppServer({ codexHome: ${JSON.stringify(root)}, timeoutMs: 800, expectedEmail: ${JSON.stringify(FAKE_EMAIL)}, ...${JSON.stringify(options)} }); } catch {}`,
     ].join("\n"));
     const started = Date.now();
     const child = spawn(process.execPath, [script], { env, stdio: "ignore", windowsHide: true });
@@ -449,7 +451,7 @@ for (const npmShape of process.platform === "win32" ? [false, true] : [false]) {
 test("server messages that reuse a response id are not mistaken for responses", async () => {
   const options = { command: process.execPath, args: [FAKE_SERVER], timeoutMs: 3_000, env: { ...process.env, FAKE_SERVER_NOISE: "1" } };
   assert.equal((await readAccountViaAppServer(options)).email, ["test", "example.invalid"].join("@"));
-  const limits = await fetchRateLimitsViaAppServer(options);
+  const limits = await fetchRateLimitsViaAppServer({ ...options, expectedEmail: FAKE_EMAIL });
   assert.equal(limits.account.email, ["test", "example.invalid"].join("@"));
   assert.equal(limits.rateLimitResetCredits.availableCount, 2);
 });
@@ -662,7 +664,7 @@ test("a server that has already exited is not signalled again, but a live one is
   // Exits by itself a moment after start: its pid may be reused, so nothing may target it.
   const brief = { command: process.execPath, args: ["-e", "process.stdin.resume(); setTimeout(() => process.exit(0), 300)"] };
   for (const reader of [readAccountViaAppServer, fetchRateLimitsViaAppServer]) {
-    await assert.rejects(reader({ codexHome: root, ...brief, platform: "win32", spawnKiller, timeoutMs: 5_000 }), /exited before/);
+    await assert.rejects(reader({ codexHome: root, ...brief, platform: "win32", spawnKiller, timeoutMs: 5_000, expectedEmail: FAKE_EMAIL }), /exited before/);
   }
   assert.deepEqual(killed, []);
   // A server still running when the read ends is taken down with its whole process tree.

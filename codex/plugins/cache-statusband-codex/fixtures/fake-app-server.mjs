@@ -6,6 +6,8 @@ if (process.env.EXPECT_CODEX_HOME && process.env.CODEX_HOME !== process.env.EXPE
   process.exit(7);
 }
 
+// FAKE_SERVER_STARTS gets one line per server process started.
+if (process.env.FAKE_SERVER_STARTS) appendFileSync(process.env.FAKE_SERVER_STARTS, "start\n");
 const lines = createInterface({ input: process.stdin });
 // FAKE_SERVER_EMAIL picks the signed-in login; FAKE_SERVER_LOG collects one line per request.
 const testEmail = process.env.FAKE_SERVER_EMAIL || ["test", "example.invalid"].join("@");
@@ -18,8 +20,9 @@ lines.on("line", (line) => {
     process.stdout.write(`${JSON.stringify({ method: "server/request", id: 2, params: {} })}\n`);
     process.stdout.write(`${JSON.stringify({ method: "server/request", id: 3, params: {} })}\n`);
   }
-  if (message.id === 2) {
-    process.stdout.write(`${JSON.stringify({ id: 2, result: { account: { type: "chatgpt", email: testEmail, planType: "pro" } } })}\n`);
+  // Ids 2 and 4 are both account/read: a client may read the login twice on one connection.
+  if (message.id === 2 || message.id === 4) {
+    process.stdout.write(`${JSON.stringify({ id: message.id, result: { account: { type: "chatgpt", email: testEmail, planType: "pro" } } })}\n`);
   }
   if (message.id === 3) {
     process.stdout.write(`${JSON.stringify({

@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
-import { link, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { renameWithRetry } from "./atomic.mjs";
 import { acquireLock } from "./lock.mjs";
 import { hasControl, stripControls } from "./sanitize.mjs";
 
@@ -58,7 +59,7 @@ function parseIdentity(text) {
   return { key: value.key, label: value.label, unavailable: false };
 }
 
-export async function saveSessionState(codexHome, sessionId, summary, savedAt = Date.now()) {
+export async function saveSessionState(codexHome, sessionId, summary, savedAt = Date.now(), { renameImpl } = {}) {
   const state = stateFromSummary(summary, savedAt);
   if (!codexHome || !sessionId || !state) return false;
   const path = sessionStatePath(codexHome, sessionId);
@@ -77,7 +78,7 @@ export async function saveSessionState(codexHome, sessionId, summary, savedAt = 
     const temporary = `${path}.${process.pid}.tmp`;
     try {
       await writeFile(temporary, `${JSON.stringify(state)}\n`, { encoding: "utf8", mode: 0o600 });
-      await rename(temporary, path);
+      await renameWithRetry(temporary, path, renameImpl ? { rename: renameImpl } : {});
     } finally {
       await unlink(temporary).catch(() => {});
     }

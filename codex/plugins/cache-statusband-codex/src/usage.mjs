@@ -1,9 +1,10 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { statSync } from "node:fs";
-import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { delimiter, dirname, join } from "node:path";
 import { createInterface } from "node:readline";
+import { renameWithRetry } from "./atomic.mjs";
 import { acquireLock } from "./lock.mjs";
 import { hasControl, stripControls } from "./sanitize.mjs";
 import { configuredSeatIdentity } from "./settings.mjs";
@@ -22,6 +23,7 @@ export async function getUsageSnapshot({
   identity: suppliedIdentity,
   timeoutMs,
   cacheOnly = false,
+  renameImpl,
 } = {}) {
   if (!codexHome) throw new Error("codexHome is required");
   const dataDir = join(codexHome, "cache-statusband-codex");
@@ -54,7 +56,7 @@ export async function getUsageSnapshot({
     cached = aligned.cache;
     if (fresh(cached, now)) {
       const { migrateSeatDeadline, ...saved } = cached;
-      if (migrateSeatDeadline) await writeCache(cachePath, saved);
+      if (migrateSeatDeadline) await tryWriteCache(cachePath, saved, renameImpl);
       return present(saved, aligned.mismatch ? "identity-changed" : "cache");
     }
 
@@ -66,15 +68,18 @@ export async function getUsageSnapshot({
       attemptedAt: now,
       nextAllowedAt: now + MIN_POLL_INTERVAL_MS,
     };
-    await writeCache(cachePath, attempted);
+    // A cache that cannot be written (a Windows rename that keeps failing) must not stop the
+    // read: the reading is still worth showing, it just will not be shared.
+    await tryWriteCache(cachePath, attempted, renameImpl);
 
+    let saved;
     try {
       // The fetcher is told whose usage is wanted so it can check the login first and
       // send no rate-limit request for any other account (see fetchRateLimitsViaAppServer).
       const raw = await fetcher({ codexHome, env, expectedEmail, ...(timeoutMs === undefined ? {} : { timeoutMs }) });
       const safe = sanitizeRateLimits(raw);
       if (!sameEmail(safe.accountEmail, expectedEmail)) throw new Error("Codex account changed during the usage read");
-      const saved = {
+      saved = {
         ...emptyCache(),
         ...safe,
         identityKey: identity?.key ?? (safe.accountEmail ? `account:${safe.accountEmail}` : null),
@@ -82,8 +87,6 @@ export async function getUsageSnapshot({
         attemptedAt: now,
         nextAllowedAt: now + MIN_POLL_INTERVAL_MS,
       };
-      await writeCache(cachePath, saved);
-      return present(saved, "live");
     } catch (error) {
       const retryMs = retryAfterMilliseconds(error, now);
       const failed = {
@@ -91,9 +94,11 @@ export async function getUsageSnapshot({
         nextAllowedAt: now + Math.min(MAX_RETRY_AFTER_MS, Math.max(MIN_POLL_INTERVAL_MS, retryMs ?? 0)),
         lastErrorAt: now,
       };
-      await writeCache(cachePath, failed);
+      await tryWriteCache(cachePath, failed, renameImpl);
       return present(failed, "stale");
     }
+    await tryWriteCache(cachePath, saved, renameImpl);
+    return present(saved, "live");
   } finally {
     await lock.release();
   }
@@ -102,6 +107,7 @@ export async function getUsageSnapshot({
 export async function captureUsageIdentity(codexHome, {
   env = process.env,
   accountReader = readAccountViaAppServer,
+  accountsReader = accountReader === readAccountViaAppServer ? readAccountsViaAppServer : twoReadsWith(accountReader),
   throwOnFailure = false,
   timeoutMs,
 } = {}) {
@@ -112,37 +118,50 @@ export async function captureUsageIdentity(codexHome, {
   const seat = await configuredSeatIdentity(codexHome, env);
   // A configured seat that cannot be read must never fall back to the account email.
   if (seat?.unavailable) return fail("The configured seat label is unavailable");
-  const started = Date.now();
-  const read = async (budget) => {
-    const account = await accountReader({ codexHome, env, ...(budget === undefined ? {} : { timeoutMs: budget }) });
-    return safeEmail(account?.email);
-  };
-  let email;
-  try {
-    email = await read(timeoutMs);
-  } catch (error) {
-    if (throwOnFailure) throw error;
-    return null;
-  }
-  const seatAfter = await configuredSeatIdentity(codexHome, env);
-  if (seat?.key !== seatAfter?.key) return fail("The seat changed during the account read");
+  const readOptions = { codexHome, env, ...(timeoutMs === undefined ? {} : { timeoutMs }) };
   if (!seat) {
+    let email;
+    try {
+      email = safeEmail((await accountReader(readOptions))?.email);
+    } catch (error) {
+      if (throwOnFailure) throw error;
+      return null;
+    }
+    const seatAfter = await configuredSeatIdentity(codexHome, env);
+    if (seatAfter?.key !== undefined) return fail("The seat changed during the account read");
     // No signed-in account is a real answer (null), not a failure.
     return email ? { key: `account:${email}`, label: email, unavailable: false } : null;
   }
   // A seat label asserts which login this session runs under, so a signed-out reading is
-  // not an answer. Read the login once more, after the seat was last checked: the pair is
-  // trusted only if the login did not change while the seat was being confirmed.
-  if (!email) return fail("No account is signed in for the configured seat");
+  // not an answer. The login is read twice on ONE app-server connection, with the seat file
+  // checked in between: the pair is trusted only if the login did not change while the seat
+  // was being confirmed. (A custom accountReader is called twice, as before.)
+  const between = async (account) => {
+    const seatAfter = await configuredSeatIdentity(codexHome, env);
+    if (seat.key !== seatAfter?.key) throw new Error("The seat changed during the account read");
+    if (!safeEmail(account?.email)) throw new Error("No account is signed in for the configured seat");
+  };
+  let email;
   let again;
   try {
-    again = await read(timeoutMs === undefined ? undefined : Math.max(500, timeoutMs - (Date.now() - started)));
+    const [first, second] = await accountsReader({ ...readOptions, between });
+    email = safeEmail(first?.email);
+    again = safeEmail(second?.email);
   } catch (error) {
     if (throwOnFailure) throw error;
     return null;
   }
-  if (again !== email) return fail("The Codex account changed while the seat was being confirmed");
+  if (!email || again !== email) return fail("The Codex account changed while the seat was being confirmed");
   return { key: `account:${email}`, label: seat.label, unavailable: false };
+}
+
+// Adapts a single-read reader to the two-read contract (reads, then between(), then reads).
+function twoReadsWith(reader) {
+  return async ({ between, ...options }) => {
+    const first = await reader(options);
+    await between(first);
+    return [first, await reader(options)];
+  };
 }
 
 // Node cannot spawn codex.cmd (npm installs) without a shell and refuses .cmd/.bat
@@ -162,7 +181,8 @@ export function resolveCodexLaunch(env = process.env, platform = process.platfor
     const line = [`"${target}"`, ...args].join(" ");
     return {
       command: env.ComSpec || "cmd.exe",
-      args: ["/d", "/s", "/c", `"${line}"`],
+      // /v:off: delayed expansion would treat "!" in a path as a variable reference.
+      args: ["/d", "/v:off", "/s", "/c", `"${line}"`],
       windowsVerbatimArguments: true,
     };
   }
@@ -247,7 +267,18 @@ export async function disposeAllAppServers({ waitMs = 1000, platform = process.p
   clearTimeout(timer);
 }
 
-export async function readAccountViaAppServer({
+export async function readAccountViaAppServer(options = {}) {
+  return readAccountSession(options, 1);
+}
+
+// Two account reads on one app-server connection (so one start, not two). After the first
+// response `between(firstAccount)` runs; if it throws, the session ends with that error and
+// no second read is made. Resolves [firstAccount, secondAccount].
+export async function readAccountsViaAppServer(options = {}) {
+  return readAccountSession(options, 2);
+}
+
+async function readAccountSession({
   codexHome,
   command,
   args,
@@ -256,7 +287,8 @@ export async function readAccountViaAppServer({
   env = process.env,
   platform = process.platform,
   spawnKiller,
-} = {}) {
+  between,
+} = {}, reads) {
   const childEnv = { ...env };
   if (codexHome) childEnv.CODEX_HOME = codexHome;
   const launch = command === undefined
@@ -271,6 +303,7 @@ export async function readAccountViaAppServer({
   liveChildren.add(child);
   const lines = createInterface({ input: child.stdout });
   let settled = false;
+  let first;
   return await new Promise((resolve, reject) => {
     const finish = (callback, value) => {
       if (settled) return;
@@ -296,9 +329,24 @@ export async function readAccountViaAppServer({
         return;
       }
       // Server notifications/requests may reuse ids; only a bare response is ours.
-      if (message.method !== undefined || message.id !== 2) return;
-      if (message.error) finish(reject, new Error("Codex account read failed"));
-      else finish(resolve, message.result?.account ?? null);
+      if (message.method !== undefined || (message.id !== 2 && message.id !== 4)) return;
+      if (message.error) {
+        finish(reject, new Error("Codex account read failed"));
+        return;
+      }
+      const account = message.result?.account ?? null;
+      if (reads === 1) {
+        finish(resolve, account);
+      } else if (message.id === 2) {
+        if (first !== undefined) return;
+        first = account;
+        Promise.resolve()
+          .then(() => between?.(account))
+          .then(() => { if (!settled) send({ method: "account/read", id: 4, params: { refreshToken: false } }); })
+          .catch((error) => finish(reject, error));
+      } else if (first !== undefined) {
+        finish(resolve, [first, account]);
+      }
     });
     const send = (value) => child.stdin.write(`${JSON.stringify(value)}\n`);
     send({
@@ -322,6 +370,9 @@ export async function fetchRateLimitsViaAppServer({
   spawnKiller,
   expectedEmail,
 } = {}) {
+  // Only a named account may be read: without one there is nothing to check the login
+  // against, and a rate-limit request would spend whichever account happens to be signed in.
+  if (!safeEmail(expectedEmail)) throw new Error("fetchRateLimitsViaAppServer requires the expected account email");
   const childEnv = { ...env };
   if (codexHome) childEnv.CODEX_HOME = codexHome;
   const launch = command === undefined
@@ -370,7 +421,7 @@ export async function fetchRateLimitsViaAppServer({
         // Only the account the caller wants is read: a rate-limit request made while a
         // different login is active would spend that account's quota, and any Retry-After
         // would be its, not ours. On a mismatch answer with the account alone.
-        if (expectedEmail !== undefined && !sameEmail(safeEmail(account.email), expectedEmail)) {
+        if (!sameEmail(safeEmail(account.email), expectedEmail)) {
           finish(resolve, { account });
           return;
         }
@@ -538,13 +589,23 @@ function cacheSuffix(identity) {
   return `-${createHash("sha256").update(identity.key).digest("hex").slice(0, 16)}`;
 }
 
-async function writeCache(path, value) {
+async function writeCache(path, value, renameImpl) {
   const temporary = `${path}.tmp`;
   try {
     await writeFile(temporary, `${JSON.stringify(value)}\n`, { encoding: "utf8", mode: 0o600 });
-    await rename(temporary, path);
+    await renameWithRetry(temporary, path, renameImpl ? { rename: renameImpl } : {});
   } finally {
     await unlink(temporary).catch(() => {});
+  }
+}
+
+// Cache writes are best effort once a reading exists: report whether it stuck, never throw.
+async function tryWriteCache(path, value, renameImpl) {
+  try {
+    await writeCache(path, value, renameImpl);
+    return true;
+  } catch {
+    return false;
   }
 }
 
