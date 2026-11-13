@@ -1,3 +1,4 @@
+#Requires -Version 7.2
 $ErrorActionPreference = "Stop"
 
 $root = Split-Path -Parent $PSScriptRoot
@@ -75,6 +76,57 @@ status_line_use_colors = false
   if (-not $rejected) { throw "TOML-looking lines inside a multiline string were not rejected" }
   if ([IO.File]::ReadAllText((Join-Path $testHome "config.toml")) -ne $instructions) {
     throw "Multiline instructions changed during candidate rejection"
+  }
+  # A fresh Codex home has no config.toml at all; a relative -SeatFile must resolve
+  # against the PowerShell location, not the process working directory.
+  $freshHome = Join-Path $testHome "fresh-home"
+  $seatDirectory = Join-Path $testHome "seat-dir"
+  New-Item -ItemType Directory -Path $seatDirectory | Out-Null
+  Push-Location $seatDirectory
+  try {
+    & (Join-Path $root "install.ps1") -CodexHome $freshHome -SkipCliLink -SeatFile "active-seat.txt" 3>$null | Out-Null
+  } finally {
+    Pop-Location
+  }
+  $freshConfig = [IO.File]::ReadAllText((Join-Path $freshHome "config.toml"))
+  if ($freshConfig -notmatch '(?m)^hooks = true$') { throw "A fresh Codex home did not get hooks enabled" }
+  $settings = Get-Content -LiteralPath (Join-Path $freshHome "cache-statusband-codex\settings.json") -Raw | ConvertFrom-Json
+  if ($settings.seatFile -ne (Join-Path $seatDirectory "active-seat.txt")) {
+    throw "A relative -SeatFile did not resolve against the PowerShell location: $($settings.seatFile)"
+  }
+
+  # A failure after Codex registered the plugin must put the original config.toml back.
+  $fakeBin = Join-Path $testHome "fake-bin"
+  New-Item -ItemType Directory -Path $fakeBin | Out-Null
+  $fakeCodex = @'
+@echo off
+if "%1"=="app-server" exit /b 0
+if "%1"=="plugin" if "%2"=="marketplace" (
+  echo [marketplaces.partial]>> "%CODEX_HOME%\config.toml"
+  exit /b 1
+)
+exit /b 0
+'@
+  [IO.File]::WriteAllText((Join-Path $fakeBin "codex.cmd"), $fakeCodex, [Text.Encoding]::ASCII)
+  $restoreHome = Join-Path $testHome "restore-home"
+  New-Item -ItemType Directory -Path $restoreHome | Out-Null
+  $original = "[history]`npersistence = `"save-all`"`n"
+  [IO.File]::WriteAllText((Join-Path $restoreHome "config.toml"), $original, [Text.UTF8Encoding]::new($false))
+  $previousPath = $env:PATH
+  $rejected = $false
+  try {
+    $env:PATH = "$fakeBin$([IO.Path]::PathSeparator)$previousPath"
+    try {
+      & (Join-Path $root "install.ps1") -CodexHome $restoreHome -SkipCliLink 3>$null | Out-Null
+    } catch {
+      $rejected = $true
+    }
+  } finally {
+    $env:PATH = $previousPath
+  }
+  if (-not $rejected) { throw "A failed registration was not reported" }
+  if ([IO.File]::ReadAllText((Join-Path $restoreHome "config.toml")) -ne $original) {
+    throw "The original config.toml was not restored after a failed registration"
   }
   Write-Output "install_config_test=passed"
 } finally {

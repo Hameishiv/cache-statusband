@@ -1,3 +1,4 @@
+#Requires -Version 7.2
 [CmdletBinding()]
 param(
   [string]$CodexHome = $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE ".codex" }),
@@ -10,7 +11,7 @@ $ErrorActionPreference = "Stop"
 
 function Set-TomlKey {
   param(
-    [Parameter(Mandatory)][string]$Text,
+    [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
     [Parameter(Mandatory)][string]$Section,
     [Parameter(Mandatory)][string]$Key,
     [Parameter(Mandatory)][string]$Value
@@ -163,35 +164,53 @@ $configText = if (Test-Path -LiteralPath $configPath) { [IO.File]::ReadAllText($
 $configText = Set-StatusbandPreferences -Text $configText
 Assert-CodexConfig -Text $configText -CodexCommand $codexCommand
 
+$backupConfig = $null
 if (Test-Path -LiteralPath $configPath) {
   $backupRoot = Join-Path $CodexHome ("backups\cache-statusband-codex-" + (Get-Date -Format "yyyyMMdd-HHmmss"))
   New-Item -ItemType Directory -Force -Path $backupRoot | Out-Null
-  Copy-Item -LiteralPath $configPath -Destination (Join-Path $backupRoot "config.toml")
+  $backupConfig = Join-Path $backupRoot "config.toml"
+  Copy-Item -LiteralPath $configPath -Destination $backupConfig
   Write-Host "Backed up config.toml to $backupRoot"
 }
 
-$previousCodexHome = $env:CODEX_HOME
+# Registration writes the live config.toml before the final merge is validated.
+# If anything fails from here until the merged file is in place, put the original back.
 try {
-  $env:CODEX_HOME = $CodexHome
-  & $codexCommand plugin marketplace add $repositoryRoot
-  if ($LASTEXITCODE -ne 0) { throw "codex plugin marketplace add failed ($LASTEXITCODE)" }
-  & $codexCommand plugin add "cache-statusband-codex@cache-statusband-codex-local"
-  if ($LASTEXITCODE -ne 0) { throw "codex plugin add failed ($LASTEXITCODE)" }
-} finally {
-  $env:CODEX_HOME = $previousCodexHome
-}
+  $previousCodexHome = $env:CODEX_HOME
+  try {
+    $env:CODEX_HOME = $CodexHome
+    & $codexCommand plugin marketplace add $repositoryRoot
+    if ($LASTEXITCODE -ne 0) { throw "codex plugin marketplace add failed ($LASTEXITCODE)" }
+    & $codexCommand plugin add "cache-statusband-codex@cache-statusband-codex-local"
+    if ($LASTEXITCODE -ne 0) { throw "codex plugin add failed ($LASTEXITCODE)" }
+  } finally {
+    $env:CODEX_HOME = $previousCodexHome
+  }
 
-# Registration writes marketplace/plugin settings. Merge into its result rather
-# than overwriting those writes with the pre-registration configuration.
-$configText = if (Test-Path -LiteralPath $configPath) { [IO.File]::ReadAllText($configPath) } else { "" }
-$configText = Set-StatusbandPreferences -Text $configText
-Assert-CodexConfig -Text $configText -CodexCommand $codexCommand
-$configCandidate = Join-Path $CodexHome (".config.toml.cache-statusband-" + [guid]::NewGuid().ToString("N") + ".tmp")
-try {
-  [IO.File]::WriteAllText($configCandidate, $configText, [Text.UTF8Encoding]::new($false))
-  Move-Item -LiteralPath $configCandidate -Destination $configPath -Force
-} finally {
-  if (Test-Path -LiteralPath $configCandidate) { Remove-Item -LiteralPath $configCandidate -Force }
+  # Registration writes marketplace/plugin settings. Merge into its result rather
+  # than overwriting those writes with the pre-registration configuration.
+  $configText = if (Test-Path -LiteralPath $configPath) { [IO.File]::ReadAllText($configPath) } else { "" }
+  $configText = Set-StatusbandPreferences -Text $configText
+  Assert-CodexConfig -Text $configText -CodexCommand $codexCommand
+  $configCandidate = Join-Path $CodexHome (".config.toml.cache-statusband-" + [guid]::NewGuid().ToString("N") + ".tmp")
+  try {
+    [IO.File]::WriteAllText($configCandidate, $configText, [Text.UTF8Encoding]::new($false))
+    Move-Item -LiteralPath $configCandidate -Destination $configPath -Force
+  } finally {
+    if (Test-Path -LiteralPath $configCandidate) { Remove-Item -LiteralPath $configCandidate -Force }
+  }
+} catch {
+  if ($backupConfig) {
+    try {
+      Copy-Item -LiteralPath $backupConfig -Destination $configPath -Force
+      Write-Warning "Installation failed; restored the original config.toml from $backupConfig"
+    } catch {
+      Write-Warning "Installation failed and config.toml could not be restored automatically. Your original is at $backupConfig"
+    }
+  } else {
+    Write-Warning "Installation failed after Codex registered the plugin; there was no earlier config.toml to restore, so $configPath is left as Codex wrote it."
+  }
+  throw
 }
 
 if ($PSBoundParameters.ContainsKey("SeatFile")) {
@@ -200,7 +219,10 @@ if ($PSBoundParameters.ContainsKey("SeatFile")) {
   if ($expandedSeatFile -match '^~[\\/]') {
     $expandedSeatFile = Join-Path $env:USERPROFILE $expandedSeatFile.Substring(2)
   }
-  $expandedSeatFile = [IO.Path]::GetFullPath($expandedSeatFile)
+  $expandedSeatFile = $PSCmdlet.GetUnresolvedProviderPathFromPSPath($expandedSeatFile)
+  if (-not (Test-Path -LiteralPath $expandedSeatFile -PathType Leaf)) {
+    Write-Warning "Seat label file does not exist yet: $expandedSeatFile (no seat is shown until it holds a label)"
+  }
   $settingsRoot = Join-Path $CodexHome "cache-statusband-codex"
   $settingsPath = Join-Path $settingsRoot "settings.json"
   New-Item -ItemType Directory -Force -Path $settingsRoot | Out-Null
