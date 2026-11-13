@@ -800,9 +800,10 @@ test("a truncated rollout shows the latest turn_context it can find, or none, ne
 });
 
 test("a transcript whose look-back chunks join the head window shows the head's turn when nothing later exists", async (t) => {
-  // Sizes between 3,342,337 and 3,407,872 bytes: the four look-back chunks stop above the
-  // floor below the head window (64 KiB under it) but already join the head window, so the head's
-  // turn_context is the latest there is. It used to be shown as an unknown model.
+  // Sizes between 3,342,337 and 3,407,872 bytes: the last look-back chunk would start above the
+  // floor 64 KiB under the head window's end (192 KiB) yet inside the head window (at most 256 KiB),
+  // so it is read down to the floor and joins the head window: the head's turn_context is the
+  // latest there is. It used to be shown as an unknown model.
   const root = await fixtureRoot(t);
   const line = (value) => `${JSON.stringify(value)}
 `;
@@ -821,8 +822,9 @@ test("a transcript whose look-back chunks join the head window shows the head's 
 });
 
 test("the look-back reaches the head up to 3,407,872 bytes and not at 3,407,873", async (t) => {
-  // The four 256 KiB chunks below the 2 MiB tail end 64 KiB under the head window's end, so a
-  // file of exactly 3,407,872 bytes is the largest whose first turn is still the latest known.
+  // The four 256 KiB chunks below the 2 MiB tail reach down to size - 3 MiB. The last one joins
+  // the head window once its start (size - 3 MiB) is at or below the window's end (256 KiB), so
+  // 3 MiB + 256 KiB = 3,407,872 bytes is the largest file whose first turn is still the latest known.
   const root = await fixtureRoot(t);
   const line = (value) => `${JSON.stringify(value)}
 `;
@@ -839,6 +841,39 @@ test("the look-back reaches the head up to 3,407,872 bytes and not at 3,407,873"
     assert.equal(summary.model, reachesHead ? "model-A" : null, `size ${size}`);
     assert.equal(summary.effort, reachesHead ? "low" : null, `size ${size}`);
   }
+});
+
+test("a turn_context that names an effort but no valid model names neither, and the earlier pair stands", async (t) => {
+  const root = await fixtureRoot(t);
+  const line = (value) => `${JSON.stringify(value)}
+`;
+  const context = (payload, hour = 12) => ({ timestamp: `2026-10-29T${hour}:01:00.000Z`, type: "turn_context", payload });
+  const first = context({ cwd: "/workspace/example", model: "model-A", effort: "low" });
+
+  // Small file: an effort with no model, with a model of the wrong type, and with an empty record.
+  for (const [name, odd] of [["absent", { effort: "high" }], ["wrong type", { model: { n: 1 }, effort: "high" }], ["neither", {}]]) {
+    const path = join(root, `small-${name.replace(" ", "-")}.jsonl`);
+    await writeFile(path, line(FIXTURE[0]) + line(first) + line(context(odd, 13)), "utf8");
+    const summary = await parseRollout(path);
+    assert.equal(summary.model, "model-A", name);
+    assert.equal(summary.effort, "low", name);
+  }
+  // With no earlier pair at all, the effort alone is not shown either.
+  const only = join(root, "only.jsonl");
+  await writeFile(only, line(FIXTURE[0]) + line(context({ effort: "high" })), "utf8");
+  const onlySummary = await parseRollout(only);
+  assert.equal(onlySummary.model, null);
+  assert.equal(onlySummary.effort, null);
+
+  // A large file: the effort-only record sits in the look-back, so it is passed over and the
+  // head's earlier pair is the latest one that names a model.
+  const filler = (count) => line({ type: "response_item", payload: { type: "message", content: "x".repeat(2048) } }).repeat(count);
+  const large = join(root, "large.jsonl");
+  await writeFile(large, line(FIXTURE[0]) + line(first) + filler(150) + line(context({ effort: "high" }, 13)) + filler(1400) + line(FIXTURE.at(-1)), "utf8");
+  assert.ok((await stat(large)).size > 256 * 1024 + 2 * 1024 * 1024);
+  const largeSummary = await parseRollout(large);
+  assert.equal(largeSummary.model, "model-A");
+  assert.equal(largeSummary.effort, "low");
 });
 
 test("rate limits are reduced to numeric primary/secondary window fields", async (t) => {
@@ -1125,6 +1160,8 @@ test("a broken pipe while reading the account says Codex exited; only spawn-time
     [{ FAKE_ACCOUNT_ERROR_CODE: "EPIPE", FAKE_ACCOUNT_ERROR_ON: "stdin" }, /^cache-statusband-codex: usage not read: Codex exited before answering$/m],
     [{ FAKE_ACCOUNT_ERROR_CODE: "ECONNRESET", FAKE_ACCOUNT_ERROR_ON: "stdin" }, /^cache-statusband-codex: usage not read: Codex exited before answering$/m],
     [{ FAKE_ACCOUNT_ERROR_CODE: "ERR_STREAM_DESTROYED", FAKE_ACCOUNT_ERROR_ON: "stdin" }, /^cache-statusband-codex: usage not read: Codex exited before answering$/m],
+    // A failed write to the child is Codex having gone away whatever the code (EOF, here).
+    [{ FAKE_ACCOUNT_ERROR_CODE: "EOF", FAKE_ACCOUNT_ERROR_SYSCALL: "write", FAKE_ACCOUNT_ERROR_ON: "stdin" }, /^cache-statusband-codex: usage not read: Codex exited before answering$/m],
     [{ FAKE_ACCOUNT_ERROR_CODE: "EACCES", FAKE_ACCOUNT_ERROR_ON: "child" }, /^cache-statusband-codex: usage not read: Codex could not be started \(EACCES\)$/m],
     [{ FAKE_ACCOUNT_ERROR_CODE: "EINVAL", FAKE_ACCOUNT_ERROR_ON: "child" }, /^cache-statusband-codex: usage not read: Codex could not be started \(EINVAL\)$/m],
   ];

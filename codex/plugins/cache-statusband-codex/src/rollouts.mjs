@@ -55,10 +55,10 @@ export async function parseRollout(path) {
         continue;
       }
       if (fromHead && item?.type === "turn_context" && item.payload) {
-        headContext = item.payload;
+        if (namesModel(item.payload)) headContext = item.payload;
         continue;
       }
-      if (!fromHead && item?.type === "turn_context" && item.payload) tailHasContext = true;
+      if (!fromHead && item?.type === "turn_context" && item.payload && namesModel(item.payload)) tailHasContext = true;
       consume(item, summary, fromHead);
     }
   }
@@ -106,6 +106,10 @@ export async function scanSessions(codexHome, { includeArchived = false, limit =
   return summaries;
 }
 
+function namesModel(payload) {
+  return text(payload?.model) !== null;
+}
+
 function consume(item, summary, fromHead = false) {
   const payload = item?.payload;
   if (fromHead && item?.type !== "session_meta") return;
@@ -122,8 +126,13 @@ function consume(item, summary, fromHead = false) {
 
   if (item?.type === "turn_context" && payload) {
     summary.cwd = text(payload.cwd) ?? summary.cwd;
-    summary.model = text(payload.model);
-    summary.effort = text(payload.effort) ?? text(payload.reasoning_effort);
+    // A turn record that names no valid model is treated as naming neither model nor effort:
+    // an effort with no model would pair a new effort with an old (or unknown) model, so the
+    // earlier pair stands. A record that names a model sets both from itself alone.
+    if (namesModel(payload)) {
+      summary.model = text(payload.model);
+      summary.effort = text(payload.effort) ?? text(payload.reasoning_effort);
+    }
     return;
   }
 
@@ -238,7 +247,7 @@ async function findEarlierContext(path, size) {
         } catch {
           continue;
         }
-        if (item?.type === "turn_context" && item.payload) return { payload: item.payload };
+        if (item?.type === "turn_context" && item.payload && namesModel(item.payload)) return { payload: item.payload };
       }
       carry = firstNewline >= 0 ? whole.subarray(0, firstNewline) : whole;
       end = start;
