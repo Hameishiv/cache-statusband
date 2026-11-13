@@ -169,12 +169,21 @@ export async function captureUsageIdentity(codexHome, {
   // A configured seat that cannot be read must never fall back to the account email.
   if (seat?.unavailable) return fail("The configured seat label is unavailable", { seatUnavailable: true });
   const readOptions = { codexHome, env, ...(timeoutMs === undefined ? {} : { timeoutMs }) };
+  // A reader that throws may have done so because the seat file went away meanwhile; the CLI
+  // stays silent about an unavailable seat, so the error says so.
+  const flagIfSeatUnavailable = async (error) => {
+    if (!error || typeof error !== "object" || error.seatUnavailable) return;
+    if ((await configuredSeatIdentity(codexHome, env))?.unavailable) error.seatUnavailable = true;
+  };
   if (!seat) {
     let account;
     try {
       account = await accountReader(readOptions);
     } catch (error) {
-      if (throwOnFailure) throw error;
+      if (throwOnFailure) {
+        await flagIfSeatUnavailable(error);
+        throw error;
+      }
       return null;
     }
     const email = safeEmail(account?.email);
@@ -207,7 +216,10 @@ export async function captureUsageIdentity(codexHome, {
     email = safeEmail(first?.email);
     again = safeEmail(second?.email);
   } catch (error) {
-    if (throwOnFailure) throw error;
+    if (throwOnFailure) {
+      await flagIfSeatUnavailable(error);
+      throw error;
+    }
     return null;
   }
   if (!email || again !== email) return fail("The Codex account changed while the seat was being confirmed");
@@ -231,6 +243,18 @@ function twoReadsWith(reader) {
     await between(first);
     return [first, await reader(options)];
   };
+}
+
+// True only when the home is known not to exist (ENOENT, or ENOTDIR for a path through a file).
+// Any other stat error (a permission problem, a name too long) is not "missing": the caller takes
+// its normal path, which reports whatever is really wrong.
+export function codexHomeIsMissing(home, stat = statSync) {
+  try {
+    stat(home);
+    return false;
+  } catch (error) {
+    return error?.code === "ENOENT" || error?.code === "ENOTDIR";
+  }
 }
 
 // Node cannot spawn codex.cmd (npm installs) without a shell and refuses .cmd/.bat

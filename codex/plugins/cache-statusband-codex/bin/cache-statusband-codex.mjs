@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import { stripControls } from "../src/sanitize.mjs";
 import { cacheUnwritableLine, capFirst, formatAge, formatPercent, formatTokens, formatUsageLines } from "../src/format.mjs";
 import { defaultCodexHome, parseRollout, projectName, scanSessions } from "../src/rollouts.mjs";
-import { captureUsageIdentity, getUsageSnapshot, resolveCodexLaunch } from "../src/usage.mjs";
+import { captureUsageIdentity, codexHomeIsMissing, getUsageSnapshot, resolveCodexLaunch } from "../src/usage.mjs";
 import { configuredSeatIdentity, usagePresentation } from "../src/settings.mjs";
 
 const args = process.argv.slice(2);
@@ -102,8 +102,11 @@ async function usage(argv) {
 // fail-closed state, not a fault.
 async function captureIdentityOrSay(home) {
   // A Codex home that does not exist has no login to read, and is never created: say so before
-  // starting an app-server for it.
-  if (!existsSync(home)) {
+  // starting an app-server for it. A seat that is configured but unavailable stays silent first
+  // (a deliberate fail-closed state), and only ENOENT/ENOTDIR mean "does not exist": any other
+  // error (a permission problem, say) falls through to the normal path, which reports its own.
+  if (codexHomeIsMissing(home)) {
+    if ((await configuredSeatIdentity(home))?.unavailable) return null;
     if (!codexUnlaunchableSaid) say(`the Codex home ${stripControls(home)} does not exist`);
     return null;
   }

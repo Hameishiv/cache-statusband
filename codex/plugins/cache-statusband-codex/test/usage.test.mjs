@@ -14,6 +14,7 @@ import { usagePresentation } from "../src/settings.mjs";
 import {
   fetchRateLimitsViaAppServer,
   captureUsageIdentity,
+  codexHomeIsMissing,
   getUsageSnapshot,
   MAX_RETRY_AFTER_MS,
   MIN_POLL_INTERVAL_MS,
@@ -1030,4 +1031,69 @@ test("a Codex home that does not exist is never created by usage, board or the s
     assert.ok(stdout.length > 0);
     await stillMissing(`cache-statusband-codex ${args.join(" ")}`);
   }
+});
+
+// Only ENOENT and ENOTDIR mean the home does not exist; any other stat error falls through to the
+// normal path (which reports what is really wrong). A seat that is configured but unreadable
+// keeps the CLI silent even for a missing home.
+test("a missing Codex home: only ENOENT/ENOTDIR say so, and an unavailable seat stays silent", async (t) => {
+  const stat = (code) => () => { throw Object.assign(new Error(code), { code }); };
+  assert.equal(codexHomeIsMissing("x", stat("ENOENT")), true);
+  assert.equal(codexHomeIsMissing("x", stat("ENOTDIR")), true);
+  for (const code of ["EACCES", "EPERM", "ENAMETOOLONG", "EBUSY", "UNKNOWN"]) assert.equal(codexHomeIsMissing("x", stat(code)), false, code);
+  assert.equal(codexHomeIsMissing("x", () => ({})), false);
+  assert.equal(codexHomeIsMissing(dirname(fileURLToPath(import.meta.url))), false);
+
+  const parent = await fixtureRoot(t);
+  const here = dirname(fileURLToPath(import.meta.url));
+  const bin = join(here, "..", "bin", "cache-statusband-codex.mjs");
+  const home = join(parent, "no-such-home");
+  const emptySeat = join(parent, "empty-seat.txt");
+  await writeFile(emptySeat, "");
+  for (const args of [["usage"], ["board"]]) {
+    const { stdout, stderr } = await promisify(execFile)(process.execPath, [bin, ...args, "--codex-home", home], {
+      env: { ...process.env, CACHE_STATUSBAND_CODEX_SEAT_FILE: emptySeat },
+      timeout: 20_000,
+    });
+    assert.equal(stderr, "", `${args.join(" ")} with an unavailable seat said: ${stderr}`);
+    assert.ok(stdout.length > 0);
+  }
+  // Without a seat the same missing home is named.
+  const { stderr } = await promisify(execFile)(process.execPath, [bin, "usage", "--codex-home", home], {
+    env: { ...process.env, CACHE_STATUSBAND_CODEX_SEAT_FILE: "" },
+    timeout: 20_000,
+  });
+  assert.match(stderr, /the Codex home .* does not exist\n$/);
+});
+
+test("an account reader that throws because the seat became unavailable is flagged seatUnavailable", async (t) => {
+  const root = await fixtureRoot(t);
+  const seatFile = join(root, "seat.txt");
+  const boom = () => Object.assign(new Error("read failed"), { code: "EPIPE" });
+
+  // No seat at the start; the seat file is configured but empty by the time the reader fails.
+  const env = {};
+  await writeFile(seatFile, "");
+  await assert.rejects(
+    captureUsageIdentity(root, { env, throwOnFailure: true, accountReader: async () => { env.CACHE_STATUSBAND_CODEX_SEAT_FILE = seatFile; throw boom(); } }),
+    (error) => error.seatUnavailable === true && error.code === "EPIPE",
+  );
+  // A reader that fails with the seat still absent is a plain failure.
+  await assert.rejects(
+    captureUsageIdentity(root, { env: {}, throwOnFailure: true, accountReader: async () => { throw boom(); } }),
+    (error) => error.seatUnavailable === undefined && error.code === "EPIPE",
+  );
+  // A seat configured and readable at the start whose file empties before the reader fails.
+  const env2 = { CACHE_STATUSBAND_CODEX_SEAT_FILE: seatFile };
+  await writeFile(seatFile, "alpha");
+  await assert.rejects(
+    captureUsageIdentity(root, { env: env2, throwOnFailure: true, accountReader: async () => { await writeFile(seatFile, ""); throw boom(); } }),
+    (error) => error.seatUnavailable === true && error.code === "EPIPE",
+  );
+  // ...and one whose seat stays readable is a plain failure.
+  await writeFile(seatFile, "alpha");
+  await assert.rejects(
+    captureUsageIdentity(root, { env: env2, throwOnFailure: true, accountReader: async () => { throw boom(); } }),
+    (error) => error.seatUnavailable === undefined && error.code === "EPIPE",
+  );
 });
