@@ -26,7 +26,7 @@ Set-Location <clone>\codex
 The installer:
 
 1. backs up an existing `%CODEX_HOME%\config.toml` into its own new folder under `%CODEX_HOME%\backups` (earlier backups are never overwritten);
-2. registers this checkout as a local Codex marketplace (the installer asks Codex to add it; only when Codex refuses with "already added from a different source", because the checkout was moved or cloned again, the installer removes that registration, prints one line, `Re-pointing the cache-statusband-codex-local marketplace registration: <old folder> -> <new folder>`, and adds this checkout again; the plugin stays enabled. Folder paths are never compared, so a junction, symbolic link or `subst` drive that leads to the same checkout is not re-pointed;
+2. registers this checkout as a local Codex marketplace (the installer asks Codex to add it; only when Codex refuses with "already added from a different source", because the checkout was moved or cloned again, the installer removes that registration, prints one line, `Re-pointing the cache-statusband-codex-local marketplace registration: <old folder> -> <new folder>`, and adds this checkout again; the plugin stays enabled. If the old folder cannot be read from `config.toml`, the line is `Re-pointing the cache-statusband-codex-local marketplace registration to <new folder>` instead. Folder paths are never compared, so a junction to the same checkout is not re-pointed (the PowerShell test covers a junction; a symbolic link or `subst` drive goes through the same code, since no paths are compared, but is not tested);
 3. installs and enables the plugin and hooks;
 4. configures the native Codex CLI footer; and
 5. runs `npm link` in the plugin package so `cache-statusband-codex` is available in terminals.
