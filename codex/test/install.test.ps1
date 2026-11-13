@@ -272,6 +272,57 @@ status_line_use_colors = false
   $withMark = Set-TomlKey -Text ([string][char]0xFEFF + "[features]`nhooks = false`n") -Section "features" -Key "hooks" -Value "true"
   if ($withMark -ne "[features]`nhooks = true`n") { throw "Set-TomlKey did not see a header behind a byte-order mark: $withMark" }
 
+  # An explicit access entry on config.toml survives the install: the candidate that replaces it is
+  # a new file, so the installer copies the old file's access list onto it first. (BUILTIN\Guests
+  # is not something a temp folder inherits, so its entry can only be the explicit one.)
+  if ($IsWindows) {
+    $aclHome = Join-Path $testHome "acl-home"
+    New-Item -ItemType Directory -Path $aclHome | Out-Null
+    $aclConfig = Join-Path $aclHome "config.toml"
+    [IO.File]::WriteAllText($aclConfig, "[features]`nhooks = false`n", [Text.UTF8Encoding]::new($false))
+    $guests = [Security.Principal.SecurityIdentifier]::new("S-1-5-32-546")
+    $aclBefore = Get-Acl -LiteralPath $aclConfig
+    $aclBefore.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($guests, "Read", "Allow"))
+    Set-Acl -LiteralPath $aclConfig -AclObject $aclBefore
+    $hasGuestEntry = {
+      @((Get-Acl -LiteralPath $aclConfig).Access | Where-Object {
+        $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -eq $guests.Value -and
+        $_.AccessControlType -eq "Allow" -and -not $_.IsInherited -and ($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::Read) -ne 0
+      }).Count -eq 1
+    }
+    if (-not (& $hasGuestEntry)) { throw "The explicit access entry fixture was not set on config.toml" }
+    # A fake codex that registers nothing and rewrites nothing: the real one rewrites config.toml
+    # itself during `plugin add`, which would drop the entry before the installer's replace.
+    $aclBin = Join-Path $testHome "acl-bin"
+    New-Item -ItemType Directory -Path $aclBin | Out-Null
+    [IO.File]::WriteAllText((Join-Path $aclBin "codex.cmd"), "@echo off`r`nexit /b 0`r`n", [Text.Encoding]::ASCII)
+    $previousPath = $env:PATH
+    try {
+      $env:PATH = "$aclBin$([IO.Path]::PathSeparator)$previousPath"
+      & (Join-Path $root "install.ps1") -CodexHome $aclHome -SkipCliLink 3>$null | Out-Null
+    } finally {
+      $env:PATH = $previousPath
+    }
+    if ([IO.File]::ReadAllText($aclConfig) -notmatch '(?m)^hooks = true$') { throw "The access-entry install did not update config.toml" }
+    if (-not (& $hasGuestEntry)) { throw "The explicit access entry on config.toml did not survive the install replacing the file" }
+    # A failure to copy the access list warns (once per replace) and the replace still happens.
+    $aclFailScript = Join-Path $testHome "acl-fail.ps1"
+    $aclMoveDefinition = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq "Move-FileOverExisting" }, $true)
+    [IO.File]::WriteAllText($aclFailScript, "function Get-Acl { throw 'simulated: no access list' }`n" + $aclMoveDefinition.Extent.Text + @'
+
+$folder = $args[0]
+[IO.File]::WriteAllText("$folder\from.txt", "new")
+[IO.File]::WriteAllText("$folder\to.txt", "old")
+Move-FileOverExisting "$folder\from.txt" "$folder\to.txt"
+[IO.File]::ReadAllText("$folder\to.txt")
+'@)
+    $aclFailFolder = Join-Path $testHome "acl-fail"
+    New-Item -ItemType Directory -Path $aclFailFolder | Out-Null
+    $aclFailOutput = @(& (Get-Process -Id $PID).Path -NoProfile -File $aclFailScript $aclFailFolder 3>&1 | ForEach-Object { "$_" })
+    if ($aclFailOutput[-1] -ne "new") { throw "A failed access-list copy stopped the replace: $($aclFailOutput -join ' | ')" }
+    if (@($aclFailOutput | Where-Object { $_ -match "Could not copy the access permissions" }).Count -ne 1) { throw "A failed access-list copy did not warn exactly once: $($aclFailOutput -join ' | ')" }
+  }
+
   # When the ORIGINAL already fails the strict check, a candidate that Codex cannot even
   # load (plain startup rejects it) is still refused; the fake codex fails strict for any
   # config and plain startup only once the plugin's footer edit is present.

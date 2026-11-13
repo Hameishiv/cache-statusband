@@ -38,11 +38,25 @@ function New-BackupFolder([string]$Name) {
 # "file not found" (measured). Elsewhere a rename already replaces atomically. When the
 # native call cannot be compiled it falls back to Move-Item -Force and says once that the
 # replace is then not atomic.
+# On Windows an EXISTING destination keeps its own access list: the source is a new file that only
+# inherits its folder's, so an explicit per-file ACE on the destination would be lost by the replace.
+# The destination's access list (its DACL, not its owner) is copied onto the source first; if that
+# fails it warns and the replace goes ahead. ([IO.File]::Replace would keep the destination's
+# attributes but leaves a window in which the file is missing, measured in round 8.)
 $script:nativeMoveWarned = $false
 function Move-FileOverExisting([string]$Source, [string]$Destination) {
   if (-not $IsWindows) {
     Move-Item -LiteralPath $Source -Destination $Destination -Force
     return
+  }
+  if (Test-Path -LiteralPath $Destination -PathType Leaf) {
+    try {
+      $acl = Get-Acl -LiteralPath $Source
+      $acl.SetSecurityDescriptorSddlForm((Get-Acl -LiteralPath $Destination).GetSecurityDescriptorSddlForm("Access"), "Access")
+      Set-Acl -LiteralPath $Source -AclObject $acl
+    } catch {
+      Write-Warning "Could not copy the access permissions of $Destination onto its replacement ($($_.Exception.Message)); the replacement has the permissions of its folder."
+    }
   }
   try {
     if (-not ('CacheStatusband.NativeMove' -as [type])) {
