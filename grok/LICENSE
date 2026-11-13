@@ -12,8 +12,10 @@ Cache Keeper, Copyright (c) 2026 Nate Herk
 The Claude Code original is cache-statusband, Copyright (c) 2026 Hameishiv
 (https://github.com/Hameishiv/cache-statusband), MIT License.
 
-This directory is a Grok Build port of that status band. It does not include
-source from Cache Keeper, ccstatusline, or the Claude Code repository.
+This directory is a Grok Build port of that status band. A few small helpers
+(the colour pairs, the contrast check, the capitalisation rule) follow the Claude
+Code band in cache-statusband. It does not include source from Cache Keeper,
+ccstatusline, or Anthropic's Claude Code.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

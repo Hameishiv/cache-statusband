@@ -22,7 +22,7 @@ Grok Build 1.0.70 can run a script as the bottom row (`[ui.status_line]` `type =
 | Context measured from a reopened transcript | Not ported. The line uses `context_window.context_tokens` when Grok sends it. It does not parse the transcript. |
 | `/board` of every local session | Not ported. Grok already lists sessions with `grok sessions list` and `/dashboard`. |
 
-The script never reads, prints, or stores an auth token. It does not call a usage endpoint. Each readable log is re-read at most once every five minutes, even when it has no credits line, and the result is kept per log in `cache-statusband-grok/usage.json` (under `%LOCALAPPDATA%` on Windows, under `$XDG_CACHE_HOME` or `~/.cache` elsewhere). If the newest complete credits line lacks the percent or the period, no weekly segment is shown. A log that cannot be read is not throttled: it keeps the last reading and is tried again on the next run. A reset that has already passed drops the weekly segment until Grok logs a new one.
+The script never reads, prints, or stores an auth token. It does not call a usage endpoint. Each readable log is re-read at most once every five minutes, even when it has no credits line (if the cache file cannot be written, every run re-reads it), and the result is kept per log in `cache-statusband-grok/usage.json` (under `%LOCALAPPDATA%` on Windows, under `$XDG_CACHE_HOME` or `~/.cache` elsewhere). If the newest complete credits line lacks the percent or the period, no weekly segment is shown. A log that cannot be read is not throttled: it keeps the last reading and is tried again on the next run. A reset that has already passed drops the weekly segment until Grok logs a new one.
 
 ## Credits
 
@@ -46,6 +46,8 @@ refresh_interval = 300
 ```
 
 The command is the `.cmd` file alone. With grok 1.0.70 on Windows, a command string that joins `node` and a `C:/...` path is one filename, and starting it fails with `os error 123`. `statusline.cmd` runs Node and forwards the payload. Node still has to be on `PATH`.
+
+This port was run only on Windows. On macOS or Linux, where a `.cmd` file cannot run, set `command` to `node /path/to/cache-statusband/grok/statusline.mjs` instead; that setup is untested.
 
 `refresh_interval` re-runs the script while the session is idle, so the countdown moves, and a newer credits line shows up once Grok logs one (the script does not fetch the percent itself). That run reads the local log. It does not call the network. Restart Grok after editing `config.toml`. The row is hidden on the welcome screen and while a subagent is full screen.
 

@@ -154,7 +154,8 @@ export function remaining(ms) {
  * `record` is `{ percent, periodType, periodEnd, fetchedAt }`. A monthly period,
  * a missing percent, or a reset that has already passed is left out.
  * The reading is as old as the credits line Grok last logged, so once it is an
- * hour old the age is shown. A missing or unreadable fetch time is shown as unknown.
+ * hour old the age is shown. A missing or unreadable fetch time, or one more than
+ * five minutes in the future, is shown as unknown.
  */
 export function weeklyLabel(record, nowMs) {
   if (!record || typeof record !== "object") return null;
@@ -169,7 +170,8 @@ export function weeklyLabel(record, nowMs) {
   if (!left) return null;
   const fetched = Date.parse(record.fetchedAt);
   let age = "";
-  if (!Number.isFinite(fetched)) age = " (read time unknown)";
+  // a read time well in the future means the clock moved: the age is not known
+  if (!Number.isFinite(fetched) || fetched - now > 5 * 60000) age = " (read time unknown)";
   else if (now - fetched >= 3600000) age = ` (read ${remaining(now - fetched)} ago)`;
   return `week ${percentText(pct)}%${age} · ${left}`;
 }
@@ -197,6 +199,7 @@ export function segments(payload, extras = {}) {
     ["cost", costLabel(payload.cost && payload.cost.total_cost_usd)],
   ];
   return parts
+    .map(([kind, label]) => [kind, label && label.replace(/[\u0000-\u001f\u007f-\u009f]/g, "").trim()])
     .filter(([, label]) => label)
     .map(([kind, label]) => ({ kind, label: capFirst(label) }));
 }
@@ -261,7 +264,8 @@ function billingRecord(line) {
   const period = cfg.currentPeriod && typeof cfg.currentPeriod === "object" ? cfg.currentPeriod : {};
   const percent = finite(cfg.creditUsagePercent);
   const periodType = text(period.type);
-  const periodEnd = text(period.end) || text(cfg.billingPeriodEnd);
+  // the billing period is its own thing: only the weekly period's end is the weekly reset
+  const periodEnd = text(period.end);
   if (percent === null || !periodType || !periodEnd) return null;
   return {
     percent,
@@ -377,7 +381,7 @@ function writeSources(cachePath, sources) {
 
 /**
  * Last weekly reading. Re-reads each readable log at most once per five
- * minutes, even when it has no credits line. A re-read that finds no credits line keeps the
+ * minutes, even when it has no credits line, as long as the cache can be written. A re-read that finds no credits line keeps the
  * last good record and only moves the next check. A re-read whose newest
  * credits line cannot be used drops it. A log that cannot be read keeps the
  * last good record and is tried again on the next run.

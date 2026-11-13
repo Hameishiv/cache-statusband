@@ -65,6 +65,12 @@ describe("segments", () => {
     assert.equal(render({}), "");
   });
 
+  it("keeps the line to one line with no control codes from the payload", () => {
+    const labels = segments({ model: { display_name: "Grok\n4.7\u001b[2J" }, effort: { level: "\u0007high" } }).map((p) => p.label);
+    assert.deepEqual(labels, ["Grok4.7[2J", "High"]);
+    assert.equal(segments({ model: { display_name: "\u001b\n" } }).length, 0);
+  });
+
   it("rounds a fractional context percent to a tenth", () => {
     assert.equal(contextLabel({ used_percentage: 28.699999999999996 }), "ctx 28.7%");
     assert.equal(contextLabel({ used_percentage: 29 }), "ctx 29%");
@@ -125,7 +131,7 @@ describe("weekly usage", () => {
     assert.equal(weeklyLabel(weekly, now), "week 23% · 4d11h");
     assert.equal(weeklyLabel(at("not a time"), now), "week 23% (read time unknown) · 4d11h");
     assert.equal(weeklyLabel({ ...weekly, fetchedAt: null }, now), "week 23% (read time unknown) · 4d11h");
-    assert.equal(weeklyLabel(at("2026-10-29T13:00:00Z"), now), "week 23% · 4d11h");
+    assert.equal(weeklyLabel(at("2026-10-29T13:00:00Z"), now), "week 23% (read time unknown) · 4d11h");
   });
 
   it("accepts only a period type that ends in _WEEKLY", () => {
@@ -348,6 +354,21 @@ describe("readLastBilling", () => {
     writeFileSync(path, body);
     return path;
   };
+
+  it("does not take the weekly reset from the billing period", () => {
+    const billingOnly = JSON.stringify({
+      ts: "2026-10-29T12:00:00Z",
+      msg: "billing: fetched credits config",
+      ctx: {
+        config: {
+          creditUsagePercent: 23,
+          currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY" },
+          billingPeriodEnd: "2026-11-02T22:57:09.651+00:00",
+        },
+      },
+    });
+    assert.equal(readLastBilling(log(`${billingOnly}\n`)), null);
+  });
 
   it("stops at the newest credits line even when it cannot be used", () => {
     const noPercent = JSON.stringify({
