@@ -150,6 +150,21 @@ if (-not (Test-Path -LiteralPath $pluginRoot -PathType Container)) {
   throw "Plugin folder not found: $pluginRoot"
 }
 
+# Validate and resolve -SeatFile first: a bad value must fail before Codex's config is
+# touched or the plugin is registered, not after.
+$expandedSeatFile = $null
+if ($PSBoundParameters.ContainsKey("SeatFile")) {
+  if ([string]::IsNullOrWhiteSpace($SeatFile)) { throw "-SeatFile requires a non-empty path" }
+  $expandedSeatFile = $SeatFile
+  if ($expandedSeatFile -match '^~[\\/]') {
+    $expandedSeatFile = Join-Path $env:USERPROFILE $expandedSeatFile.Substring(2)
+  }
+  $expandedSeatFile = $PSCmdlet.GetUnresolvedProviderPathFromPSPath($expandedSeatFile)
+  if (-not (Test-Path -LiteralPath $expandedSeatFile -PathType Leaf)) {
+    Write-Warning "Seat label file does not exist yet: $expandedSeatFile (no seat is shown until it holds a label)"
+  }
+}
+
 function Set-StatusbandPreferences([string]$Text) {
   $Text = Set-TomlKey -Text $Text -Section "features" -Key "hooks" -Value "true"
   if (-not $KeepExistingFooter) {
@@ -214,15 +229,6 @@ try {
 }
 
 if ($PSBoundParameters.ContainsKey("SeatFile")) {
-  if ([string]::IsNullOrWhiteSpace($SeatFile)) { throw "-SeatFile requires a non-empty path" }
-  $expandedSeatFile = $SeatFile
-  if ($expandedSeatFile -match '^~[\\/]') {
-    $expandedSeatFile = Join-Path $env:USERPROFILE $expandedSeatFile.Substring(2)
-  }
-  $expandedSeatFile = $PSCmdlet.GetUnresolvedProviderPathFromPSPath($expandedSeatFile)
-  if (-not (Test-Path -LiteralPath $expandedSeatFile -PathType Leaf)) {
-    Write-Warning "Seat label file does not exist yet: $expandedSeatFile (no seat is shown until it holds a label)"
-  }
   $settingsRoot = Join-Path $CodexHome "cache-statusband-codex"
   $settingsPath = Join-Path $settingsRoot "settings.json"
   New-Item -ItemType Directory -Force -Path $settingsRoot | Out-Null

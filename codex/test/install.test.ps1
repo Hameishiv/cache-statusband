@@ -95,6 +95,19 @@ status_line_use_colors = false
     throw "A relative -SeatFile did not resolve against the PowerShell location: $($settings.seatFile)"
   }
 
+  # An empty or blank -SeatFile must be rejected before anything is changed or registered.
+  foreach ($blank in @("", "   ")) {
+    $blankHome = Join-Path $testHome "blank-seat-home"
+    $rejected = $false
+    try {
+      & (Join-Path $root "install.ps1") -CodexHome $blankHome -SkipCliLink -SeatFile $blank 3>$null | Out-Null
+    } catch {
+      $rejected = $_.Exception.Message -match "SeatFile"
+    }
+    if (-not $rejected) { throw "A blank -SeatFile ('$blank') was not rejected with a -SeatFile error" }
+    if (Test-Path -LiteralPath $blankHome) { throw "A rejected -SeatFile still created or changed the Codex home" }
+  }
+
   # A failure after Codex registered the plugin must put the original config.toml back.
   $fakeBin = Join-Path $testHome "fake-bin"
   New-Item -ItemType Directory -Path $fakeBin | Out-Null

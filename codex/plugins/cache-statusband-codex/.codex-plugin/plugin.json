@@ -7,8 +7,5 @@
   "interface": {
     "displayName": "Cache Statusband Codex",
     "shortDescription": "Codex context, quota, and local-session status"
-  },
-  "extensions": {
-    "com.openai.hooks": "./hooks/hooks.json"
   }
 }
