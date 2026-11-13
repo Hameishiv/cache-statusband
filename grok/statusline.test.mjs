@@ -99,6 +99,9 @@ describe("segments", () => {
     // rounding never carries a figure into the next unit
     assert.equal(formatTokens(999949), "1M");
     assert.equal(formatTokens(999.6), "1k");
+    assert.equal(formatTokens(999.4), "999");
+    assert.equal(formatTokens(999499), "999k");
+    assert.equal(formatTokens(999500), "1M");
     assert.equal(costLabel(9.999), "session $10");
     assert.equal(costLabel(9.994), "session $9.99");
     // a write count alone still says it is a cache figure
@@ -422,6 +425,25 @@ describe("weekly usage", () => {
   });
 });
 
+describe("home folder", () => {
+  it("uses no log and no cache when the home folder is relative", () => {
+    const names = ["USERPROFILE", "HOME", "HOMEDRIVE", "HOMEPATH", "GROK_HOME", "CSB_BILLING_LOG", "CSB_USAGE_CACHE", "LOCALAPPDATA", "XDG_CACHE_HOME"];
+    const saved = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+    try {
+      for (const name of names) delete process.env[name];
+      process.env.USERPROFILE = "relhome";
+      process.env.HOME = "relhome";
+      assert.equal(billingLogPath(), null);
+      assert.equal(usageCachePath(), null);
+    } finally {
+      for (const name of names) {
+        if (saved[name] === undefined) delete process.env[name];
+        else process.env[name] = saved[name];
+      }
+    }
+  });
+});
+
 describe("billingLogPath", () => {
   const keep = { log: process.env.CSB_BILLING_LOG, home: process.env.GROK_HOME };
   const restore = () => {
@@ -539,6 +561,16 @@ describe("readLastBilling", () => {
     writeFileSync(path, body);
     return path;
   };
+
+  it("shows no reading when a finished credits line is broken, not an older one", () => {
+    const broken = '{"ts":"2026-10-29T12:00:00Z","msg":"billing: fetched credits config","ctx":{"config":{"creditUsag';
+    assert.equal(readLastBilling(log(`${credits(24)}\n${broken}\n{"msg":"other"}\n`)), null);
+  });
+
+  it("passes over a credits line still being written at the end of the log", () => {
+    const partial = '{"ts":"2026-10-29T12:00:00Z","msg":"billing: fetched credits config","ctx":{"config":{"creditUsag';
+    assert.equal(readLastBilling(log(`${credits(24)}\n${partial}`)).percent, 24);
+  });
 
   it("does not take the weekly reset from the billing period", () => {
     const billingOnly = JSON.stringify({

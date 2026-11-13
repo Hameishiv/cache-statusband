@@ -6,7 +6,7 @@ A status line for [Grok Build](https://x.ai). It paints the session figures Grok
  Grok 4.7 ▶ High ▶ Ctx 29% · 287k/1M ▶ Cache read 80k · write 1.5k ▶ Week 40% · 3d2h ▶ Session $0.04
 ```
 
-Each segment is a colour block. The arrow is `▶` (U+25B6), which does not need a special font. A figure that is neither in the status-line payload nor in a current weekly credits reading is left off the line. A zero Grok did send is shown as zero. The `40%` above is a sample. When the row is narrower than the band (Grok passes its width as `COLUMNS`), segments are dropped whole from the right until it fits, so a figure is never cut part-way. If even the first segment cannot fit on its own, the line is left empty (a model name usually carries a version number too).
+Each segment is a colour block. The arrow is `▶` (U+25B6), which does not need a special font. A figure that is neither in the status-line payload nor in a current weekly credits reading is left off the line. A zero Grok did send is shown as zero. The `40%` above is a sample. When the row is narrower than the band (Grok passes its width as `COLUMNS`), segments are dropped whole from the right until it fits, so a figure is never cut part-way. If even the first segment cannot fit on its own, the script prints nothing (a model name usually carries a version number too), and Grok then hides the row, so the transcript moves up a line until the row is wide enough again.
 
 ## What was ported
 
@@ -36,7 +36,7 @@ The Claude Code mod this is ported from, and the two projects it is built on, ar
 
 Requires Node.js on `PATH` (tested on Node v24.16.0; the tests need Node 20.11 or later, because they use `import.meta.dirname`) and Grok Build with the status-line command (this port was checked against `grok 1.0.70`).
 
-Add this to `config.toml` in your Grok home (`$GROK_HOME`, by default `~/.grok`). A repository config cannot set the row. Leave any existing keys in that file as they are. If `[ui.status_line]` is already there, this replaces that table only. `command` is the full path to `statusline.cmd` in your clone.
+Add this to `config.toml` in your Grok home (`$GROK_HOME`, by default `~/.grok`). A repository config cannot set the row. Leave any existing keys in that file as they are. If `[ui.status_line]` is already there, this replaces that table only. `command` is the full path to `statusline.cmd` in your clone. If that path contains a space, quote it inside the TOML string as you would at a prompt, for example `command = '"C:/Users/Jane Doe/cache-statusband/grok/statusline.cmd"'`.
 
 ```toml
 [ui.status_line]
@@ -47,7 +47,7 @@ refresh_interval = 300
 
 The command is the `.cmd` file alone. With grok 1.0.70 on Windows, a command string that joins `node` and a `C:/...` path is one filename, and starting it fails with `os error 123`. `statusline.cmd` moves to `%SystemRoot%\System32` (a local folder, so a clone on a network path maps no drive letter; it stops if the move fails), starts the `node` on your `PATH` with the script's full path, forwards the payload, and exits with Node's exit code. It never runs a `node` program from the repository Grok has open, which is the folder Grok starts it in.
 
-This port was run only on Windows. On macOS or Linux, where a `.cmd` file cannot run, set `command` to `node /path/to/cache-statusband/grok/statusline.mjs` instead, quoting a path that contains spaces as you would at a prompt; that setup is untested.
+This port was run only on Windows. On macOS or Linux, where a `.cmd` file cannot run, set `command` to node's full path followed by the script's, for example `/usr/local/bin/node /path/to/cache-statusband/grok/statusline.mjs` (find node's path with `command -v node`), quoting a path that contains spaces as you would at a prompt. Grok runs that line through `sh -c` in the open repository, so a bare `node` could pick up a program named `node` there if your `PATH` has an empty entry. That setup is untested.
 
 `refresh_interval` re-runs the script while the session is idle, so the countdown moves, and a newer credits line shows up once Grok logs one (the script does not fetch the percent itself). That run reads the local log. It does not call the network. Restart Grok after editing `config.toml`. The row is hidden on the welcome screen and while a subagent is full screen.
 

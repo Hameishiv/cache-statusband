@@ -74,7 +74,8 @@ export function formatTokens(value) {
   if (v === null) return null;
   const sign = v < 0 ? "-" : "";
   const abs = Math.abs(v);
-  // the unit thresholds sit where rounding would carry into the next unit ("1000k" -> "1M")
+  // the k and M thresholds sit where rounding would carry into the next unit ("1000k" -> "1M");
+  // there is no unit above M, so a billion tokens still reads "1000M"
   if (abs >= 999500) {
     const millions = abs / 1e6;
     const body = millions >= 10 ? millions.toFixed(0) : trimFixed(millions.toFixed(1));
@@ -263,6 +264,16 @@ export function render(payload, extras) {
  * A path setting, or null when it is unset or relative. The script runs in the
  * repository Grok has open, so a relative path would point inside it.
  */
+/** The home folder, or null when it is unknown or relative (it would point inside the open repository). */
+function homeDir() {
+  try {
+    const home = homedir();
+    return home && isAbsolute(home) ? home : null;
+  } catch {
+    return null;
+  }
+}
+
 function absoluteSetting(name) {
   const value = process.env[name];
   if (!value || !isAbsolute(value)) return null;
@@ -283,7 +294,9 @@ export function billingLogPath() {
     const home = absoluteSetting("GROK_HOME");
     return home ? join(home, "logs", "unified.jsonl") : null;
   }
-  const home = join(homedir(), ".grok");
+  const user = homeDir();
+  if (!user) return null;
+  const home = join(user, ".grok");
   return join(home, "logs", "unified.jsonl");
 }
 
@@ -296,22 +309,26 @@ export function usageCachePath() {
   const set = absoluteSetting("CSB_USAGE_CACHE");
   if (set) return set;
   let base;
-  if (process.platform === "win32") base = absoluteSetting("LOCALAPPDATA") || join(homedir(), "AppData", "Local");
-  else base = absoluteSetting("XDG_CACHE_HOME") || join(homedir(), ".cache");
+  const user = homeDir();
+  if (process.platform === "win32") base = absoluteSetting("LOCALAPPDATA") || (user && join(user, "AppData", "Local"));
+  else base = absoluteSetting("XDG_CACHE_HOME") || (user && join(user, ".cache"));
+  if (!base) return null;
   return join(base, "cache-statusband-grok", "usage.json");
 }
 
 /**
  * undefined: not a credits line. null: a credits line that cannot be used.
- * Otherwise the reading.
+ * Otherwise the reading. Only the unfinished last line of the file (no newline
+ * after it yet) may fail to parse and be passed over; any other broken line
+ * that mentions the marker means there is no reading, not an older one.
  */
-function billingRecord(line) {
+function billingRecord(line, finished = true) {
   if (!line.includes(BILLING_MARKER)) return undefined;
   let obj;
   try {
     obj = JSON.parse(line);
   } catch {
-    return undefined;
+    return finished ? null : undefined;
   }
   if (!obj || obj.msg !== BILLING_MARKER) return undefined;
   const cfg = obj && obj.ctx && obj.ctx.config;
@@ -376,13 +393,15 @@ function scanBilling(path, maxBytes = 4 * 1024 * 1024) {
       const text = buf.toString("utf8") + pending;
       const lines = text.split("\n");
       pending = offset > 0 ? lines.shift() ?? "" : "";
+      // the last piece of the first chunk read is the end of the file: it has no newline after it
+      const tailIndex = readTotal === len ? lines.length - 1 : -1;
       for (let i = lines.length - 1; i >= 0; i--) {
-        const found = billingRecord(lines[i].replace(/\r$/, ""));
+        const found = billingRecord(lines[i].replace(/\r$/, ""), i !== tailIndex);
         if (found !== undefined) return found && { ...found, sourceMtimeMs: st.mtimeMs, sourceSize: st.size };
       }
     }
     if (offset === 0 && pending) {
-      const found = billingRecord(pending.replace(/\r$/, ""));
+      const found = billingRecord(pending.replace(/\r$/, ""), true);
       if (found !== undefined) return found && { ...found, sourceMtimeMs: st.mtimeMs, sourceSize: st.size };
     }
     return undefined;
