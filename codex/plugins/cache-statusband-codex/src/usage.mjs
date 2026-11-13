@@ -14,6 +14,7 @@ export const MIN_POLL_INTERVAL_MS = 5 * 60 * 1000;
 export const MAX_RETRY_AFTER_MS = 60 * 60 * 1000;
 const LOCK_STALE_MS = 30 * 1000;
 const CLIENT_VERSION = "0.4.2";
+const MAX_CREDIT_ROWS = 20;
 
 export async function getUsageSnapshot({
   codexHome,
@@ -457,8 +458,11 @@ export async function fetchRateLimitsViaAppServer({
 export function sanitizeRateLimits(raw) {
   const bank = raw?.rateLimitResetCredits;
   const availableCount = finiteNonnegative(bank?.availableCount);
+  // Rows beyond the cap are cut here, so how many were cut is recorded: "not shown" (this
+  // plugin cut them) is a different statement from "not supplied" (Codex sent fewer).
+  const creditsOmitted = Array.isArray(bank?.credits) ? Math.max(0, bank.credits.length - MAX_CREDIT_ROWS) : 0;
   const credits = Array.isArray(bank?.credits)
-    ? bank.credits.slice(0, 20).map((credit) => ({
+    ? bank.credits.slice(0, MAX_CREDIT_ROWS).map((credit) => ({
         title: safeText(credit?.title),
         expiresAt: finiteNonnegative(credit?.expiresAt),
       }))
@@ -468,6 +472,7 @@ export function sanitizeRateLimits(raw) {
     accountEmail: safeEmail(raw?.account?.email),
     availableCount,
     credits,
+    creditsOmitted,
     primary: safeWindow(rateLimits?.primary),
     secondary: safeWindow(rateLimits?.secondary),
   };

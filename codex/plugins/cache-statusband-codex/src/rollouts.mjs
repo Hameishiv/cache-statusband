@@ -83,7 +83,7 @@ function consume(item, summary, fromHead = false) {
     summary.id = text(payload.id) ?? summary.id;
     summary.cwd = text(payload.cwd) ?? summary.cwd;
     summary.source = scalarSource(payload.source) ?? summary.source;
-    summary.createdAt = payload.timestamp ?? item.timestamp ?? summary.createdAt;
+    summary.createdAt = text(payload.timestamp) ?? text(item.timestamp) ?? summary.createdAt;
     summary.contextWindow = number(payload.context_window) ?? summary.contextWindow;
     return;
   }
@@ -100,7 +100,7 @@ function consume(item, summary, fromHead = false) {
   if (!info) return;
   const last = info.last_token_usage ?? info.lastTokenUsage;
   const total = info.total_token_usage ?? info.totalTokenUsage;
-  summary.tokenReportAt = item.timestamp ?? summary.tokenReportAt;
+  summary.tokenReportAt = text(item.timestamp) ?? summary.tokenReportAt;
   summary.contextUsed = number(last?.total_tokens ?? last?.totalTokens) ?? summary.contextUsed;
   summary.contextWindow = number(info.model_context_window ?? info.modelContextWindow) ?? summary.contextWindow;
   summary.totalUsage = usage(total) ?? summary.totalUsage;
@@ -145,7 +145,7 @@ function number(value) {
 
 function scalarSource(value) {
   if (typeof value === "string") return value;
-  if (value && typeof value === "object") return value.type ?? null;
+  if (value && typeof value === "object") return text(value.type);
   return null;
 }
 

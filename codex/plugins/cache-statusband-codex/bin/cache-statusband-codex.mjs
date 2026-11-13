@@ -163,11 +163,11 @@ function clean(value) {
   return stripControls(value);
 }
 
-// JSON.stringify escapes C0 controls but passes C1 controls (8-bit terminal escape
+// JSON.stringify escapes C0 controls but passes DEL and the C1 controls (8-bit terminal escape
 // introducers), the line/paragraph separators and the bidirectional controls through, so a
 // transcript string could still act on a terminal that prints the JSON. Escape those too.
 function json(value) {
-  return JSON.stringify(value, null, 2).replace(/[\u0080-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g, (character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`);
+  return JSON.stringify(value, null, 2).replace(/[\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g, (character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`);
 }
 
 function shorten(value, length) {

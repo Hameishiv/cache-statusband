@@ -525,11 +525,11 @@ test("transcript fields of the wrong type are ignored, so one odd session cannot
   assert.ok(json.sessions.some((item) => item.id === "session-1" && item.cwd === "/workspace/example"));
 });
 
-test("--json output escapes C1, line/paragraph separator and bidi controls", async (t) => {
+test("--json output escapes DEL, C1, line/paragraph separator and bidi controls", async (t) => {
   const root = await fixtureRoot(t);
   const sessions = join(root, "sessions");
   await mkdir(sessions);
-  const nasty = "a\u0085b\u009bc\u2028d\u2029e\u202ef\u2066g";
+  const nasty = "a\u007f\u0085b\u009bc\u2028d\u2029e\u202ef\u2066g";
   const meta = { timestamp: "2026-10-29T12:00:00.000Z", type: "session_meta", payload: { id: "evil", cwd: `/w/${nasty}`, source: "cli" } };
   const context = { timestamp: "2026-10-29T12:01:00.000Z", type: "turn_context", payload: { model: nasty, effort: "high" } };
   const path = join(sessions, "evil.jsonl");
@@ -537,7 +537,8 @@ test("--json output escapes C1, line/paragraph separator and bidi controls", asy
   const { run } = cliRunner(root);
   for (const [args, pick] of [[["session", path, "--json"], (value) => value], [["board", "--json"], (value) => value.sessions[0]]]) {
     const stdout = await run(args);
-    assert.doesNotMatch(stdout, /[\u0080-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/, args[0]);
+    assert.doesNotMatch(stdout, /[\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/, args[0]);
+    assert.match(stdout, /\\u007f/);
     assert.match(stdout, /\\u0085/);
     assert.match(stdout, /\\u202e/);
     // The escapes are still the same string once parsed.

@@ -94,6 +94,12 @@ export async function loadSessionState(codexHome, sessionId) {
     const value = JSON.parse(await readFile(sessionStatePath(codexHome, sessionId), "utf8"));
     if (value?.version !== STATE_VERSION) return null;
     if (!Number.isFinite(value.contextUsed) || !Number.isFinite(value.contextWindow)) return null;
+    // A saved file is untrusted too: a contextAt that is neither text nor a number (an array
+    // would still parse as a date) is dropped rather than trusted.
+    if (typeof value.contextAt !== "string" && !Number.isFinite(value.contextAt)) {
+      const { contextAt, ...rest } = value;
+      return rest;
+    }
     return value;
   } catch {
     return null;

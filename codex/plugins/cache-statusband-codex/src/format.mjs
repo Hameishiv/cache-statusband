@@ -53,8 +53,14 @@ export function formatUsageLines(snapshot, now = Date.now(), {
             : `${formatDuration(now - expiresAt)} ago`;
           lines.push(`  ${title} — expires ${absolute} (${relative})`);
         });
-        if (credits.length < snapshot.availableCount) {
-          lines.push(`  ${snapshot.availableCount - credits.length} additional reset expiration${snapshot.availableCount - credits.length === 1 ? " was" : "s were"} not supplied by Codex.`);
+        // Rows this plugin cut off are "not shown"; only the remainder is "not supplied".
+        const omitted = Number.isFinite(snapshot.creditsOmitted) ? Math.max(0, snapshot.creditsOmitted) : 0;
+        if (omitted > 0) {
+          lines.push(`  ${omitted} more reset expiration${omitted === 1 ? "" : "s"} not shown.`);
+        }
+        const missing = snapshot.availableCount - credits.length - omitted;
+        if (missing > 0) {
+          lines.push(`  ${missing} additional reset expiration${missing === 1 ? " was" : "s were"} not supplied by Codex.`);
         }
       }
     }
