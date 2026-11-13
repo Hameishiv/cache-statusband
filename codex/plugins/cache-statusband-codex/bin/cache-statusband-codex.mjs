@@ -46,12 +46,21 @@ async function board(argv) {
   const limit = integer(options.limit ?? "30", "--limit");
   warnIfCodexUnlaunchable();
   const summaries = await scanSessions(home, { includeArchived: Boolean(options.all), limit });
-  const identity = await captureUsageIdentity(home);
-  const usageSnapshot = await getUsageSnapshot({ codexHome: home, identity });
-  warnIfCacheUnwritable(usageSnapshot);
-  const presented = await usagePresentation(usageSnapshot, { codexHome: home, identity });
+  // The usage part is separate from the session list: if it throws, say so on stderr and
+  // still print the sessions (usage shown as unavailable, null in --json).
+  let presented = { snapshot: null, identity: null };
+  let usageKnown = true;
+  try {
+    const identity = await captureUsageIdentity(home);
+    const usageSnapshot = await getUsageSnapshot({ codexHome: home, identity });
+    warnIfCacheUnwritable(usageSnapshot);
+    presented = await usagePresentation(usageSnapshot, { codexHome: home, identity });
+  } catch (error) {
+    usageKnown = false;
+    process.stderr.write(`cache-statusband-codex: usage not read: ${stripControls(error?.message ?? String(error))}\n`);
+  }
   if (options.json) {
-    process.stdout.write(`${json({ usage: await publicSnapshot(presented.snapshot, home), sessions: summaries })}\n`);
+    process.stdout.write(`${json({ usage: usageKnown ? await publicSnapshot(presented.snapshot, home) : null, sessions: summaries })}\n`);
     return;
   }
   process.stdout.write(`${formatUsageLines(presented.snapshot, Date.now(), { identity: presented.identity }).join(" | ")}\n\n`);

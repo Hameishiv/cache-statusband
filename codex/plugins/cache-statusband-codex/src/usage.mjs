@@ -28,7 +28,15 @@ export async function getUsageSnapshot({
 } = {}) {
   if (!codexHome) throw new Error("codexHome is required");
   const dataDir = join(codexHome, "cache-statusband-codex");
-  await mkdir(dataDir, { recursive: true });
+  // A cache folder that cannot be created is not an error to the caller: no marker can be
+  // written there, so no live read is made (see the lock step below), but whatever can still
+  // be read is shown.
+  let dataDirReady = true;
+  try {
+    await mkdir(dataDir, { recursive: true });
+  } catch {
+    dataDirReady = false;
+  }
 
   const identity = suppliedIdentity === undefined
     ? await captureUsageIdentity(codexHome, { env })
@@ -50,7 +58,23 @@ export async function getUsageSnapshot({
     return present(cached ? stored : null, aligned.mismatch ? "identity-changed" : "stale");
   }
 
-  const lock = await acquireLock(lockPath, { now, staleMs: LOCK_STALE_MS });
+  // Only a lock held by someone else is "busy" (acquireLock answers null). Any other failure
+  // (a folder that cannot be created or written, a denied lock file) means the cache cannot be
+  // used to throttle, so no live read is made: the stored reading is returned, marked the same
+  // way as an attempt marker that cannot be written.
+  let lock = null;
+  let lockFailed = !dataDirReady;
+  if (dataDirReady) {
+    try {
+      lock = await acquireLock(lockPath, { now, staleMs: LOCK_STALE_MS });
+    } catch {
+      lockFailed = true;
+    }
+  }
+  if (lockFailed) {
+    const { migrateSeatDeadline, ...stored } = cached ?? {};
+    return { ...present(cached ? stored : null, aligned.mismatch ? "identity-changed" : "stale"), cacheUnwritable: true, cacheDir: dataDir };
+  }
   if (!lock) return present(cached, aligned.mismatch ? "identity-changed" : "cache-busy");
   try {
     aligned = alignCache(await readScopedCache(cachePath, legacyPath, identity), identity);

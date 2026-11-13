@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, rename, rm } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
+import { chmod, mkdir, mkdtemp, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import test from "node:test";
 import { renameWithRetry } from "../src/atomic.mjs";
 import { loadSessionState, saveSessionState } from "../src/session-state.mjs";
@@ -15,6 +18,20 @@ const RAW = {
   rateLimits: { primary: { usedPercent: 40, windowDurationMins: 300, resetsAt: 1_793_285_913 } },
   rateLimitResetCredits: { availableCount: 1, credits: [] },
 };
+
+// Makes a folder refuse new files (a real deny ACL on Windows, mode 555 elsewhere), the way
+// a read-only or protected cache folder does. Returns a function that undoes it, or null
+// when the platform or account cannot be made to refuse (the test is then skipped).
+async function denyNewFiles(dir) {
+  if (process.platform === "win32") {
+    const icacls = (...args) => promisify(execFile)("icacls", args);
+    await icacls(dir, "/deny", "*S-1-1-0:(WD,AD)");
+    return async () => { await icacls(dir, "/remove:d", "*S-1-1-0"); };
+  }
+  if (process.getuid?.() === 0) return null;
+  await chmod(dir, 0o555);
+  return async () => { await chmod(dir, 0o755); };
+}
 
 async function fixtureRoot(t) {
   const root = await mkdtemp(join(tmpdir(), "cache-statusband-atomic-"));
@@ -92,6 +109,55 @@ test("a cache that can never be written sends no rate-limit request and leaves n
   const files = await readdir(join(root, "cache-statusband-codex"));
   assert.ok(!files.some((name) => name.endsWith(".tmp")), files.join(","));
   assert.ok(!files.some((name) => /^rate-limits-.*\.json$/.test(name)));
+});
+
+test("a lock file that cannot be created is reported as an unwritable cache, not thrown", async (t) => {
+  const root = await fixtureRoot(t);
+  const dataDir = join(root, "cache-statusband-codex");
+  await mkdir(dataDir, { recursive: true });
+  // A stored reading whose throttle has passed, so a live read would be due.
+  const name = `rate-limits-${createHash("sha256").update(IDENTITY.key).digest("hex").slice(0, 16)}.json`;
+  await writeFile(join(dataDir, name), `${JSON.stringify({
+    version: 3, attemptedAt: 1, fetchedAt: 1, nextAllowedAt: 2, lastErrorAt: null, identityKey: IDENTITY.key,
+    accountEmail: TEST_EMAIL, availableCount: 3, credits: [], primary: null, secondary: null,
+  })}
+`);
+  const undo = await denyNewFiles(dataDir);
+  if (!undo) return t.skip("this account cannot be denied file creation");
+  let requests = 0;
+  let snapshot;
+  try {
+    snapshot = await getUsageSnapshot({
+      codexHome: root, now: Date.parse("2026-10-29T12:00:00.000Z"), identity: IDENTITY,
+      fetcher: async () => { requests += 1; return RAW; },
+    });
+  } finally {
+    // Lift the restriction before anything else, so the folder can be removed.
+    await undo();
+  }
+  assert.equal(requests, 0);
+  assert.equal(snapshot.source, "stale");
+  assert.equal(snapshot.availableCount, 3);
+  assert.equal(snapshot.cacheUnwritable, true);
+  assert.equal(snapshot.cacheDir, dataDir);
+  assert.equal(formatUsageLines(snapshot, Date.now()).at(-1), `Usage not read: cannot update the cache in ${dataDir}`);
+});
+
+test("a cache folder that cannot be created is reported as an unwritable cache, not thrown", async (t) => {
+  const root = await fixtureRoot(t);
+  // A file where the cache folder belongs: mkdir fails.
+  await writeFile(join(root, "cache-statusband-codex"), "not a folder");
+  let requests = 0;
+  const snapshot = await getUsageSnapshot({
+    codexHome: root, now: Date.parse("2026-10-29T12:00:00.000Z"), identity: IDENTITY,
+    fetcher: async () => { requests += 1; return RAW; },
+  });
+  assert.equal(requests, 0);
+  assert.equal(snapshot.cacheUnwritable, true);
+  assert.equal(snapshot.availableCount, null);
+  // The cache-only path never needed the folder to be writable either.
+  const cacheOnly = await getUsageSnapshot({ codexHome: root, identity: IDENTITY, cacheOnly: true, fetcher: async () => RAW });
+  assert.equal(cacheOnly.source, "stale");
 });
 
 test("the unwritable-cache line strips control characters from the path and is absent otherwise", () => {

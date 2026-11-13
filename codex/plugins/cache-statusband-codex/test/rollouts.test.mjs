@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { execFile } from "node:child_process";
 import { dirname, join } from "node:path";
@@ -678,6 +678,52 @@ test("the CLI says once, on stderr, that no usage was read when the cache cannot
       assert.ok(stdout.includes(line), `${args.join(" ")}: ${stdout}`);
     }
   }
+});
+
+test("a lock file that cannot be created leaves usage and board working, with the stale reading", async (t) => {
+  const root = await fixtureRoot(t);
+  const email = ["test", "example.invalid"].join("@");
+  const dataDir = join(root, "cache-statusband-codex");
+  await mkdir(dataDir, { recursive: true });
+  await mkdir(join(root, "sessions"));
+  const meta = { timestamp: "2026-10-29T12:00:00.000Z", type: "session_meta", payload: { id: "lock-denied-session", cwd: "/workspace/example", source: "cli" } };
+  await writeFile(join(root, "sessions", "lock-denied.jsonl"), `${JSON.stringify(meta)}
+`, "utf8");
+  const name = `rate-limits-${createHash("sha256").update(`account:${email}`).digest("hex").slice(0, 16)}.json`;
+  await writeFile(join(dataDir, name), `${JSON.stringify({
+    version: 3, attemptedAt: 1, fetchedAt: 1, nextAllowedAt: 2, lastErrorAt: null, identityKey: `account:${email}`,
+    accountEmail: email, availableCount: 7, credits: [], primary: null, secondary: null,
+  })}
+`);
+  // A folder that refuses new files: the lock file cannot be created (a real deny ACL on
+  // Windows, mode 555 elsewhere).
+  let undo;
+  if (process.platform === "win32") {
+    await promisify(execFile)("icacls", [dataDir, "/deny", "*S-1-1-0:(WD,AD)"]);
+    undo = () => promisify(execFile)("icacls", [dataDir, "/remove:d", "*S-1-1-0"]);
+  } else if (process.getuid?.() === 0) {
+    return t.skip("root cannot be denied file creation");
+  } else {
+    await chmod(dataDir, 0o555);
+    undo = () => chmod(dataDir, 0o755);
+  }
+  const line = `Usage not read: cannot update the cache in ${dataDir}`;
+  const cli = cliRunner(root);
+  let results;
+  try {
+    results = [];
+    for (const args of [["usage"], ["board"]]) {
+      results.push([args, await cli.runWithStderr(args, { CACHE_STATUSBAND_CODEX_SEAT_FILE: "" })]);
+    }
+  } finally {
+    await undo();
+  }
+  for (const [args, { stdout, stderr }] of results) {
+    assert.ok(stdout.includes(line), `${args.join(" ")}: ${stdout}`);
+    assert.equal(stderr.split(line).length - 1, 1, `${args.join(" ")}: ${stderr}`);
+    assert.match(stdout, /Banked resets: 7/, args.join(" "));
+  }
+  assert.match(results[1][1].stdout, /lock-denied…/);
 });
 
 // Runs the CLI against a scratch Codex home, with a fake app-server standing in for codex.
