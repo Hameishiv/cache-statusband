@@ -2,19 +2,30 @@
 //
 // The rule is a strict grammar, not a search; nothing is scanned for a wait further on.
 // A message has two kinds of key:
-//   * HEADER form: "Retry-After", "retry_after" or "retry-after" (also "retry after" with a
-//     colon), with or without a unit in the key name (retry_after_seconds), followed by ":" or "=".
-//   * PROSE form: "retry after" or "retry at" (or the hyphen/underscore spellings) followed by a space.
+//   * HEADER form: only the spellings with no whitespace in them, "Retry-After", "retry-after",
+//     "retry_after", "RetryAfter" or "retryAfter", with or without a unit suffix in the key name
+//     (retry_after_seconds, retry-after-ms), followed by ":" or "=" (an optional closing quote
+//     and spaces may come first).
+//   * PROSE form: every other "retry after" or "retry at" (or the hyphen/underscore spellings,
+//     any case) followed by a space, ":" or "=". "retry after:", "retry at:", "retryAt:" and
+//     "retry at =" are prose: the ":" or "=" is just a prefix token.
 // What is read is only what comes IMMEDIATELY after the key (spaces, ":", "=", a spaced dash, a
 // quote, "(", "~" and the filler words in, about, approximately, around, at least are skipped), as one of:
 //   * a duration: number+unit pairs (30s, 5 minutes, "1 hour 30 minutes"); pairs in falling order
-//     are summed (1h30m), and a list of durations joined by "or", "to", "-", an en or em dash, a
-//     comma or whitespace ("30 minutes or 2 hours", "5m-3h", "1m 2h") is the LONGEST item;
+//     are summed (1h30m); a number range sharing one unit ("5-10 minutes", "5 to 10 min", "5-10m")
+//     is its larger number with the unit; and a list of durations joined by "or", "to", "and", "&",
+//     "-", an en or em dash, a comma or spaces and tabs ("30 minutes or 2 hours", "30 minutes and
+//     1 hour", "5m-3h", "1m 2h") is the LONGEST item. Neither a joiner nor a compound ever reaches
+//     across a line break: the next line is not read;
 //   * a moment: ISO 8601 (no zone = UTC), a zone after a space, or an HTTP-date; a date with no
-//     time is the end of that day, UTC;
+//     time is the end of that day, UTC. A time with no zone that is followed by a space and a
+//     letter or "(" ("12:30 EST", "12:30:00 America/New_York", "12:30 (UTC+2)") names a zone we
+//     do not read, so it is unparsed, never UTC;
 //   * a bare whole number (seconds, or the unit the key name gave), only when followed by the end
 //     of the text, a newline, whitespace and then the end, or one of . , ; ) ] } (never before
-//     ( ' " or a digit).
+//     ( ' " or a digit). If the text between the key and the number included a quote, that same
+//     quote may directly follow the number ('Retry-After: "30"', {"retry_after":"120"}). After a
+//     HEADER key the number may also be decimal (Retry-After: 30.5 is 30.5 seconds).
 // A value that is not one of these is UNPARSED. After a PROSE key that means there is no key at
 // all (so "retry after reconnecting", "retry at most 3 times" and "retry at any time" are
 // nothing). After a HEADER key it means the server named a Retry-After it did not make readable,
@@ -40,12 +51,24 @@ const NUMBER = String.raw`(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?|\.\d+)`;
 const UNIT = String.raw`(ms|msecs?|milliseconds?|secs?|seconds?|mins?|minutes?|hrs?|hours?|days?|weeks?|wks?|s|m|h|d|w)(?![a-z])`;
 // "5 minutes", "5 more minutes", "5 (minutes)".
 const PAIR = new RegExp(String.raw`${NUMBER}\s*\(?\s*(?:more\s+)?${UNIT}\)?`, "iy");
-const SEPARATOR = /\s*(?:,|and|&)?\s*/iy;
-// A bare whole number: the end of the text, a newline, whitespace and then the end, or one of
-// . , ; ) ] } (a "." or "," before a digit is a decimal or a list, not an end). Never before ( ' ".
-const BARE_INTEGER = /(\d{1,3}(?:,\d{3})+|\d+)(?=[ \t]*(?:\r?\n|$)|[.,](?!\d)|[;)\]}])/y;
-// Between two durations of a list.
-const JOINER = /(?:\s|,|-|–|—|(?:or|to)(?![a-z0-9]))+/iy;
+// Two numbers sharing one unit: "5-10 minutes", "5 to 10 min", "5–10m" (the larger, with the unit).
+const RANGE = new RegExp(String.raw`${NUMBER}\s*(?:-|–|—|to(?![a-z0-9]))\s*${NUMBER}\s*\(?\s*(?:more\s+)?${UNIT}\)?`, "iy");
+// Between the pairs of one compound duration: spaces and tabs only, never a line break.
+const SEPARATOR = /[ \t]*(?:,|and(?![a-z0-9])|&)?[ \t]*/iy;
+// A bare number is read in steps: its digits (whole after a prose key, whole or decimal after a
+// header key), an optional closing quote, then what may follow: the end of the text, a newline,
+// whitespace and then the end, or one of . , ; ) ] } (a "." or "," before a digit is a decimal or a
+// list, not an end). Never before ( ' ".
+const BARE_WHOLE = /(\d{1,3}(?:,\d{3})+|\d+)/y;
+const BARE_DECIMAL = /(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)/y;
+const BARE_END = /(?=[ \t]*(?:\r?\n|$)|[.,](?!\d)|[;)\]}])/y;
+// Between two durations of a list: spaces and tabs (never a line break), a comma, a dash, or the
+// words or, to, and, &.
+const JOINER = /(?:[ \t]|,|-|–|—|&|(?:or|to|and)(?![a-z0-9]))+/iy;
+// The header spellings of the key: no whitespace anywhere in it.
+const HEADER_KEY = /^retry[_-]?after(?:[_-]+(?:ms|milliseconds?|secs?|seconds?|mins?|minutes?|hrs?|hours?|s|m|h))?$/i;
+// What follows a time that has no zone when the next word is one we do not read: "12:30 EST", "12:30 (UTC+2)".
+const ZONE_WORD = /^[ \t]+[A-Za-z(]/;
 const NULLISH = /^(?:null|none)(?![a-z0-9])/i;
 const WORD_END = /[A-Za-z0-9]/y;
 const ISO = String.raw`\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:\s?(?:Z|UTC|GMT|[+-]\d{2}:?\d{2}))?)?`;
@@ -100,6 +123,15 @@ function matchAt(regex, text, at) {
   return regex.exec(text);
 }
 
+// One pair read at `at`: a number with a unit, or two numbers sharing one unit ("5-10 minutes":
+// the larger). {number, unit, end}, or null.
+function matchPair(tail, at) {
+  const range = matchAt(RANGE, tail, at);
+  if (range) return { number: Math.max(toNumber(range[1]), toNumber(range[2])), unit: range[3], end: range.index + range[0].length };
+  const pair = matchAt(PAIR, tail, at);
+  return pair ? { number: toNumber(pair[1]), unit: pair[2], end: pair.index + pair[0].length } : null;
+}
+
 // A compound duration read at `from`: pairs in falling order are one wait (1h30m, "1 hour and 30
 // minutes"), and it must end at a word boundary (7d9f3, 41d4 and 8d1e are not durations).
 // {total, end}, or null.
@@ -113,33 +145,50 @@ function readDuration(tail, from) {
       const separator = matchAt(SEPARATOR, tail, end);
       pairAt = end + (separator ? separator[0].length : 0);
     }
-    const pair = matchAt(PAIR, tail, pairAt);
+    const pair = matchPair(tail, pairAt);
     if (!pair) break;
-    const pairScale = unitMilliseconds(pair[2]);
+    const pairScale = unitMilliseconds(pair.unit);
     if (pairScale >= scale) break;
-    total += toNumber(pair[1]) * pairScale;
+    total += pair.number * pairScale;
     scale = pairScale;
-    end = pair.index + pair[0].length;
+    end = pair.end;
   }
   if (end === from || matchAt(WORD_END, tail, end)) return null;
   return { total, end };
 }
 
+// A bare number at the start of `tail`, in `defaultUnit`: whole after a prose key, whole or decimal
+// after a header key. When the text before it included a quote, that quote may close it. null when
+// what follows is not one of the allowed ends.
+function readBare(tail, defaultUnit, header, quote) {
+  const digits = matchAt(header ? BARE_DECIMAL : BARE_WHOLE, tail, 0);
+  if (!digits) return null;
+  let end = digits[0].length;
+  if (quote && tail[end] === quote) end += 1;
+  return matchAt(BARE_END, tail, end) ? toNumber(digits[1]) * defaultUnit : null;
+}
+
 // The wait stated by `text` read from its start, in milliseconds; null when it is not one of the
 // forms (unparsed); NO_VALUE for "null" / "none". `defaultUnit` is what a bare number counts in
-// (seconds, or the unit the key name gave). Text after a complete duration or moment is not read.
+// (seconds, or the unit the key name gave); `header` is true after a header key. Text after a
+// complete duration or moment is not read.
 const NO_VALUE = Symbol("no value");
-function waitFromTail(text, now, defaultUnit = SECOND) {
+function waitFromTail(text, now, defaultUnit = SECOND, header = false) {
   let at = 0;
+  let quote = "";
   for (let i = 0; i < PREFIX_LIMIT; i += 1) {
     const token = matchAt(PREFIX_TOKEN, text, at);
     if (!token) break;
+    if (token[0] === '"' || token[0] === "'") quote = token[0];
     at += token[0].length;
   }
   const tail = text.slice(at, at + TAIL_CHARS);
   if (NULLISH.test(tail)) return NO_VALUE;
   const moment = matchAt(MOMENT, tail, 0);
   if (moment) {
+    // A time with no zone, then a space and a word or "(": a zone we do not read, never UTC.
+    const zoneless = /:\d{2}(?:\.\d+)?$/.test(moment[0]) && !/(?:Z|UTC|GMT|[+-]\d{2}:?\d{2})$/i.test(moment[0]);
+    if (zoneless && ZONE_WORD.test(tail.slice(moment[0].length))) return null;
     const time = momentTime(moment[0]);
     return Number.isFinite(time) ? Math.max(0, time - now) : null;
   }
@@ -158,8 +207,7 @@ function waitFromTail(text, now, defaultUnit = SECOND) {
     }
     return longest;
   }
-  const bare = matchAt(BARE_INTEGER, tail, 0);
-  return bare ? toNumber(bare[1]) * defaultUnit : null;
+  return readBare(tail, defaultUnit, header, quote);
 }
 
 // Record one stated value: a number is a parsed wait, null an unparsed one (the cap), NO_VALUE nothing.
@@ -176,10 +224,10 @@ function messageWaits(message, now, found) {
     const start = key.index + key[0].length;
     const rest = message.slice(start, start + TAIL_CHARS + 64);
     const unit = key[1] ? unitMilliseconds(key[1]) : SECOND;
-    const header = HEADER_SEPARATOR.exec(rest);
+    const header = HEADER_KEY.test(key[0]) ? HEADER_SEPARATOR.exec(rest) : null;
     if (header) {
-      record(waitFromTail(rest.slice(header[0].length), now, unit), found);
-    } else if (/^\s/.test(rest)) {
+      record(waitFromTail(rest.slice(header[0].length), now, unit, true), found);
+    } else if (/^[\s:=]/.test(rest)) {
       const wait = waitFromTail(rest, now, unit);
       if (typeof wait === "number") found.waits.push(wait);
     }
@@ -225,7 +273,7 @@ function structuredWaits(key, value, now, found) {
   }
   if (text === null || !text.trim()) return;
   // A string: a moment, a duration or a bare number, by the same grammar as message text.
-  record(waitFromTail(text, now, scale ?? SECOND), found);
+  record(waitFromTail(text, now, scale ?? SECOND, true), found);
 }
 
 // Never negative, never NaN; a count too big to hold is as long as a wait can be.

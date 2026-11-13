@@ -612,8 +612,12 @@ test("retry-after wording in an error message: filler words and key suffixes dir
     ["please retry after about 20 minutes", 1.2e6],
     ["retry after at least 10m", 6e5],
     ["retry after: ~30s", 3e4],
-    // A bare integer before a quote is unparsed; after a HEADER key that is the cap.
-    ['Retry-After: "30"', MAX_RETRY_AFTER_MS],
+    ["retry after = 30s", 3e4],
+    // A bare integer may be closed by the quote the prefix opened.
+    ['Retry-After: "30"', 3e4],
+    ['{"retry_after":"120"}', 1.2e5],
+    ['"retry-after": "30"', 3e4],
+    ["Retry-After: '30'", 3e4],
     ["retry after (30s)", 3e4],
     ["retry after - 30s", 3e4],
     ["retry_after_seconds=30", 3e4],
@@ -695,7 +699,7 @@ test("retry-after: one strict grammar; a prose key with no readable wait is no k
     ["retry after 1.5 hours", 5.4e6],
     ["retry after the 5h limit resets in 3 hours", null],
     ["retry after the 5 hour quota resets in 20 minutes", null],
-    // Durations joined by "or", "to", a dash, a comma or whitespace are a list: the longest.
+    // Durations joined by "or", "to", "and", "&", a dash, a comma, spaces or tabs are a list: the longest.
     ["retry after 30 minutes or 2 hours", 7.2e6],
     ["retry after 5m-3h", 1.08e7],
     ["retry after 5m\u20143h", 1.08e7],
@@ -708,10 +712,44 @@ test("retry-after: one strict grammar; a prose key with no readable wait is no k
     // A list stops at the first item that is not a duration; what follows is not read.
     ["retry after 30s or in 10 minutes", 3e4],
     ["retry after 30s, request 41d4", 3e4],
-    // A range with no unit on its first number is not a list of durations.
-    ["retry after 5-10 minutes", null],
+    // "and" and "&" join a list; the longest item wins.
+    ["retry after 30 minutes and 1 hour", 3.6e6],
+    ["retry after 20 minutes & 1 hour", 3.6e6],
+    ["retry after 2 hours and 30 minutes", 9e6],
+    ["Retry-After: 30 minutes and 1 hour", 3.6e6],
+    // A joiner never reaches across a line break: the next line is not read.
+    ["Retry-After: 30s\n5h limit reached", 3e4],
+    ["retry after 5 minutes\n2 hours later", 3e5],
+    ["retry after 5 minutes\r\n2 hours later", 3e5],
+    ["retry after 1 hour\n30 minutes", 3.6e6],
+    // Two numbers sharing one unit are the larger number with that unit.
+    ["retry after 5-10 minutes", 6e5],
+    ["retry after 5 to 10 minutes", 6e5],
+    ["retry after 5\u201310 min", 6e5],
+    ["Retry-After: 5-10 minutes", 6e5],
+    ["retry after 2-3 hours", 1.08e7],
+    ["retry after 5-10 minutes or 1 hour", 3.6e6],
+    // A decimal number after a HEADER key is seconds; after a prose key it is not a wait.
+    ["Retry-After: 30.5", 30500],
+    ["Retry-After: 0.5", 500],
+    ["retry_after=1,500.25", 1500250],
+    ["retry after 30.5", null],
+    // A time with no zone followed by a space and a word or "(" names a zone we do not read:
+    // unparsed (a header key then gives the cap, a prose key nothing), never UTC.
+    ["Retry-After: 2026-11-13 12:30 EST", MAX_RETRY_AFTER_MS],
+    ["Retry-After: 2026-11-13T12:30:00 America/New_York", MAX_RETRY_AFTER_MS],
+    ["Retry-After: 2026-11-13 12:30 (UTC+2)", MAX_RETRY_AFTER_MS],
+    ["Retry-After: Fri, 13 Nov 2026 12:30:00 EST", MAX_RETRY_AFTER_MS],
+    ["retry after 2026-11-13 12:30 EST", null],
+    ["retry after 2026-11-13T12:30:00 America/New_York", null],
+    ["retry after 2026-11-13 12:30 (UTC+2)", null],
+    // A zone that is read (or no zone with nothing after) is still a moment.
+    ["retry after 2026-11-13 12:30 UTC", 1.8e6],
+    ["retry after 2026-11-13 12:30:00 +02:00 please", 0],
+    ["retry after 2026-11-13 12:30", 1.8e6],
     // A bare number is seconds only at the end of the text, a newline, or before . , ; ) ] }
-    // (never before ( ' " or a digit).
+    // (never before ( ' " or a digit), or before the quote the prefix opened ('"30"'), and a
+    // number is whole except after a HEADER key.
     ["retry after 90", 9e4],
     ["retry after 90  ", 9e4],
     ["retry after 90.", 9e4],
@@ -753,7 +791,8 @@ test("retry-after: one strict grammar; a prose key with no readable wait is no k
     ["retry after 1 minute (id 41d4-8d1e-7d9f3)", 6e4],
     ["retry after 20 minutes; your 5 hour usage is high", 1.2e6],
     ["retry after 20 minutes 2026", 1.2e6],
-    // A moment: ISO with a zone, ISO with none (UTC), a zone after a space, an HTTP-date.
+    // A moment: ISO with a zone, ISO with none and nothing after it but the end or a non-word (UTC),
+    // a zone after a space, an HTTP-date.
     ["retry after 2026-11-13T12:20:00Z", 1.2e6],
     ["retry after 2026-11-13T14:20:00+02:00", 1.2e6],
     ["retry after 2026-11-13 14:20:00 +02:00", 1.2e6],
@@ -786,11 +825,19 @@ test("retry-after: one strict grammar; a prose key with no readable wait is no k
     ["retry_after: null", null],
     ["Retry-After: none", null],
     ["retry after none", null],
-    // After a HEADER key (colon or equals) an unparsed value is the cap: the server named a
-    // Retry-After it did not make readable.
+    // "retry after:", "retry at:", "retryAt:" and "retry at =" are PROSE keys (a key with a space in it
+    // is not a header): ":" and "=" are only prefix tokens, so an unreadable value is no key.
+    ["Cannot retry after: the thread is closed", null],
+    ["retry at: any time", null],
+    ["retry after: the window resets", null],
+    ["retryAt: later", null],
+    ["retry at = soon", null],
+    ["retryAt: 30", 3e4],
+    ["retry at = 30", 3e4],
+    // After a HEADER key (a spelling with no space in it, then a colon or equals) an unparsed value
+    // is the cap: the server named a Retry-After it did not make readable.
     ["Retry-After: soon", MAX_RETRY_AFTER_MS],
     ["retry_after=later", MAX_RETRY_AFTER_MS],
-    ["retry after: the window resets", MAX_RETRY_AFTER_MS],
     ["retry-after-ms: later", MAX_RETRY_AFTER_MS],
     ['{"retry_after":"soon"}', MAX_RETRY_AFTER_MS],
     // A date with no time is the end of that day, UTC (the clock here is 12:00Z).
@@ -817,6 +864,10 @@ test("retry-after in structured error data: keys with unit suffixes in any case,
     [{ retry_after: "900" }, 9e5],
     [{ retry_after: "5 minutes" }, 3e5],
     [{ retry_after: "1h30m" }, 5.4e6],
+    [{ retry_after: "30 minutes and 1 hour" }, 3.6e6],
+    [{ retry_after: "5-10 minutes" }, 6e5],
+    [{ retry_after: "30.5" }, 30500],
+    [{ retry_after: '"30"' }, 3e4],
     [{ retry_after: "2026-11-13T12:20:00Z" }, 1.2e6],
     [{ retry_after: "2026-11-13T12:20:00" }, 1.2e6],
     [{ retry_after: "2026-11-13 14:20:00 +02:00" }, 1.2e6],
@@ -863,10 +914,11 @@ test("retry-after in structured error data: keys with unit suffixes in any case,
   assert.equal(retryAfterMilliseconds({ rpcData: { retry_after: [30] }, message: "Retry-After: soon" }, now), MAX_RETRY_AFTER_MS);
   assert.equal(retryAfterMilliseconds({ rpcData: { retry_after: null }, message: "Retry-After: soon" }, now), MAX_RETRY_AFTER_MS);
   assert.equal(retryAfterMilliseconds({ rpcData: { retry_after: null }, message: "no Retry-After header was sent" }, now), null);
-  // A retry key whose string value is not a wait is the cap, in data as in text.
+  // A retry key whose string value is not a wait is the cap, as after a header key in text.
   assert.equal(data({ retry_after: "soon" }), MAX_RETRY_AFTER_MS);
   assert.equal(data({ retryAfter: "a 2-hour cooldown" }), MAX_RETRY_AFTER_MS);
   assert.equal(data({ retry_after: "7d9f3" }), MAX_RETRY_AFTER_MS);
+  assert.equal(data({ retry_after: "2026-11-13 12:30 EST" }), MAX_RETRY_AFTER_MS);
   assert.equal(data({ retry_after: "20s (request 41d4)" }), 2e4);
   // Depth is limited, a cycle ends, and a long string is cut.
   let deep = { retry_after: 9999 };
@@ -890,6 +942,9 @@ test("retry-after: hostile messages finish quickly and never throw", () => {
   assert.equal(retryAfterMilliseconds({ message: `retry after ${"1,".repeat(100_000)}` }, 0), null);
   assert.equal(retryAfterMilliseconds({ message: `retry after ${"5m-".repeat(100_000)}` }, 0), 300_000);
   assert.equal(retryAfterMilliseconds({ message: `retry after ${"1m ".repeat(100_000)}` }, 0), 60_000 * 1);
+  assert.equal(retryAfterMilliseconds({ message: `retry after ${"1m and ".repeat(100_000)}` }, 0), 60_000);
+  assert.equal(retryAfterMilliseconds({ message: `retry after ${"5-10 min, ".repeat(100_000)}` }, 0), 600_000);
+  assert.equal(retryAfterMilliseconds({ message: `Retry-After: ${'"'.repeat(100_000)}5` }, 0), MAX_RETRY_AFTER_MS);
   assert.ok(Date.now() - started < 3000, `took ${Date.now() - started} ms`);
 });
 
