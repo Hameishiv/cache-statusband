@@ -26,7 +26,7 @@ test("a lock holds a token and only its owner's release removes it", async (t) =
   await assert.rejects(readFile(path));
 });
 
-test("racing reclaimers of a stale lock yield exactly one holder", async (t) => {
+test("racing reclaimers of a stale lock ordinarily yield one holder (best effort, not a guarantee)", async (t) => {
   const root = await fixtureRoot(t);
   const path = join(root, "stale.lock");
   await writeFile(path, "dead-holder");

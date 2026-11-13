@@ -71,13 +71,15 @@ export async function handleSessionStart(input, {
 }
 
 async function main() {
+  let output = "{}\n";
   try {
     const raw = await readStdin(1024 * 1024);
     const input = JSON.parse(raw || "{}");
-    process.stdout.write(`${JSON.stringify(await handleSessionStart(input))}\n`);
-  } catch {
-    process.stdout.write("{}\n");
-  }
+    output = `${JSON.stringify(await handleSessionStart(input))}\n`;
+  } catch {}
+  // A read that outlived the deadline may still hold handles open; the hook is done once
+  // its answer is flushed, so end the process rather than wait for them.
+  process.stdout.write(output, () => process.exit(0));
 }
 
 async function readStdin(limit) {

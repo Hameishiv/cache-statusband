@@ -5,6 +5,8 @@ import { acquireLock } from "./lock.mjs";
 
 const STATE_VERSION = 1;
 const SAVE_LOCK_STALE_MS = 10_000;
+const SAVE_LOCK_RETRIES = 5;
+const SAVE_LOCK_RETRY_MS = 50;
 
 export async function getSessionIdentity(codexHome, sessionId, capture) {
   if (!codexHome || !sessionId) return null;
@@ -61,7 +63,12 @@ export async function saveSessionState(codexHome, sessionId, summary, savedAt = 
   const path = sessionStatePath(codexHome, sessionId);
   await mkdir(join(codexHome, "cache-statusband-codex", "sessions"), { recursive: true });
   // One writer per session; a fresh lock means another Stop hook is saving right now.
-  const lock = await acquireLock(`${path}.lock`, { staleMs: SAVE_LOCK_STALE_MS });
+  // A save takes milliseconds, so wait briefly for it before giving up on this one.
+  let lock = await acquireLock(`${path}.lock`, { staleMs: SAVE_LOCK_STALE_MS });
+  for (let retry = 0; !lock && retry < SAVE_LOCK_RETRIES; retry += 1) {
+    await new Promise((resolve) => setTimeout(resolve, SAVE_LOCK_RETRY_MS));
+    lock = await acquireLock(`${path}.lock`, { staleMs: SAVE_LOCK_STALE_MS });
+  }
   if (!lock) return false;
   try {
     const previous = await loadSessionState(codexHome, sessionId);

@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 import { capFirst, formatAge, formatDuration, formatUsageLines } from "../src/format.mjs";
 import { displayIdentity, usagePresentation } from "../src/settings.mjs";
@@ -333,6 +334,23 @@ test("resolves a runnable Codex command from CODEX_BIN or the Windows PATH", asy
   assert.deepEqual(resolveCodexLaunch({ PATH: join(root, "empty") }, "win32"), { command: "codex", args: ["app-server"] });
 });
 
+test("a codex.cmd whose path contains % is refused rather than expanded by cmd.exe", async (t) => {
+  const root = await fixtureRoot(t);
+  const bin = join(root, "100%PATH%");
+  await mkdir(bin);
+  await writeFile(join(bin, "codex.cmd"), "");
+  assert.throws(() => resolveCodexLaunch({ Path: bin }, "win32"), /CODEX_BIN.*codex\.exe/);
+  assert.throws(() => resolveCodexLaunch({ CODEX_BIN: join(bin, "codex.cmd") }, "win32"), /%/);
+  // Only the cmd.exe wrapper has the problem: an .exe or a non-Windows path is fine.
+  assert.equal(resolveCodexLaunch({ CODEX_BIN: join(bin, "codex.exe") }, "win32").command, join(bin, "codex.exe"));
+  assert.equal(resolveCodexLaunch({ CODEX_BIN: "/opt/100%/codex" }, "linux").command, "/opt/100%/codex");
+  // The readers surface it as an ordinary reader error.
+  const env = { ...process.env, CODEX_BIN: join(bin, "codex.cmd") };
+  const launch = { codexHome: root, env, platform: "win32", timeoutMs: 1000 };
+  await assert.rejects(readAccountViaAppServer(launch), /CODEX_BIN/);
+  await assert.rejects(fetchRateLimitsViaAppServer(launch), /CODEX_BIN/);
+});
+
 test("the app-server readers run an npm-style codex.cmd found on PATH", { skip: process.platform !== "win32" }, async (t) => {
   const root = await fixtureRoot(t);
   const bin = join(root, "npm bin dir");
@@ -347,6 +365,84 @@ test("the app-server readers run an npm-style codex.cmd found on PATH", { skip: 
   const limits = await fetchRateLimitsViaAppServer({ codexHome: root, env, timeoutMs: 5_000 });
   assert.equal(limits.rateLimitResetCredits.availableCount, 2);
 });
+
+const HUNG_SERVER = join(dirname(fileURLToPath(import.meta.url)), "..", "fixtures", "hung-app-server.mjs");
+const USAGE_MODULE = join(dirname(fileURLToPath(import.meta.url)), "..", "src", "usage.mjs");
+
+function alive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitUntil(condition, ms) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    if (await condition()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return condition();
+}
+
+// Launch options for a Codex that never answers: a plain node process everywhere, and on
+// Windows the npm shape too (codex.cmd -> cmd.exe -> node), where killing the wrapper
+// alone leaves the real server running.
+async function hungLaunch(root, { npmShape }) {
+  const pidFile = join(root, "hung.pid");
+  const env = { ...process.env, HUNG_PID_FILE: pidFile };
+  if (!npmShape) return { pidFile, env, options: { command: process.execPath, args: [HUNG_SERVER] } };
+  const bin = join(root, "npm bin dir");
+  await mkdir(bin);
+  await writeFile(join(bin, "codex.cmd"), `@echo off\r\n"${process.execPath}" "${HUNG_SERVER}" %*\r\n`);
+  for (const key of Object.keys(env)) if (key.toLowerCase() === "path") delete env[key];
+  env.Path = `${bin}${delimiter}${process.env.PATH ?? process.env.Path ?? ""}`;
+  delete env.CODEX_BIN;
+  return { pidFile, env, options: {} };
+}
+
+for (const npmShape of process.platform === "win32" ? [false, true] : [false]) {
+  const shape = npmShape ? "an npm-style codex.cmd" : "a plain executable";
+  for (const [name, reader] of [["account", readAccountViaAppServer], ["rate-limit", fetchRateLimitsViaAppServer]]) {
+    test(`a timed-out ${name} read leaves no server behind (${shape})`, async (t) => {
+      const root = await fixtureRoot(t);
+      const { pidFile, env, options } = await hungLaunch(root, { npmShape });
+      await assert.rejects(reader({ codexHome: root, env, timeoutMs: 1500, ...options }), /timed out/);
+      const pid = Number(await readFile(pidFile, "utf8"));
+      assert.ok(Number.isInteger(pid) && pid > 0);
+      try {
+        assert.ok(await waitUntil(() => !alive(pid), 5_000), "the hung server was left running");
+      } finally {
+        if (alive(pid)) process.kill(pid);
+      }
+    });
+  }
+
+  test(`a process that timed out on a hung Codex exits promptly (${shape})`, async (t) => {
+    const root = await fixtureRoot(t);
+    const { pidFile, env, options } = await hungLaunch(root, { npmShape });
+    const script = join(root, "call-reader.mjs");
+    await writeFile(script, [
+      `import { fetchRateLimitsViaAppServer } from ${JSON.stringify(pathToFileURL(USAGE_MODULE).href)};`,
+      `try { await fetchRateLimitsViaAppServer({ codexHome: ${JSON.stringify(root)}, timeoutMs: 800, ...${JSON.stringify(options)} }); } catch {}`,
+    ].join("\n"));
+    const started = Date.now();
+    const child = spawn(process.execPath, [script], { env, stdio: "ignore", windowsHide: true });
+    const exited = new Promise((resolve) => child.once("exit", resolve));
+    const gaveUp = new Promise((resolve) => setTimeout(() => resolve("hung"), 8_000));
+    const outcome = await Promise.race([exited, gaveUp]);
+    if (outcome === "hung") child.kill();
+    try {
+      assert.notEqual(outcome, "hung", "the process was held open by the abandoned server");
+      assert.ok(Date.now() - started < 5_000);
+    } finally {
+      const pid = Number(await readFile(pidFile, "utf8").catch(() => 0));
+      if (pid && alive(pid)) process.kill(pid);
+    }
+  });
+}
 
 test("server messages that reuse a response id are not mistaken for responses", async () => {
   const options = { command: process.execPath, args: [FAKE_SERVER], timeoutMs: 3_000, env: { ...process.env, FAKE_SERVER_NOISE: "1" } };

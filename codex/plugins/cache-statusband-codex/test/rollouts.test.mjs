@@ -300,7 +300,7 @@ test("a startup whose account read fails reports nothing and persists no identit
   assert.deepEqual(files.filter((name) => name.endsWith(".identity.json")), []);
 });
 
-test("Stop skips its save while another save holds a fresh lock, and reclaims a stale one", async (t) => {
+test("Stop waits briefly for another save's lock, then skips; a stale lock is reclaimed", async (t) => {
   const root = await fixtureRoot(t);
   const summary = { contextUsed: 10, contextWindow: 100, tokenReportAt: "2026-10-29T12:00:00.000Z" };
   await mkdir(join(root, "cache-statusband-codex", "sessions"), { recursive: true });
@@ -311,12 +311,29 @@ test("Stop skips its save while another save holds a fresh lock, and reclaims a 
   const lockPath = join(dir, `${stateName}.lock`);
   await writeFile(lockPath, "another-hook");
   const newer = { ...summary, contextUsed: 20, tokenReportAt: "2026-10-29T13:00:00.000Z" };
+  const waitStarted = Date.now();
   assert.equal(await saveSessionState(root, "locked-session", newer), false);
+  // Five retries at 50ms: it waited for the holder before giving up.
+  assert.ok(Date.now() - waitStarted >= 200, "gave up without retrying");
   assert.equal((await loadSessionState(root, "locked-session")).contextUsed, 10);
   const old = new Date(Date.now() - 60_000);
   await utimes(lockPath, old, old);
   assert.equal(await saveSessionState(root, "locked-session", newer), true);
   assert.equal((await loadSessionState(root, "locked-session")).contextUsed, 20);
+});
+
+test("Stop saves once a briefly held lock is released", async (t) => {
+  const root = await fixtureRoot(t);
+  const summary = { contextUsed: 10, contextWindow: 100, tokenReportAt: "2026-10-29T12:00:00.000Z" };
+  assert.equal(await saveSessionState(root, "busy-session", summary), true);
+  const dir = join(root, "cache-statusband-codex", "sessions");
+  const stateName = (await readdir(dir)).find((name) => name.endsWith(".json") && !name.endsWith(".identity.json"));
+  const lockPath = join(dir, `${stateName}.lock`);
+  await writeFile(lockPath, "another-hook");
+  setTimeout(() => rm(lockPath, { force: true }), 80);
+  const newer = { ...summary, contextUsed: 20, tokenReportAt: "2026-10-29T13:00:00.000Z" };
+  assert.equal(await saveSessionState(root, "busy-session", newer), true);
+  assert.equal((await loadSessionState(root, "busy-session")).contextUsed, 20);
 });
 
 test("a truncated rollout takes only identity from its head and everything else from its tail", async (t) => {

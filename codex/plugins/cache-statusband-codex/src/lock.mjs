@@ -3,7 +3,10 @@ import { link, open, readFile, rename, stat, unlink } from "node:fs/promises";
 
 // An advisory lock file holding a random token. Returns { token, release() } or
 // null when another live holder owns it. A lock older than staleMs is reclaimed by
-// renaming it aside, so of several racing reclaimers exactly one rename succeeds.
+// renaming it aside, so ordinarily only one of several racing reclaimers succeeds.
+// Reclaiming is best effort, not a guarantee: if a holder refreshes the lock between our
+// first stat and the rename, and a third process creates the path before we give it
+// back, two processes can both hold it. The cost is a duplicate poll or a skipped save.
 export async function acquireLock(path, { now = Date.now(), staleMs = 30_000 } = {}) {
   const token = randomUUID();
   if (await create(path, token)) return holder(path, token);

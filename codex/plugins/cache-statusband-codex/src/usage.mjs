@@ -153,6 +153,10 @@ export function resolveCodexLaunch(env = process.env, platform = process.platfor
   if (!target && windows) target = findOnWindowsPath(env);
   if (!target) return { command: "codex", args };
   if (windows && /\.(cmd|bat)$/i.test(target)) {
+    // cmd.exe expands %VAR% inside a quoted command line and offers no way to escape it.
+    if (target.includes("%")) {
+      throw new Error(`Cannot launch ${target}: cmd.exe cannot safely run a path containing "%". Set CODEX_BIN to codex.exe or move the Codex install.`);
+    }
     const line = [`"${target}"`, ...args].join(" ");
     return {
       command: env.ComSpec || "cmd.exe",
@@ -175,6 +179,36 @@ function findOnWindowsPath(env) {
     }
   }
   return null;
+}
+
+// Stop a finished or abandoned app-server and release every handle on it, so a hung
+// server cannot keep this process alive. Through cmd.exe (npm's codex.cmd) the real
+// server is a grandchild that child.kill() does not reach, so on Windows take the whole
+// tree. Killing cmd.exe first would orphan the server before taskkill could see it, so
+// child.kill() is only the fallback when taskkill cannot run or fails.
+function disposeChild(child) {
+  let taskkilled = false;
+  if (process.platform === "win32" && Number.isInteger(child.pid)) {
+    try {
+      const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+      const fallback = () => { try { child.kill(); } catch {} };
+      killer.once("error", fallback);
+      killer.once("exit", (code) => { if (code !== 0) fallback(); });
+      taskkilled = true;
+    } catch {}
+  }
+  for (const action of [
+    () => child.stdin.end(),
+    () => { if (!taskkilled) child.kill(); },
+    () => child.stdin.destroy(),
+    () => child.stdout.destroy(),
+    () => child.stderr.destroy(),
+    () => child.unref(),
+  ]) {
+    try {
+      action();
+    } catch {}
+  }
 }
 
 export async function readAccountViaAppServer({
@@ -205,8 +239,7 @@ export async function readAccountViaAppServer({
       settled = true;
       clearTimeout(timer);
       lines.close();
-      child.stdin.end();
-      child.kill();
+      disposeChild(child);
       callback(value);
     };
     const timer = setTimeout(() => finish(reject, new Error("Codex account read timed out")), timeoutMs);
@@ -272,8 +305,7 @@ export async function fetchRateLimitsViaAppServer({
       settled = true;
       clearTimeout(timer);
       lines.close();
-      child.stdin.end();
-      child.kill();
+      disposeChild(child);
       callback(value);
     };
     const timer = setTimeout(() => finish(reject, new Error("Codex rate-limit read timed out")), timeoutMs);
