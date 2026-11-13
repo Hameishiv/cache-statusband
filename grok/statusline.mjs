@@ -376,8 +376,8 @@ function writeSources(cachePath, sources) {
 }
 
 /**
- * Last weekly reading. Re-reads each log at most once per five minutes, even
- * when it has no credits line. A re-read that finds no credits line keeps the
+ * Last weekly reading. Re-reads each readable log at most once per five
+ * minutes, even when it has no credits line. A re-read that finds no credits line keeps the
  * last good record and only moves the next check. A re-read whose newest
  * credits line cannot be used drops it. A log that cannot be read keeps the
  * last good record and is tried again on the next run.
@@ -444,9 +444,9 @@ if (isDirectRun()) {
     process.stderr.write("statusline: stdin is not a JSON object\n");
     process.exit(1);
   }
-  const logPath = billingLogPath();
   let weekly = null;
   try {
+    const logPath = billingLogPath();
     weekly = logPath ? loadWeekly(logPath, usageCachePath()) : null;
   } catch {
     // the other segments do not depend on the log

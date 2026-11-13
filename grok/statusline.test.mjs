@@ -115,7 +115,7 @@ describe("weekly usage", () => {
     assert.equal(weeklyLabel({ ...weekly, percent: 23.4 }, now), "week 23.4% · 4d11h");
   });
 
-  it("shows how old the reading is once it is an hour old, and never invents an age", () => {
+  it("shows how old the reading is once it is an hour old, and marks an unknown read time", () => {
     const at = (iso) => ({ ...weekly, fetchedAt: iso });
     assert.equal(weeklyLabel(at("2026-10-29T11:00:00Z"), now), "week 23% · 4d11h");
     assert.equal(weeklyLabel(at("2026-10-29T10:46:00Z"), now), "week 23% (read 60m ago) · 4d11h");
