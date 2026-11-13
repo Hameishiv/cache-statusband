@@ -591,7 +591,12 @@ export function retryAfterMilliseconds(error, now = Date.now()) {
   }
   const message = error?.rpcMessage ?? error?.message;
   if (typeof message === "string") {
-    const match = message.match(/retry[\s_-]*after(?:[\s_-]*(ms|milliseconds?)\b)?[^0-9]*(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?)?(?![a-z])/i);
+    // The number must follow "retry after" directly (spaces, ":", "=" and "in" only), so
+    // "retry after the 5h window" does not read the 5h. An ISO date there is a moment, not a count.
+    const iso = message.match(/retry[\s_-]*after[\s:=]*(?:in\s+)?(\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)?(?:Z|[+-]\d{2}:?\d{2})?)/i);
+    const at = iso ? Date.parse(iso[1].replace(" ", "T")) : NaN;
+    if (Number.isFinite(at)) candidates.push(Math.max(0, at - now));
+    const match = iso ? null : message.match(/retry[\s_-]*after(?:[\s_-]*(ms|milliseconds?)\b)?[\s:=]*(?:in\s+)?(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?)?(?![a-z])/i);
     if (match) {
       const unit = (match[1] ?? match[3] ?? "s").toLowerCase();
       const scale = unit.startsWith("ms") || unit.startsWith("milli") ? 1

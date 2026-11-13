@@ -582,6 +582,20 @@ test("parses retry-after units from error text", () => {
   assert.equal(ms("retry after 1500ms"), 1_500);
   assert.equal(ms("retry after 2 hours"), 7_200_000);
   assert.equal(ms("no hint here"), null);
+  assert.equal(ms("retry after in 90 seconds"), 90_000);
+});
+
+test("a retry-after date in an error message is a moment, and a number must directly follow the words", () => {
+  const now = Date.parse("2026-10-29T12:00:00.000Z");
+  const ms = (message) => retryAfterMilliseconds({ message }, now);
+  assert.equal(ms("rate limited. Retry after 2026-10-29T12:20:00Z"), 20 * 60_000);
+  assert.equal(ms("Retry-After: 2026-10-29T12:05:30.500Z please"), 5 * 60_000 + 30_500);
+  assert.equal(ms("retry after 2026-10-29T14:00:00+02:00"), 0);
+  // An ISO date is never read as "2026 seconds".
+  assert.notEqual(ms("retry after 2026-10-29T12:20:00Z"), 2026_000);
+  // The 5h is a window name, not the wait: nothing follows "retry after" directly.
+  assert.equal(ms("retry after the 5h window (in 40 minutes)"), null);
+  assert.equal(ms("retry after the 5h window"), null);
 });
 
 test("a cache deadline beyond the longest possible backoff does not suppress polling", async (t) => {
