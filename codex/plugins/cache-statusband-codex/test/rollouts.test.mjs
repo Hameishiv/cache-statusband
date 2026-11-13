@@ -441,22 +441,29 @@ test("the SessionStart hook process prints its answer and exits", async () => {
 });
 
 // 400ms ends before the 500ms floor a read is given, so the hook (not the reader) has to stop the
-// server: it must have started (its pid file appears) and be gone once the hook has exited. At
-// 2500ms the first read, the account capture (told to give up half a second before the deadline,
-// counted from the start of the hook process), times out first, and the reader's own cleanup
-// stops the server; that variant leaves it well over a second to start a server behind a slow cmd
-// shim. (With under 3.5 s left, the usage read that follows only reads the cache.)
+// server: it must have started (its pid file appears) and be gone BEFORE the hook process ends.
+// A child started by a hook dies with the hook process on its own, so "gone after the hook has
+// exited" would hold even with the disposal removed; the test therefore holds the hook alive. A
+// preload (test-preload.cjs, written below) wraps process.exit in the hook process only: it writes
+// a marker file, then waits 4 s, then really exits. The marker appears after the hook's answer is
+// flushed and disposeAllAppServers() has run, so the server must already be dead while the hook
+// is still alive and waiting. (Mutation-checked: with disposeChild a no-op the server is still
+// running at the marker and this test fails.) At 2500ms the first read, the account capture (told
+// to give up half a second before the deadline, counted from the start of the hook process),
+// times out first, and the reader's own cleanup stops the server; that variant leaves it well
+// over a second to start a server behind a slow cmd shim. (With under 3.5 s left, the usage read
+// that follows only reads the cache.)
 // On Windows the 400ms variant launches the hung server WITHOUT cmd.exe (a copy of node.exe named
 // codex.exe, held by a preload that writes the pid and then blocks the main thread for good, so the
 // hung server really hangs and node never tries to load the app-server arguments as a script):
 // the hook kills at a moment when cmd.exe may be starting its child, and taskkill /T's snapshot of
 // the tree can miss a grandchild born in that instant. The real Codex app-server exits when its
-// stdin closes (observed in round 20 with the real 0.169 app-server, about 1.5 s), which happens as
-// the hook lets go of its pipes, so in the product that grandchild does not outlive the hook; this
-// fixture ignores stdin EOF, so a test that raced it would report an orphan the product does not
-// leave. The copy of node.exe is run once first so the first-run virus scan of a new executable
-// does not use up the 400ms. The 2500ms variant keeps the codex.cmd shim, where the start is long
-// over by the kill.
+// stdin closes (observed with codex-cli 0.169, about 1.5 s after the hook lets go of its pipes), so
+// in the product a grandchild missed that way exits about 1.5 s after the hook; this fixture
+// ignores stdin EOF, so a test that raced it would report an orphan the product does not leave.
+// The copy of node.exe is run once first so the first-run virus scan of a new executable does not
+// use up the 400ms. The 2500ms variant keeps the codex.cmd shim, where the start is long over by
+// the kill.
 for (const [deadline, direct, allowance, title] of [
   ["400", true, 5_000, "the hook, at its deadline, stops a Codex app-server whose read is still running (400ms)"],
   ["2500", false, 3_000, "a read that times out before the hook deadline stops its own Codex app-server (2500ms)"],
@@ -466,59 +473,87 @@ for (const [deadline, direct, allowance, title] of [
   const hook = join(here, "..", "hooks", "session-start.mjs");
   const hung = join(here, "..", "fixtures", "hung-app-server.mjs");
   const pidFile = join(root, "hung.pid");
+  const exitMarker = join(root, "hook-exiting.marker");
   // The npm shape on Windows (codex.cmd -> cmd.exe -> node), a script elsewhere.
   const noShell = direct && process.platform === "win32";
   const launcher = join(root, noShell ? "codex.exe" : process.platform === "win32" ? "codex.cmd" : "codex");
-  const extra = {};
+  // One preload for every node process of this test (NODE_OPTIONS reaches the hook and the server):
+  //  * the hook (argv[1] is session-start.mjs) has process.exit wrapped: marker first, 4 s wait, exit;
+  //  * the copy named codex.exe writes its pid and then blocks the main thread for good.
+  const preload = join(root, "test-preload.cjs");
+  await writeFile(preload, [
+    'const fs = require("node:fs");',
+    'if (/codex\\.exe$/i.test(process.execPath)) {',
+    '  fs.writeFileSync(process.env.HUNG_PID_FILE, String(process.pid));',
+    '  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);',
+    '}',
+    'if (/session-start\\.mjs$/i.test(process.argv[1] || "")) {',
+    '  const realExit = process.exit;',
+    '  let held = false;',
+    '  process.exit = (code) => {',
+    '    if (!held) {',
+    '      held = true;',
+    '      fs.writeFileSync(process.env.HOOK_EXIT_MARKER, String(Date.now()));',
+    '      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 4000);',
+    '    }',
+    '    return realExit.call(process, code);',
+    '  };',
+    '}',
+    '',
+  ].join("\n"), "utf8");
   if (noShell) {
-    const preload = join(root, "hung-preload.cjs");
-    // Only the copy named codex.exe hangs: NODE_OPTIONS also reaches the hook's own node.exe.
-    // The pid is written first; then the main thread blocks for good (nothing ever wakes it).
-    await writeFile(preload, [
-      'if (/codex\\.exe$/i.test(process.execPath)) {',
-      '  require("node:fs").writeFileSync(process.env.HUNG_PID_FILE, String(process.pid));',
-      '  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);',
-      '}',
-      '',
-    ].join("\n"), "utf8");
     await copyFile(process.execPath, launcher);
     // Warm the copy (the first run of a new executable is scanned): --version exits before any
     // preload runs, so it neither hangs nor writes the pid file.
     await promisify(execFile)(launcher, ["--version"], { timeout: 20_000 });
-    extra.NODE_OPTIONS = `--require "${preload.replaceAll("\\", "/")}"`;
   } else {
     await writeFile(launcher, process.platform === "win32"
       ? `@echo off\r\n"${process.execPath}" "${hung}" %*\r\n`
       : `#!/bin/sh\nexec "${process.execPath}" "${hung}" "$@"\n`, { mode: 0o755 });
   }
-  const env = { ...process.env, ...extra, CODEX_HOME: root, CODEX_BIN: launcher, HUNG_PID_FILE: pidFile, CACHE_STATUSBAND_HOOK_DEADLINE_MS: deadline };
+  const env = {
+    ...process.env,
+    NODE_OPTIONS: `--require "${preload.replaceAll("\\", "/")}"`,
+    CODEX_HOME: root, CODEX_BIN: launcher, HUNG_PID_FILE: pidFile, HOOK_EXIT_MARKER: exitMarker,
+    CACHE_STATUSBAND_HOOK_DEADLINE_MS: deadline,
+  };
   const child = execFile(process.execPath, [hook], { env, timeout: 15_000 });
   let stdout = "";
   child.stdout.on("data", (chunk) => { stdout += chunk; });
+  const exited = new Promise((resolve) => child.once("exit", resolve));
   const began = Date.now();
   child.stdin.end(JSON.stringify({ source: "startup", session_id: "orphan-session" }));
-  const code = await new Promise((resolve) => child.once("exit", resolve));
-  const elapsed = Date.now() - began;
-  assert.equal(code, 0);
-  // The hook answers by its deadline (plus process start-up and cleanup) whatever the server did.
-  assert.ok(elapsed < Number(deadline) + allowance, `the hook took ${elapsed}ms against a ${deadline}ms deadline`);
-  assert.doesNotThrow(() => JSON.parse(stdout), `the hook printed invalid JSON: ${stdout}`);
   const until = async (condition, ms) => {
     const end = Date.now() + ms;
     while (Date.now() < end && !(await condition())) await new Promise((resolve) => setTimeout(resolve, 50));
     return condition();
   };
   const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
-  // The server records its pid once it is up. It must have started (the hook's own read launches it
-  // before the deadline, and the start gets a generous allowance on a slow machine); a pid file that
-  // never appears means the launch itself failed, which must not pass as "nothing left running".
-  const started = await until(async () => (await readFile(pidFile, "utf8").catch(() => "")) !== "", 10_000);
-  assert.ok(started, "the Codex app-server never started (no pid file), so the cleanup was not exercised");
-  const pid = Number(await readFile(pidFile, "utf8"));
+  const exists = async (path) => (await readFile(path, "utf8").catch(() => "")) !== "";
+  let pid = null;
   try {
-    assert.ok(await until(() => !alive(pid), 5_000), "the hook left the Codex app-server running");
+    // The marker appears once the hook has flushed its answer and disposed of the servers; the hook
+    // then waits 4 s before it really exits.
+    assert.ok(await until(() => exists(exitMarker), 14_000), "the hook never reached its exit");
+    const elapsed = Date.now() - began;
+    // The hook answers by its deadline (plus process start-up and cleanup) whatever the server did.
+    assert.ok(elapsed < Number(deadline) + allowance, `the hook took ${elapsed}ms against a ${deadline}ms deadline`);
+    // The server records its pid once it is up. It must have started (the hook's own read launches it
+    // before the deadline); a pid file that never appears means the launch itself failed, which must
+    // not pass as "nothing left running".
+    assert.ok(await exists(pidFile), "the Codex app-server never started (no pid file), so the cleanup was not exercised");
+    pid = Number(await readFile(pidFile, "utf8"));
+    // The hook process is still alive here (it is in its 4 s wait), so a server that is gone was
+    // stopped by the hook's disposal, not by the hook process ending. A signal may take a moment to
+    // land (well inside the 4 s), so allow 1.5 s.
+    assert.equal(child.exitCode, null, "the hook already exited, so this proves nothing about its disposal");
+    assert.ok(await until(() => !alive(pid), 1_500), "the hook left the Codex app-server running while it was still alive");
+    assert.equal(child.exitCode, null, "the server was only seen gone after the hook exited, so this proves nothing about its disposal");
+    assert.equal(await exited, 0);
+    assert.doesNotThrow(() => JSON.parse(stdout), `the hook printed invalid JSON: ${stdout}`);
   } finally {
-    if (alive(pid)) process.kill(pid);
+    if (pid !== null && alive(pid)) process.kill(pid);
+    if (child.exitCode === null) child.kill();
   }
 });
 
@@ -1167,7 +1202,8 @@ function cliRunner(root) {
 
 async function fixtureRoot(t) {
   const root = await mkdtemp(join(tmpdir(), "cache-statusband-codex-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  // A just-killed copy of node.exe can hold its file for a moment (EPERM on Windows): retry.
+  t.after(() => rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   return root;
 }
 
