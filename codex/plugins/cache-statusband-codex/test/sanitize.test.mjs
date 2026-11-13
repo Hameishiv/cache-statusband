@@ -45,3 +45,14 @@ test("every displayed or stored text field goes through it, C1 included", async 
     assert.equal(safe.credits[0].title, "Full reset");
   }
 });
+
+test("bidi overrides, isolates and line separators are stripped; Hebrew text and emoji survive", () => {
+  for (const sample of ["\u202a", "\u202b", "\u202c", "\u202d", "\u202e", "\u2066", "\u2067", "\u2068", "\u2069", "\u2028", "\u2029"]) {
+    assert.equal(hasControl(`a${sample}b`), true);
+    assert.equal(stripControls(`a${sample}b`), "a b");
+  }
+  for (const text of ["שלום עולם", "משיב — Codex", "family 👨‍👩‍👧 ok", "مرحبا", "plain\u200eRLM-ok"]) {
+    assert.equal(hasControl(text), false);
+    assert.equal(stripControls(text), text);
+  }
+});

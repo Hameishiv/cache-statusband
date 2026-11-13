@@ -175,39 +175,58 @@ export function resolveCodexLaunch(env = process.env, platform = process.platfor
   return { command: target, args };
 }
 
+// A .cmd/.bat wrapper in a directory whose name contains % cannot be run safely through
+// cmd.exe, so look past it for a usable candidate; only when nothing else exists is the
+// unsafe one returned, so that resolveCodexLaunch can explain why it was refused.
 function findOnWindowsPath(env) {
   const pathKey = Object.keys(env).find((key) => key.toLowerCase() === "path");
   const directories = String(pathKey ? env[pathKey] : "").split(delimiter).map((value) => value.trim().replace(/^"|"$/g, "")).filter(Boolean);
+  let refused = null;
   for (const directory of directories) {
     for (const extension of [".exe", ".cmd", ".bat"]) {
       const candidate = join(directory, `codex${extension}`);
       try {
-        if (statSync(candidate).isFile()) return candidate;
-      } catch {}
+        if (!statSync(candidate).isFile()) continue;
+      } catch {
+        continue;
+      }
+      if (extension !== ".exe" && candidate.includes("%")) refused ??= candidate;
+      else return candidate;
     }
   }
-  return null;
+  return refused;
 }
+
+// Every app-server this process has started and not yet finished with. A hook that
+// reaches its deadline calls disposeAllAppServers() before exiting, so a server whose
+// reader is still waiting is not left running.
+const liveChildren = new Set();
 
 // Stop a finished or abandoned app-server and release every handle on it, so a hung
 // server cannot keep this process alive. Through cmd.exe (npm's codex.cmd) the real
 // server is a grandchild that child.kill() does not reach, so on Windows take the whole
 // tree. Killing cmd.exe first would orphan the server before taskkill could see it, so
-// child.kill() is only the fallback when taskkill cannot run or fails.
-function disposeChild(child) {
+// child.kill() is only the fallback when taskkill cannot run or fails. A child that has
+// already exited is never signalled: its pid may be reused by an unrelated process.
+// Returns a promise that settles once taskkill (if any) has finished.
+function disposeChild(child, { platform = process.platform, spawnKiller = spawn } = {}) {
+  const gone = child.exitCode != null || child.signalCode != null;
   let taskkilled = false;
-  if (process.platform === "win32" && Number.isInteger(child.pid)) {
+  let finished = Promise.resolve();
+  if (!gone && platform === "win32" && Number.isInteger(child.pid)) {
     try {
-      const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+      const killer = spawnKiller("taskkill", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
       const fallback = () => { try { child.kill(); } catch {} };
-      killer.once("error", fallback);
-      killer.once("exit", (code) => { if (code !== 0) fallback(); });
+      finished = new Promise((resolve) => {
+        killer.once("error", () => { fallback(); resolve(); });
+        killer.once("exit", (code) => { if (code !== 0) fallback(); resolve(); });
+      });
       taskkilled = true;
     } catch {}
   }
   for (const action of [
     () => child.stdin.end(),
-    () => { if (!taskkilled) child.kill(); },
+    () => { if (!taskkilled && !gone) child.kill(); },
     () => child.stdin.destroy(),
     () => child.stdout.destroy(),
     () => child.stderr.destroy(),
@@ -217,6 +236,20 @@ function disposeChild(child) {
       action();
     } catch {}
   }
+  return finished;
+}
+
+// Dispose every app-server still running, waiting briefly (never longer than waitMs) for
+// taskkill so it has actually run before the caller exits the process.
+export async function disposeAllAppServers({ waitMs = 1000, platform = process.platform, spawnKiller = spawn } = {}) {
+  const pending = [...liveChildren].map((child) => disposeChild(child, { platform, spawnKiller }));
+  liveChildren.clear();
+  let timer;
+  await Promise.race([
+    Promise.all(pending),
+    new Promise((resolve) => { timer = setTimeout(resolve, waitMs); }),
+  ]);
+  clearTimeout(timer);
 }
 
 export async function readAccountViaAppServer({
@@ -227,6 +260,7 @@ export async function readAccountViaAppServer({
   spawnImpl = spawn,
   env = process.env,
   platform = process.platform,
+  spawnKiller,
 } = {}) {
   const childEnv = { ...env };
   if (codexHome) childEnv.CODEX_HOME = codexHome;
@@ -239,6 +273,7 @@ export async function readAccountViaAppServer({
     windowsHide: true,
     ...(launch.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
   });
+  liveChildren.add(child);
   const lines = createInterface({ input: child.stdout });
   let settled = false;
   return await new Promise((resolve, reject) => {
@@ -247,7 +282,8 @@ export async function readAccountViaAppServer({
       settled = true;
       clearTimeout(timer);
       lines.close();
-      disposeChild(child);
+      liveChildren.delete(child);
+      disposeChild(child, { platform, ...(spawnKiller ? { spawnKiller } : {}) });
       callback(value);
     };
     const timer = setTimeout(() => finish(reject, new Error("Codex account read timed out")), timeoutMs);
@@ -288,6 +324,7 @@ export async function fetchRateLimitsViaAppServer({
   spawnImpl = spawn,
   env = process.env,
   platform = process.platform,
+  spawnKiller,
 } = {}) {
   const childEnv = { ...env };
   if (codexHome) childEnv.CODEX_HOME = codexHome;
@@ -300,6 +337,7 @@ export async function fetchRateLimitsViaAppServer({
     windowsHide: true,
     ...(launch.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
   });
+  liveChildren.add(child);
   const lines = createInterface({ input: child.stdout });
   let settled = false;
   let accountDone = false;
@@ -313,7 +351,8 @@ export async function fetchRateLimitsViaAppServer({
       settled = true;
       clearTimeout(timer);
       lines.close();
-      disposeChild(child);
+      liveChildren.delete(child);
+      disposeChild(child, { platform, ...(spawnKiller ? { spawnKiller } : {}) });
       callback(value);
     };
     const timer = setTimeout(() => finish(reject, new Error("Codex rate-limit read timed out")), timeoutMs);

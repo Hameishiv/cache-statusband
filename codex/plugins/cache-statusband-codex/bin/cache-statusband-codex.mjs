@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import { stripControls } from "../src/sanitize.mjs";
 import { capFirst, formatAge, formatPercent, formatTokens, formatUsageLines } from "../src/format.mjs";
 import { defaultCodexHome, parseRollout, projectName, scanSessions } from "../src/rollouts.mjs";
-import { captureUsageIdentity, getUsageSnapshot } from "../src/usage.mjs";
+import { captureUsageIdentity, getUsageSnapshot, resolveCodexLaunch } from "../src/usage.mjs";
 import { configuredSeatIdentity, usagePresentation } from "../src/settings.mjs";
 
 const args = process.argv.slice(2);
@@ -35,7 +35,8 @@ Commands:
   footer
       Print the recommended native Codex TUI footer setting.
 
-This program never reads authentication files or calls a usage endpoint.
+This program never reads authentication files itself and makes no direct usage HTTP
+request; usage is read through the Codex app-server.
 `);
 }
 
@@ -43,6 +44,7 @@ async function board(argv) {
   const options = parseOptions(argv);
   const home = resolve(options["codex-home"] ?? defaultCodexHome());
   const limit = integer(options.limit ?? "30", "--limit");
+  warnIfCodexUnlaunchable();
   const summaries = await scanSessions(home, { includeArchived: Boolean(options.all), limit });
   const identity = await captureUsageIdentity(home);
   const usageSnapshot = await getUsageSnapshot({ codexHome: home, identity });
@@ -73,11 +75,23 @@ async function board(argv) {
 async function usage(argv) {
   const options = parseOptions(argv);
   const home = resolve(options["codex-home"] ?? defaultCodexHome());
+  warnIfCodexUnlaunchable();
   const identity = await captureUsageIdentity(home);
   const snapshot = await getUsageSnapshot({ codexHome: home, identity });
   const presented = await usagePresentation(snapshot, { codexHome: home, identity });
   if (options.json) process.stdout.write(`${JSON.stringify(await publicSnapshot(presented.snapshot, home), null, 2)}\n`);
   else process.stdout.write(`${formatUsageLines(presented.snapshot, Date.now(), { includeResetDetails: true, identity: presented.identity }).join("\n")}\n`);
+}
+
+// An unlaunchable Codex (for example a codex.cmd under a path containing %) makes every
+// account read fail, which the readers report only as "identity unavailable". Say why,
+// once, and carry on with whatever is cached.
+function warnIfCodexUnlaunchable() {
+  try {
+    resolveCodexLaunch();
+  } catch (error) {
+    process.stderr.write(`cache-statusband-codex: ${error.message}\n`);
+  }
 }
 
 // With a seat configured the email is deliberately not shown (the seat label is the
