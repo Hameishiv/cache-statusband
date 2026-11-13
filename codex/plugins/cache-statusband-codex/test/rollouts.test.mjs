@@ -263,6 +263,38 @@ test("concurrent session starts publish only one complete starting identity", as
   assert.deepEqual(await getSessionIdentity(root, "shared-session", async () => { throw new Error("must not recapture"); }), first);
 });
 
+test("a record that cannot be linked is tried again, then yields to a concurrent winner, then is left unrecorded", async (t) => {
+  const email = (name) => [name, "example.invalid"].join("@");
+  const identityOf = (name) => ({ key: `account:${email(name)}`, label: email(name), unavailable: false });
+  const refused = (code) => Object.assign(new Error(code), { code });
+
+  // A momentary refusal: the second try publishes the record.
+  const first = await fixtureRoot(t);
+  let tries = 0;
+  const linkOnce = async (from, to) => { tries += 1; if (tries === 1) throw refused("EBUSY"); return (await import("node:fs/promises")).link(from, to); };
+  assert.deepEqual(await getSessionIdentity(first, "s", async () => identityOf("mine"), { linkImpl: linkOnce }), identityOf("mine"));
+  assert.equal(tries, 2);
+  assert.deepEqual(await getSessionIdentity(first, "s", async () => identityOf("later")), identityOf("mine"), "the record was saved");
+
+  // A refusal that persists while another start has published a record: that record wins.
+  const second = await fixtureRoot(t);
+  const sessionsDir = join(second, "cache-statusband-codex", "sessions");
+  const winnerThenRefuse = async () => {
+    const [name] = (await readdir(sessionsDir)).filter((file) => file.endsWith(".tmp"));
+    await writeFile(join(sessionsDir, name.replace(/\.[0-9a-f-]+\.tmp$/, "")), `${JSON.stringify({ version: 1, identity: identityOf("winner") })}\n`);
+    throw refused("EPERM");
+  };
+  assert.deepEqual(await getSessionIdentity(second, "s", async () => identityOf("loser"), { linkImpl: winnerThenRefuse }), identityOf("winner"));
+
+  // A refusal that persists with nothing there: the login is used now, unrecorded.
+  const third = await fixtureRoot(t);
+  let attempts = 0;
+  const alwaysRefuse = async () => { attempts += 1; throw refused("EPERM"); };
+  assert.deepEqual(await getSessionIdentity(third, "s", async () => identityOf("mine"), { linkImpl: alwaysRefuse }), identityOf("mine"));
+  assert.equal(attempts, 3, "tried once and retried twice");
+  assert.deepEqual((await readdir(join(third, "cache-statusband-codex", "sessions"))).filter((file) => file.endsWith(".identity.json") || file.endsWith(".tmp")), []);
+});
+
 test("an unknown starting identity remains unknown rather than adopting a later login", async (t) => {
   const root = await fixtureRoot(t);
   assert.equal(await getSessionIdentity(root, "unknown-session", async () => null), null);

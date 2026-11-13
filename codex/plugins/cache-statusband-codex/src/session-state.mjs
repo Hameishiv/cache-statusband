@@ -9,8 +9,10 @@ const STATE_VERSION = 1;
 const SAVE_LOCK_STALE_MS = 10_000;
 const SAVE_LOCK_RETRIES = 5;
 const SAVE_LOCK_RETRY_MS = 50;
+const LINK_RETRIES = 2;
+const LINK_RETRY_MS = 30;
 
-export async function getSessionIdentity(codexHome, sessionId, capture) {
+export async function getSessionIdentity(codexHome, sessionId, capture, { linkImpl = link } = {}) {
   if (!codexHome || !sessionId) return null;
   const path = sessionStatePath(codexHome, sessionId).replace(/\.json$/, ".identity.json");
   try {
@@ -36,18 +38,31 @@ export async function getSessionIdentity(codexHome, sessionId, capture) {
   try {
     await mkdir(join(codexHome, "cache-statusband-codex", "sessions"), { recursive: true });
     await writeFile(temporary, `${JSON.stringify({ version: STATE_VERSION, identity: safeIdentity })}\n`, { encoding: "utf8", mode: 0o600 });
-    try {
-      // Publishing a complete file with link is atomic and cannot replace a winner.
-      await link(temporary, path);
-      published = true;
-    } catch (error) {
-      if (error.code !== "EEXIST") throw error;
+    // Publishing a complete file with link is atomic and cannot replace a winner. A refusal
+    // that may be momentary (EPERM/EBUSY: another process holding the file) is tried again
+    // briefly.
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        await linkImpl(temporary, path);
+        published = true;
+        break;
+      } catch (error) {
+        if (error.code === "EEXIST") break;
+        if ((error.code !== "EPERM" && error.code !== "EBUSY") || attempt >= LINK_RETRIES) throw error;
+        await new Promise((resolve) => setTimeout(resolve, LINK_RETRY_MS));
+      }
     }
   } catch {
-    // The record could not be written (a read-only or protected folder). The login just read
-    // is still this session's login: use it now, unrecorded, rather than lose the whole usage
-    // display. A later resume of this session finds no record and shows it as unknown.
-    return safeIdentity;
+    // The record could not be saved (a folder that refuses new files, a full disk, a file
+    // system with no hard links...). A concurrent start may have published one meanwhile: if a
+    // valid record is there, it is the answer. Otherwise the login just read is still this
+    // session's login: use it now, unrecorded, rather than lose the whole usage display. A
+    // later resume of this session finds no record and shows it as unknown.
+    try {
+      return parseIdentity(await readFile(path, "utf8"));
+    } catch {
+      return safeIdentity;
+    }
   } finally {
     await unlink(temporary).catch(() => {});
   }
