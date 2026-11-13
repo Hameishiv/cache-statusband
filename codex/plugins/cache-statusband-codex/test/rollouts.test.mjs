@@ -388,10 +388,11 @@ test("the SessionStart hook process prints its answer and exits", async () => {
 // 400ms ends before the 500ms floor a read is given, so the hook (not the reader) has to
 // stop the server; a slow machine may not have started it by then, so that variant checks
 // that the hook still answered inside its deadline with valid JSON and, only if the server
-// did record its pid, that nothing is left running. At 2500ms the reader (told to give up half
-// a second before the deadline) times out first, and the reader's own cleanup stops the
-// server; that variant leaves it well over a second to start a server behind a slow cmd
-// shim, so it must find its pid.
+// did record its pid, that nothing is left running. At 2500ms the first read, the account
+// capture (told to give up half a second before the deadline, counted from the start of the
+// hook process), times out first, and the reader's own cleanup stops the server; that variant
+// leaves it well over a second to start a server behind a slow cmd shim, so it must find its
+// pid. (With under 3.5 s left, the usage read that follows only reads the cache.)
 for (const [deadline, mustStart, title] of [
   ["400", false, "the hook, at its deadline, stops a Codex app-server whose read is still running (400ms)"],
   ["2500", true, "a read that times out before the hook deadline stops its own Codex app-server (2500ms)"],
@@ -435,6 +436,47 @@ for (const [deadline, mustStart, title] of [
     assert.ok(await until(() => !alive(pid), 5_000), "the hook left the Codex app-server running");
   } finally {
     if (alive(pid)) process.kill(pid);
+  }
+});
+
+// The deadline counts from the start of the hook process, not from when main() gets its
+// input. Codex may take a while to write the input, so that wait must come out of the budget:
+// with a 2500ms deadline and the input written after 2000ms, the hook has about 500ms left
+// and must answer inside it. Were the deadline counted from the input, the hung read below
+// would be given its full 2500ms (the account capture alone would wait about 2000ms).
+test("the SessionStart hook process counts its deadline from when it started, not from its input", async (t) => {
+  const root = await fixtureRoot(t);
+  const here = dirname(fileURLToPath(import.meta.url));
+  const hook = join(here, "..", "hooks", "session-start.mjs");
+  const hung = join(here, "..", "fixtures", "hung-app-server.mjs");
+  const pidFile = join(root, "hung.pid");
+  const launcher = join(root, process.platform === "win32" ? "codex.cmd" : "codex");
+  await writeFile(launcher, process.platform === "win32"
+    ? `@echo off
+"${process.execPath}" "${hung}" %*
+`
+    : `#!/bin/sh
+exec "${process.execPath}" "${hung}" "$@"
+`, { mode: 0o755 });
+  const env = { ...process.env, CODEX_HOME: root, CODEX_BIN: launcher, HUNG_PID_FILE: pidFile, CACHE_STATUSBAND_HOOK_DEADLINE_MS: "2500" };
+  const child = execFile(process.execPath, [hook], { env, timeout: 20_000 });
+  let stdout = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  const exited = new Promise((resolve) => child.once("exit", resolve));
+  await new Promise((resolve) => setTimeout(resolve, 2_000));
+  const wrote = Date.now();
+  child.stdin.end(JSON.stringify({ source: "startup", session_id: "late-input-session" }));
+  const code = await exited;
+  const afterInput = Date.now() - wrote;
+  try {
+    assert.equal(code, 0);
+    assert.doesNotThrow(() => JSON.parse(stdout), `the hook printed invalid JSON: ${stdout}`);
+    // About 500ms of the budget was left, plus cleanup; counting from the input it would be
+    // 2500ms or more.
+    assert.ok(afterInput < 1_500, `the hook took ${afterInput}ms after its input arrived, against a 2500ms deadline that began 2000ms earlier`);
+  } finally {
+    const pid = Number(await readFile(pidFile, "utf8").catch(() => ""));
+    if (Number.isFinite(pid) && pid > 0) { try { process.kill(pid); } catch {} }
   }
 });
 
