@@ -12,7 +12,7 @@
 
 import { closeSync, fstatSync, fsyncSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, normalize } from "node:path";
+import { basename, dirname, isAbsolute, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /** Each family is [dark, light], the same pairs the Claude Code band already checked. */
@@ -338,6 +338,8 @@ export function billingLogPath() {
  * the raw line. A relative CSB_USAGE_CACHE, XDG_CACHE_HOME or LOCALAPPDATA is
  * ignored.
  */
+const CACHE_FILE = "usage.json";
+
 export function usageCachePath() {
   const set = absoluteSetting("CSB_USAGE_CACHE");
   if (set) return set;
@@ -346,7 +348,7 @@ export function usageCachePath() {
   if (process.platform === "win32") base = absoluteSetting("LOCALAPPDATA") || (user && join(user, "AppData", "Local"));
   else base = absoluteSetting("XDG_CACHE_HOME") || (user && join(user, ".cache"));
   if (!base) return null;
-  return join(base, "cache-statusband-grok", "usage.json");
+  return join(base, "cache-statusband-grok", CACHE_FILE);
 }
 
 /**
@@ -467,7 +469,9 @@ function storedRecord(entry) {
  * be read (locked, no permission, not a regular file), is in a newer format
  * (v above 2), or is not this cache at all (text that is not JSON, or JSON of
  * another shape, say from a mistyped CSB_USAGE_CACHE): it is then neither used
- * nor rewritten. A missing file or the old single-entry format counts as empty.
+ * nor rewritten. A missing file counts as empty, and so does a file named
+ * usage.json that is empty or NUL-filled (what a crash can leave) or in the old
+ * single-entry format; under any other name such a file is left as it is.
  */
 export function readSources(cachePath) {
   if (!cachePath) return {};
@@ -479,6 +483,8 @@ export function readSources(cachePath) {
   } catch (err) {
     return err && err.code === "ENOENT" ? {} : null;
   }
+  // only a file carrying this cache's own name may be taken for a damaged or old copy of it
+  const ownName = basename(cachePath) === CACHE_FILE;
   try {
     const body = JSON.parse(text);
     // a newer format written by a newer copy: leave it as it is
@@ -488,11 +494,11 @@ export function readSources(cachePath) {
       return sources && typeof sources === "object" && !Array.isArray(sources) ? sources : {};
     }
     // the old single-entry format of this cache is replaced; any other file is not ours to rewrite
-    if (body && typeof body === "object" && "source" in body && "record" in body) return {};
+    if (ownName && body && typeof body === "object" && "source" in body && "record" in body) return {};
     return null;
   } catch {
-    // empty or NUL-filled: what a crash right after a write can leave; this cache, so replace it
-    if (/^[\s\0]*$/.test(text)) return {};
+    // empty or NUL-filled: what a crash right after a write can leave to this cache, so replace it
+    if (ownName && /^[\s\0]*$/.test(text)) return {};
     // not JSON at all: not a file this script wrote
     return null;
   }
@@ -531,7 +537,8 @@ function writeSources(cachePath, sources) {
  * credits line cannot be used drops it. A log that cannot be read keeps the
  * last good record and is tried again on the next run. A cache file that
  * exists but cannot be read, is in a newer format, or is not this cache (not
- * JSON, or JSON of another shape) is left as it is, and its entries are not used.
+ * JSON, or JSON of another shape) is left as it is, and its entries are not used;
+ * only a file named usage.json that is empty, NUL-filled or in the old format is replaced.
  * The cache holds one entry per log: the log's size and time, when it was read,
  * and the percent, period type, period end, and fetch time.
  */

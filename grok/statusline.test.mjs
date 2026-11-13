@@ -389,10 +389,17 @@ describe("weekly usage", () => {
     writeFileSync(join(dir, "other.json"), '{"name":"something else"}');
     assert.equal(readSources(join(dir, "other.json")), null);
     // what a crash right after a write can leave is this cache, and is replaced
-    writeFileSync(join(dir, "empty.json"), "");
-    assert.deepEqual(readSources(join(dir, "empty.json")), {});
-    writeFileSync(join(dir, "nul.json"), Buffer.alloc(16));
-    assert.deepEqual(readSources(join(dir, "nul.json")), {});
+    mkdirSync(join(dir, "a"));
+    writeFileSync(join(dir, "a", "usage.json"), "");
+    assert.deepEqual(readSources(join(dir, "a", "usage.json")), {});
+    mkdirSync(join(dir, "b"));
+    writeFileSync(join(dir, "b", "usage.json"), Buffer.alloc(16));
+    assert.deepEqual(readSources(join(dir, "b", "usage.json")), {});
+    // under another name, say a mistyped CSB_USAGE_CACHE, an empty or old-shaped file is left alone
+    writeFileSync(join(dir, "marker"), "");
+    assert.equal(readSources(join(dir, "marker")), null);
+    writeFileSync(join(dir, "other-old.json"), '{"source":"x","record":1,"other":"keep me"}');
+    assert.equal(readSources(join(dir, "other-old.json")), null);
     mkdirSync(join(dir, "folder.json"));
     assert.equal(readSources(join(dir, "folder.json")), null);
   });
