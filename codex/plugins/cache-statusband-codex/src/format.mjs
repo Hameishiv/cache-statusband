@@ -38,8 +38,17 @@ export function formatUsageLines(snapshot, now = Date.now(), {
     if (includeResetDetails && snapshot.availableCount > 0) {
       const credits = Array.isArray(snapshot.credits) ? [...snapshot.credits] : [];
       credits.sort((a, b) => (epochMilliseconds(a.expiresAt) ?? Number.POSITIVE_INFINITY) - (epochMilliseconds(b.expiresAt) ?? Number.POSITIVE_INFINITY));
+      // Rows this plugin dropped for their status (redeeming, redeemed, unknown) are counted
+      // apart. Codex's own count may or may not include such rows, so when any were dropped
+      // the gap below is not blamed on Codex and is not reduced by them.
+      const otherStatus = Number.isFinite(snapshot.creditsNotAvailable) ? Math.max(0, snapshot.creditsNotAvailable) : 0;
       if (!credits.length) {
-        lines.push("  Expiration details were not supplied by Codex.");
+        if (otherStatus === 0) {
+          lines.push("  Expiration details were not supplied by Codex.");
+        } else {
+          lines.push(`  ${otherStatus} reset row${otherStatus === 1 ? "" : "s"} with another status not shown.`);
+          lines.push("  Expiration details were not listed.");
+        }
       } else {
         credits.forEach((credit, index) => {
           const title = credit.title || `Reset ${index + 1}`;
@@ -56,19 +65,17 @@ export function formatUsageLines(snapshot, now = Date.now(), {
             : `${formatDuration(now - expiresAt)} ago`;
           lines.push(`  ${title} — expires ${absolute} (${relative})`);
         });
-        // Rows this plugin cut off are "not shown"; only the remainder (less the rows dropped for
-        // their status) is "not supplied".
-        // The count says how many rows should exist beyond those listed: rows cut beyond that
-        // are ones Codex sent over its own count, which is a different statement again.
+        // Rows this plugin cut off are "not shown". The count says how many rows should exist
+        // beyond those listed: rows cut beyond that are ones Codex sent over its own count,
+        // which is a different statement again.
         const omitted = Number.isFinite(snapshot.creditsOmitted) ? Math.max(0, snapshot.creditsOmitted) : 0;
         const expected = Math.max(0, snapshot.availableCount - credits.length);
         const notShown = Math.min(omitted, expected);
         const beyondCount = omitted - notShown;
-        // Rows this plugin dropped for their status (redeeming, redeemed, unknown) may account
-        // for part of what Codex's count says should be there; those are worded separately and
-        // taken out of the "not supplied" remainder.
-        const otherStatus = Math.min(Number.isFinite(snapshot.creditsNotAvailable) ? Math.max(0, snapshot.creditsNotAvailable) : 0, expected - notShown);
-        const missing = expected - notShown - otherStatus;
+        // What remains is "not supplied by Codex" only when no row was dropped for its status;
+        // otherwise it is worded neutrally, because whether Codex's count includes the dropped
+        // rows is not known.
+        const missing = expected - notShown;
         if (notShown > 0) {
           lines.push(`  ${notShown} more reset expiration${notShown === 1 ? "" : "s"} not shown.`);
         }
@@ -76,7 +83,9 @@ export function formatUsageLines(snapshot, now = Date.now(), {
           lines.push(`  ${otherStatus} reset row${otherStatus === 1 ? "" : "s"} with another status not shown.`);
         }
         if (missing > 0) {
-          lines.push(`  ${missing} additional reset expiration${missing === 1 ? " was" : "s were"} not supplied by Codex.`);
+          lines.push(otherStatus > 0
+            ? `  ${missing} more reset expiration${missing === 1 ? "" : "s"} not listed.`
+            : `  ${missing} additional reset expiration${missing === 1 ? " was" : "s were"} not supplied by Codex.`);
         }
         if (beyondCount > 0) {
           lines.push(`  ${beyondCount} more row${beyondCount === 1 ? "" : "s"} beyond Codex's count of ${snapshot.availableCount} not shown.`);

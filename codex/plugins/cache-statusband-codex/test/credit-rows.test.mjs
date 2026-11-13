@@ -82,8 +82,9 @@ test("reset rows whose status is not 'available' are dropped and counted apart f
   assert.equal(safe.creditsOmitted, 0);
   const text = details({ ...safe, source: "live", fetchedAt: NOW });
   assert.doesNotMatch(text, /Spent|Lapsed|Unsure|Odd/);
-  // Dropped for status is not "cut by the cap" and not "not supplied by Codex".
-  assert.doesNotMatch(text, /not shown|not supplied by Codex/);
+  // Dropped for status is its own line: not "cut by the cap" and not "not supplied by Codex".
+  assert.match(text, /4 reset rows with another status not shown\./);
+  assert.doesNotMatch(text, /more reset expirations? not shown|not supplied by Codex|not listed/);
 
   // With many unusable rows and few usable ones, nothing is reported as cut by the cap.
   const many = [...rows(5), ...Array.from({ length: 30 }, () => ({ title: "Spent", status: "redeemed" }))];
@@ -91,22 +92,53 @@ test("reset rows whose status is not 'available' are dropped and counted apart f
   assert.equal(capped.credits.length, 5);
   assert.equal(capped.creditsOmitted, 0);
   assert.equal(capped.creditsNotAvailable, 30);
-  assert.doesNotMatch(details({ ...capped, source: "live", fetchedAt: NOW }), /not shown/);
+  const cappedText = details({ ...capped, source: "live", fetchedAt: NOW });
+  assert.match(cappedText, /30 reset rows with another status not shown\./);
+  assert.doesNotMatch(cappedText, /more reset expirations? not shown|not supplied by Codex/);
 });
 
-test("rows dropped for their status come out of the 'not supplied' remainder and are worded separately", () => {
+test("rows dropped for their status are named, and the remaining gap is not blamed on Codex or reduced by them", () => {
   const dropped = (count) => Array.from({ length: count }, () => ({ title: "Spent", expiresAt: 1_793_302_999, status: "redeemed" }));
-  // Codex counts 5; 3 usable rows are listed and 2 rows had another status: nothing is missing.
+  // Codex counts 5; 3 usable rows are listed and 2 rows had another status. Whether Codex's
+  // count includes the dropped rows is not known, so the gap of 2 is "not listed", never
+  // "not supplied by Codex", and the dropped rows are not subtracted from it.
   const explained = sanitizeRateLimits({ rateLimitResetCredits: { availableCount: 5, credits: [...rows(3), ...dropped(2)] } });
   assert.equal(explained.creditsNotAvailable, 2);
   const text = details({ ...explained, source: "live", fetchedAt: NOW });
   assert.match(text, /2 reset rows with another status not shown\./);
+  assert.match(text, /2 more reset expirations not listed\./);
   assert.doesNotMatch(text, /not supplied by Codex/);
-  // Count 6 with the same rows: one is still not supplied, named apart from the two.
+  // Count 6 with the same rows: the gap is 3, still not subtracted from.
   const partly = details({ ...sanitizeRateLimits({ rateLimitResetCredits: { availableCount: 6, credits: [...rows(3), ...dropped(2)] } }), source: "live", fetchedAt: NOW });
   assert.match(partly, /2 reset rows with another status not shown\./);
-  assert.match(partly, /1 additional reset expiration was not supplied by Codex\./);
-  // One such row reads in the singular.
+  assert.match(partly, /3 more reset expirations not listed\./);
+  assert.doesNotMatch(partly, /not supplied by Codex/);
+  // One such row reads in the singular, and one missing expiration likewise.
   const single = details({ ...sanitizeRateLimits({ rateLimitResetCredits: { availableCount: 4, credits: [...rows(3), ...dropped(1)] } }), source: "live", fetchedAt: NOW });
   assert.match(single, /1 reset row with another status not shown\./);
+  assert.match(single, /1 more reset expiration not listed\./);
+});
+
+test("a dropped-status count larger than the gap, or with nothing left to list, is still reported", () => {
+  const dropped = (count) => Array.from({ length: count }, () => ({ title: "Spent", expiresAt: 1_793_302_999, status: "redeemed" }));
+  // More dropped rows than the count leaves room for: they are all named, and no gap line is invented.
+  const more = details({ ...sanitizeRateLimits({ rateLimitResetCredits: { availableCount: 4, credits: [...rows(3), ...dropped(6)] } }), source: "live", fetchedAt: NOW });
+  assert.match(more, /6 reset rows with another status not shown\./);
+  assert.match(more, /1 more reset expiration not listed\./);
+  // Every row filtered out: the dropped rows are still named, and Codex is not blamed.
+  const none = sanitizeRateLimits({ rateLimitResetCredits: { availableCount: 2, credits: dropped(2) } });
+  assert.equal(none.credits.length, 0);
+  assert.equal(none.creditsNotAvailable, 2);
+  const noneText = details({ ...none, source: "live", fetchedAt: NOW });
+  assert.match(noneText, /2 reset rows with another status not shown\./);
+  assert.doesNotMatch(noneText, /not supplied by Codex/);
+  // No rows at all and none dropped: Codex gave no detail.
+  const silent = details({ ...sanitizeRateLimits({ rateLimitResetCredits: { availableCount: 2, credits: [] } }), source: "live", fetchedAt: NOW });
+  assert.match(silent, /Expiration details were not supplied by Codex\./);
+  // Cut by the cap together with dropped rows: each is named for what it is.
+  const mixed = details({ ...sanitizeRateLimits({ rateLimitResetCredits: { availableCount: 30, credits: [...rows(25), ...dropped(2)] } }), source: "live", fetchedAt: NOW });
+  assert.match(mixed, /5 more reset expirations not shown\./);
+  assert.match(mixed, /2 reset rows with another status not shown\./);
+  assert.match(mixed, /5 more reset expirations not listed\./);
+  assert.doesNotMatch(mixed, /not supplied by Codex/);
 });
