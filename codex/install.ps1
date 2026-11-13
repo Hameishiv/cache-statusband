@@ -141,6 +141,16 @@ function Test-SameText([AllowNull()][string]$A, [AllowNull()][string]$B) {
   return $A -ceq $B
 }
 
+# True once Codex has registered the plugin: a config.toml refusal found from then on must not
+# say that nothing was installed or registered.
+$script:ConfigRefusalAfterRegistration = $false
+$afterRegistrationNotice = "Codex had already registered the plugin when this was found, so the install stopped part-way; see the warning above for what was done with config.toml."
+
+function New-ConfigRefusal([string]$Problem, [string]$Advice) {
+  if ($script:ConfigRefusalAfterRegistration) { return "$afterRegistrationNotice $Problem $Advice" }
+  return "$Problem Nothing was installed or registered, and config.toml was not changed. $Advice"
+}
+
 function Set-TomlKey {
   param(
     [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
@@ -150,7 +160,7 @@ function Set-TomlKey {
   )
 
   if ($Text.Contains("'''") -or $Text.Contains('"""')) {
-    throw "Cannot safely edit config.toml because it contains a TOML multi-line string (written with three quote marks in a row). Nothing was installed or registered, and config.toml was not changed. Remove the multi-line string or rewrite it as a single-line string, then run the installer again."
+    throw (New-ConfigRefusal "Cannot safely edit config.toml because it contains a TOML multi-line string (written with three quote marks in a row)." "Remove the multi-line string or rewrite it as a single-line string, then run the installer again.")
   }
 
   $lines = [Collections.Generic.List[string]]::new()
@@ -293,7 +303,7 @@ function Find-TomlValueEnd {
       }
     }
     if ($quote -ne [char]0) {
-      throw "Cannot safely replace [$Section].$Key because it contains a multi-line string, which the installer cannot edit. Nothing was installed or registered, and config.toml was not changed. Rewrite that value on one line (or remove it), then run the installer again."
+      throw (New-ConfigRefusal "Cannot safely replace [$Section].$Key because it contains a multi-line string, which the installer cannot edit." "Rewrite that value on one line (or remove it), then run the installer again.")
     }
   }
   throw "Unterminated array in [$Section].$Key"
@@ -510,6 +520,7 @@ try {
   $expectedConfigText = Read-TextOrNull $configPath
   $lastSeenConfigText = $expectedConfigText
   $registrationDone = $true
+  $script:ConfigRefusalAfterRegistration = $true
 
   # Registration writes marketplace/plugin settings. Merge into its result rather than
   # overwriting those writes with the pre-registration configuration. Validating takes a
@@ -526,11 +537,13 @@ try {
     try {
       $configText = Set-StatusbandPreferences -Text $(if ($null -ne $registeredConfigText) { $registeredConfigText } else { "" })
     } catch {
-      # Codex has already registered the plugin here, so the refusal's "Nothing was installed or
-      # registered, and config.toml was not changed" would be untrue. Drop that sentence; the
-      # warning from the catch below says what became of config.toml.
-      $refusal = ($_.Exception.Message -replace '\s*Nothing was installed or registered, and config\.toml was not changed\.', '').Trim()
-      throw "$refusal This was found after Codex had already registered the plugin, so the install stopped part-way; the warning that follows says what was done with config.toml."
+      # Codex has already registered the plugin here. The refusals that carry advice already
+      # say so first (New-ConfigRefusal); any other refusal gets the same sentence put before
+      # it. The warning from the catch below, printed above the error, says what became of
+      # config.toml.
+      $refusal = $_.Exception.Message
+      if ($refusal.StartsWith($afterRegistrationNotice)) { throw $refusal }
+      throw "$afterRegistrationNotice $refusal"
     }
     Assert-CodexConfig -Text $configText -CodexCommand $codexCommand -Original $registeredConfigText
     # A symbolic link is replaced at its target, with the candidate beside it (same folder,
@@ -654,8 +667,12 @@ if (-not $SkipCliLink) {
       $linkExit = $LASTEXITCODE
     } catch {
       # Any way of failing to run it (npm missing, refused to start, a terminating error)
-      # is the link step failing.
-      throw (& $linkFailure "npm link could not be run ($($_.Exception.Message))")
+      # is the link step failing. Only a missing npm is "could not be run"; any other error
+      # may have come from npm itself, so it is reported as a failure with its message.
+      if ($_.Exception -is [System.Management.Automation.CommandNotFoundException]) {
+        throw (& $linkFailure "npm link could not be run ($($_.Exception.Message))")
+      }
+      throw (& $linkFailure "npm link failed ($($_.Exception.Message))")
     } finally {
       Pop-Location
     }
