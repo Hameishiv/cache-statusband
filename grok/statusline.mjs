@@ -111,9 +111,10 @@ export function cacheLabel(usage) {
   const read = finite(usage.cache_read_input_tokens);
   const write = finite(usage.cache_creation_input_tokens);
   const parts = [];
-  if (read !== null) parts.push(`cache read ${formatTokens(read)}`);
+  if (read !== null) parts.push(`read ${formatTokens(read)}`);
   if (write !== null) parts.push(`write ${formatTokens(write)}`);
-  return parts.length ? parts.join(" · ") : null;
+  // the word "cache" leads the segment, whichever counts are present
+  return parts.length ? `cache ${parts.join(" · ")}` : null;
 }
 
 export function costLabel(usd) {
@@ -142,9 +143,12 @@ export function percentText(value) {
 export function remaining(ms) {
   const v = finite(ms);
   if (v === null || v <= 0) return null;
-  const hours = Math.floor(v / 3600000);
-  if (hours >= 24) return `${Math.floor(hours / 24)}d${hours % 24}h`;
+  // round to the minute first, so just under a day reads "1d0h", not "24h00m"
   const mins = Math.round(v / 60000);
+  if (mins >= 1440) {
+    const hours = Math.floor(mins / 60);
+    return `${Math.floor(hours / 24)}d${hours % 24}h`;
+  }
   if (mins <= 60) return `${mins}m`;
   return `${Math.floor(mins / 60)}h${String(mins % 60).padStart(2, "0")}m`;
 }
@@ -222,10 +226,23 @@ function paint(label, kind, index, nextKind) {
   return out;
 }
 
-/** One status line, or "" when there is nothing we can show. */
+/** Visible columns of the painted band: a space either side of each label, and one arrow between. */
+export function bandWidth(parts) {
+  return parts.reduce((sum, part, i) => sum + [...part.label].length + 2 + (i < parts.length - 1 ? 1 : 0), 0);
+}
+
+/**
+ * One status line, or "" when there is nothing we can show. With
+ * extras.columns set (Grok's COLUMNS), trailing segments are dropped whole
+ * until the band fits, so a cut never leaves part of a number behind.
+ */
 export function render(payload, extras) {
   const parts = segments(payload, extras);
   if (parts.length === 0) return "";
+  const columns = finite(extras && extras.columns);
+  if (columns !== null && columns > 0) {
+    while (parts.length > 1 && bandWidth(parts) > columns) parts.pop();
+  }
   return parts.map((part, i) => paint(part.label, part.kind, i, parts[i + 1]?.kind)).join("");
 }
 
@@ -235,7 +252,10 @@ export function render(payload, extras) {
  */
 function absoluteSetting(name) {
   const value = process.env[name];
-  return value && isAbsolute(value) ? normalize(value) : null;
+  if (!value || !isAbsolute(value)) return null;
+  // on Windows "\x" is relative to the current drive: require a drive letter or a UNC path
+  if (process.platform === "win32" && !/^([a-zA-Z]:[\\/]|[\\/]{2})/.test(value)) return null;
+  return normalize(value);
 }
 
 /**
@@ -256,7 +276,8 @@ export function billingLogPath() {
 
 /**
  * Cache of the last weekly reading, one entry per log. Never holds a token or
- * the raw line. A relative CSB_USAGE_CACHE or XDG_CACHE_HOME is ignored.
+ * the raw line. A relative CSB_USAGE_CACHE, XDG_CACHE_HOME or LOCALAPPDATA is
+ * ignored.
  */
 export function usageCachePath() {
   const set = absoluteSetting("CSB_USAGE_CACHE");
@@ -472,9 +493,11 @@ export function loadWeekly(logPath, cachePath, nowMs = Date.now(), readCache = r
 function isDirectRun() {
   const entry = process.argv[1];
   if (!entry) return false;
-  // a junction or symlink makes the typed path differ from the real one
+  // a junction or symlink makes the typed path differ from the real one; on
+  // Windows, where paths ignore case, a file URL also lowercases a UNC host
+  const same = process.platform === "win32" ? (p) => p.toLowerCase() : (p) => p;
   try {
-    return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(entry);
+    return same(realpathSync(fileURLToPath(import.meta.url))) === same(realpathSync(entry));
   } catch {
     return false;
   }
@@ -502,6 +525,6 @@ if (isDirectRun()) {
   } catch {
     // the other segments do not depend on the log
   }
-  const line = render(payload, { weekly });
+  const line = render(payload, { weekly, columns: Number(process.env.COLUMNS) || null });
   if (line) process.stdout.write(`${line}\n`);
 }

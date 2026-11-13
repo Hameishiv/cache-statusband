@@ -93,6 +93,8 @@ describe("segments", () => {
   it("keeps a real zero", () => {
     assert.equal(contextLabel({ used_percentage: 0, context_tokens: 0 }), "ctx 0% · 0");
     assert.equal(cacheLabel({ cache_read_input_tokens: 0 }), "cache read 0");
+    // a write count alone still says it is a cache figure
+    assert.equal(cacheLabel({ cache_creation_input_tokens: 1500 }), "cache write 1.5k");
     assert.equal(costLabel(0), "session $0");
   });
 
@@ -421,7 +423,7 @@ describe("billingLogPath", () => {
     }
   };
 
-  it("ignores a relative setting, which would point inside the open repository", () => {
+  it("shows nothing for a relative log setting, which would point inside the open repository", () => {
     try {
       delete process.env.CSB_BILLING_LOG;
       delete process.env.GROK_HOME;
@@ -430,9 +432,17 @@ describe("billingLogPath", () => {
       // a log that was asked for by a relative path shows nothing, never the default log's reading
       process.env.CSB_BILLING_LOG = join("rel", "unified.jsonl");
       assert.equal(billingLogPath(), null);
-      process.env.CSB_BILLING_LOG = join(tmpdir(), "a", "..", "b.jsonl");
+      // a plain string, not join(), which would already collapse the ".."
+      process.env.CSB_BILLING_LOG = `${tmpdir()}/a/../b.jsonl`;
       assert.equal(billingLogPath(), join(tmpdir(), "b.jsonl"));
       delete process.env.CSB_BILLING_LOG;
+      if (process.platform === "win32") {
+        // "\x" hangs off whichever drive is current; a UNC path is a full path
+        process.env.GROK_HOME = String.raw`\grokhome`;
+        assert.equal(billingLogPath(), null);
+        process.env.GROK_HOME = String.raw`\\srv\share\home`;
+        assert.equal(billingLogPath(), String.raw`\\srv\share\home\logs\unified.jsonl`);
+      }
       process.env.GROK_HOME = "relhome";
       assert.equal(billingLogPath(), null);
       const abs = join(tmpdir(), "grok-home");
@@ -468,6 +478,28 @@ describe("billingLogPath", () => {
       if (keepCache === undefined) delete process.env.CSB_USAGE_CACHE;
       else process.env.CSB_USAGE_CACHE = keepCache;
     }
+  });
+});
+
+describe("render width", () => {
+  const payload = {
+    model: { display_name: "Grok 4.7" },
+    effort: { level: "high" },
+    context_window: { used_percentage: 29, context_window_size: 1e6, total_input_tokens: 287000 },
+    cost: { total_cost_usd: 12.5 },
+  };
+  const plain = (line) => line.replace(/\x1b\[[0-9;]*m/g, "");
+
+  it("drops trailing segments whole until the band fits the row", () => {
+    const full = plain(render(payload));
+    assert.match(full, /Session \$13/);
+    for (const columns of [10, 20, 25, 35, 40, [...full].length - 1]) {
+      const line = plain(render(payload, { columns }));
+      assert.ok([...line].length <= columns || line === " Grok 4.7 ", `${columns}: ${line}`);
+      // never part of a number: the cost is either whole or gone
+      if (line.includes("Session")) assert.match(line, /Session \$13 $/);
+    }
+    assert.equal(plain(render(payload, { columns: [...full].length })), full);
   });
 });
 
@@ -550,6 +582,8 @@ describe("display", () => {
     assert.equal(remaining(Date.parse("2026-10-30T07:05:00Z") - at), "23h05m");
     assert.equal(remaining(Date.parse("2026-10-29T08:40:00Z") - at), "40m");
     assert.equal(remaining(177 * 3600000 + 48 * 60000), "7d9h");
+    // just under a day rounds to a whole day, never "24h00m"
+    assert.equal(remaining(24 * 3600000 - 20000), "1d0h");
     assert.equal(remaining(-1), null);
   });
 

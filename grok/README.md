@@ -6,7 +6,7 @@ A status line for [Grok Build](https://x.ai). It paints the session figures Grok
  Grok 4.7 ▶ High ▶ Ctx 29% · 287k/1M ▶ Cache read 80k · write 1.5k ▶ Week 40% · 3d2h ▶ Session $0.04
 ```
 
-Each segment is a colour block. The arrow is `▶` (U+25B6), which does not need a special font. A figure that is neither in the status-line payload nor in a current weekly credits reading is left off the line. A zero Grok did send is shown as zero. The `40%` above is a sample.
+Each segment is a colour block. The arrow is `▶` (U+25B6), which does not need a special font. A figure that is neither in the status-line payload nor in a current weekly credits reading is left off the line. A zero Grok did send is shown as zero. The `40%` above is a sample. When the row is narrower than the band (Grok passes its width as `COLUMNS`), segments are dropped whole from the right until it fits, so a figure is never cut part-way.
 
 ## What was ported
 
@@ -15,14 +15,14 @@ Grok Build 1.0.70 can run a script as the bottom row (`[ui.status_line]` `type =
 | Claude mod feature | In this port |
 | --- | --- |
 | Model, effort, context size, session cost | Shown when Grok puts them on the status-line payload. |
-| Cache token counts (`cache read`, `write`) | Shown when `session_usage` includes them. These are cumulative counts, not a warm/cold flag. |
+| Cache token counts (`cache read`, `write`; `cache write` when only that count is sent) | Shown when `session_usage` includes them. These are cumulative counts, not a warm/cold flag. |
 | Warm/cold cache, keep-warm pings, cold-send guard | Not ported. xAI prompt caching is automatic. Cache entries can be evicted at any time. There is no 5-minute or 1-hour lifetime you pay to rewrite, so there is nothing to keep warm and nothing to compact before a cold send. |
 | Weekly usage and reset countdown | Shown when Grok's log has a current weekly credits reading: `creditUsagePercent` and a period whose type is weekly and whose end is still in the future. `/usage` shows this percentage. The status-line payload does not include it, so the script reads the newest `billing: fetched credits config` line Grok wrote and keeps only the percent, period type, period end, and fetch time. The figure is only as new as the last such line: grok 1.0.77 was seen logging it while a session starts, and not again during that session. Once the reading is an hour old the band shows its age, for example `Week 24% (read 16h00m ago) · 3d10h`. A reading whose time cannot be read, or is more than five minutes in the future, is marked `(read time unknown)`. |
 | 5-hour usage | Not ported. The credits reading this script understands is the weekly period `/usage` shows. There is no 5-hour window in that reading. |
 | Context measured from a reopened transcript | Not ported. The line uses `context_window.context_tokens` when Grok sends it. It does not parse the transcript. |
 | `/board` of every local session | Not ported. Grok already lists sessions with `grok sessions list` and `/dashboard`. |
 
-The script never reads, prints, or stores an auth token. It does not call a usage endpoint. Each readable log is re-read at most once every five minutes, even when it has no credits line (if the cache file cannot be read or written, every run re-reads it), and the result is kept per log in `cache-statusband-grok/usage.json` (under `%LOCALAPPDATA%` on Windows, under `$XDG_CACHE_HOME` or `~/.cache` elsewhere; a relative `XDG_CACHE_HOME`, `LOCALAPPDATA`, `CSB_USAGE_CACHE` or `GROK_HOME` is ignored, since the script runs in the repository Grok has open, and a relative `CSB_BILLING_LOG` shows no weekly segment). A cache file that exists but cannot be read is left as it is, and every run then re-reads the log. If the newest complete credits line lacks the percent or the period, no weekly segment is shown. A log that cannot be read is not throttled: it keeps the last reading and is tried again on the next run. A reset that has already passed drops the weekly segment until Grok logs a new one.
+The script never reads, prints, or stores an auth token. It does not call a usage endpoint. Each readable log is re-read at most once every five minutes, even when it has no credits line (if the cache file cannot be read or written, every run re-reads it), and the result is kept per log in `cache-statusband-grok/usage.json` (under `%LOCALAPPDATA%` on Windows, under `$XDG_CACHE_HOME` or `~/.cache` elsewhere; a relative `XDG_CACHE_HOME`, `LOCALAPPDATA` or `CSB_USAGE_CACHE` is ignored, since the script runs in the repository Grok has open, and a relative `CSB_BILLING_LOG` or `GROK_HOME` shows no weekly segment; on Windows a path that starts with a single `\` counts as relative). A cache file that exists but cannot be read is left as it is, and every run then re-reads the log. If the newest complete credits line lacks the percent or the period, no weekly segment is shown. A log that cannot be read is not throttled: it keeps the last reading and is tried again on the next run. A reset that has already passed drops the weekly segment until Grok logs a new one.
 
 ## Credits
 
