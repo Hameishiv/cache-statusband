@@ -1,0 +1,49 @@
+import { appendFileSync } from "node:fs";
+import { createInterface } from "node:readline";
+
+if (process.env.EXPECT_CODEX_HOME && process.env.CODEX_HOME !== process.env.EXPECT_CODEX_HOME) {
+  process.stderr.write("CODEX_HOME was not forwarded\n");
+  process.exit(7);
+}
+
+// FAKE_SERVER_STARTS gets one line per server process started.
+if (process.env.FAKE_SERVER_STARTS) appendFileSync(process.env.FAKE_SERVER_STARTS, "start\n");
+const lines = createInterface({ input: process.stdin });
+// FAKE_SERVER_EMAIL picks the signed-in login; FAKE_SERVER_LOG collects one line per request.
+const testEmail = process.env.FAKE_SERVER_EMAIL || ["test", "example.invalid"].join("@");
+lines.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (process.env.FAKE_SERVER_LOG && message.method) appendFileSync(process.env.FAKE_SERVER_LOG, `${message.method}\n`);
+  if (message.id === 1) process.stdout.write(`${JSON.stringify({ id: 1, result: { userAgent: "test" } })}\n`);
+  if (message.id === 1 && process.env.FAKE_SERVER_NOISE) {
+    // Server-initiated messages may reuse small ids; they are not responses.
+    process.stdout.write(`${JSON.stringify({ method: "server/request", id: 2, params: {} })}\n`);
+    process.stdout.write(`${JSON.stringify({ method: "server/request", id: 3, params: {} })}\n`);
+  }
+  // Ids 2 and 4 are both account/read: a client may read the login twice on one connection.
+  if (message.id === 2 || message.id === 4) {
+    // FAKE_SERVER_SIGNED_OUT answers with no account, as Codex does when no one is signed in.
+    // FAKE_SERVER_ACCOUNT_TYPE answers with a login of that type and no email, as an API-key
+    // or cloud-provider login does.
+    const account = process.env.FAKE_SERVER_SIGNED_OUT ? null
+      : process.env.FAKE_SERVER_ACCOUNT_TYPE ? { type: process.env.FAKE_SERVER_ACCOUNT_TYPE }
+        : { type: "chatgpt", email: testEmail, planType: "pro" };
+    process.stdout.write(`${JSON.stringify({ id: message.id, result: { account } })}\n`);
+  }
+  if (message.id === 3) {
+    process.stdout.write(`${JSON.stringify({
+      id: 3,
+      result: {
+        rateLimits: {
+          primary: { usedPercent: 70, windowDurationMins: 300, resetsAt: 1_793_285_913 },
+          secondary: { usedPercent: 14, windowDurationMins: 10_080, resetsAt: 1_793_796_876 },
+        },
+        rateLimitResetCredits: {
+          availableCount: 2,
+          credits: [{ id: "opaque-reset-id", title: "Full reset", expiresAt: 1_793_302_971 }],
+        },
+        accountId: "opaque-account-id",
+      },
+    })}\n`);
+  }
+});
