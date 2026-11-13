@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { execFile } from "node:child_process";
@@ -341,8 +342,28 @@ test("the SessionStart deadline counts from the hook's start, not from after the
       usageGetter: () => new Promise(() => {}),
     },
   );
-  // 1000ms reading plus the 500ms that remain; restarting the clock would take ~2500ms.
+  // The hook ends at its 1500ms deadline; a clock restarted after the 1000ms read would take ~2500ms.
   assert.ok(Date.now() - started < 2_000, `took ${Date.now() - started}ms`);
+});
+
+test("a transcript read that never finishes cannot push the hook past its deadline, and the usage still shows", async (t) => {
+  const root = await fixtureRoot(t);
+  const email = ["person", "example.invalid"].join("@");
+  const identity = { key: `account:${email}`, label: "Seat slow", unavailable: false };
+  const started = Date.now();
+  const output = await handleSessionStart(
+    { source: "startup", session_id: "slow-transcript", transcript_path: join(root, "rollout.jsonl") },
+    {
+      codexHome: root,
+      deadlineMs: 400,
+      rolloutParser: () => new Promise(() => {}),
+      identityGetter: async () => identity,
+      usageGetter: async () => ({ identityKey: identity.key, accountEmail: email, availableCount: 3 }),
+    },
+  );
+  assert.ok(Date.now() - started < 2_000, `took ${Date.now() - started}ms`);
+  assert.match(output.systemMessage, /Banked resets: 3/);
+  assert.doesNotMatch(output.systemMessage, /restored/);
 });
 
 test("the SessionStart hook process prints its answer and exits", async () => {
@@ -359,9 +380,14 @@ test("the SessionStart hook process prints its answer and exits", async () => {
 // 400ms ends before the 500ms floor a read is given, so the hook (not the reader) has to
 // stop the server; a slow machine may not have started it by then, so that variant checks
 // that the hook still answered inside its deadline with valid JSON and, only if the server
-// did record its pid, that nothing is left running. The 2500ms variant leaves the reader
-// well over a second to start a server behind a slow cmd shim, so it must find its pid.
-for (const [deadline, mustStart] of [["400", false], ["2500", true]]) test(`the hook process stops a Codex app-server whose read is still running at the deadline (${deadline}ms)`, async (t) => {
+// did record its pid, that nothing is left running. At 2500ms the reader (told to give up half
+// a second before the deadline) times out first, and the reader's own cleanup stops the
+// server; that variant leaves it well over a second to start a server behind a slow cmd
+// shim, so it must find its pid.
+for (const [deadline, mustStart, title] of [
+  ["400", false, "the hook, at its deadline, stops a Codex app-server whose read is still running (400ms)"],
+  ["2500", true, "a read that times out before the hook deadline stops its own Codex app-server (2500ms)"],
+]) test(title, async (t) => {
   const root = await fixtureRoot(t);
   const here = dirname(fileURLToPath(import.meta.url));
   const hook = join(here, "..", "hooks", "session-start.mjs");
@@ -646,6 +672,26 @@ test("usage --json and board --json omit the email and account key when a seat i
   assert.equal(plain.accountEmail, email);
 });
 
+test("the CLI says once, on stderr, that no usage was read when the cache cannot be written", async (t) => {
+  const root = await fixtureRoot(t);
+  const email = ["test", "example.invalid"].join("@");
+  const name = `rate-limits-${createHash("sha256").update(`account:${email}`).digest("hex").slice(0, 16)}.json`;
+  // A directory where the cache file belongs: the attempt marker cannot replace it.
+  await mkdir(join(root, "cache-statusband-codex", name), { recursive: true });
+  const line = `Usage not read: cannot write ${join(root, "cache-statusband-codex")}`;
+  const cli = cliRunner(root);
+  for (const args of [["usage"], ["usage", "--json"], ["board"], ["board", "--json"]]) {
+    const { stdout, stderr } = await cli.runWithStderr(args, { CACHE_STATUSBAND_CODEX_SEAT_FILE: "" });
+    assert.equal(stderr.split(line).length - 1, 1, `${args.join(" ")}: ${stderr}`);
+    if (args.includes("--json")) {
+      const parsed = JSON.parse(stdout);
+      assert.equal((parsed.usage ?? parsed).cacheUnwritable, true, args.join(" "));
+    } else {
+      assert.ok(stdout.includes(line), `${args.join(" ")}: ${stdout}`);
+    }
+  }
+});
+
 // Runs the CLI against a scratch Codex home, with a fake app-server standing in for codex.
 function cliRunner(root) {
   const here = dirname(fileURLToPath(import.meta.url));
@@ -653,15 +699,13 @@ function cliRunner(root) {
   const server = join(here, "..", "fixtures", "fake-app-server.mjs");
   const windows = process.platform === "win32";
   const wrapper = join(root, windows ? "codex.cmd" : "codex");
-  return {
-    async run(args, env = {}) {
-      await writeFile(wrapper, windows
-        ? `@echo off\r\n"${process.execPath}" "${server}" %*\r\n`
-        : `#!/bin/sh\nexec "${process.execPath}" "${server}" "$@"\n`, { mode: 0o755 });
-      const { stdout } = await promisify(execFile)(process.execPath, [bin, ...args, "--codex-home", root], { env: { ...process.env, CODEX_BIN: wrapper, ...env }, timeout: 20_000 });
-      return stdout;
-    },
+  const runWithStderr = async (args, env = {}) => {
+    await writeFile(wrapper, windows
+      ? `@echo off\r\n"${process.execPath}" "${server}" %*\r\n`
+      : `#!/bin/sh\nexec "${process.execPath}" "${server}" "$@"\n`, { mode: 0o755 });
+    return promisify(execFile)(process.execPath, [bin, ...args, "--codex-home", root], { env: { ...process.env, CODEX_BIN: wrapper, ...env }, timeout: 20_000 });
   };
+  return { runWithStderr, run: async (args, env) => (await runWithStderr(args, env)).stdout };
 }
 
 async function fixtureRoot(t) {

@@ -1,12 +1,24 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { closeSync, openSync, readFileSync, readSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 const REPOSITORY = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "..");
-const BINARY = /\.(png|jpe?g|gif|ico|webp|zip|gz|woff2?)$/i;
+const SNIFF_BYTES = 8192;
+
+// A file is binary when a NUL byte turns up in its first 8 KiB (git's own heuristic), so no
+// list of extensions has to be kept up to date.
+function isBinary(path) {
+  const descriptor = openSync(path, "r");
+  try {
+    const buffer = Buffer.alloc(SNIFF_BYTES);
+    return buffer.subarray(0, readSync(descriptor, buffer, 0, SNIFF_BYTES, 0)).includes(0);
+  } finally {
+    closeSync(descriptor);
+  }
+}
 
 // A text edit that mangled an escape sequence once turned `\b` into a backspace character
 // in README.md. No tracked text file under codex/ has a reason to hold a C0 control other
@@ -14,18 +26,23 @@ const BINARY = /\.(png|jpe?g|gif|ico|webp|zip|gz|woff2?)$/i;
 test("no tracked text file under codex/ contains a C0 control character other than tab, CR or LF", (t) => {
   let tracked;
   try {
-    tracked = execFileSync("git", ["ls-files", "--", "codex"], { cwd: REPOSITORY, encoding: "utf8" }).split("\n").filter(Boolean);
-  } catch {
-    t.skip("not inside a git checkout");
+    // -z: NUL-separated, so a path with spaces or non-ASCII characters is listed verbatim.
+    tracked = execFileSync("git", ["ls-files", "-z", "--", "codex"], { cwd: REPOSITORY, encoding: "utf8" }).split("\0").filter(Boolean);
+  } catch (error) {
+    t.skip(`could not list tracked files with git (${error.code ?? error.message})`);
     return;
   }
-  assert.ok(tracked.length > 10, `only ${tracked.length} tracked files found under codex/`);
+  if (!tracked.length) {
+    t.skip("git lists no tracked files under codex/ (not a checkout of the repository)");
+    return;
+  }
   const offences = [];
   for (const file of tracked) {
-    if (BINARY.test(file)) continue;
+    const path = join(REPOSITORY, file);
     let text;
     try {
-      text = readFileSync(join(REPOSITORY, file), "utf8");
+      if (isBinary(path)) continue;
+      text = readFileSync(path, "utf8");
     } catch {
       continue; // listed in the index but absent from the working tree
     }

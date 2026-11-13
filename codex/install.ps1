@@ -37,6 +37,18 @@ function Set-TomlKey {
   $lines = [Collections.Generic.List[string]]::new()
   foreach ($line in ($Text -split "`r?`n")) { $lines.Add($line) }
   while ($lines.Count -gt 0 -and $lines[$lines.Count - 1] -eq "") { $lines.RemoveAt($lines.Count - 1) }
+  # A byte-order mark is not whitespace, so left on the first line it would hide a header
+  # there from every pattern below and the section would be added a second time.
+  if ($lines.Count -gt 0 -and $lines[0].Length -gt 0 -and $lines[0][0] -eq [char]0xFEFF) { $lines[0] = $lines[0].Substring(1) }
+
+  # How deep in brackets each line STARTS: a line inside a multi-line array (such as a
+  # nested array's "[1, 2]," line) is a value, never a table header or a top-level key.
+  $startDepth = [int[]]::new($lines.Count)
+  $depth = 0
+  for ($i = 0; $i -lt $lines.Count; $i += 1) {
+    $startDepth[$i] = $depth
+    $depth = [Math]::Max(0, $depth + (Get-TomlBracketDelta -Line $lines[$i]))
+  }
 
   # A table written some other way than a plain [Section] header (dotted keys or an inline
   # table at the top level, a quoted header) would make the [Section] we append a duplicate
@@ -44,14 +56,17 @@ function Set-TomlKey {
   $sectionName = '(?:' + [Regex]::Escape($Section) + '|"' + [Regex]::Escape($Section) + '"|''' + [Regex]::Escape($Section) + ''')'
   $quotedHeaderPattern = '^\s*\[\s*["'']' + [Regex]::Escape($Section) + '["'']\s*\]'
   $topLevelPattern = '^\s*' + $sectionName + '\s*(?:\.|=)'
+  $skipHint = if ($Section -eq "tui") { ", or rerun with -KeepExistingFooter to skip the footer edit" } else { "" }
   $inRootTable = $true
-  foreach ($line in $lines) {
+  for ($i = 0; $i -lt $lines.Count; $i += 1) {
+    $line = $lines[$i]
+    if ($startDepth[$i] -gt 0) { continue }
     if ($line -match $quotedHeaderPattern) {
-      throw "config.toml defines [$Section] with a quoted header; configure the footer and hooks manually, or rewrite it as a plain [$Section] table first"
+      throw "config.toml defines [$Section] with a quoted header; configure the footer and hooks manually, or rewrite it as a plain [$Section] table first$skipHint"
     }
     if ($line -match '^\s*\[') { $inRootTable = $false }
     if ($inRootTable -and $line -match $topLevelPattern) {
-      throw "config.toml defines the $Section table with dotted keys or an inline table; configure the footer and hooks manually, or rewrite it as a plain [$Section] table first"
+      throw "config.toml defines the $Section table with dotted keys or an inline table; configure the footer and hooks manually, or rewrite it as a plain [$Section] table first$skipHint"
     }
   }
 
@@ -59,7 +74,7 @@ function Set-TomlKey {
   $sectionPattern = '^\s*\[\s*' + [Regex]::Escape($Section) + '\s*\]\s*(?:#.*)?$'
   $sectionStarts = @()
   for ($i = 0; $i -lt $lines.Count; $i += 1) {
-    if ($lines[$i] -match $sectionPattern) { $sectionStarts += $i }
+    if ($startDepth[$i] -eq 0 -and $lines[$i] -match $sectionPattern) { $sectionStarts += $i }
   }
   if ($sectionStarts.Count -gt 1) { throw "config.toml contains more than one [$Section] section" }
   $sectionStart = if ($sectionStarts.Count -eq 1) { $sectionStarts[0] } else { -1 }
@@ -73,12 +88,12 @@ function Set-TomlKey {
 
   $sectionEnd = $lines.Count
   for ($i = $sectionStart + 1; $i -lt $lines.Count; $i += 1) {
-    if ($lines[$i] -match '^\s*\[{1,2}[^\]]') { $sectionEnd = $i; break }
+    if ($startDepth[$i] -eq 0 -and $lines[$i] -match '^\s*\[{1,2}[^\]]') { $sectionEnd = $i; break }
   }
   $keyPattern = '^\s*' + [Regex]::Escape($Key) + '\s*='
   $keyLines = @()
   for ($i = $sectionStart + 1; $i -lt $sectionEnd; $i += 1) {
-    if ($lines[$i] -match $keyPattern) { $keyLines += $i }
+    if ($startDepth[$i] -eq 0 -and $lines[$i] -match $keyPattern) { $keyLines += $i }
   }
   if ($keyLines.Count -gt 1) { throw "config.toml contains more than one $Key assignment in [$Section]" }
   if ($keyLines.Count -eq 1) {
@@ -91,6 +106,28 @@ function Set-TomlKey {
   }
   $lines.Insert($sectionStart + 1, "$Key = $Value")
   return ($lines -join "`n") + "`n"
+}
+
+# Net change in bracket depth over one line: [ and ] outside strings and comments. (Multi-line
+# strings are refused before this is used, so a quote never stays open past the line.)
+function Get-TomlBracketDelta {
+  param([Parameter(Mandatory)][AllowEmptyString()][string]$Line)
+
+  $delta = 0
+  $quote = [char]0
+  $escaped = $false
+  foreach ($char in $Line.ToCharArray()) {
+    if ($quote -ne [char]0) {
+      if ($quote -eq '"' -and $escaped) { $escaped = $false; continue }
+      if ($quote -eq '"' -and $char -eq '\') { $escaped = $true; continue }
+      if ($char -eq $quote) { $quote = [char]0 }
+      continue
+    }
+    if ($char -eq '#') { break }
+    if ($char -eq '"' -or $char -eq "'") { $quote = $char; continue }
+    if ($char -eq '[') { $delta += 1 } elseif ($char -eq ']') { $delta -= 1 }
+  }
+  return $delta
 }
 
 function Find-TomlValueEnd {
@@ -334,7 +371,15 @@ if ($PSBoundParameters.ContainsKey("SeatFile")) {
     Copy-Item -LiteralPath $settingsPath -Destination (Join-Path $settingsBackup "settings.json")
   }
   $settingsJson = @{ version = 1; seatFile = $expandedSeatFile } | ConvertTo-Json
-  [IO.File]::WriteAllText($settingsPath, $settingsJson + "`n", [Text.UTF8Encoding]::new($false))
+  # Written to a temporary file beside it and moved into place, so a session starting at that
+  # moment reads either the old settings.json or the new one, never a half-written file.
+  $settingsCandidate = Join-Path $settingsRoot (".settings.json.cache-statusband-" + [guid]::NewGuid().ToString("N") + ".tmp")
+  try {
+    [IO.File]::WriteAllText($settingsCandidate, $settingsJson + "`n", [Text.UTF8Encoding]::new($false))
+    Move-Item -LiteralPath $settingsCandidate -Destination $settingsPath -Force
+  } finally {
+    if (Test-Path -LiteralPath $settingsCandidate) { Remove-Item -LiteralPath $settingsCandidate -Force }
+  }
   Write-Host "Configured optional seat label file: $expandedSeatFile"
 }
 

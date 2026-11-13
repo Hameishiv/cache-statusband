@@ -1,3 +1,4 @@
+import { stripControls } from "./sanitize.mjs";
 import { MIN_POLL_INTERVAL_MS } from "./usage.mjs";
 
 export function formatTokens(value) {
@@ -85,8 +86,19 @@ export function formatUsageLines(snapshot, now = Date.now(), {
     lines.push(`${label} ${Math.round(window.usedPercent)}%${reset}`);
   }
   if (Number.isFinite(snapshot?.fetchedAt)) lines.push(`Checked ${formatAge(snapshot.fetchedAt, now)} ago (${snapshot.source})`);
+  const unwritable = cacheUnwritableLine(snapshot);
+  if (unwritable) lines.push(unwritable);
   if (identity) lines.push(identity);
   return lines.map(capFirst);
+}
+
+// Said when the usage cache cannot be written: no live read is made then (the five-minute
+// limit could not hold), so the reader must be told why nothing newer is shown. The path is
+// ours but still passes through the control-character filter before it is printed.
+export function cacheUnwritableLine(snapshot) {
+  if (snapshot?.cacheUnwritable !== true) return null;
+  const directory = typeof snapshot.cacheDir === "string" ? stripControls(snapshot.cacheDir).slice(0, 500) : "";
+  return `Usage not read: cannot write ${directory || "the cache directory"}`;
 }
 
 // Match the original mod: capitalize the first word past leading symbols/spacing.

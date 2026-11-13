@@ -94,6 +94,14 @@ status_line_use_colors = false
   if ($settings.seatFile -ne (Join-Path $seatDirectory "active-seat.txt")) {
     throw "A relative -SeatFile did not resolve against the PowerShell location: $($settings.seatFile)"
   }
+  # Re-running with another seat replaces settings.json in place (via a temporary file that
+  # is gone afterwards) and keeps the earlier one in a backup.
+  & (Join-Path $root "install.ps1") -CodexHome $freshHome -SkipCliLink -SeatFile (Join-Path $seatDirectory "second-seat.txt") 3>$null | Out-Null
+  $settingsFolder = Join-Path $freshHome "cache-statusband-codex"
+  $replaced = Get-Content -LiteralPath (Join-Path $settingsFolder "settings.json") -Raw | ConvertFrom-Json
+  if ($replaced.seatFile -ne (Join-Path $seatDirectory "second-seat.txt")) { throw "A second install did not replace settings.json" }
+  $leftovers = @(Get-ChildItem -LiteralPath $settingsFolder -Force -File | Where-Object { $_.Name -ne "settings.json" })
+  if ($leftovers.Count -ne 0) { throw "The settings.json update left a temporary file behind: $($leftovers.Name -join ', ')" }
 
   # A relative -CodexHome follows the PowerShell location too: the Codex and Node
   # children are started in the process working directory, which Set-Location leaves behind.
@@ -200,6 +208,52 @@ status_line_use_colors = false
   if ([IO.File]::ReadAllText((Join-Path $dottedHome "config.toml")) -ne $quotedText) {
     throw "The live config changed after a quoted tui header was refused"
   }
+
+  # A root-level multi-line array (its lines can start with [) must not end the "root table"
+  # for the dotted-key check: tui.status_line after it is still refused, with the way out named.
+  $arrayHome = Join-Path $testHome "array-home"
+  New-Item -ItemType Directory -Path $arrayHome | Out-Null
+  $arrayText = "matrix = [`n  [1, 2],`n  [3, 4],`n]`ntui.status_line = [`"model`"]`n`n[features]`nhooks = true`n"
+  [IO.File]::WriteAllText((Join-Path $arrayHome "config.toml"), $arrayText, [Text.UTF8Encoding]::new($false))
+  $arrayMessage = ""
+  try {
+    & (Join-Path $root "install.ps1") -CodexHome $arrayHome -SkipCliLink 3>$null | Out-Null
+  } catch {
+    $arrayMessage = $_.Exception.Message
+  }
+  if ($arrayMessage -notmatch "tui table with dotted keys or an inline table") { throw "A dotted tui key after a multi-line array was not refused with the dotted-key message: $arrayMessage" }
+  if ($arrayMessage -notmatch "-KeepExistingFooter") { throw "The refusal did not name -KeepExistingFooter as the way to skip the footer edit: $arrayMessage" }
+  if ([IO.File]::ReadAllText((Join-Path $arrayHome "config.toml")) -ne $arrayText) { throw "The live config changed after the dotted tui key was refused" }
+  # ...and with the footer edit skipped, that same file installs.
+  & (Join-Path $root "install.ps1") -CodexHome $arrayHome -SkipCliLink -KeepExistingFooter 3>$null | Out-Null
+  if ([IO.File]::ReadAllText((Join-Path $arrayHome "config.toml")) -notmatch '(?m)^tui\.status_line = \["model"\]$') { throw "-KeepExistingFooter changed the existing dotted footer" }
+
+  # A line inside a multi-line array that merely LOOKS like a quoted [tui] header is a value.
+  $lookalikeHome = Join-Path $testHome "lookalike-home"
+  New-Item -ItemType Directory -Path $lookalikeHome | Out-Null
+  [IO.File]::WriteAllText((Join-Path $lookalikeHome "config.toml"), "names = [`n  [`"tui`"],`n]`n", [Text.UTF8Encoding]::new($false))
+  & (Join-Path $root "install.ps1") -CodexHome $lookalikeHome -SkipCliLink 3>$null | Out-Null
+  $lookalikeAfter = [IO.File]::ReadAllText((Join-Path $lookalikeHome "config.toml"))
+  if ($lookalikeAfter -notmatch '(?m)^\[tui\]$' -or $lookalikeAfter -notmatch '(?m)^status_line_use_colors = true$') { throw "An array value that looks like a quoted tui header blocked the footer edit" }
+
+  # A config.toml that starts with a byte-order mark: the header on its first line is still
+  # recognised, so no second [features] table is added.
+  $bomHome = Join-Path $testHome "bom-home"
+  New-Item -ItemType Directory -Path $bomHome | Out-Null
+  [IO.File]::WriteAllText((Join-Path $bomHome "config.toml"), "[features]`nhooks = false`n", [Text.UTF8Encoding]::new($true))
+  if ([IO.File]::ReadAllBytes((Join-Path $bomHome "config.toml"))[0] -ne 0xEF) { throw "The BOM fixture was written without a BOM" }
+  & (Join-Path $root "install.ps1") -CodexHome $bomHome -SkipCliLink 3>$null | Out-Null
+  $bomAfter = [IO.File]::ReadAllText((Join-Path $bomHome "config.toml"))
+  if ([regex]::Matches($bomAfter, '(?m)^\[features\]').Count -ne 1) { throw "A BOM-prefixed config.toml got a duplicate [features] table" }
+  if ($bomAfter -notmatch '(?m)^hooks = true$') { throw "A BOM-prefixed config.toml did not get hooks enabled" }
+  # Set-TomlKey itself, given text that still holds the mark (ReadAllText normally drops it).
+  $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $root "install.ps1"), [ref]$null, [ref]$null)
+  foreach ($name in @("Set-TomlKey", "Get-TomlBracketDelta", "Find-TomlValueEnd")) {
+    $definition = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true)
+    . ([scriptblock]::Create($definition.Extent.Text))
+  }
+  $withMark = Set-TomlKey -Text ([string][char]0xFEFF + "[features]`nhooks = false`n") -Section "features" -Key "hooks" -Value "true"
+  if ($withMark -ne "[features]`nhooks = true`n") { throw "Set-TomlKey did not see a header behind a byte-order mark: $withMark" }
 
   # When the ORIGINAL already fails the strict check, a candidate that Codex cannot even
   # load (plain startup rejects it) is still refused; the fake codex fails strict for any

@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
-import { configuredSeatIdentity, usagePresentation } from "../src/settings.mjs";
+import { configuredSeatFile, configuredSeatIdentity, usagePresentation } from "../src/settings.mjs";
 
 const EMAIL = ["test", "example.invalid"].join("@");
 
@@ -65,4 +65,44 @@ test("a malformed settings.json never lets the CLI show or emit the account emai
     const { stdout, stderr } = await promisify(execFile)(process.execPath, [bin, ...args, "--codex-home", root], { env, timeout: 20_000 });
     assert.doesNotMatch(stdout + stderr, /test@example|accountEmail|identityKey|account:/, args.join(" "));
   }
+});
+
+test("a settings.json read that fails once or is caught half-written is retried, then fails closed", async () => {
+  const good = JSON.stringify({ version: 1, seatFile: "seat.txt" });
+  const sequence = (...steps) => {
+    const calls = [];
+    const reader = async () => {
+      calls.push(1);
+      const step = steps[Math.min(calls.length - 1, steps.length - 1)];
+      if (step instanceof Error) throw step;
+      return step;
+    };
+    return { reader, calls };
+  };
+  const busy = Object.assign(new Error("EBUSY: simulated"), { code: "EBUSY" });
+  const fast = { retryMs: 1 };
+
+  const failedOnce = sequence(busy, good);
+  assert.equal(await configuredSeatFile("home", { ...fast, reader: failedOnce.reader }), "seat.txt");
+  assert.equal(failedOnce.calls.length, 2);
+
+  const halfWritten = sequence("{\"version\":1,\"seat", good);
+  assert.equal(await configuredSeatFile("home", { ...fast, reader: halfWritten.reader }), "seat.txt");
+  assert.equal(halfWritten.calls.length, 2);
+
+  // Three retries after the first read, then it fails closed.
+  const broken = sequence("{not json");
+  await assert.rejects(configuredSeatFile("home", { ...fast, reader: broken.reader }), SyntaxError);
+  assert.equal(broken.calls.length, 4);
+  const stuck = sequence(busy);
+  await assert.rejects(configuredSeatFile("home", { ...fast, reader: stuck.reader }), /EBUSY/);
+  assert.equal(stuck.calls.length, 4);
+
+  // A missing file and a well-formed file with a bad value are answers, not glitches.
+  const missing = sequence(Object.assign(new Error("ENOENT"), { code: "ENOENT" }));
+  assert.equal(await configuredSeatFile("home", { ...fast, reader: missing.reader }), null);
+  assert.equal(missing.calls.length, 1);
+  const badValue = sequence(JSON.stringify({ seatFile: 5 }));
+  await assert.rejects(configuredSeatFile("home", { ...fast, reader: badValue.reader }), /non-empty string/);
+  assert.equal(badValue.calls.length, 1);
 });

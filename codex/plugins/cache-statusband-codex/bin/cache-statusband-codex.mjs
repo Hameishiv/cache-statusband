@@ -2,7 +2,7 @@
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { stripControls } from "../src/sanitize.mjs";
-import { capFirst, formatAge, formatPercent, formatTokens, formatUsageLines } from "../src/format.mjs";
+import { cacheUnwritableLine, capFirst, formatAge, formatPercent, formatTokens, formatUsageLines } from "../src/format.mjs";
 import { defaultCodexHome, parseRollout, projectName, scanSessions } from "../src/rollouts.mjs";
 import { captureUsageIdentity, getUsageSnapshot, resolveCodexLaunch } from "../src/usage.mjs";
 import { configuredSeatIdentity, usagePresentation } from "../src/settings.mjs";
@@ -48,6 +48,7 @@ async function board(argv) {
   const summaries = await scanSessions(home, { includeArchived: Boolean(options.all), limit });
   const identity = await captureUsageIdentity(home);
   const usageSnapshot = await getUsageSnapshot({ codexHome: home, identity });
+  warnIfCacheUnwritable(usageSnapshot);
   const presented = await usagePresentation(usageSnapshot, { codexHome: home, identity });
   if (options.json) {
     process.stdout.write(`${json({ usage: await publicSnapshot(presented.snapshot, home), sessions: summaries })}\n`);
@@ -78,6 +79,7 @@ async function usage(argv) {
   warnIfCodexUnlaunchable();
   const identity = await captureUsageIdentity(home);
   const snapshot = await getUsageSnapshot({ codexHome: home, identity });
+  warnIfCacheUnwritable(snapshot);
   const presented = await usagePresentation(snapshot, { codexHome: home, identity });
   if (options.json) process.stdout.write(`${json(await publicSnapshot(presented.snapshot, home))}\n`);
   else process.stdout.write(`${formatUsageLines(presented.snapshot, Date.now(), { includeResetDetails: true, identity: presented.identity }).join("\n")}\n`);
@@ -93,6 +95,13 @@ function warnIfCodexUnlaunchable() {
   } catch (error) {
     process.stderr.write(`cache-statusband-codex: ${error.message}\n`);
   }
+}
+
+// A cache that cannot be written means no usage was read at all; say so on stderr (once per
+// command), which also covers --json, whose stdout carries only the snapshot.
+function warnIfCacheUnwritable(snapshot) {
+  const line = cacheUnwritableLine(snapshot);
+  if (line) process.stderr.write(`cache-statusband-codex: ${line}\n`);
 }
 
 // With a seat configured, available or not, the email is deliberately not shown (a seat

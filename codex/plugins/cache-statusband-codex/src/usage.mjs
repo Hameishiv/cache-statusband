@@ -71,10 +71,11 @@ export async function getUsageSnapshot({
     };
     // The throttle holds only if this attempt marker lands: other callers read it to know a
     // poll is under way or was just made. A cache that cannot be written (a Windows rename
-    // that keeps failing) therefore means no live read at all; what is stored is returned.
+    // that keeps failing) therefore means no live read at all; what is stored is returned,
+    // marked so the caller can say why no usage was read.
     if (!await tryWriteCache(cachePath, attempted, renameImpl)) {
       const { migrateSeatDeadline, ...stored } = cached ?? {};
-      return present(cached ? stored : null, aligned.mismatch ? "identity-changed" : "stale");
+      return { ...present(cached ? stored : null, aligned.mismatch ? "identity-changed" : "stale"), cacheUnwritable: true, cacheDir: dataDir };
     }
 
     let saved;

@@ -33,7 +33,12 @@ export async function handleSessionStart(input, {
   try {
     home ??= defaultCodexHome();
   } catch {}
-  if (input.transcript_path) {
+  // The transcript read and the usage read run side by side, and the one deadline below
+  // covers both: a slow transcript cannot push the hook past it, and whatever has been
+  // collected by then is what is emitted.
+  const resumeMessages = [];
+  const transcriptPart = (async () => {
+    if (!input.transcript_path) return;
     try {
       let summary = null;
       try {
@@ -41,9 +46,9 @@ export async function handleSessionStart(input, {
       } catch {}
       if (home && input.session_id) summary = mergeSavedContext(summary, await stateLoader(home, input.session_id));
       const message = resumeMessage(summary, now);
-      if (message) messages.push(message);
+      if (message) resumeMessages.push(message);
     } catch {}
-  }
+  })();
 
   const usageMessages = [];
   const usagePart = (async () => {
@@ -72,14 +77,14 @@ export async function handleSessionStart(input, {
     } catch {}
   })();
   let timer;
-  // The deadline counts from the start of the hook; the transcript read above already used some.
+  // The deadline counts from the start of the hook.
   const expired = new Promise((resolve) => { timer = setTimeout(resolve, Math.max(0, deadlineMs - (Date.now() - started))); });
   try {
-    await Promise.race([usagePart, expired]);
+    await Promise.race([Promise.all([transcriptPart, usagePart]), expired]);
   } finally {
     clearTimeout(timer);
   }
-  messages.push(...usageMessages.splice(0));
+  messages.push(...resumeMessages.splice(0), ...usageMessages.splice(0));
   return messages.length ? { systemMessage: messages.join(" ") } : {};
 }
 

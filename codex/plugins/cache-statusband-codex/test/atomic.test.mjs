@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { renameWithRetry } from "../src/atomic.mjs";
 import { loadSessionState, saveSessionState } from "../src/session-state.mjs";
+import { formatUsageLines } from "../src/format.mjs";
 import { getUsageSnapshot } from "../src/usage.mjs";
 
 const TEST_EMAIL = ["person", "example.invalid"].join("@");
@@ -83,9 +84,22 @@ test("a cache that can never be written sends no rate-limit request and leaves n
   assert.equal(requests, 0);
   assert.equal(snapshot.source, "stale");
   assert.equal(snapshot.availableCount, null);
+  // The caller is told why nothing was read, and where.
+  const dataDir = join(root, "cache-statusband-codex");
+  assert.equal(snapshot.cacheUnwritable, true);
+  assert.equal(snapshot.cacheDir, dataDir);
+  assert.deepEqual(formatUsageLines(snapshot, Date.now()), ["Banked resets: unavailable", `Usage not read: cannot write ${dataDir}`]);
   const files = await readdir(join(root, "cache-statusband-codex"));
   assert.ok(!files.some((name) => name.endsWith(".tmp")), files.join(","));
   assert.ok(!files.some((name) => /^rate-limits-.*\.json$/.test(name)));
+});
+
+test("the unwritable-cache line strips control characters from the path and is absent otherwise", () => {
+  const line = formatUsageLines({ cacheUnwritable: true, cacheDir: "C:\\codex\u001b[31m\u0007\u202ehome" }, Date.now()).at(-1);
+  assert.match(line, /^Usage not read: cannot write C:\\codex/);
+  assert.doesNotMatch(line, /[\u0000-\u001f\u007f-\u009f\u202a-\u202e]/);
+  assert.equal(formatUsageLines({ cacheUnwritable: true }, Date.now()).at(-1), "Usage not read: cannot write the cache directory");
+  assert.ok(!formatUsageLines({ availableCount: 1, source: "live", fetchedAt: Date.now() }, Date.now()).some((text) => text.startsWith("Usage not read")));
 });
 
 test("a cache that stops being writable after the attempt marker still returns the live reading", async (t) => {
@@ -102,6 +116,7 @@ test("a cache that stops being writable after the attempt marker still returns t
   });
   assert.equal(snapshot.source, "live");
   assert.equal(snapshot.availableCount, 1);
+  assert.equal(snapshot.cacheUnwritable, undefined);
   const files = await readdir(join(root, "cache-statusband-codex"));
   assert.ok(!files.some((name) => name.endsWith(".tmp")), files.join(","));
 });

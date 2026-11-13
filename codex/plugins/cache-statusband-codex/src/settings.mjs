@@ -70,15 +70,31 @@ function isSeatLabel(identity) {
 // settings.json at all, or one without a seatFile). Anything else that stops the setting
 // being read, or a seatFile that is not a non-empty string, throws: a seat that may have been
 // configured but cannot be read must never fall back to showing the account email.
-export async function configuredSeatFile(codexHome) {
-  let raw;
-  try {
-    raw = await readFile(resolve(codexHome, "cache-statusband-codex", "settings.json"), "utf8");
-  } catch (error) {
-    if (error?.code === "ENOENT") return null;
-    throw error;
+// The installer replaces settings.json while sessions may be starting, and an editor may save
+// it in two steps, so a failed read or parse is tried again (up to SETTINGS_RETRIES more
+// times, SETTINGS_RETRY_MS apart) before it counts as a failure. A missing file is a real
+// answer and is not retried, nor is a well-formed file with a bad value.
+const SETTINGS_RETRIES = 3;
+const SETTINGS_RETRY_MS = 50;
+
+export async function configuredSeatFile(codexHome, {
+  reader = readFile,
+  retryMs = SETTINGS_RETRY_MS,
+  retries = SETTINGS_RETRIES,
+} = {}) {
+  const path = resolve(codexHome, "cache-statusband-codex", "settings.json");
+  let settings;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      const raw = await reader(path, "utf8");
+      settings = JSON.parse(raw.charCodeAt(0) === 0xFEFF ? raw.slice(1) : raw);
+      break;
+    } catch (error) {
+      if (error?.code === "ENOENT") return null;
+      if (attempt >= retries) throw error;
+      await new Promise((done) => setTimeout(done, retryMs));
+    }
   }
-  const settings = JSON.parse(raw.charCodeAt(0) === 0xFEFF ? raw.slice(1) : raw);
   if (!settings || typeof settings !== "object" || Array.isArray(settings)) throw new Error("settings.json is not an object");
   if (!Object.hasOwn(settings, "seatFile")) return null;
   const value = settings.seatFile;
