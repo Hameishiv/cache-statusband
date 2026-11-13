@@ -303,10 +303,11 @@ test("the SessionStart hook process prints its answer and exits", async () => {
 });
 
 // 400ms ends before the 500ms floor a read is given, so the hook (not the reader) has to
-// stop the server; but a slow machine may not have started it by then, so that variant only
-// checks that nothing is left running IF the server got as far as recording its pid. The
-// 1500ms variant always starts the server and so must find its pid.
-for (const [deadline, mustStart] of [["400", false], ["1500", true]]) test(`the hook process stops a Codex app-server whose read is still running at the deadline (${deadline}ms)`, async (t) => {
+// stop the server; a slow machine may not have started it by then, so that variant checks
+// that the hook still answered inside its deadline with valid JSON and, only if the server
+// did record its pid, that nothing is left running. The 2500ms variant leaves the reader
+// well over a second to start a server behind a slow cmd shim, so it must find its pid.
+for (const [deadline, mustStart] of [["400", false], ["2500", true]]) test(`the hook process stops a Codex app-server whose read is still running at the deadline (${deadline}ms)`, async (t) => {
   const root = await fixtureRoot(t);
   const here = dirname(fileURLToPath(import.meta.url));
   const hook = join(here, "..", "hooks", "session-start.mjs");
@@ -319,9 +320,16 @@ for (const [deadline, mustStart] of [["400", false], ["1500", true]]) test(`the 
     : `#!/bin/sh\nexec "${process.execPath}" "${hung}" "$@"\n`, { mode: 0o755 });
   const env = { ...process.env, CODEX_HOME: root, CODEX_BIN: launcher, HUNG_PID_FILE: pidFile, CACHE_STATUSBAND_HOOK_DEADLINE_MS: deadline };
   const child = execFile(process.execPath, [hook], { env, timeout: 15_000 });
+  let stdout = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  const began = Date.now();
   child.stdin.end(JSON.stringify({ source: "startup", session_id: "orphan-session" }));
   const code = await new Promise((resolve) => child.once("exit", resolve));
+  const elapsed = Date.now() - began;
   assert.equal(code, 0);
+  // The hook answers by its deadline (plus process start-up and cleanup) whatever the server did.
+  assert.ok(elapsed < Number(deadline) + 3_000, `the hook took ${elapsed}ms against a ${deadline}ms deadline`);
+  assert.doesNotThrow(() => JSON.parse(stdout), `the hook printed invalid JSON: ${stdout}`);
   const until = async (condition, ms) => {
     const end = Date.now() + ms;
     while (Date.now() < end && !(await condition())) await new Promise((resolve) => setTimeout(resolve, 50));
@@ -332,8 +340,8 @@ for (const [deadline, mustStart] of [["400", false], ["1500", true]]) test(`the 
   // launches it before the deadline); a pid file that never appears means the launch itself
   // failed, which must not pass as "nothing left running".
   const started = await until(async () => (await readFile(pidFile, "utf8").catch(() => "")) !== "", 5_000);
-  if (!mustStart && !started) return;
-  assert.ok(started, "the Codex app-server never started (no pid file), so the cleanup was not exercised");
+  if (mustStart) assert.ok(started, "the Codex app-server never started (no pid file), so the cleanup was not exercised");
+  if (!started) return;
   const pid = Number(await readFile(pidFile, "utf8"));
   try {
     assert.ok(await until(() => !alive(pid), 5_000), "the hook left the Codex app-server running");

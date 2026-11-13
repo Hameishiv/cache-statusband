@@ -44,7 +44,9 @@ export function formatUsageLines(snapshot, now = Date.now(), {
           const title = credit.title || `Reset ${index + 1}`;
           const expiresAt = epochMilliseconds(credit.expiresAt);
           if (!Number.isFinite(expiresAt)) {
-            lines.push(`  ${title} — expiration not supplied`);
+            // Codex sending an explicit null means the reset never expires; a missing or
+            // malformed value means Codex did not say.
+            lines.push(`  ${title} — ${credit.neverExpires === true ? "does not expire" : "expiration not supplied"}`);
             return;
           }
           const absolute = formatLocalDate(expiresAt, { locale, timeZone });
@@ -54,13 +56,21 @@ export function formatUsageLines(snapshot, now = Date.now(), {
           lines.push(`  ${title} — expires ${absolute} (${relative})`);
         });
         // Rows this plugin cut off are "not shown"; only the remainder is "not supplied".
+        // The count says how many rows should exist beyond those listed: rows cut beyond that
+        // are ones Codex sent over its own count, which is a different statement again.
         const omitted = Number.isFinite(snapshot.creditsOmitted) ? Math.max(0, snapshot.creditsOmitted) : 0;
-        if (omitted > 0) {
-          lines.push(`  ${omitted} more reset expiration${omitted === 1 ? "" : "s"} not shown.`);
+        const expected = Math.max(0, snapshot.availableCount - credits.length);
+        const notShown = Math.min(omitted, expected);
+        const beyondCount = omitted - notShown;
+        const missing = expected - notShown;
+        if (notShown > 0) {
+          lines.push(`  ${notShown} more reset expiration${notShown === 1 ? "" : "s"} not shown.`);
         }
-        const missing = snapshot.availableCount - credits.length - omitted;
         if (missing > 0) {
           lines.push(`  ${missing} additional reset expiration${missing === 1 ? " was" : "s were"} not supplied by Codex.`);
+        }
+        if (beyondCount > 0) {
+          lines.push(`  ${beyondCount} more row${beyondCount === 1 ? "" : "s"} beyond Codex's count of ${snapshot.availableCount} not shown.`);
         }
       }
     }

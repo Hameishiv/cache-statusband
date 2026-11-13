@@ -71,18 +71,39 @@ test("a cache write that fails twice with EPERM still lands, and the live readin
   assert.ok(!files.some((name) => name.endsWith(".tmp")));
 });
 
-test("a cache that can never be written still returns the live reading and leaves no temp file", async (t) => {
+test("a cache that can never be written sends no rate-limit request and leaves no temp file", async (t) => {
   const root = await fixtureRoot(t);
   const failing = async () => { throw Object.assign(new Error("EPERM: simulated"), { code: "EPERM" }); };
+  let requests = 0;
   const snapshot = await getUsageSnapshot({
     codexHome: root, now: Date.parse("2026-10-29T12:00:00.000Z"), identity: IDENTITY,
-    fetcher: async () => RAW, renameImpl: failing,
+    fetcher: async () => { requests += 1; return RAW; }, renameImpl: failing,
+  });
+  // The attempt marker is what throttles other callers; without it no live read is made.
+  assert.equal(requests, 0);
+  assert.equal(snapshot.source, "stale");
+  assert.equal(snapshot.availableCount, null);
+  const files = await readdir(join(root, "cache-statusband-codex"));
+  assert.ok(!files.some((name) => name.endsWith(".tmp")), files.join(","));
+  assert.ok(!files.some((name) => /^rate-limits-.*\.json$/.test(name)));
+});
+
+test("a cache that stops being writable after the attempt marker still returns the live reading", async (t) => {
+  const root = await fixtureRoot(t);
+  let renames = 0;
+  const failAfterMarker = async (from, to) => {
+    renames += 1;
+    if (renames > 1) throw Object.assign(new Error("EPERM: simulated"), { code: "EPERM" });
+    return rename(from, to);
+  };
+  const snapshot = await getUsageSnapshot({
+    codexHome: root, now: Date.parse("2026-10-29T12:00:00.000Z"), identity: IDENTITY,
+    fetcher: async () => RAW, renameImpl: failAfterMarker,
   });
   assert.equal(snapshot.source, "live");
   assert.equal(snapshot.availableCount, 1);
   const files = await readdir(join(root, "cache-statusband-codex"));
   assert.ok(!files.some((name) => name.endsWith(".tmp")), files.join(","));
-  assert.ok(!files.some((name) => /^rate-limits-.*\.json$/.test(name)));
 });
 
 test("a session-state save retries a transient rename failure and cleans up when it keeps failing", async (t) => {

@@ -13,7 +13,14 @@ export async function displayIdentity(snapshot, {
 }
 
 export async function configuredSeatIdentity(codexHome, env = process.env) {
-  const configured = env.CACHE_STATUSBAND_CODEX_SEAT_FILE || await configuredSeatFile(codexHome);
+  let configured = env.CACHE_STATUSBAND_CODEX_SEAT_FILE;
+  if (!configured) {
+    try {
+      configured = await configuredSeatFile(codexHome);
+    } catch {
+      return { key: "seat:unavailable", label: null, unavailable: true };
+    }
+  }
   if (!configured) return null;
   const seat = await readSeatLabel(expandPath(configured, codexHome, env));
   return seat
@@ -38,6 +45,7 @@ export async function usagePresentation(snapshot, {
       accountEmail: null,
       availableCount: null,
       credits: null,
+      creditsOmitted: null,
       primary: null,
       secondary: null,
       source: "identity-changed",
@@ -45,14 +53,24 @@ export async function usagePresentation(snapshot, {
   };
 }
 
+// Resolves to the configured seat label file, or null when none is configured (no
+// settings.json at all, or one without a seatFile). Anything else that stops the setting
+// being read, or a seatFile that is not a non-empty string, throws: a seat that may have been
+// configured but cannot be read must never fall back to showing the account email.
 export async function configuredSeatFile(codexHome) {
+  let raw;
   try {
-    const raw = await readFile(resolve(codexHome, "cache-statusband-codex", "settings.json"), "utf8");
-    const value = JSON.parse(raw)?.seatFile;
-    return typeof value === "string" && value.trim() ? value.trim() : null;
-  } catch {
-    return null;
+    raw = await readFile(resolve(codexHome, "cache-statusband-codex", "settings.json"), "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
   }
+  const settings = JSON.parse(raw.charCodeAt(0) === 0xFEFF ? raw.slice(1) : raw);
+  if (!settings || typeof settings !== "object" || Array.isArray(settings)) throw new Error("settings.json is not an object");
+  if (!Object.hasOwn(settings, "seatFile")) return null;
+  const value = settings.seatFile;
+  if (typeof value !== "string" || !value.trim()) throw new Error("settings.json seatFile is not a non-empty string");
+  return value.trim();
 }
 
 export async function readSeatLabel(path) {

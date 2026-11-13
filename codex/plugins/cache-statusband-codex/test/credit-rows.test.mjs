@@ -31,3 +31,37 @@ test("fewer rows than the count, with nothing cut, still says Codex did not supp
   const old = details({ availableCount: 3, credits: rows(2), source: "cache", fetchedAt: NOW });
   assert.match(old, /1 additional reset expiration was not supplied by Codex\./);
 });
+
+test("an explicit null expiresAt reads 'does not expire'; a missing or invalid one stays 'expiration not supplied'", () => {
+  const safe = sanitizeRateLimits({
+    rateLimitResetCredits: {
+      availableCount: 4,
+      credits: [
+        { title: "Forever", expiresAt: null },
+        { title: "Silent" },
+        { title: "Garbled", expiresAt: "soon" },
+        { title: "Dated", expiresAt: 1_793_302_971 },
+      ],
+    },
+  });
+  assert.deepEqual(safe.credits.map((credit) => credit.neverExpires), [true, undefined, undefined, undefined]);
+  const text = details({ ...safe, source: "live", fetchedAt: NOW });
+  assert.match(text, /Forever — does not expire/);
+  assert.match(text, /Silent — expiration not supplied/);
+  assert.match(text, /Garbled — expiration not supplied/);
+  assert.match(text, /Dated — expires /);
+  // The flag survives the cache's JSON round trip.
+  const cached = details({ ...JSON.parse(JSON.stringify(safe)), source: "cache", fetchedAt: NOW });
+  assert.match(cached, /Forever — does not expire/);
+});
+
+test("rows Codex sent beyond its own count are described against that count", () => {
+  const safe = sanitizeRateLimits({ rateLimitResetCredits: { availableCount: 20, credits: rows(25) } });
+  assert.equal(safe.creditsOmitted, 5);
+  const text = details({ ...safe, source: "live", fetchedAt: NOW });
+  assert.match(text, /Banked resets: 20/);
+  assert.match(text, /5 more rows beyond Codex's count of 20 not shown\./);
+  assert.doesNotMatch(text, /more reset expirations not shown|not supplied by Codex/);
+  const one = details({ ...sanitizeRateLimits({ rateLimitResetCredits: { availableCount: 20, credits: rows(21) } }), source: "live", fetchedAt: NOW });
+  assert.match(one, /1 more row beyond Codex's count of 20 not shown\./);
+});

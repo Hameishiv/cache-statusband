@@ -69,9 +69,13 @@ export async function getUsageSnapshot({
       attemptedAt: now,
       nextAllowedAt: now + MIN_POLL_INTERVAL_MS,
     };
-    // A cache that cannot be written (a Windows rename that keeps failing) must not stop the
-    // read: the reading is still worth showing, it just will not be shared.
-    await tryWriteCache(cachePath, attempted, renameImpl);
+    // The throttle holds only if this attempt marker lands: other callers read it to know a
+    // poll is under way or was just made. A cache that cannot be written (a Windows rename
+    // that keeps failing) therefore means no live read at all; what is stored is returned.
+    if (!await tryWriteCache(cachePath, attempted, renameImpl)) {
+      const { migrateSeatDeadline, ...stored } = cached ?? {};
+      return present(cached ? stored : null, aligned.mismatch ? "identity-changed" : "stale");
+    }
 
     let saved;
     try {
@@ -340,8 +344,9 @@ async function readAccountSession({
       } catch {
         return;
       }
-      // Server notifications/requests may reuse ids; only a bare response is ours.
-      if (message.method !== undefined || (message.id !== 2 && message.id !== 4)) return;
+      // Server notifications/requests may reuse ids; only a bare response is ours. Id 2 is
+      // the first read; id 4 exists only on a two-read connection.
+      if (message.method !== undefined || (message.id !== 2 && !(reads === 2 && message.id === 4))) return;
       if (message.error) {
         finish(reject, new Error("Codex account read failed"));
         return;
@@ -476,6 +481,9 @@ export function sanitizeRateLimits(raw) {
     ? bank.credits.slice(0, MAX_CREDIT_ROWS).map((credit) => ({
         title: safeText(credit?.title),
         expiresAt: finiteNonnegative(credit?.expiresAt),
+        // An explicit null is Codex saying the reset does not expire; a missing or invalid
+        // value is Codex not saying, and must stay distinguishable from it.
+        ...(credit && typeof credit === "object" && credit.expiresAt === null ? { neverExpires: true } : {}),
       }))
     : null;
   const rateLimits = raw?.rateLimits;

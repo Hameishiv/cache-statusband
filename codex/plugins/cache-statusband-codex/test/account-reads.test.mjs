@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { captureUsageIdentity, disposeAllAppServers, fetchRateLimitsViaAppServer, readAccountViaAppServer, readAccountsViaAppServer } from "../src/usage.mjs";
 
@@ -63,6 +64,22 @@ test("the rate-limit reader fails closed without an expected account", async () 
   }
 });
 
+test("a seat-less single read ignores a stray id-4 response, which only a two-read connection expects", async (t) => {
+  const root = await fixtureRoot(t);
+  const strayServer = join(root, "stray-server.mjs");
+  await writeFile(strayServer, `
+import { createInterface } from "node:readline";
+const reply = (id, email) => process.stdout.write(JSON.stringify({ id, result: { account: { type: "chatgpt", email } } }) + "\\n");
+createInterface({ input: process.stdin }).on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.id === 1) process.stdout.write(JSON.stringify({ id: 1, result: {} }) + "\\n");
+  if (message.id === 2) { reply(4, "stray@example.invalid"); reply(2, "${FAKE_EMAIL}"); }
+});
+`);
+  const account = await readAccountViaAppServer({ codexHome: root, command: process.execPath, args: [strayServer], timeoutMs: 5_000 });
+  assert.equal(account.email, FAKE_EMAIL);
+});
+
 test("disposeAllAppServers waits for the cleanup a finished reader already started", async (t) => {
   const root = await fixtureRoot(t);
   let killerFinished = false;
@@ -71,12 +88,23 @@ test("disposeAllAppServers waits for the cleanup a finished reader already start
     setTimeout(() => { killerFinished = true; fake.emit("exit", 0); }, 300);
     return fake;
   };
-  // A server that never answers and ends by itself after a few seconds (the killer is faked).
+  // A server that never answers and ends by itself after a few seconds (the killer is faked,
+  // so the test ends the real process itself, by the pid it started).
   const idle = { command: process.execPath, args: ["-e", "process.stdin.resume(); setTimeout(() => process.exit(0), 4000)"] };
-  await assert.rejects(readAccountViaAppServer({ codexHome: root, ...idle, platform: "win32", spawnKiller, timeoutMs: 200 }), /timed out/);
-  // The reader gave up and moved on, but its taskkill is still running. A hook that exits
-  // now would leave the server behind, so the exit path must wait for it.
-  assert.equal(killerFinished, false);
-  await disposeAllAppServers({ waitMs: 2_000, platform: "win32", spawnKiller });
-  assert.equal(killerFinished, true);
+  let pid;
+  const spawnImpl = (...spawnArguments) => {
+    const child = spawn(...spawnArguments);
+    pid = child.pid;
+    return child;
+  };
+  try {
+    await assert.rejects(readAccountViaAppServer({ codexHome: root, ...idle, spawnImpl, platform: "win32", spawnKiller, timeoutMs: 200 }), /timed out/);
+    // The reader gave up and moved on, but its taskkill is still running. A hook that exits
+    // now would leave the server behind, so the exit path must wait for it.
+    assert.equal(killerFinished, false);
+    await disposeAllAppServers({ waitMs: 2_000, platform: "win32", spawnKiller });
+    assert.equal(killerFinished, true);
+  } finally {
+    if (pid) { try { process.kill(pid); } catch { /* already gone */ } }
+  }
 });
