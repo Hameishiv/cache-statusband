@@ -4,7 +4,7 @@ import { chmod, mkdtemp, mkdir, readdir, readFile, rm, utimes, writeFile } from 
 import { tmpdir } from "node:os";
 import { execFile } from "node:child_process";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
 import { handleSessionStart } from "../hooks/session-start.mjs";
@@ -751,3 +751,25 @@ async function fixtureRoot(t) {
 async function writeFixture(path) {
   await writeFile(path, FIXTURE.map((item) => typeof item === "string" ? item : JSON.stringify(item)).join("\n") + "\n", "utf8");
 }
+
+test("board still lists sessions when the usage read throws, and says so on stderr; --json has usage: null", async (t) => {
+  const root = await fixtureRoot(t);
+  await mkdir(join(root, "sessions"));
+  const meta = { timestamp: "2026-10-29T12:00:00.000Z", type: "session_meta", payload: { id: "usage-throws-session", cwd: "/workspace/example", source: "cli" } };
+  await writeFile(join(root, "sessions", "usage-throws.jsonl"), `${JSON.stringify(meta)}\n`, "utf8");
+  const preload = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), "..", "fixtures", "fail-usage-cache-key.mjs")).href;
+  const cli = cliRunner(root);
+  const env = { CACHE_STATUSBAND_CODEX_SEAT_FILE: "", NODE_OPTIONS: `--import=${preload}` };
+
+  const text = await cli.runWithStderr(["board"], env);
+  assert.match(text.stderr, /^cache-statusband-codex: usage not read: simulated failure while building the cache name$/m);
+  assert.match(text.stdout, /usage-throw…/);
+  assert.match(text.stdout, /Banked resets: unavailable/);
+
+  const json = await cli.runWithStderr(["board", "--json"], env);
+  assert.match(json.stderr, /usage not read: simulated failure/);
+  const parsed = JSON.parse(json.stdout);
+  assert.equal(parsed.usage, null);
+  assert.equal(parsed.sessions.length, 1);
+  assert.equal(parsed.sessions[0].id, "usage-throws-session");
+});
