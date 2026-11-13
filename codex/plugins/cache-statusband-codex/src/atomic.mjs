@@ -1,4 +1,4 @@
-import { rename as fsRename } from "node:fs/promises";
+import { mkdir, rename as fsRename } from "node:fs/promises";
 
 const RETRYABLE = new Set(["EPERM", "EACCES", "EBUSY"]);
 const RENAME_BACKOFF_MS = [20, 40, 80, 160, 320];
@@ -14,5 +14,15 @@ export async function renameWithRetry(from, to, { rename = fsRename, delaysMs = 
       if (attempt >= delaysMs.length || !RETRYABLE.has(error?.code)) throw error;
       await new Promise((resolve) => setTimeout(resolve, delaysMs[attempt]));
     }
+  }
+}
+
+// Creates one folder, never its parents: a Codex home that does not exist is not ours to
+// create (ENOENT is thrown to the caller), and a folder that already exists is fine.
+export async function makeFolder(path) {
+  try {
+    await mkdir(path);
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
   }
 }

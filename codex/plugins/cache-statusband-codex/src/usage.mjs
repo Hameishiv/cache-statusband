@@ -1,10 +1,10 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { statSync } from "node:fs";
-import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { readFile, unlink, writeFile } from "node:fs/promises";
 import { delimiter, dirname, join } from "node:path";
 import { createInterface } from "node:readline";
-import { renameWithRetry } from "./atomic.mjs";
+import { makeFolder, renameWithRetry } from "./atomic.mjs";
 import { acquireLock } from "./lock.mjs";
 import { hasControl, stripControls } from "./sanitize.mjs";
 import { configuredSeatIdentity } from "./settings.mjs";
@@ -32,16 +32,6 @@ export async function getUsageSnapshot({
 } = {}) {
   if (!codexHome) throw new Error("codexHome is required");
   const dataDir = join(codexHome, "cache-statusband-codex");
-  // A cache folder that cannot be created is not an error to the caller: no marker can be
-  // written there, so no live read is made (see the lock step below), but whatever can still
-  // be read is shown.
-  let dataDirReady = true;
-  try {
-    await mkdir(dataDir, { recursive: true });
-  } catch {
-    dataDirReady = false;
-  }
-
   const identity = suppliedIdentity === undefined
     ? await captureUsageIdentity(codexHome, { env })
     : suppliedIdentity;
@@ -74,6 +64,17 @@ export async function getUsageSnapshot({
   // it either, or the lock fails some other way) is the cache unwritable: no live read is
   // made, and the stored reading is returned marked the same way as an attempt marker that
   // cannot be written.
+  //
+  // The cache folder is created here, after the identity is known and only when a read may
+  // be made, and only that one folder: a Codex home that does not exist is never created. A
+  // folder that cannot be created is not an error to the caller: no marker can be written
+  // there, so no live read is made, but whatever can still be read is shown.
+  let dataDirReady = true;
+  try {
+    await makeFolder(dataDir);
+  } catch {
+    dataDirReady = false;
+  }
   let lock = null;
   let lockFailed = !dataDirReady;
   if (dataDirReady) {

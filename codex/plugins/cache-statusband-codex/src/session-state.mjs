@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
-import { link, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { link, readFile, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { renameWithRetry } from "./atomic.mjs";
+import { makeFolder, renameWithRetry } from "./atomic.mjs";
 import { acquireLock } from "./lock.mjs";
 import { hasControl, stripControls } from "./sanitize.mjs";
 
@@ -36,7 +36,7 @@ export async function getSessionIdentity(codexHome, sessionId, capture, { linkIm
   const temporary = `${path}.${randomUUID()}.tmp`;
   let published = false;
   try {
-    await mkdir(join(codexHome, "cache-statusband-codex", "sessions"), { recursive: true });
+    await makeSessionsFolder(codexHome);
     await writeFile(temporary, `${JSON.stringify({ version: STATE_VERSION, identity: safeIdentity })}\n`, { encoding: "utf8", mode: 0o600 });
     // Publishing a complete file with link is atomic and cannot replace a winner. A refusal
     // that may be momentary (EPERM/EBUSY: another process holding the file) is tried again
@@ -75,6 +75,14 @@ export async function getSessionIdentity(codexHome, sessionId, capture, { linkIm
   return published ? safeIdentity : parseIdentity(await readFile(path, "utf8"));
 }
 
+// Only the plugin's own two folders are created, one at a time; a Codex home that does not
+// exist is never created (the error is thrown to the caller).
+async function makeSessionsFolder(codexHome) {
+  const dataDir = join(codexHome, "cache-statusband-codex");
+  await makeFolder(dataDir);
+  await makeFolder(join(dataDir, "sessions"));
+}
+
 function parseIdentity(text) {
   const record = JSON.parse(text);
   if (record?.version !== STATE_VERSION) throw new Error("Unknown session identity version");
@@ -92,7 +100,7 @@ export async function saveSessionState(codexHome, sessionId, summary, savedAt = 
   const state = stateFromSummary(summary, savedAt);
   if (!codexHome || !sessionId || !state) return false;
   const path = sessionStatePath(codexHome, sessionId);
-  await mkdir(join(codexHome, "cache-statusband-codex", "sessions"), { recursive: true });
+  await makeSessionsFolder(codexHome);
   // One writer per session; a fresh lock means another Stop hook is saving right now, and a
   // lock file refused for a moment (acquireLock also returns null for that) takes the same
   // path. A save takes milliseconds, so wait briefly before giving up on this one.

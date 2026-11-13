@@ -9,6 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
 import { capFirst, formatAge, formatDuration, formatUsageLines } from "../src/format.mjs";
+import { getSessionIdentity, saveSessionState } from "../src/session-state.mjs";
 import { usagePresentation } from "../src/settings.mjs";
 import {
   fetchRateLimitsViaAppServer,
@@ -675,10 +676,11 @@ test("a cache-only snapshot reports what is stored and records no attempt", asyn
   const name = `rate-limits-${createHash("sha256").update(ACCOUNT_IDENTITY.key).digest("hex").slice(0, 16)}.json`;
   const fetcher = async () => { throw new Error("must not read"); };
 
-  // Nothing stored: empty, and nothing written.
+  // Nothing stored: empty, and nothing written (not even the cache folder).
   const empty = await getUsageSnapshot({ codexHome: root, now, identity: ACCOUNT_IDENTITY, fetcher, cacheOnly: true });
   assert.equal(empty.availableCount, null);
-  await assert.rejects(access(join(dataDir, name)));
+  await assert.rejects(access(dataDir));
+  await mkdir(dataDir);
 
   // An expired reading is shown as stale and the file is untouched.
   const stored = JSON.stringify({ version: 3, identityKey: ACCOUNT_IDENTITY.key, accountEmail: TEST_EMAIL, availableCount: 4, fetchedAt: now - 3_600_000, nextAllowedAt: now - 1000, lastErrorAt: null });
@@ -757,5 +759,51 @@ test("a server that has already exited is not signalled again, but a live one is
       if (process.platform === "win32") await promisify(execFile)("taskkill", ["/PID", String(pid), "/T", "/F"]).catch(() => {});
       else process.kill(pid);
     }
+  }
+});
+
+test("a Codex home that does not exist is never created by usage, board or the session-state writers", async (t) => {
+  const parent = await fixtureRoot(t);
+  const home = join(parent, "no-such-codex-home");
+  const stillMissing = async (what) => assert.deepEqual((await readdir(parent)).filter((name) => name === "no-such-codex-home"), [], `${what} created the home`);
+  const fetcher = async () => { throw new Error("must not read"); };
+
+  // Both the normal and the cache-only paths take the "cannot update the cache" answer.
+  const snapshot = await getUsageSnapshot({ codexHome: home, identity: ACCOUNT_IDENTITY, fetcher });
+  assert.equal(snapshot.cacheUnwritable, true);
+  assert.equal(snapshot.availableCount, null);
+  await stillMissing("getUsageSnapshot");
+  await getUsageSnapshot({ codexHome: home, identity: ACCOUNT_IDENTITY, fetcher, cacheOnly: true });
+  await stillMissing("getUsageSnapshot (cacheOnly)");
+  // No identity: nothing is created before the identity is known either.
+  assert.equal((await getUsageSnapshot({ codexHome: home, identity: null, fetcher })).source, "identity-unavailable");
+  await stillMissing("getUsageSnapshot (no identity)");
+
+  // The session-state writers: a missing home is not created, a failed identity record falls
+  // back to the login just read, and a failed Stop save throws (the hook swallows it).
+  const identity = await getSessionIdentity(home, "missing-home-session", async () => ACCOUNT_IDENTITY);
+  assert.equal(identity.key, ACCOUNT_IDENTITY.key);
+  await stillMissing("getSessionIdentity");
+  const summary = { contextUsed: 10, contextWindow: 100, updatedAt: "2026-10-29T12:00:00.000Z" };
+  await assert.rejects(saveSessionState(home, "missing-home-session", summary), { code: "ENOENT" });
+  await stillMissing("saveSessionState");
+
+  // The CLI, with a fake app-server that signs in an account.
+  const here = dirname(fileURLToPath(import.meta.url));
+  const bin = join(here, "..", "bin", "cache-statusband-codex.mjs");
+  const server = join(here, "..", "fixtures", "fake-app-server.mjs");
+  const windows = process.platform === "win32";
+  const wrapper = join(parent, windows ? "codex.cmd" : "codex");
+  await writeFile(wrapper, windows
+    ? `@echo off\r\n"${process.execPath}" "${server}" %*\r\n`
+    : `#!/bin/sh\nexec "${process.execPath}" "${server}" "$@"\n`, { mode: 0o755 });
+  for (const args of [["usage"], ["usage", "--json"], ["board"], ["board", "--json"]]) {
+    const { stdout, stderr } = await promisify(execFile)(process.execPath, [bin, ...args, "--codex-home", home], {
+      env: { ...process.env, CODEX_BIN: wrapper, CACHE_STATUSBAND_CODEX_SEAT_FILE: "" },
+      timeout: 20_000,
+    });
+    assert.match(stderr, /cannot update the cache/, `${args.join(" ")}: ${stderr}`);
+    assert.ok(stdout.length > 0);
+    await stillMissing(`cache-statusband-codex ${args.join(" ")}`);
   }
 });
