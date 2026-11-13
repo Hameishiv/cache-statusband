@@ -364,6 +364,92 @@ exit /b 0
   if ([IO.File]::ReadAllText((Join-Path $restoreHome "config.toml")) -ne $original) {
     throw "The original config.toml was not restored after a failed registration"
   }
+  # Replacing a file must never leave a gap in which it does not exist: a reader hammering
+  # the file while it is replaced over and over must always find it.
+  foreach ($name in @("Move-FileOverExisting")) {
+    $definition = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true)
+    . ([scriptblock]::Create($definition.Extent.Text))
+  }
+  $swapFolder = Join-Path $testHome "swap"
+  New-Item -ItemType Directory -Path $swapFolder | Out-Null
+  $swapTarget = Join-Path $swapFolder "target.json"
+  [IO.File]::WriteAllText($swapTarget, "0")
+  $swapReader = Start-ThreadJob -ArgumentList $swapTarget -ScriptBlock {
+    param($path)
+    $missing = 0
+    $deadline = [DateTime]::UtcNow.AddSeconds(8)
+    while ([DateTime]::UtcNow -lt $deadline) {
+      try {
+        # Opened the way Node and Codex open files: allowing the file to be replaced under it.
+        $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+        $stream.Dispose()
+      } catch [IO.FileNotFoundException] { $missing += 1 } catch { }
+    }
+    $missing
+  }
+  Start-Sleep -Milliseconds 200
+  for ($n = 1; $n -le 1500; $n += 1) {
+    $swapCandidate = Join-Path $swapFolder "candidate-$n.tmp"
+    [IO.File]::WriteAllText($swapCandidate, "$n")
+    Move-FileOverExisting $swapCandidate $swapTarget
+  }
+  $swapMissing = [int](Receive-Job -Job $swapReader -Wait -AutoRemoveJob)
+  if ($swapMissing -ne 0) { throw "A reader found the replaced file missing $swapMissing time(s)" }
+  if ([IO.File]::ReadAllText($swapTarget) -ne "1500") { throw "The last replacement did not land" }
+
+  # Something else edits config.toml while the installer is validating its candidate (the fake
+  # codex appends to the live file during the first check after registration). The installer
+  # must rebuild from the new text and keep that edit rather than overwrite it.
+  $raceBin = Join-Path $testHome "race-bin"
+  New-Item -ItemType Directory -Path $raceBin | Out-Null
+  $raceCodex = @'
+@echo off
+if "%1"=="plugin" if "%2"=="add" (
+  echo.> "%FAKE_STATE%\armed"
+  exit /b 0
+)
+if not "%1"=="app-server" exit /b 0
+if not exist "%FAKE_STATE%\armed" exit /b 0
+if "%FAKE_ONCE%"=="1" if exist "%FAKE_STATE%\done" exit /b 0
+echo.> "%FAKE_STATE%\done"
+echo # edited by someone else>> "%FAKE_LIVE%"
+exit /b 0
+'@
+  [IO.File]::WriteAllText((Join-Path $raceBin "codex.cmd"), $raceCodex, [Text.Encoding]::ASCII)
+  $previousPath = $env:PATH
+  try {
+    $env:PATH = "$raceBin$([IO.Path]::PathSeparator)$previousPath"
+    foreach ($once in @("1", "0")) {
+      $raceHome = Join-Path $testHome "race-home-$once"
+      $raceState = Join-Path $testHome "race-state-$once"
+      New-Item -ItemType Directory -Path $raceHome, $raceState | Out-Null
+      $raceOriginal = "[history]`npersistence = `"save-all`"`n"
+      [IO.File]::WriteAllText((Join-Path $raceHome "config.toml"), $raceOriginal, [Text.UTF8Encoding]::new($false))
+      $env:FAKE_STATE = $raceState
+      $env:FAKE_LIVE = Join-Path $raceHome "config.toml"
+      $env:FAKE_ONCE = $once
+      $raceMessage = ""
+      try {
+        & (Join-Path $root "install.ps1") -CodexHome $raceHome -SkipCliLink 3>$null | Out-Null
+      } catch {
+        $raceMessage = $_.Exception.Message
+      }
+      $raceAfter = [IO.File]::ReadAllText((Join-Path $raceHome "config.toml"))
+      if ($raceAfter -notmatch '(?m)^# edited by someone else\r?$') { throw "An edit made to config.toml during validation was lost (once=$once)" }
+      if ($once -eq "1") {
+        if ($raceMessage) { throw "A single concurrent edit should be absorbed by a retry, but the install failed: $raceMessage" }
+        if ($raceAfter -notmatch '(?m)^status_line_use_colors = true$') { throw "The retried install did not apply the plugin's edit" }
+      } else {
+        if ($raceMessage -notmatch "kept changing") { throw "Endless concurrent edits were not reported: $raceMessage" }
+        if ($raceAfter -match '(?m)^status_line_use_colors') { throw "The plugin's edit was written despite a concurrent change" }
+        if ($raceAfter -eq $raceOriginal) { throw "The original config.toml was restored over a concurrent edit" }
+      }
+      if (@(Get-ChildItem -LiteralPath $raceHome -Force -File | Where-Object { $_.Name -like "*.tmp" }).Count -ne 0) { throw "A temporary config file was left behind (once=$once)" }
+    }
+  } finally {
+    $env:PATH = $previousPath
+    Remove-Item Env:FAKE_STATE, Env:FAKE_LIVE, Env:FAKE_ONCE -ErrorAction SilentlyContinue
+  }
   Write-Output "install_config_test=passed"
 } finally {
   if (Test-Path -LiteralPath $testHome) {
