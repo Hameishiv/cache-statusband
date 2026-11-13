@@ -594,9 +594,48 @@ test("a retry-after date in an error message is a moment, and a number must dire
   assert.equal(ms("retry after 2026-10-29T14:00:00+02:00"), 0);
   // An ISO date is never read as "2026 seconds".
   assert.notEqual(ms("retry after 2026-10-29T12:20:00Z"), 2026_000);
-  // The 5h is a window name, not the wait: nothing follows "retry after" directly.
-  assert.equal(ms("retry after the 5h window (in 40 minutes)"), null);
+  // The 5h is a window name, not the wait: the 40 minutes is what the message states for the retry.
+  assert.equal(ms("retry after the 5h window (in 40 minutes)"), 40 * 60_000);
   assert.equal(ms("retry after the 5h window"), null);
+  // A date-time with no zone is UTC, whatever zone this machine is in.
+  assert.equal(ms("retry after 2026-10-29T12:20:00"), 20 * 60_000);
+  assert.equal(ms("retry after 2026-10-29 12:20:00"), 20 * 60_000);
+  assert.equal(ms("retry after 2026-10-29T12:20:00.500"), 20 * 60_000 + 500);
+});
+
+test("retry-after wording in an error message: filler words, key suffixes, and a number a few words away", () => {
+  const ms = (message) => retryAfterMilliseconds({ message }, 0);
+  const rows = [
+    ["retry after approximately 30 minutes", 1.8e6],
+    ["please retry after about 20 minutes", 1.2e6],
+    ["retry after at least 10m", 6e5],
+    ["retry after: ~30s", 3e4],
+    ['Retry-After: "30"', 3e4],
+    ["retry after (30s)", 3e4],
+    ["retry after - 30s", 3e4],
+    ["retry_after_seconds=30", 3e4],
+    ["retry_after_seconds: 30", 3e4],
+    ["retry-after-secs: 3", 3e3],
+    ["retry-after-ms: 250", 250],
+    ["retry after the window resets in 3 hours", 1.08e7],
+    ["retry after the 5h window (in 40 minutes)", 2.4e6],
+  ];
+  for (const [message, expected] of rows) assert.equal(ms(message), expected, message);
+  // A message with no number near the words states no wait.
+  assert.equal(ms("retry after the window resets"), null);
+  assert.equal(ms("retry after the 5h window"), null);
+});
+
+test("a message-stated wait of hours is capped at one hour by the caller", async (t) => {
+  const root = await fixtureRoot(t);
+  const now = Date.parse("2026-10-29T12:00:00.000Z");
+  const failed = await getUsageSnapshot({
+    codexHome: root,
+    now,
+    identity: ACCOUNT_IDENTITY,
+    fetcher: async () => { throw new Error("limited; retry after the window resets in 3 hours"); },
+  });
+  assert.equal(failed.nextAllowedAt, now + MAX_RETRY_AFTER_MS);
 });
 
 test("a cache deadline beyond the longest possible backoff does not suppress polling", async (t) => {

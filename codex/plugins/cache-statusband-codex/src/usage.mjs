@@ -592,22 +592,54 @@ export function retryAfterMilliseconds(error, now = Date.now()) {
   }
   const message = error?.rpcMessage ?? error?.message;
   if (typeof message === "string") {
-    // The number must follow "retry after" directly (spaces, ":", "=" and "in" only), so
-    // "retry after the 5h window" does not read the 5h. An ISO date there is a moment, not a count.
-    const iso = message.match(/retry[\s_-]*after[\s:=]*(?:in\s+)?(\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)?(?:Z|[+-]\d{2}:?\d{2})?)/i);
-    const at = iso ? Date.parse(iso[1].replace(" ", "T")) : NaN;
-    if (Number.isFinite(at)) candidates.push(Math.max(0, at - now));
-    const match = iso ? null : message.match(/retry[\s_-]*after(?:[\s_-]*(ms|milliseconds?)\b)?[\s:=]*(?:in\s+)?(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?)?(?![a-z])/i);
-    if (match) {
-      const unit = (match[1] ?? match[3] ?? "s").toLowerCase();
-      const scale = unit.startsWith("ms") || unit.startsWith("milli") ? 1
-        : unit.startsWith("h") ? 3_600_000
-        : unit.startsWith("m") ? 60_000
-        : 1000;
-      candidates.push(Number(match[2]) * scale);
-    }
+    const stated = retryAfterFromMessage(message, now);
+    if (stated !== null) candidates.push(stated);
   }
   return candidates.length ? Math.max(...candidates.filter((value) => value >= 0)) : null;
+}
+
+// Words that may sit between "retry after" and the number ("retry after about 20 minutes",
+// "retry after: ~30s", 'Retry-After: "30"', "retry after (30s)", "retry after - 30s").
+const RETRY_FILLER = String.raw`(?:[\s:="'(~-]|(?:about|approximately|approx\.?|around|roughly|at\s+least|in)\b)*`;
+const RETRY_UNIT = String.raw`(ms|milliseconds?|secs?|seconds?|s|mins?|minutes?|m|hrs?|hours?|h)(?![a-z])`;
+// "retry after", optionally with a unit in the key name (retry_after_seconds, retry-after-ms).
+const RETRY_KEY = String.raw`retry[\s_-]*after(?:(?:[_-]+|\s+(?=ms\b|milliseconds?\b))(ms|milliseconds?|secs?|seconds?|mins?|minutes?|hrs?|hours?|s|m|h)\b)?`;
+const RETRY_ISO = String.raw`(\d{4}-\d{2}-\d{2})(?:[T ](\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?))?(Z|[+-]\d{2}:?\d{2})?`;
+const RETRY_NUMBER = String.raw`(\d+(?:\.\d+)?)`;
+// How far past "retry after" a number with a unit is looked for when none directly follows it.
+const RETRY_LOOKAHEAD_CHARS = 40;
+
+function unitScale(unit) {
+  const name = unit.toLowerCase();
+  return name.startsWith("ms") || name.startsWith("milli") ? 1
+    : name.startsWith("h") ? 3_600_000
+    : name.startsWith("m") ? 60_000
+    : 1000;
+}
+
+// The wait a message states for its own retry, in milliseconds, or null. A date is a moment
+// (a date-time with no zone is UTC, as a server's timestamps are), not a count. Otherwise the
+// number is read directly after "retry after" (past filler words, and with the unit taken from
+// the key name as in retry_after_seconds=30); failing that, the first number with a unit
+// within a short window after it ("retry after the window resets in 3 hours"). A number that
+// names a window ("the 5h window") is the window's length, not the wait.
+function retryAfterFromMessage(message, now) {
+  const iso = message.match(new RegExp(`${RETRY_KEY}${RETRY_FILLER}${RETRY_ISO}`, "i"));
+  if (iso) {
+    const [, , date, time, zone] = iso;
+    const at = Date.parse(time ? `${date}T${time}${zone ?? "Z"}` : `${date}${zone ?? ""}`);
+    return Number.isFinite(at) ? Math.max(0, at - now) : null;
+  }
+  const direct = message.match(new RegExp(`${RETRY_KEY}${RETRY_FILLER}${RETRY_NUMBER}(?:\\s*${RETRY_UNIT})?`, "i"));
+  if (direct) return Number(direct[2]) * unitScale(direct[3] ?? direct[1] ?? "s");
+  const key = message.match(new RegExp(RETRY_KEY, "i"));
+  if (!key) return null;
+  const start = key.index + key[0].length;
+  const after = message.slice(start, start + RETRY_LOOKAHEAD_CHARS);
+  for (const found of after.matchAll(new RegExp(`${RETRY_NUMBER}\\s*${RETRY_UNIT}(?!\\s+window)`, "gi"))) {
+    return Number(found[1]) * unitScale(found[2]);
+  }
+  return null;
 }
 
 function emptyCache() {
