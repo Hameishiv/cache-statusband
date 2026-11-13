@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { capFirst, formatAge, formatDuration, formatUsageLines } from "../src/format.mjs";
@@ -13,6 +13,8 @@ import {
   getUsageSnapshot,
   MAX_RETRY_AFTER_MS,
   MIN_POLL_INTERVAL_MS,
+  readAccountViaAppServer,
+  resolveCodexLaunch,
   retryAfterMilliseconds,
   sanitizeRateLimits,
 } from "../src/usage.mjs";
@@ -304,6 +306,156 @@ test("uses an explicitly configured seat file before the account email", async (
   );
   assert.equal(await displayIdentity({ accountEmail: TEST_EMAIL }, { codexHome: root, env: {} }), `${SEAT_PREFIX} ${FIRST_SEAT} unsafe`);
   assert.equal(await displayIdentity({ accountEmail: TEST_EMAIL }, { codexHome: join(root, "missing"), env: {} }), TEST_EMAIL);
+});
+
+const FAKE_SERVER = join(dirname(fileURLToPath(import.meta.url)), "..", "fixtures", "fake-app-server.mjs");
+
+test("resolves a runnable Codex command from CODEX_BIN or the Windows PATH", async (t) => {
+  const root = await fixtureRoot(t);
+  const bin = join(root, "npm bin");
+  const other = join(root, "other");
+  await mkdir(bin);
+  await mkdir(other);
+  await writeFile(join(bin, "codex.cmd"), "");
+  await writeFile(join(other, "codex.exe"), "");
+  const ComSpec = "C:\\Windows\\System32\\cmd.exe";
+
+  const wrapped = resolveCodexLaunch({ Path: bin, ComSpec }, "win32");
+  assert.equal(wrapped.command, ComSpec);
+  assert.deepEqual(wrapped.args, ["/d", "/s", "/c", `""${join(bin, "codex.cmd")}" app-server"`]);
+  assert.equal(wrapped.windowsVerbatimArguments, true);
+
+  assert.equal(resolveCodexLaunch({ PATH: `${bin}${delimiter}${other}` }, "win32").command, "cmd.exe");
+  assert.deepEqual(resolveCodexLaunch({ PATH: `${other}${delimiter}${bin}` }, "win32"), { command: join(other, "codex.exe"), args: ["app-server"] });
+  assert.equal(resolveCodexLaunch({ PATH: other, CODEX_BIN: join(bin, "codex.cmd"), ComSpec }, "win32").windowsVerbatimArguments, true);
+  assert.deepEqual(resolveCodexLaunch({ CODEX_BIN: "/opt/codex" }, "linux"), { command: "/opt/codex", args: ["app-server"] });
+  assert.deepEqual(resolveCodexLaunch({ PATH: bin }, "linux"), { command: "codex", args: ["app-server"] });
+  assert.deepEqual(resolveCodexLaunch({ PATH: join(root, "empty") }, "win32"), { command: "codex", args: ["app-server"] });
+});
+
+test("the app-server readers run an npm-style codex.cmd found on PATH", { skip: process.platform !== "win32" }, async (t) => {
+  const root = await fixtureRoot(t);
+  const bin = join(root, "npm bin dir");
+  await mkdir(bin);
+  await writeFile(join(bin, "codex.cmd"), `@echo off\r\n"${process.execPath}" "${FAKE_SERVER}" %*\r\n`);
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) if (key.toLowerCase() === "path") delete env[key];
+  env.Path = `${bin}${delimiter}${process.env.PATH ?? process.env.Path ?? ""}`;
+  delete env.CODEX_BIN;
+  const account = await readAccountViaAppServer({ codexHome: root, env, timeoutMs: 5_000 });
+  assert.equal(account.email, ["test", "example.invalid"].join("@"));
+  const limits = await fetchRateLimitsViaAppServer({ codexHome: root, env, timeoutMs: 5_000 });
+  assert.equal(limits.rateLimitResetCredits.availableCount, 2);
+});
+
+test("server messages that reuse a response id are not mistaken for responses", async () => {
+  const options = { command: process.execPath, args: [FAKE_SERVER], timeoutMs: 3_000, env: { ...process.env, FAKE_SERVER_NOISE: "1" } };
+  assert.equal((await readAccountViaAppServer(options)).email, ["test", "example.invalid"].join("@"));
+  const limits = await fetchRateLimitsViaAppServer(options);
+  assert.equal(limits.account.email, ["test", "example.invalid"].join("@"));
+  assert.equal(limits.rateLimitResetCredits.availableCount, 2);
+});
+
+test("identity capture can fail loudly and never labels an unreadable seat with the email", async (t) => {
+  const root = await fixtureRoot(t);
+  const accountReader = async () => ({ email: TEST_EMAIL });
+  await assert.rejects(captureUsageIdentity(root, { env: {}, throwOnFailure: true, accountReader: async () => { throw new Error("app-server down"); } }), /app-server down/);
+  assert.equal(await captureUsageIdentity(root, { env: {}, accountReader: async () => { throw new Error("app-server down"); } }), null);
+  // Signed out is an answer, not a failure.
+  assert.equal(await captureUsageIdentity(root, { env: {}, throwOnFailure: true, accountReader: async () => ({ account: null }) }), null);
+
+  const emptySeat = join(root, "empty-seat.txt");
+  await writeFile(emptySeat, "  \n");
+  const env = { CACHE_STATUSBAND_CODEX_SEAT_FILE: emptySeat };
+  assert.equal(await captureUsageIdentity(root, { env, accountReader }), null);
+  await assert.rejects(captureUsageIdentity(root, { env, accountReader, throwOnFailure: true }), /seat/i);
+  assert.equal(await displayIdentity({ accountEmail: TEST_EMAIL }, { codexHome: root, env }), null);
+
+  const seatPath = join(root, "seat.txt");
+  await writeFile(seatPath, FIRST_SEAT);
+  await assert.rejects(captureUsageIdentity(root, {
+    env: { CACHE_STATUSBAND_CODEX_SEAT_FILE: seatPath },
+    throwOnFailure: true,
+    accountReader: async () => { await writeFile(seatPath, SECOND_SEAT); return { email: TEST_EMAIL }; },
+  }), /seat/i);
+});
+
+test("a per-call timeout reaches the identity reader and the usage fetcher", async (t) => {
+  const root = await fixtureRoot(t);
+  let readerTimeout;
+  const identity = await captureUsageIdentity(root, { env: {}, timeoutMs: 1234, accountReader: async ({ timeoutMs }) => { readerTimeout = timeoutMs; return { email: TEST_EMAIL }; } });
+  assert.equal(readerTimeout, 1234);
+  let fetchTimeout;
+  await getUsageSnapshot({ codexHome: root, now: Date.now(), identity, timeoutMs: 4321, fetcher: async ({ timeoutMs }) => { fetchTimeout = timeoutMs; return RAW; } });
+  assert.equal(fetchTimeout, 4321);
+});
+
+test("parses retry-after units from error text", () => {
+  const ms = (message) => retryAfterMilliseconds({ message }, 0);
+  assert.equal(ms("limited; retry_after_ms: 500"), 500);
+  assert.equal(ms("retry-after-ms=250"), 250);
+  assert.equal(ms("retry after 5 minutes"), 300_000);
+  assert.equal(ms("retry after 2m"), 120_000);
+  assert.equal(ms("Retry-After: 30"), 30_000);
+  assert.equal(ms("retry after 1500ms"), 1_500);
+  assert.equal(ms("retry after 2 hours"), 7_200_000);
+  assert.equal(ms("no hint here"), null);
+});
+
+test("a cache deadline beyond the longest possible backoff does not suppress polling", async (t) => {
+  const root = await fixtureRoot(t);
+  const now = Date.parse("2026-10-29T12:00:00.000Z");
+  const dataDir = join(root, "cache-statusband-codex");
+  await mkdir(dataDir, { recursive: true });
+  const name = `rate-limits-${createHash("sha256").update(ACCOUNT_IDENTITY.key).digest("hex").slice(0, 16)}.json`;
+  await writeFile(join(dataDir, name), JSON.stringify({ version: 3, identityKey: ACCOUNT_IDENTITY.key, availableCount: 9, nextAllowedAt: now + 10 * 60 * 60_000 }));
+  let calls = 0;
+  const snapshot = await getUsageSnapshot({ codexHome: root, now, identity: ACCOUNT_IDENTITY, fetcher: async () => { calls += 1; return RAW; } });
+  assert.equal(calls, 1);
+  assert.equal(snapshot.source, "live");
+  assert.equal(snapshot.availableCount, 2);
+});
+
+test("a verified reading for a different login is kept for that login, never for the expected one", async (t) => {
+  const root = await fixtureRoot(t);
+  const now = Date.parse("2026-10-29T12:00:00.000Z");
+  const otherIdentity = { key: `account:${OTHER_EMAIL}`, label: OTHER_EMAIL, unavailable: false };
+  const seated = { ...ACCOUNT_IDENTITY, label: `${SEAT_PREFIX} ${FIRST_SEAT}` };
+  const otherRaw = { ...RAW, account: { email: OTHER_EMAIL }, rateLimitResetCredits: { availableCount: 6 }, rateLimits: { primary: { usedPercent: 91 } } };
+  const expected = await getUsageSnapshot({ codexHome: root, now, identity: seated, fetcher: async () => otherRaw });
+  assert.equal(expected.source, "stale");
+  assert.equal(expected.availableCount, null);
+  assert.equal(expected.accountEmail, null);
+  const other = await getUsageSnapshot({ codexHome: root, now: now + 1_000, identity: otherIdentity, fetcher: async () => { throw new Error("must reuse the verified reading"); } });
+  assert.equal(other.source, "cache");
+  assert.equal(other.availableCount, 6);
+  assert.equal(other.primary.usedPercent, 91);
+  assert.equal(other.identityKey, otherIdentity.key);
+
+  // A fresh cache for that login is left alone.
+  const newer = { ...otherRaw, rateLimitResetCredits: { availableCount: 7 } };
+  await getUsageSnapshot({ codexHome: root, now: now + 2_000, identity: seated, fetcher: async () => newer });
+  const stillOther = await getUsageSnapshot({ codexHome: root, now: now + 3_000, identity: otherIdentity, fetcher: async () => { throw new Error("cache is fresh"); } });
+  assert.equal(stillOther.availableCount, 6);
+});
+
+test("banked-reset lines say how old a non-live reading is", () => {
+  const now = Date.parse("2026-10-29T12:00:00.000Z");
+  const base = { availableCount: 2, credits: null };
+  assert.equal(formatUsageLines({ ...base, source: "live", fetchedAt: now }, now)[0], "Banked resets: 2");
+  assert.equal(formatUsageLines({ ...base, source: "cache", fetchedAt: now - MIN_POLL_INTERVAL_MS }, now)[0], "Banked resets: 2");
+  assert.equal(formatUsageLines({ ...base, source: "cache", fetchedAt: now - 3 * MIN_POLL_INTERVAL_MS }, now)[0], "Banked resets: 2 (checked 15m ago)");
+  assert.equal(formatUsageLines({ ...base, source: "stale", fetchedAt: now - 60_000 }, now)[0], "Banked resets: 2 (checked 1m ago)");
+  assert.equal(formatUsageLines({ ...base, source: "stale" }, now)[0], "Banked resets: 2 (check time unknown)");
+});
+
+test("local dates use a plain space before AM/PM", () => {
+  const [, detail] = formatUsageLines(
+    { availableCount: 1, credits: [{ title: "Reset", expiresAt: Date.parse("2026-10-29T20:22:00.000Z") / 1000 }] },
+    Date.parse("2026-10-29T12:00:00.000Z"),
+    { includeResetDetails: true, locale: "en-US", timeZone: "UTC" },
+  );
+  assert.doesNotMatch(detail, /[\u202f\u00a0]/);
 });
 
 async function fixtureRoot(t) {

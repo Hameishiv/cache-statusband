@@ -10,6 +10,11 @@ const testEmail = ["test", "example.invalid"].join("@");
 lines.on("line", (line) => {
   const message = JSON.parse(line);
   if (message.id === 1) process.stdout.write(`${JSON.stringify({ id: 1, result: { userAgent: "test" } })}\n`);
+  if (message.id === 1 && process.env.FAKE_SERVER_NOISE) {
+    // Server-initiated messages may reuse small ids; they are not responses.
+    process.stdout.write(`${JSON.stringify({ method: "server/request", id: 2, params: {} })}\n`);
+    process.stdout.write(`${JSON.stringify({ method: "server/request", id: 3, params: {} })}\n`);
+  }
   if (message.id === 2) {
     process.stdout.write(`${JSON.stringify({ id: 2, result: { account: { type: "chatgpt", email: testEmail, planType: "pro" } } })}\n`);
   }
