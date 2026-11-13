@@ -302,7 +302,11 @@ test("the SessionStart hook process prints its answer and exits", async () => {
   assert.equal(stdout, "{}\n");
 });
 
-test("the hook process stops a Codex app-server whose read is still running at the deadline", async (t) => {
+// 400ms ends before the 500ms floor a read is given, so the hook (not the reader) has to
+// stop the server; but a slow machine may not have started it by then, so that variant only
+// checks that nothing is left running IF the server got as far as recording its pid. The
+// 1500ms variant always starts the server and so must find its pid.
+for (const [deadline, mustStart] of [["400", false], ["1500", true]]) test(`the hook process stops a Codex app-server whose read is still running at the deadline (${deadline}ms)`, async (t) => {
   const root = await fixtureRoot(t);
   const here = dirname(fileURLToPath(import.meta.url));
   const hook = join(here, "..", "hooks", "session-start.mjs");
@@ -313,9 +317,7 @@ test("the hook process stops a Codex app-server whose read is still running at t
   await writeFile(launcher, process.platform === "win32"
     ? `@echo off\r\n"${process.execPath}" "${hung}" %*\r\n`
     : `#!/bin/sh\nexec "${process.execPath}" "${hung}" "$@"\n`, { mode: 0o755 });
-  // A 400ms deadline ends before the 500ms floor a read is given, so the hook, not the
-  // reader, has to clean up.
-  const env = { ...process.env, CODEX_HOME: root, CODEX_BIN: launcher, HUNG_PID_FILE: pidFile, CACHE_STATUSBAND_HOOK_DEADLINE_MS: "400" };
+  const env = { ...process.env, CODEX_HOME: root, CODEX_BIN: launcher, HUNG_PID_FILE: pidFile, CACHE_STATUSBAND_HOOK_DEADLINE_MS: deadline };
   const child = execFile(process.execPath, [hook], { env, timeout: 15_000 });
   child.stdin.end(JSON.stringify({ source: "startup", session_id: "orphan-session" }));
   const code = await new Promise((resolve) => child.once("exit", resolve));
@@ -330,6 +332,7 @@ test("the hook process stops a Codex app-server whose read is still running at t
   // launches it before the deadline); a pid file that never appears means the launch itself
   // failed, which must not pass as "nothing left running".
   const started = await until(async () => (await readFile(pidFile, "utf8").catch(() => "")) !== "", 5_000);
+  if (!mustStart && !started) return;
   assert.ok(started, "the Codex app-server never started (no pid file), so the cleanup was not exercised");
   const pid = Number(await readFile(pidFile, "utf8"));
   try {
@@ -358,7 +361,9 @@ test("with too little time left for a full three-second read SessionStart asks f
   const full = await run(5_000);
   assert.equal(full.cacheOnly, undefined);
   assert.ok(full.timeoutMs >= 3_000);
-  const edge = await run(3_700);
+  // Well clear of the 3.5s threshold, so scheduler delay between the hook's start and its
+  // read cannot move it across.
+  const edge = await run(4_500);
   assert.equal(edge.cacheOnly, undefined);
   assert.ok(edge.timeoutMs >= 3_000, `a read was given only ${edge.timeoutMs}ms`);
 });

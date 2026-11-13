@@ -56,10 +56,14 @@ export async function handleSessionStart(input, {
         ? async () => null
         : (target) => identityGetter(target, { throwOnFailure: true, timeoutMs: readBudget() });
       const identity = await getSessionIdentity(home, input.session_id, capture);
-      // The read's own budget is what remains less the margin; unless that is at least
+      // What remains is measured ONCE and both decisions come from that one value, so a
+      // read is never promised the full budget by one clock reading and refused by another.
+      // The read's own budget is that value less the margin; unless it is at least
       // MIN_FETCH_BUDGET_MS, show what is cached rather than start a read that cannot finish.
-      const cacheOnly = deadlineMs - (Date.now() - started) < MIN_FETCH_BUDGET_MS + READ_MARGIN_MS;
-      const usage = await usageGetter({ codexHome: home, now, identity, timeoutMs: readBudget(), ...(cacheOnly ? { cacheOnly: true } : {}) });
+      const remaining = deadlineMs - (Date.now() - started);
+      const cacheOnly = remaining < MIN_FETCH_BUDGET_MS + READ_MARGIN_MS;
+      const timeoutMs = Math.max(READ_MARGIN_MS, remaining - READ_MARGIN_MS);
+      const usage = await usageGetter({ codexHome: home, now, identity, timeoutMs, ...(cacheOnly ? { cacheOnly: true } : {}) });
       const presented = await usagePresentation(usage, { codexHome: home, identity });
       const built = [];
       if (Number.isFinite(presented.snapshot.availableCount)) built.push(formatUsageLines(presented.snapshot, now)[0]);

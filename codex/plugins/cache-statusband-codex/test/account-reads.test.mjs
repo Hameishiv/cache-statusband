@@ -4,7 +4,8 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { captureUsageIdentity, fetchRateLimitsViaAppServer, readAccountsViaAppServer } from "../src/usage.mjs";
+import { EventEmitter } from "node:events";
+import { captureUsageIdentity, disposeAllAppServers, fetchRateLimitsViaAppServer, readAccountViaAppServer, readAccountsViaAppServer } from "../src/usage.mjs";
 
 const FIXTURES = join(dirname(fileURLToPath(import.meta.url)), "..", "fixtures");
 const FAKE_SERVER = join(FIXTURES, "fake-app-server.mjs");
@@ -60,4 +61,22 @@ test("the rate-limit reader fails closed without an expected account", async () 
   for (const expectedEmail of [undefined, null, "", "not an email"]) {
     await assert.rejects(fetchRateLimitsViaAppServer({ ...options, expectedEmail }), /expected account/);
   }
+});
+
+test("disposeAllAppServers waits for the cleanup a finished reader already started", async (t) => {
+  const root = await fixtureRoot(t);
+  let killerFinished = false;
+  const spawnKiller = () => {
+    const fake = new EventEmitter();
+    setTimeout(() => { killerFinished = true; fake.emit("exit", 0); }, 300);
+    return fake;
+  };
+  // A server that never answers and ends by itself after a few seconds (the killer is faked).
+  const idle = { command: process.execPath, args: ["-e", "process.stdin.resume(); setTimeout(() => process.exit(0), 4000)"] };
+  await assert.rejects(readAccountViaAppServer({ codexHome: root, ...idle, platform: "win32", spawnKiller, timeoutMs: 200 }), /timed out/);
+  // The reader gave up and moved on, but its taskkill is still running. A hook that exits
+  // now would leave the server behind, so the exit path must wait for it.
+  assert.equal(killerFinished, false);
+  await disposeAllAppServers({ waitMs: 2_000, platform: "win32", spawnKiller });
+  assert.equal(killerFinished, true);
 });

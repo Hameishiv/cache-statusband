@@ -217,6 +217,16 @@ function findOnWindowsPath(env) {
 // reader is still waiting is not left running.
 const liveChildren = new Set();
 
+// Disposals already under way (a reader that finished by itself starts its server's
+// taskkill and moves on). disposeAllAppServers waits for these too: a hook that exits the
+// moment its answer is written would otherwise leave the taskkill unfinished and the
+// server running.
+const pendingDisposals = new Set();
+function trackDisposal(finished) {
+  pendingDisposals.add(finished);
+  finished.then(() => pendingDisposals.delete(finished));
+}
+
 // Stop a finished or abandoned app-server and release every handle on it, so a hung
 // server cannot keep this process alive. Through cmd.exe (npm's codex.cmd) the real
 // server is a grandchild that child.kill() does not reach, so on Windows take the whole
@@ -259,6 +269,7 @@ function disposeChild(child, { platform = process.platform, spawnKiller = spawn 
 // taskkill so it has actually run before the caller exits the process.
 export async function disposeAllAppServers({ waitMs = 1000, platform = process.platform, spawnKiller = spawn } = {}) {
   const pending = [...liveChildren].map((child) => disposeChild(child, { platform, spawnKiller }));
+  pending.push(...pendingDisposals);
   liveChildren.clear();
   let timer;
   await Promise.race([
@@ -312,7 +323,7 @@ async function readAccountSession({
       clearTimeout(timer);
       lines.close();
       liveChildren.delete(child);
-      disposeChild(child, { platform, ...(spawnKiller ? { spawnKiller } : {}) });
+      trackDisposal(disposeChild(child, { platform, ...(spawnKiller ? { spawnKiller } : {}) }));
       callback(value);
     };
     const timer = setTimeout(() => finish(reject, new Error("Codex account read timed out")), timeoutMs);
@@ -397,7 +408,7 @@ export async function fetchRateLimitsViaAppServer({
       clearTimeout(timer);
       lines.close();
       liveChildren.delete(child);
-      disposeChild(child, { platform, ...(spawnKiller ? { spawnKiller } : {}) });
+      trackDisposal(disposeChild(child, { platform, ...(spawnKiller ? { spawnKiller } : {}) }));
       callback(value);
     };
     const timer = setTimeout(() => finish(reject, new Error("Codex rate-limit read timed out")), timeoutMs);
