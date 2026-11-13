@@ -9,6 +9,19 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# A relative -CodexHome follows the PowerShell location, not the process working
+# directory that Codex and Node would later see.
+$CodexHome = $PSCmdlet.GetUnresolvedProviderPathFromPSPath($CodexHome)
+
+# A backup folder name that no earlier run can have used, even within the same second.
+function New-BackupFolder([string]$Name) {
+  $unique = (Get-Date -Format "yyyyMMdd-HHmmss") + "-" + [guid]::NewGuid().ToString("N").Substring(0, 8)
+  $path = Join-Path (Join-Path $CodexHome "backups") "$Name-$unique"
+  if (Test-Path -LiteralPath $path) { throw "Backup folder already exists: $path" }
+  New-Item -ItemType Directory -Force -Path $path | Out-Null
+  return $path
+}
+
 function Set-TomlKey {
   param(
     [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
@@ -181,8 +194,7 @@ Assert-CodexConfig -Text $configText -CodexCommand $codexCommand
 
 $backupConfig = $null
 if (Test-Path -LiteralPath $configPath) {
-  $backupRoot = Join-Path $CodexHome ("backups\cache-statusband-codex-" + (Get-Date -Format "yyyyMMdd-HHmmss"))
-  New-Item -ItemType Directory -Force -Path $backupRoot | Out-Null
+  $backupRoot = New-BackupFolder "cache-statusband-codex"
   $backupConfig = Join-Path $backupRoot "config.toml"
   Copy-Item -LiteralPath $configPath -Destination $backupConfig
   Write-Host "Backed up config.toml to $backupRoot"
@@ -233,8 +245,7 @@ if ($PSBoundParameters.ContainsKey("SeatFile")) {
   $settingsPath = Join-Path $settingsRoot "settings.json"
   New-Item -ItemType Directory -Force -Path $settingsRoot | Out-Null
   if (Test-Path -LiteralPath $settingsPath) {
-    $settingsBackup = Join-Path $CodexHome ("backups\cache-statusband-codex-settings-" + (Get-Date -Format "yyyyMMdd-HHmmss"))
-    New-Item -ItemType Directory -Force -Path $settingsBackup | Out-Null
+    $settingsBackup = New-BackupFolder "cache-statusband-codex-settings"
     Copy-Item -LiteralPath $settingsPath -Destination (Join-Path $settingsBackup "settings.json")
   }
   $settingsJson = @{ version = 1; seatFile = $expandedSeatFile } | ConvertTo-Json

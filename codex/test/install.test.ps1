@@ -95,6 +95,38 @@ status_line_use_colors = false
     throw "A relative -SeatFile did not resolve against the PowerShell location: $($settings.seatFile)"
   }
 
+  # A relative -CodexHome follows the PowerShell location too: the Codex and Node
+  # children are started in the process working directory, which Set-Location leaves behind.
+  $relativeParent = Join-Path $testHome "relative-parent"
+  New-Item -ItemType Directory -Path $relativeParent | Out-Null
+  Push-Location $relativeParent
+  try {
+    [Environment]::CurrentDirectory = $testHome
+    & (Join-Path $root "install.ps1") -CodexHome "rel-codex-home" -SkipCliLink 3>$null | Out-Null
+  } finally {
+    Pop-Location
+    [Environment]::CurrentDirectory = (Get-Location).Path
+  }
+  if (-not (Test-Path -LiteralPath (Join-Path $relativeParent "rel-codex-home/config.toml"))) {
+    throw "A relative -CodexHome was not resolved against the PowerShell location"
+  }
+  if (Test-Path -LiteralPath (Join-Path $testHome "rel-codex-home")) {
+    throw "A relative -CodexHome was resolved against the process working directory"
+  }
+
+  # Two runs in the same second must not share or overwrite a backup: the first backup
+  # keeps the original config.toml.
+  $backupHome = Join-Path $testHome "backup-home"
+  New-Item -ItemType Directory -Path $backupHome | Out-Null
+  $originalConfig = "[history]`npersistence = `"save-all`"`n"
+  [IO.File]::WriteAllText((Join-Path $backupHome "config.toml"), $originalConfig, [Text.UTF8Encoding]::new($false))
+  & (Join-Path $root "install.ps1") -CodexHome $backupHome -SkipCliLink 3>$null | Out-Null
+  & (Join-Path $root "install.ps1") -CodexHome $backupHome -SkipCliLink 3>$null | Out-Null
+  $backups = @(Get-ChildItem -LiteralPath (Join-Path $backupHome "backups") -Directory | Where-Object { $_.Name -like "cache-statusband-codex-2*" })
+  if ($backups.Count -ne 2) { throw "Expected two distinct backups from two runs, found $($backups.Count)" }
+  $holdsOriginal = @($backups | Where-Object { [IO.File]::ReadAllText((Join-Path $_.FullName "config.toml")) -eq $originalConfig })
+  if ($holdsOriginal.Count -ne 1) { throw "The first run's backup of the original config.toml was lost or overwritten" }
+
   # An empty or blank -SeatFile must be rejected before anything is changed or registered.
   foreach ($blank in @("", "   ")) {
     $blankHome = Join-Path $testHome "blank-seat-home"
