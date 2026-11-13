@@ -67,7 +67,7 @@ test("a malformed settings.json never lets the CLI show or emit the account emai
   }
 });
 
-test("a settings.json read that fails once or is caught half-written is retried, then fails closed", async () => {
+test("a settings.json read that fails once, is caught half-written or is briefly missing is retried, then fails closed", async () => {
   const good = JSON.stringify({ version: 1, seatFile: "seat.txt" });
   const sequence = (...steps) => {
     const calls = [];
@@ -98,10 +98,19 @@ test("a settings.json read that fails once or is caught half-written is retried,
   await assert.rejects(configuredSeatFile("home", { ...fast, reader: stuck.reader }), /EBUSY/);
   assert.equal(stuck.calls.length, 4);
 
-  // A missing file and a well-formed file with a bad value are answers, not glitches.
-  const missing = sequence(Object.assign(new Error("ENOENT"), { code: "ENOENT" }));
+  // A missing file is retried twice (a delete-and-recreate save leaves a gap), then means no seat.
+  const enoent = () => Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+  const missing = sequence(enoent());
   assert.equal(await configuredSeatFile("home", { ...fast, reader: missing.reader }), null);
-  assert.equal(missing.calls.length, 1);
+  assert.equal(missing.calls.length, 3);
+  const appears = sequence(enoent(), good);
+  assert.equal(await configuredSeatFile("home", { ...fast, reader: appears.reader }), "seat.txt");
+  assert.equal(appears.calls.length, 2);
+  // The two retries are separate from the failed-read retries.
+  const mixed = sequence(enoent(), busy, busy, busy, good);
+  assert.equal(await configuredSeatFile("home", { ...fast, reader: mixed.reader }), "seat.txt");
+  assert.equal(mixed.calls.length, 5);
+  // A well-formed file with a bad value is an answer, not a glitch.
   const badValue = sequence(JSON.stringify({ seatFile: 5 }));
   await assert.rejects(configuredSeatFile("home", { ...fast, reader: badValue.reader }), /non-empty string/);
   assert.equal(badValue.calls.length, 1);

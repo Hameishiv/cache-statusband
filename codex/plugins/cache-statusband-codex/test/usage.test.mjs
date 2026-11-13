@@ -9,7 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
 import { capFirst, formatAge, formatDuration, formatUsageLines } from "../src/format.mjs";
-import { displayIdentity, usagePresentation } from "../src/settings.mjs";
+import { usagePresentation } from "../src/settings.mjs";
 import {
   fetchRateLimitsViaAppServer,
   captureUsageIdentity,
@@ -309,8 +309,8 @@ test("uses an explicitly configured seat file before the account email", async (
     `${JSON.stringify({ version: 1, seatFile: seatPath })}\n`,
     "utf8",
   );
-  assert.equal(await displayIdentity({ accountEmail: TEST_EMAIL }, { codexHome: root, env: {} }), `${SEAT_PREFIX} ${FIRST_SEAT} unsafe`);
-  assert.equal(await displayIdentity({ accountEmail: TEST_EMAIL }, { codexHome: join(root, "missing"), env: {} }), TEST_EMAIL);
+  assert.equal((await usagePresentation({ accountEmail: TEST_EMAIL }, { codexHome: root, env: {} })).identity, `${SEAT_PREFIX} ${FIRST_SEAT} unsafe`);
+  assert.equal((await usagePresentation({ accountEmail: TEST_EMAIL }, { codexHome: join(root, "missing"), env: {} })).identity, TEST_EMAIL);
 });
 
 const FAKE_SERVER = join(dirname(fileURLToPath(import.meta.url)), "..", "fixtures", "fake-app-server.mjs");
@@ -469,7 +469,7 @@ test("identity capture can fail loudly and never labels an unreadable seat with 
   const env = { CACHE_STATUSBAND_CODEX_SEAT_FILE: emptySeat };
   assert.equal(await captureUsageIdentity(root, { env, accountReader }), null);
   await assert.rejects(captureUsageIdentity(root, { env, accountReader, throwOnFailure: true }), /seat/i);
-  assert.equal(await displayIdentity({ accountEmail: TEST_EMAIL }, { codexHome: root, env }), null);
+  assert.equal((await usagePresentation({ accountEmail: TEST_EMAIL }, { codexHome: root, env })).identity, null);
 
   const seatPath = join(root, "seat.txt");
   await writeFile(seatPath, FIRST_SEAT);
