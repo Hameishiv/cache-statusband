@@ -158,12 +158,14 @@ status_line_use_colors = false
     throw "The strict-check warning was not printed exactly once"
   }
   $realCodex = Get-Command codex -All | Where-Object { $_.CommandType -eq "Application" } | Select-Object -First 1 -ExpandProperty Source
+  $previousCodexHome = $env:CODEX_HOME
   $env:CODEX_HOME = $retiredHome
   try {
     & $realCodex app-server --print-startup-config *> $null
     $plainExit = $LASTEXITCODE
   } finally {
-    Remove-Item Env:CODEX_HOME
+    # Put back what was there, and leave the variable unset only if it was unset before.
+    if ($null -eq $previousCodexHome) { Remove-Item Env:CODEX_HOME -ErrorAction SilentlyContinue } else { $env:CODEX_HOME = $previousCodexHome }
   }
   if ($plainExit -ne 0) { throw "The installed config.toml with a retired key does not pass plain Codex startup" }
 

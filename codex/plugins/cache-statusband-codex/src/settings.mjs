@@ -33,9 +33,16 @@ export async function usagePresentation(snapshot, {
   env = process.env,
   identity: suppliedIdentity,
 } = {}) {
-  const identity = suppliedIdentity === undefined
-    ? (codexHome ? await configuredSeatIdentity(codexHome, env) : null)
-    : suppliedIdentity;
+  const seat = codexHome ? await configuredSeatIdentity(codexHome, env) : null;
+  const identity = suppliedIdentity === undefined ? seat : suppliedIdentity;
+  // A supplied identity may be a RECORDED one (a resumed session's), made when no seat was
+  // configured, so its label can be the account email. With a seat configured NOW (available
+  // or not) the email is never shown: only a recorded seat label is. The reading itself
+  // belongs to the recorded account, so it stays; the email and key do not.
+  if (seat && suppliedIdentity !== undefined && !identity?.unavailable && !isSeatLabel(identity)) {
+    const { accountEmail, identityKey, ...rest } = snapshot ?? {};
+    return { snapshot: rest, identity: null };
+  }
   if (!identity) return { snapshot, identity: sanitizeEmail(snapshot?.accountEmail) };
   if (!identity.unavailable && snapshot?.identityKey === identity.key) return { snapshot, identity: identity.label };
   return {
@@ -51,6 +58,12 @@ export async function usagePresentation(snapshot, {
       source: "identity-changed",
     },
   };
+}
+
+// A seat label is "Seat <label>", which is never the account email it was recorded beside.
+function isSeatLabel(identity) {
+  return typeof identity?.label === "string" && identity.label.startsWith("Seat ")
+    && identity.label.toLowerCase() !== String(identity.key ?? "").slice(8).toLowerCase();
 }
 
 // Resolves to the configured seat label file, or null when none is configured (no

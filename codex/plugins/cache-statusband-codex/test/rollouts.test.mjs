@@ -175,6 +175,60 @@ test("resuming a session retains its starting identity after account rotation", 
   assert.deepEqual(record, { version: 1, identity: original });
 });
 
+test("a resume never shows a recorded email once a seat is configured, available or not", async (t) => {
+  const root = await fixtureRoot(t);
+  const email = ["recorded", "example.invalid"].join("@");
+  const recorded = { key: `account:${email}`, label: email, unavailable: false };
+  const settings = join(root, "cache-statusband-codex", "settings.json");
+  const options = {
+    codexHome: root,
+    rolloutParser: async () => null,
+    identityGetter: async () => recorded,
+    usageGetter: async () => ({ identityKey: recorded.key, accountEmail: email, availableCount: 2 }),
+  };
+  const resume = () => handleSessionStart({ source: "resume", session_id: "privacy-session", transcript_path: "missing.jsonl" }, options);
+
+  // Started with no seat configured: the record holds the email as its label.
+  const startup = await handleSessionStart({ source: "startup", session_id: "privacy-session" }, options);
+  assert.match(startup.systemMessage, new RegExp(`Account: ${email}`));
+  assert.match((await resume()).systemMessage, new RegExp(`Account: ${email}`), "no seat configured: the recorded login is shown");
+
+  // Resumed after settings.json became unreadable: a seat may be configured, so no email.
+  await writeFile(settings, "{not json");
+  const malformed = await resume();
+  assert.doesNotMatch(malformed.systemMessage, /example\.invalid|Account:/);
+  assert.match(malformed.systemMessage, /Banked resets: 2/);
+
+  // Resumed once a valid seat file is configured: the seat label is not the recorded identity.
+  const seat = join(root, "seat.txt");
+  await writeFile(seat, "alpha");
+  await writeFile(settings, JSON.stringify({ version: 1, seatFile: seat }));
+  const seated = await resume();
+  assert.doesNotMatch(seated.systemMessage, /example\.invalid|Account:/);
+  assert.match(seated.systemMessage, /Banked resets: 2/);
+
+  // The seat is unavailable (its file is missing): still no email.
+  await writeFile(seat, "");
+  assert.doesNotMatch((await resume()).systemMessage, /example\.invalid/);
+});
+
+test("a resume still shows a recorded seat label, whatever seat is configured now", async (t) => {
+  const root = await fixtureRoot(t);
+  const email = ["recorded", "example.invalid"].join("@");
+  const recorded = { key: `account:${email}`, label: "Seat first", unavailable: false };
+  const seat = join(root, "seat.txt");
+  await writeFile(seat, "second");
+  await mkdir(join(root, "cache-statusband-codex"), { recursive: true });
+  await writeFile(join(root, "cache-statusband-codex", "settings.json"), JSON.stringify({ version: 1, seatFile: seat }));
+  const output = await handleSessionStart({ source: "startup", session_id: "seat-session" }, {
+    codexHome: root,
+    identityGetter: async () => recorded,
+    usageGetter: async () => ({ identityKey: recorded.key, accountEmail: email, availableCount: 2 }),
+  });
+  assert.match(output.systemMessage, /Seat first\./);
+  assert.doesNotMatch(output.systemMessage, /example\.invalid/);
+});
+
 test("concurrent session starts publish only one complete starting identity", async (t) => {
   const root = await fixtureRoot(t);
   const identity = (name) => {

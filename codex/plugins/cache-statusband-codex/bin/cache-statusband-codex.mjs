@@ -85,7 +85,8 @@ async function usage(argv) {
 
 // An unlaunchable Codex (for example a codex.cmd under a path containing %) makes every
 // account read fail, which the readers report only as "identity unavailable". Say why,
-// once, and carry on with whatever is cached.
+// once. No usage is shown until Codex can be launched: with no verified account there is no
+// cached fallback.
 function warnIfCodexUnlaunchable() {
   try {
     resolveCodexLaunch();
@@ -94,8 +95,9 @@ function warnIfCodexUnlaunchable() {
   }
 }
 
-// With a seat configured the email is deliberately not shown (the seat label is the
-// identity), so the machine-readable output must not carry it or its key either.
+// With a seat configured, available or not, the email is deliberately not shown (a seat
+// label or nothing is the identity), so the machine-readable output must not carry it or
+// its key either, whatever identity was recorded for the session.
 async function publicSnapshot(snapshot, home) {
   if (!(await configuredSeatIdentity(home))) return snapshot;
   const { accountEmail, identityKey, ...rest } = snapshot;

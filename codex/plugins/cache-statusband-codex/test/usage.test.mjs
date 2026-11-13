@@ -648,7 +648,9 @@ test("the CLI says once, on stderr, why an unlaunchable Codex cannot be read", {
     });
     assert.equal(stderr.split("cannot safely run a path containing").length - 1, 1, stderr);
     assert.match(stderr, /CODEX_BIN/);
-    assert.ok(stdout.length > 0);
+    // No account can be verified, so no cached or invented usage: just the unavailable header.
+    const header = "Banked resets: unavailable\n";
+    assert.equal(stdout, command === "usage" ? header : `${header}\nNo Codex rollout transcripts found under ${root}.\n`);
   }
 });
 
