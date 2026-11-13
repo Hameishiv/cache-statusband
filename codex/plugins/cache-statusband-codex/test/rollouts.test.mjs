@@ -243,7 +243,7 @@ test("a hung identity or usage read cannot hold back the resume summary past the
   assert.match(output.systemMessage, /saved context 25k\/200k/);
 });
 
-test("each read in SessionStart gets at least a second and no more than what remains of the deadline", async (t) => {
+test("each read in SessionStart ends half a second before the deadline, and gets at least half a second", async (t) => {
   const root = await fixtureRoot(t);
   const seen = [];
   const email = ["person", "example.invalid"].join("@");
@@ -260,8 +260,18 @@ test("each read in SessionStart gets at least a second and no more than what rem
     },
   });
   assert.equal(seen[0].throwOnFailure, true);
-  assert.ok(seen[0].timeoutMs >= 1_000 && seen[0].timeoutMs <= 5_000);
-  assert.ok(seen[1].usageTimeout >= 1_000 && seen[1].usageTimeout <= 5_000);
+  // 5000ms deadline: each read may use what remains less the 500ms margin.
+  assert.ok(seen[0].timeoutMs >= 500 && seen[0].timeoutMs <= 4_500);
+  assert.ok(seen[1].usageTimeout >= 500 && seen[1].usageTimeout <= 4_500);
+  // A nearly spent deadline still leaves a read its 500ms floor.
+  let late;
+  await handleSessionStart({ source: "startup", session_id: "late-session" }, {
+    codexHome: root,
+    deadlineMs: 300,
+    identityGetter: async (_home, options) => { late = options.timeoutMs; return null; },
+    usageGetter: async () => ({ availableCount: null }),
+  });
+  assert.equal(late, 500);
 });
 
 test("the SessionStart deadline counts from the hook's start, not from after the transcript read", async (t) => {
@@ -271,14 +281,14 @@ test("the SessionStart deadline counts from the hook's start, not from after the
     { source: "startup", session_id: "clock-session", transcript_path: join(root, "rollout.jsonl") },
     {
       codexHome: root,
-      deadlineMs: 800,
-      rolloutParser: async () => { await new Promise((resolve) => setTimeout(resolve, 500)); return null; },
+      deadlineMs: 1_500,
+      rolloutParser: async () => { await new Promise((resolve) => setTimeout(resolve, 1_000)); return null; },
       identityGetter: async () => null,
       usageGetter: () => new Promise(() => {}),
     },
   );
-  // 500ms reading plus the 300ms that remain; restarting the clock would take ~1300ms.
-  assert.ok(Date.now() - started < 1_100, `took ${Date.now() - started}ms`);
+  // 1000ms reading plus the 500ms that remain; restarting the clock would take ~2500ms.
+  assert.ok(Date.now() - started < 2_000, `took ${Date.now() - started}ms`);
 });
 
 test("the SessionStart hook process prints its answer and exits", async () => {
@@ -290,6 +300,41 @@ test("the SessionStart hook process prints its answer and exits", async () => {
   const code = await new Promise((resolve) => child.once("exit", resolve));
   assert.equal(code, 0);
   assert.equal(stdout, "{}\n");
+});
+
+test("the hook process stops a Codex app-server whose read is still running at the deadline", async (t) => {
+  const root = await fixtureRoot(t);
+  const here = dirname(fileURLToPath(import.meta.url));
+  const hook = join(here, "..", "hooks", "session-start.mjs");
+  const hung = join(here, "..", "fixtures", "hung-app-server.mjs");
+  const pidFile = join(root, "hung.pid");
+  // The npm shape on Windows (codex.cmd -> cmd.exe -> node), a script elsewhere.
+  const launcher = join(root, process.platform === "win32" ? "codex.cmd" : "codex");
+  await writeFile(launcher, process.platform === "win32"
+    ? `@echo off\r\n"${process.execPath}" "${hung}" %*\r\n`
+    : `#!/bin/sh\nexec "${process.execPath}" "${hung}" "$@"\n`, { mode: 0o755 });
+  // A 400ms deadline ends before the 500ms floor a read is given, so the hook, not the
+  // reader, has to clean up.
+  const env = { ...process.env, CODEX_HOME: root, CODEX_BIN: launcher, HUNG_PID_FILE: pidFile, CACHE_STATUSBAND_HOOK_DEADLINE_MS: "400" };
+  const child = execFile(process.execPath, [hook], { env, timeout: 15_000 });
+  child.stdin.end(JSON.stringify({ source: "startup", session_id: "orphan-session" }));
+  const code = await new Promise((resolve) => child.once("exit", resolve));
+  assert.equal(code, 0);
+  const until = async (condition, ms) => {
+    const end = Date.now() + ms;
+    while (Date.now() < end && !(await condition())) await new Promise((resolve) => setTimeout(resolve, 50));
+    return condition();
+  };
+  const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  // The server records its pid once it is up; one that was stopped before then has nothing to check.
+  if (await until(async () => (await readFile(pidFile, "utf8").catch(() => "")) !== "", 2_000)) {
+    const pid = Number(await readFile(pidFile, "utf8"));
+    try {
+      assert.ok(await until(() => !alive(pid), 5_000), "the hook left the Codex app-server running");
+    } finally {
+      if (alive(pid)) process.kill(pid);
+    }
+  }
 });
 
 test("with under three seconds left SessionStart asks for the cache only", async (t) => {

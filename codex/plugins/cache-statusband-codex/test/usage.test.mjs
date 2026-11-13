@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { access, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { promisify } from "node:util";
 import test from "node:test";
 import { capFirst, formatAge, formatDuration, formatUsageLines } from "../src/format.mjs";
 import { displayIdentity, usagePresentation } from "../src/settings.mjs";
@@ -580,4 +582,66 @@ test("a cache-only snapshot reports what is stored and records no attempt", asyn
   assert.equal(stale.source, "stale");
   assert.equal(await readFile(join(dataDir, name), "utf8"), stored);
   assert.deepEqual((await readdir(dataDir)).sort(), [name]);
+});
+
+test("a % codex.cmd earlier on PATH is skipped when a usable codex.exe comes later", async (t) => {
+  const root = await fixtureRoot(t);
+  const bad = join(root, "100%PATH%");
+  const good = join(root, "good");
+  await mkdir(bad);
+  await mkdir(good);
+  await writeFile(join(bad, "codex.cmd"), "");
+  await writeFile(join(good, "codex.exe"), "");
+  assert.deepEqual(resolveCodexLaunch({ PATH: `${bad}${delimiter}${good}` }, "win32"), { command: join(good, "codex.exe"), args: ["app-server"] });
+  // Nothing usable anywhere: the refusal still names the problem.
+  assert.throws(() => resolveCodexLaunch({ PATH: bad }, "win32"), /CODEX_BIN.*codex\.exe/);
+  // A % in the directory only matters to the cmd.exe wrapper.
+  await writeFile(join(bad, "codex.exe"), "");
+  assert.equal(resolveCodexLaunch({ PATH: bad }, "win32").command, join(bad, "codex.exe"));
+});
+
+test("the CLI says once, on stderr, why an unlaunchable Codex cannot be read", { skip: process.platform !== "win32" }, async (t) => {
+  const root = await fixtureRoot(t);
+  const bad = join(root, "100%PATH%");
+  await mkdir(bad);
+  await writeFile(join(bad, "codex.cmd"), "");
+  const bin = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "cache-statusband-codex.mjs");
+  for (const command of ["usage", "board"]) {
+    const { stdout, stderr } = await promisify(execFile)(process.execPath, [bin, command, "--codex-home", root], {
+      env: { ...process.env, CODEX_BIN: join(bad, "codex.cmd") },
+      timeout: 20_000,
+    });
+    assert.equal(stderr.split("cannot safely run a path containing").length - 1, 1, stderr);
+    assert.match(stderr, /CODEX_BIN/);
+    assert.ok(stdout.length > 0);
+  }
+});
+
+test("a server that has already exited is not signalled again, but a live one is stopped", async (t) => {
+  const root = await fixtureRoot(t);
+  const killed = [];
+  const spawnKiller = (...call) => {
+    killed.push(call);
+    const fake = new EventEmitter();
+    setImmediate(() => fake.emit("exit", 0));
+    return fake;
+  };
+  // Exits by itself a moment after start: its pid may be reused, so nothing may target it.
+  const brief = { command: process.execPath, args: ["-e", "process.stdin.resume(); setTimeout(() => process.exit(0), 300)"] };
+  for (const reader of [readAccountViaAppServer, fetchRateLimitsViaAppServer]) {
+    await assert.rejects(reader({ codexHome: root, ...brief, platform: "win32", spawnKiller, timeoutMs: 5_000 }), /exited before/);
+  }
+  assert.deepEqual(killed, []);
+  // A server still running when the read ends is taken down with its whole process tree.
+  const pidFile = join(root, "live.pid");
+  const env = { ...process.env, HUNG_PID_FILE: pidFile };
+  await assert.rejects(readAccountViaAppServer({ codexHome: root, command: process.execPath, args: [HUNG_SERVER], env, platform: "win32", spawnKiller, timeoutMs: 400 }), /timed out/);
+  try {
+    assert.equal(killed.length, 1);
+    assert.deepEqual(killed[0][0], "taskkill");
+    assert.deepEqual(killed[0][1].slice(2), ["/T", "/F"]);
+  } finally {
+    const pid = Number(await readFile(pidFile, "utf8").catch(() => 0));
+    if (pid && alive(pid)) process.kill(pid);
+  }
 });

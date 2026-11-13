@@ -5,12 +5,15 @@ import { defaultCodexHome, parseRollout } from "../src/rollouts.mjs";
 import { resumeMessage } from "../src/resume.mjs";
 import { getSessionIdentity, loadSessionState, mergeSavedContext } from "../src/session-state.mjs";
 import { usagePresentation } from "../src/settings.mjs";
-import { captureUsageIdentity, getUsageSnapshot } from "../src/usage.mjs";
+import { captureUsageIdentity, disposeAllAppServers, getUsageSnapshot } from "../src/usage.mjs";
 
 // hooks.json gives SessionStart 15s; stay inside it so what is already built is emitted.
 const DEFAULT_DEADLINE_MS = 12_000;
 // A usage read needs a few seconds; with less than this left, use the cache only.
 const MIN_FETCH_BUDGET_MS = 3_000;
+// A read is told to give up this long before the hook deadline, so that its own cleanup
+// (which stops the Codex app-server it started) normally runs before the hook exits.
+const READ_MARGIN_MS = 500;
 
 export async function handleSessionStart(input, {
   usageGetter = getUsageSnapshot,
@@ -24,7 +27,7 @@ export async function handleSessionStart(input, {
   const source = input?.source;
   if (!["startup", "resume", "fork"].includes(source)) return {};
   const started = Date.now();
-  const remaining = () => Math.max(1000, deadlineMs - (Date.now() - started));
+  const readBudget = () => Math.max(READ_MARGIN_MS, deadlineMs - (Date.now() - started) - READ_MARGIN_MS);
   const messages = [];
   let home = codexHome;
   try {
@@ -51,11 +54,11 @@ export async function handleSessionStart(input, {
       // A new session records its login only when the read actually succeeded.
       const capture = source === "resume"
         ? async () => null
-        : (target) => identityGetter(target, { throwOnFailure: true, timeoutMs: remaining() });
+        : (target) => identityGetter(target, { throwOnFailure: true, timeoutMs: readBudget() });
       const identity = await getSessionIdentity(home, input.session_id, capture);
       // Too little of the deadline left for a read to finish: show what is cached.
       const cacheOnly = deadlineMs - (Date.now() - started) < MIN_FETCH_BUDGET_MS;
-      const usage = await usageGetter({ codexHome: home, now, identity, timeoutMs: remaining(), ...(cacheOnly ? { cacheOnly: true } : {}) });
+      const usage = await usageGetter({ codexHome: home, now, identity, timeoutMs: readBudget(), ...(cacheOnly ? { cacheOnly: true } : {}) });
       const presented = await usagePresentation(usage, { codexHome: home, identity });
       const built = [];
       if (Number.isFinite(presented.snapshot.availableCount)) built.push(formatUsageLines(presented.snapshot, now)[0]);
@@ -80,11 +83,23 @@ async function main() {
   try {
     const raw = await readStdin(1024 * 1024);
     const input = JSON.parse(raw || "{}");
-    output = `${JSON.stringify(await handleSessionStart(input))}\n`;
+    output = `${JSON.stringify(await handleSessionStart(input, deadlineOption()))}\n`;
   } catch {}
-  // A read that outlived the deadline may still hold handles open; the hook is done once
-  // its answer is flushed, so end the process rather than wait for them.
-  process.stdout.write(output, () => process.exit(0));
+  // A read that outlived the deadline may still hold handles open, and its Codex
+  // app-server is still running. The hook is done once its answer is flushed: stop those
+  // servers (they would otherwise be orphaned), then end the process.
+  process.stdout.write(output, async () => {
+    try {
+      await disposeAllAppServers();
+    } catch {}
+    process.exit(0);
+  });
+}
+
+// Lets a test shorten the deadline of the real hook process; unset in normal use.
+function deadlineOption() {
+  const value = Number(process.env.CACHE_STATUSBAND_HOOK_DEADLINE_MS);
+  return Number.isFinite(value) && value > 0 ? { deadlineMs: value } : {};
 }
 
 async function readStdin(limit) {
