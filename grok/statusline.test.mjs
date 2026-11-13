@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import {
   cacheLabel,
   capFirst,
@@ -38,6 +38,17 @@ const full = {
   cost: { total_cost_usd: 0.04 },
   authorization: "secret-token-should-not-appear",
 };
+
+// every temp folder a test makes is removed when the run ends
+const made = [];
+function tempDir(prefix) {
+  const dir = mkdtempSync(prefix);
+  made.push(dir);
+  return dir;
+}
+after(() => {
+  for (const dir of made) rmSync(dir, { recursive: true, force: true });
+});
 
 describe("formatTokens", () => {
   it("keeps small counts and compacts the rest", () => {
@@ -151,7 +162,7 @@ describe("weekly usage", () => {
   });
 
   it("reads the last credits line and keeps every other field out of the cache", () => {
-    const dir = mkdtempSync(join(tmpdir(), "csb-week-"));
+    const dir = tempDir(join(tmpdir(), "csb-week-"));
     const logPath = join(dir, "unified.jsonl");
     const cachePath = join(dir, "usage.json");
     const line = JSON.stringify({
@@ -204,7 +215,7 @@ describe("weekly usage", () => {
   });
 
   it("scans a log with no credits line once per five minutes", () => {
-    const dir = mkdtempSync(join(tmpdir(), "csb-week-"));
+    const dir = tempDir(join(tmpdir(), "csb-week-"));
     const logPath = join(dir, "unified.jsonl");
     const cachePath = join(dir, "usage.json");
     writeFileSync(logPath, "no credits line\n");
@@ -219,7 +230,7 @@ describe("weekly usage", () => {
   });
 
   it("drops the cached reading when the newest credits line cannot be used", () => {
-    const dir = mkdtempSync(join(tmpdir(), "csb-week-"));
+    const dir = tempDir(join(tmpdir(), "csb-week-"));
     const logPath = join(dir, "unified.jsonl");
     const cachePath = join(dir, "usage.json");
     writeFileSync(logPath, `${creditsLine(23)}\n`);
@@ -236,7 +247,7 @@ describe("weekly usage", () => {
   });
 
   it("re-reads when the cached scan time is in the future", () => {
-    const dir = mkdtempSync(join(tmpdir(), "csb-week-"));
+    const dir = tempDir(join(tmpdir(), "csb-week-"));
     const logPath = join(dir, "unified.jsonl");
     const cachePath = join(dir, "usage.json");
     writeFileSync(logPath, "no credits line\n");
@@ -248,7 +259,7 @@ describe("weekly usage", () => {
   });
 
   it("keeps the reading, and does not re-date the cache, when the log cannot be read", () => {
-    const dir = mkdtempSync(join(tmpdir(), "csb-week-"));
+    const dir = tempDir(join(tmpdir(), "csb-week-"));
     const logPath = join(dir, "unified.jsonl");
     const cachePath = join(dir, "usage.json");
     writeFileSync(logPath, `${creditsLine(23)}\n`);
@@ -263,7 +274,7 @@ describe("weekly usage", () => {
   });
 
   it("writes no cache entry for a log it could not read", () => {
-    const dir = mkdtempSync(join(tmpdir(), "csb-week-"));
+    const dir = tempDir(join(tmpdir(), "csb-week-"));
     const logPath = join(dir, "unified.jsonl");
     const cachePath = join(dir, "usage.json");
     mkdirSync(logPath);
@@ -272,7 +283,7 @@ describe("weekly usage", () => {
   });
 
   it("does not re-read an unchanged log with no credits line after the window", () => {
-    const dir = mkdtempSync(join(tmpdir(), "csb-week-"));
+    const dir = tempDir(join(tmpdir(), "csb-week-"));
     const logPath = join(dir, "unified.jsonl");
     const cachePath = join(dir, "usage.json");
     writeFileSync(logPath, "no credits line\n");
@@ -283,7 +294,7 @@ describe("weekly usage", () => {
   });
 
   it("keeps a separate entry for each log in one cache file", () => {
-    const dir = mkdtempSync(join(tmpdir(), "csb-week-"));
+    const dir = tempDir(join(tmpdir(), "csb-week-"));
     const cachePath = join(dir, "usage.json");
     const a = join(dir, "a.jsonl");
     const b = join(dir, "b.jsonl");
@@ -303,7 +314,7 @@ describe("weekly usage", () => {
   });
 
   it("treats the old single-entry cache file as empty", () => {
-    const dir = mkdtempSync(join(tmpdir(), "csb-week-"));
+    const dir = tempDir(join(tmpdir(), "csb-week-"));
     const logPath = join(dir, "unified.jsonl");
     const cachePath = join(dir, "usage.json");
     writeFileSync(logPath, "no credits line\n");
@@ -322,7 +333,7 @@ describe("weekly usage", () => {
   });
 
   it("does not show one log's reading for another log that shares the cache", () => {
-    const dir = mkdtempSync(join(tmpdir(), "csb-week-"));
+    const dir = tempDir(join(tmpdir(), "csb-week-"));
     const cachePath = join(dir, "usage.json");
     const credits = (percent) =>
       `${JSON.stringify({
@@ -353,7 +364,7 @@ describe("readLastBilling", () => {
       },
     });
   const log = (body) => {
-    const path = join(mkdtempSync(join(tmpdir(), "csb-bill-")), "unified.jsonl");
+    const path = join(tempDir(join(tmpdir(), "csb-bill-")), "unified.jsonl");
     writeFileSync(path, body);
     return path;
   };
@@ -457,7 +468,7 @@ describe("cli", () => {
   });
 
   it("prints the weekly block from a credits log and nothing else in that line", () => {
-    const dir = mkdtempSync(join(tmpdir(), "csb-cli-"));
+    const dir = tempDir(join(tmpdir(), "csb-cli-"));
     const logPath = join(dir, "unified.jsonl");
     const cachePath = join(dir, "usage.json");
     writeFileSync(
@@ -505,8 +516,27 @@ describe("cli", () => {
     assert.equal(run.stdout.includes("secret-token"), false);
   });
 
+  it("does not run a node program from the folder it is started in", { skip: process.platform !== "win32" }, () => {
+    const dir = tempDir(join(tmpdir(), "csb-cwd-"));
+    writeFileSync(join(dir, "node.cmd"), "@echo HIJACKED-FROM-CWD\r\n");
+    writeFileSync(join(dir, "node.bat"), "@echo HIJACKED-FROM-CWD\r\n");
+    const env = { ...process.env, CSB_BILLING_LOG: "" };
+    for (const key of Object.keys(env)) {
+      if (key.toLowerCase() === "nodefaultcurrentdirectoryinexepath") delete env[key];
+    }
+    const run = spawnSync(process.env.ComSpec || "cmd.exe", ["/d", "/c", join(import.meta.dirname, "statusline.cmd")], {
+      cwd: dir,
+      env,
+      input: JSON.stringify({ model: { display_name: "Grok 4.7" } }),
+      encoding: "utf8",
+    });
+    assert.equal(run.stdout.includes("HIJACKED"), false);
+    assert.equal(run.status, 0);
+    assert.match(run.stdout, /Grok 4\.7/);
+  });
+
   it("prints the band when started through a junction or symlink to the folder", () => {
-    const dir = mkdtempSync(join(tmpdir(), "csb-link-"));
+    const dir = tempDir(join(tmpdir(), "csb-link-"));
     const link = join(dir, "grok-link");
     symlinkSync(import.meta.dirname, link, process.platform === "win32" ? "junction" : "dir");
     try {
