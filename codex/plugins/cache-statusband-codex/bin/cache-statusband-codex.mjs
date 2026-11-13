@@ -9,6 +9,8 @@ import { configuredSeatIdentity, usagePresentation } from "../src/settings.mjs";
 
 const args = process.argv.slice(2);
 const command = args.shift() ?? "help";
+// Set once warnIfCodexUnlaunchable has explained why Codex cannot be launched.
+let codexUnlaunchableSaid = false;
 
 try {
   if (["help", "--help", "-h"].includes(command)) help();
@@ -51,7 +53,7 @@ async function board(argv) {
   let presented = { snapshot: null, identity: null };
   let usageKnown = true;
   try {
-    const identity = await captureUsageIdentity(home);
+    const identity = await captureIdentityOrSay(home);
     const usageSnapshot = await getUsageSnapshot({ codexHome: home, identity });
     warnIfCacheUnwritable(usageSnapshot);
     presented = await usagePresentation(usageSnapshot, { codexHome: home, identity });
@@ -86,12 +88,43 @@ async function usage(argv) {
   const options = parseOptions(argv);
   const home = resolve(options["codex-home"] ?? defaultCodexHome());
   warnIfCodexUnlaunchable();
-  const identity = await captureUsageIdentity(home);
+  const identity = await captureIdentityOrSay(home);
   const snapshot = await getUsageSnapshot({ codexHome: home, identity });
   warnIfCacheUnwritable(snapshot);
   const presented = await usagePresentation(snapshot, { codexHome: home, identity });
   if (options.json) process.stdout.write(`${json(await publicSnapshot(presented.snapshot, home))}\n`);
   else process.stdout.write(`${formatUsageLines(presented.snapshot, Date.now(), { includeResetDetails: true, identity: presented.identity }).join("\n")}\n`);
+}
+
+// Reads the login the usage is for. When it cannot be read, say why in one line on stderr and
+// carry on with no identity, which shows usage as unavailable (stdout and the exit code are
+// the same as before). A configured seat that is unavailable stays silent: it is a deliberate
+// fail-closed state, not a fault.
+async function captureIdentityOrSay(home) {
+  try {
+    const identity = await captureUsageIdentity(home, { throwOnFailure: true });
+    if (!identity) say("no Codex account is signed in");
+    return identity;
+  } catch (error) {
+    // An unlaunchable Codex was already explained by warnIfCodexUnlaunchable.
+    if (error?.seatUnavailable || codexUnlaunchableSaid) return null;
+    if (error?.signedOut) say("no Codex account is signed in");
+    else say(captureFailureReason(error));
+    return null;
+  }
+}
+
+function captureFailureReason(error) {
+  const code = error?.code;
+  const message = stripControls(error?.message ?? String(error));
+  if (code === "ENOENT") return "Codex was not found (is it installed and on your PATH? CODEX_BIN can point to it)";
+  if (typeof code === "string" && /^E[A-Z]+$/.test(code)) return `Codex could not be started (${code})`;
+  return message || "the Codex account read failed";
+}
+
+function say(reason) {
+  process.stderr.write(`cache-statusband-codex: usage not read: ${reason}
+`);
 }
 
 // An unlaunchable Codex (for example a codex.cmd under a path containing %) makes every
@@ -102,6 +135,7 @@ function warnIfCodexUnlaunchable() {
   try {
     resolveCodexLaunch();
   } catch (error) {
+    codexUnlaunchableSaid = true;
     process.stderr.write(`cache-statusband-codex: ${error.message}\n`);
   }
 }

@@ -1040,3 +1040,34 @@ test("board still lists sessions when the usage read throws, and says so on stde
   assert.equal(parsed.sessions.length, 1);
   assert.equal(parsed.sessions[0].id, "usage-throws-session");
 });
+
+test("usage and board say once, on stderr, why no usage was read when Codex is missing or no one is signed in", async (t) => {
+  const root = await fixtureRoot(t);
+  const cli = cliRunner(root);
+  const noSeat = { CACHE_STATUSBAND_CODEX_SEAT_FILE: "" };
+  const missing = join(root, "no-such-dir", "codex.exe");
+  const cases = [
+    [{ ...noSeat, CODEX_BIN: missing }, /^cache-statusband-codex: usage not read: Codex was not found/m],
+    [{ ...noSeat, FAKE_SERVER_SIGNED_OUT: "1" }, /^cache-statusband-codex: usage not read: no Codex account is signed in$/m],
+  ];
+  for (const [env, expected] of cases) {
+    for (const args of [["usage"], ["board"]]) {
+      // The exit code stays 0 (the promise resolves) and stdout is the usual unavailable header.
+      const { stdout, stderr } = await cli.runWithStderr(args, env);
+      assert.match(stderr, expected, `${args.join(" ")}: ${stderr}`);
+      assert.equal(stderr.split("usage not read").length - 1, 1, `${args.join(" ")}: ${stderr}`);
+      assert.equal(stderr.trim().split(/\r?\n/).length, 1, `${args.join(" ")}: ${stderr}`);
+      assert.match(stdout, /Banked resets: unavailable/);
+    }
+  }
+});
+
+test("a configured seat that cannot be read keeps usage and board silent on stderr", async (t) => {
+  const root = await fixtureRoot(t);
+  const cli = cliRunner(root);
+  const env = { CACHE_STATUSBAND_CODEX_SEAT_FILE: join(root, "no-such-seat.txt") };
+  for (const args of [["usage"], ["board"]]) {
+    const { stderr } = await cli.runWithStderr(args, env);
+    assert.equal(stderr, "", `${args.join(" ")}: ${stderr}`);
+  }
+});

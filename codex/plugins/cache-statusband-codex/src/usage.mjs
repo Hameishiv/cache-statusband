@@ -153,13 +153,16 @@ export async function captureUsageIdentity(codexHome, {
   throwOnFailure = false,
   timeoutMs,
 } = {}) {
-  const fail = (message) => {
-    if (throwOnFailure) throw new Error(message);
+  // The thrown errors carry a flag the CLI reads: `seatUnavailable` (a configured seat that
+  // cannot be read, which the CLI keeps silent about) and `signedOut` (a login read that
+  // confirmed no one is signed in).
+  const fail = (message, flags = {}) => {
+    if (throwOnFailure) throw Object.assign(new Error(message), flags);
     return null;
   };
   const seat = await configuredSeatIdentity(codexHome, env);
   // A configured seat that cannot be read must never fall back to the account email.
-  if (seat?.unavailable) return fail("The configured seat label is unavailable");
+  if (seat?.unavailable) return fail("The configured seat label is unavailable", { seatUnavailable: true });
   const readOptions = { codexHome, env, ...(timeoutMs === undefined ? {} : { timeoutMs }) };
   if (!seat) {
     let email;
@@ -181,7 +184,7 @@ export async function captureUsageIdentity(codexHome, {
   const between = async (account) => {
     const seatAfter = await configuredSeatIdentity(codexHome, env);
     if (seat.key !== seatAfter?.key) throw new Error("The seat changed during the account read");
-    if (!safeEmail(account?.email)) throw new Error("No account is signed in for the configured seat");
+    if (!safeEmail(account?.email)) throw Object.assign(new Error("No account is signed in for the configured seat"), { signedOut: true });
   };
   let email;
   let again;
