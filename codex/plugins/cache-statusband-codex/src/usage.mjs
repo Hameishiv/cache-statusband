@@ -48,23 +48,28 @@ export async function getUsageSnapshot({
   // A seat is a display label, not proof of which account the client will use.
   const expectedEmail = identity?.key?.startsWith("account:") ? safeEmail(identity.key.slice(8)) : null;
   if (!expectedEmail || identity?.unavailable) return present(null, "identity-unavailable");
+  // From here on the identity is known, so even an empty result carries it: the caller
+  // compares identityKey and would otherwise call a lock-busy or unwritable answer a different
+  // account's.
+  const show = (cache, source) => present(cache, source, identity.key);
   const suffix = cacheSuffix(identity);
   const cachePath = join(dataDir, `rate-limits${suffix}.json`);
   const lockPath = join(dataDir, `rate-limits${suffix}.lock`);
   const legacyPath = join(dataDir, "rate-limits.json");
   let aligned = alignCache(await readScopedCache(cachePath, legacyPath, identity), identity);
   let cached = aligned.cache;
-  if (fresh(cached, now) && !cached?.migrateSeatDeadline) return present(cached, aligned.mismatch ? "identity-changed" : "cache");
+  if (fresh(cached, now) && !cached?.migrateSeatDeadline) return show(cached, aligned.mismatch ? "identity-changed" : "cache");
   if (cacheOnly) {
     // The caller has no time left for a read. Report what is stored and change nothing,
     // so no attempt or error is recorded and the next caller may still poll.
     const { migrateSeatDeadline, ...stored } = cached ?? {};
-    return present(cached ? stored : null, aligned.mismatch ? "identity-changed" : "stale");
+    return show(cached ? stored : null, aligned.mismatch ? "identity-changed" : "stale");
   }
 
-  // A lock held by someone else, or one that could not be created for a moment (EPERM/EACCES/
-  // EBUSY, tried again first) in a folder that still accepts new files, is "busy" (acquireLock
-  // answers null): the stored reading is shown and nothing is said about the cache. Only when
+  // A lock held by someone else, one whose creation keeps failing with EBUSY (another process
+  // has the file open), or one that could not be created for a moment (EPERM/EACCES, tried
+  // again first) in a folder that still accepts new files, is "busy" (acquireLock answers
+  // null): the stored reading is shown and nothing is said about the cache. Only when
   // the folder itself cannot be used (it cannot be created, a probe file cannot be created in
   // it either, or the lock fails some other way) is the cache unwritable: no live read is
   // made, and the stored reading is returned marked the same way as an attempt marker that
@@ -80,16 +85,16 @@ export async function getUsageSnapshot({
   }
   if (lockFailed) {
     const { migrateSeatDeadline, ...stored } = cached ?? {};
-    return { ...present(cached ? stored : null, aligned.mismatch ? "identity-changed" : "stale"), cacheUnwritable: true, cacheDir: dataDir };
+    return { ...show(cached ? stored : null, aligned.mismatch ? "identity-changed" : "stale"), cacheUnwritable: true, cacheDir: dataDir };
   }
-  if (!lock) return present(cached, aligned.mismatch ? "identity-changed" : "cache-busy");
+  if (!lock) return show(cached, aligned.mismatch ? "identity-changed" : "cache-busy");
   try {
     aligned = alignCache(await readScopedCache(cachePath, legacyPath, identity), identity);
     cached = aligned.cache;
     if (fresh(cached, now)) {
       const { migrateSeatDeadline, ...saved } = cached;
       if (migrateSeatDeadline) await tryWriteCache(cachePath, saved, renameImpl);
-      return present(saved, aligned.mismatch ? "identity-changed" : "cache");
+      return show(saved, aligned.mismatch ? "identity-changed" : "cache");
     }
 
     const attempted = {
@@ -106,7 +111,7 @@ export async function getUsageSnapshot({
     // marked so the caller can say why no usage was read.
     if (!await tryWriteCache(cachePath, attempted, renameImpl)) {
       const { migrateSeatDeadline, ...stored } = cached ?? {};
-      return { ...present(cached ? stored : null, aligned.mismatch ? "identity-changed" : "stale"), cacheUnwritable: true, cacheDir: dataDir };
+      return { ...show(cached ? stored : null, aligned.mismatch ? "identity-changed" : "stale"), cacheUnwritable: true, cacheDir: dataDir };
     }
 
     let saved;
@@ -132,10 +137,10 @@ export async function getUsageSnapshot({
         lastErrorAt: now,
       };
       await tryWriteCache(cachePath, failed, renameImpl);
-      return present(failed, "stale");
+      return show(failed, "stale");
     }
     await tryWriteCache(cachePath, saved, renameImpl);
-    return present(saved, "live");
+    return show(saved, "live");
   } finally {
     await lock.release();
   }
@@ -609,12 +614,12 @@ function alignCache(cache, identity) {
   };
 }
 
-function present(cache, source) {
-  return cache ? { ...cache, source } : { ...emptyCache(), source };
+function present(cache, source, identityKey = null) {
+  return cache ? { ...cache, source } : { ...emptyCache(), identityKey, source };
 }
 
 function fresh(cache, now) {
-  // A deadline further out than any backoff we would write is corrupt, not a backoff.
+  // A deadline further out than any backoff we would write (plus allowed clock slack) is corrupt, not a backoff.
   return Number.isFinite(cache?.nextAllowedAt) && now < cache.nextAllowedAt && cache.nextAllowedAt <= now + MAX_RETRY_AFTER_MS + CLOCK_SLACK_MS;
 }
 

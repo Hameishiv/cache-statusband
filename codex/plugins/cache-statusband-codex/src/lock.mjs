@@ -12,11 +12,14 @@ import { link, open, readFile, rename, stat, unlink } from "node:fs/promises";
 //
 // Creating the lock file can fail for a moment on Windows (a scanner or another process has
 // the folder or an old lock file open, which shows up as EPERM, EACCES or EBUSY), so that is
-// tried again a few times and, if it keeps failing, counts as "someone else holds it" (null)
-// as long as the folder itself can be written to: a small probe file is created there to
-// tell. So null means either that another live holder owns the lock or that creating it was
-// refused for a moment in a folder that can be written to. A folder that cannot be written at all (the probe fails too, or the folder is missing
-// or read-only) throws the original error, so the caller can report an unwritable cache.
+// tried again a few times. If it keeps failing with EPERM or EACCES it counts as "someone else
+// holds it" (null) as long as the folder itself can be written to: a small probe file is
+// created there to tell. EBUSY is different: it means another process has this very file open,
+// so after the retries it always counts as busy (null) and no probe is made. So null means
+// either that another live holder owns the lock or that creating it was refused for a moment.
+// A folder that cannot be written at all (EPERM or EACCES and the probe fails too, or the
+// folder is missing or read-only) throws the original error, so the caller can report an
+// unwritable cache.
 export async function acquireLock(path, { now = Date.now(), staleMs = 30_000, openImpl = open, retryDelaysMs = CREATE_RETRY_DELAYS_MS } = {}) {
   const token = randomUUID();
   const make = () => create(path, token, openImpl, retryDelaysMs);
@@ -66,7 +69,8 @@ async function create(path, token, openImpl, retryDelaysMs) {
         await new Promise((resolve) => setTimeout(resolve, retryDelaysMs[attempt]));
         continue;
       }
-      // Still refused. Busy (not unwritable) unless a probe file cannot be created beside it either.
+      // Still refused. EBUSY always means busy (another process has the file open). EPERM and
+      // EACCES are busy too, unless a probe file cannot be created beside it either.
       if (error.code === "EBUSY" || await folderAcceptsNewFiles(path, openImpl)) return false;
       throw error;
     }

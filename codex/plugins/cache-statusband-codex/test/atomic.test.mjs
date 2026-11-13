@@ -9,6 +9,7 @@ import test from "node:test";
 import { renameWithRetry } from "../src/atomic.mjs";
 import { loadSessionState, saveSessionState } from "../src/session-state.mjs";
 import { formatUsageLines } from "../src/format.mjs";
+import { usagePresentation } from "../src/settings.mjs";
 import { getUsageSnapshot } from "../src/usage.mjs";
 
 const TEST_EMAIL = ["person", "example.invalid"].join("@");
@@ -226,4 +227,47 @@ test("a lock file refused with EPERM in a folder that still accepts files is bus
   assert.equal(snapshot.cacheUnwritable, undefined);
   assert.ok(!formatUsageLines(snapshot, Date.now()).some((text) => text.startsWith("Usage not read")));
   assert.deepEqual((await readdir(dataDir)).filter((file) => file.includes(".probe.")), []);
+});
+
+// An empty result (nothing stored yet) must still say whose reading was asked for, or the
+// presentation step calls it a different account's and hides why nothing was read.
+test("empty results from a busy lock, a cache-only read or an unwritable cache keep their source", async (t) => {
+  const NOW = Date.parse("2026-10-29T12:00:00.000Z");
+  const present = async (snapshot, root) => (await usagePresentation(snapshot, { codexHome: root, env: {}, identity: IDENTITY })).snapshot;
+
+  const busyRoot = await fixtureRoot(t);
+  const ebusy = async (path, ...rest) => {
+    if (String(path).endsWith(".lock")) throw Object.assign(new Error("EBUSY: simulated"), { code: "EBUSY" });
+    return open(path, ...rest);
+  };
+  let requests = 0;
+  const busy = await getUsageSnapshot({
+    codexHome: busyRoot, now: NOW, identity: IDENTITY, fetcher: async () => { requests += 1; return RAW; }, lockOpenImpl: ebusy,
+  });
+  assert.equal(requests, 0);
+  assert.equal(busy.source, "cache-busy");
+  assert.equal(busy.identityKey, IDENTITY.key);
+  assert.equal((await present(busy, busyRoot)).source, "cache-busy");
+
+  const onlyRoot = await fixtureRoot(t);
+  const only = await getUsageSnapshot({ codexHome: onlyRoot, now: NOW, identity: IDENTITY, cacheOnly: true, fetcher: async () => { throw new Error("no read"); } });
+  assert.equal(only.source, "stale");
+  assert.equal(only.identityKey, IDENTITY.key);
+  assert.equal((await present(only, onlyRoot)).source, "stale");
+
+  const failRoot = await fixtureRoot(t);
+  const failing = async () => { throw Object.assign(new Error("EPERM: simulated"), { code: "EPERM" }); };
+  const unwritable = await getUsageSnapshot({ codexHome: failRoot, now: NOW, identity: IDENTITY, fetcher: async () => RAW, renameImpl: failing });
+  assert.equal(unwritable.cacheUnwritable, true);
+  const shown = await present(unwritable, failRoot);
+  assert.equal(shown.source, "stale");
+  assert.equal(shown.cacheUnwritable, true);
+
+  // A snapshot with no identity key at all is not another account's.
+  const unnamed = await usagePresentation({ source: "cache-busy", identityKey: null, availableCount: null }, { codexHome: busyRoot, env: {}, identity: IDENTITY });
+  assert.equal(unnamed.snapshot.source, "cache-busy");
+  // A different key still is.
+  const other = await usagePresentation({ source: "cache", identityKey: "account:other@example.invalid", availableCount: 5 }, { codexHome: busyRoot, env: {}, identity: IDENTITY });
+  assert.equal(other.snapshot.source, "identity-changed");
+  assert.equal(other.snapshot.availableCount, null);
 });
