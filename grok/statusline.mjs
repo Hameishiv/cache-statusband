@@ -52,7 +52,9 @@ export function shade(kind, index) {
 }
 
 const BILLING_MARKER = "billing: fetched credits config";
-const RESCAN_MS = 5 * 60 * 1000;
+// a little under the five-minute refresh_interval the README suggests, so timer jitter
+// never makes an idle session wait a second interval
+const RESCAN_MS = 290 * 1000;
 
 function finite(value) {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
@@ -138,13 +140,15 @@ export function percentText(value) {
 /**
  * Time left, in the Claude Code band's format, rounded to the minute first.
  * Up to an hour: "40m". Under a day: "23h05m". A day or more: "7d9h".
- * A non-positive duration returns null.
+ * Under half a minute: "<1m". A non-positive duration returns null.
  */
 export function remaining(ms) {
   const v = finite(ms);
   if (v === null || v <= 0) return null;
   // round to the minute first, so just under a day reads "1d0h", not "24h00m"
   const mins = Math.round(v / 60000);
+  // under half a minute left is still time left, not zero
+  if (mins === 0) return "<1m";
   if (mins >= 1440) {
     const hours = Math.floor(mins / 60);
     return `${Math.floor(hours / 24)}d${hours % 24}h`;
@@ -247,7 +251,7 @@ export function render(payload, extras) {
   const columns = finite(extras && extras.columns);
   if (columns !== null && columns > 0) {
     while (parts.length > 1 && bandWidth(parts) > columns) parts.pop();
-    // a lone segment that still does not fit would be cut: even a model name carries a version figure
+    // a lone segment that still does not fit would be cut: a model name usually carries a version figure too
     if (bandWidth(parts) > columns) return "";
   }
   return parts.map((part, i) => paint(part.label, part.kind, i, parts[i + 1]?.kind)).join("");

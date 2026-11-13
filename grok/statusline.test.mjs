@@ -493,14 +493,14 @@ describe("render width", () => {
   });
 
   it("prints nothing when a lone figure is wider than the row", () => {
-    const line = render({ context_window: { used_percentage: 29, context_window_size: 1e6, total_input_tokens: 287000 } }, { columns: 5 });
+    const line = render({ context_window: { used_percentage: 29, context_window_size: 1e6, context_tokens: 287000 } }, { columns: 5 });
     assert.equal(line, "");
   });
 
   const payload = {
     model: { display_name: "Grok 4.7" },
     effort: { level: "high" },
-    context_window: { used_percentage: 29, context_window_size: 1e6, total_input_tokens: 287000 },
+    context_window: { used_percentage: 29, context_window_size: 1e6, context_tokens: 287000 },
     cost: { total_cost_usd: 12.5 },
   };
   const plain = (line) => line.replace(/\x1b\[[0-9;]*m/g, "");
@@ -510,9 +510,10 @@ describe("render width", () => {
     assert.match(full, /Session \$13/);
     for (const columns of [10, 20, 25, 35, 40, [...full].length - 1]) {
       const line = plain(render(payload, { columns }));
-      assert.ok([...line].length <= columns || line === " Grok 4.7 ", `${columns}: ${line}`);
+      assert.ok([...line].length <= columns, `${columns}: ${line}`);
       // never part of a number: the cost is either whole or gone
       if (line.includes("Session")) assert.match(line, /Session \$13 $/);
+      if (line.includes("Ctx")) assert.match(line, /Ctx 29% · 287k\/1M /);
     }
     assert.equal(plain(render(payload, { columns: [...full].length })), full);
   });
@@ -599,6 +600,7 @@ describe("display", () => {
     assert.equal(remaining(177 * 3600000 + 48 * 60000), "7d9h");
     // just under a day rounds to a whole day, never "24h00m"
     assert.equal(remaining(24 * 3600000 - 20000), "1d0h");
+    assert.equal(remaining(20000), "<1m");
     assert.equal(remaining(-1), null);
   });
 
