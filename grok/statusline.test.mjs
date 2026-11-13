@@ -110,6 +110,12 @@ describe("segments", () => {
     // a write count alone still says it is a cache figure
     assert.equal(cacheLabel({ cache_creation_input_tokens: 1500 }), "cache write 1.5k");
     assert.equal(costLabel(0), "session $0");
+    // a negative count or amount is not a known figure
+    assert.equal(costLabel(-0.04), null);
+    assert.equal(costLabel(-0.004), null);
+    assert.equal(cacheLabel({ cache_read_input_tokens: -80000 }), null);
+    assert.equal(contextLabel({ context_tokens: -1500, context_window_size: 1e6 }), null);
+    assert.equal(contextLabel({ used_percentage: 29, context_tokens: -1500 }), "ctx 29%");
   });
 
   it("does not invent rate limits, cache age, or a rewrite price", () => {
@@ -403,6 +409,13 @@ describe("weekly usage", () => {
     writeFileSync(b, "gone\n");
     assert.equal(loadWeekly(a, cachePath, now + 2000).percent, 23);
     assert.equal(loadWeekly(b, cachePath, now + 3000).percent, 61);
+  });
+
+  it("leaves a cache file in a newer format as it is", () => {
+    const dir = tempDir(join(tmpdir(), "csb-week-"));
+    const cachePath = join(dir, "usage.json");
+    writeFileSync(cachePath, JSON.stringify({ v: 3, other: {} }));
+    assert.equal(readSources(cachePath), null);
   });
 
   it("treats the old single-entry cache file as empty", () => {
@@ -827,6 +840,19 @@ describe("cli", () => {
     assert.notEqual(run.status, 0);
     assert.equal(run.stdout, "");
     assert.match(run.stderr, /not a JSON object/);
+  });
+
+  it("fails closed on JSON that is not an object", () => {
+    for (const input of ["null", "[]", "5", '"x"']) {
+      const run = spawnSync(process.execPath, ["statusline.mjs"], {
+        cwd: import.meta.dirname,
+        env: { ...process.env, CSB_BILLING_LOG: "" },
+        input,
+        encoding: "utf8",
+      });
+      assert.equal(run.status, 1, input);
+      assert.match(run.stderr, /not a JSON object/);
+    }
   });
 });
 

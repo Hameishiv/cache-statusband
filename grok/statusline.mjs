@@ -94,13 +94,17 @@ export function modelLabel(model) {
   return text(model.display_name) || text(model.id);
 }
 
+/** A count or amount that cannot be negative: a negative one is not a known figure. */
+function nonNegative(value) {
+  const v = finite(value);
+  return v !== null && v >= 0 ? v : null;
+}
+
 export function contextLabel(window) {
   if (!window || typeof window !== "object") return null;
-  const raw = finite(window.used_percentage);
-  // a negative percent is not a known figure
-  const pct = raw !== null && raw >= 0 ? raw : null;
-  const used = finite(window.context_tokens);
-  const size = finite(window.context_window_size);
+  const pct = nonNegative(window.used_percentage);
+  const used = nonNegative(window.context_tokens);
+  const size = nonNegative(window.context_window_size);
   if (pct === null && used === null) return null;
   let label = "ctx";
   if (pct !== null) label += ` ${percentText(pct)}%`;
@@ -114,8 +118,8 @@ export function contextLabel(window) {
 
 export function cacheLabel(usage) {
   if (!usage || typeof usage !== "object") return null;
-  const read = finite(usage.cache_read_input_tokens);
-  const write = finite(usage.cache_creation_input_tokens);
+  const read = nonNegative(usage.cache_read_input_tokens);
+  const write = nonNegative(usage.cache_creation_input_tokens);
   const parts = [];
   if (read !== null) parts.push(`read ${formatTokens(read)}`);
   if (write !== null) parts.push(`write ${formatTokens(write)}`);
@@ -124,11 +128,11 @@ export function cacheLabel(usage) {
 }
 
 export function costLabel(usd) {
-  const v = finite(usd);
+  const v = nonNegative(usd);
   if (v === null) return null;
-  const abs = Math.abs(v);
+  const abs = v;
   if (abs === 0) return "session $0";
-  if (abs < 0.01) return v < 0 ? "session >-$0.01" : "session <$0.01";
+  if (abs < 0.01) return "session <$0.01";
   // compare the amount as it will print, so $9.999 shows as "$10", not "$10.00"
   if (Math.round(abs * 100) < 1000) return `session $${v.toFixed(2)}`;
   return `session $${v.toFixed(0)}`;
@@ -457,6 +461,8 @@ export function readSources(cachePath) {
   }
   try {
     const body = JSON.parse(text);
+    // a newer format written by a newer copy: leave it as it is
+    if (body && typeof body.v === "number" && body.v > 2) return null;
     const sources = body && body.v === 2 ? body.sources : null;
     return sources && typeof sources === "object" && !Array.isArray(sources) ? sources : {};
   } catch {
@@ -563,6 +569,9 @@ if (isDirectRun()) {
   try {
     payload = JSON.parse(input);
   } catch {
+    payload = undefined;
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     process.stderr.write("statusline: stdin is not a JSON object\n");
     process.exit(1);
   }
