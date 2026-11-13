@@ -82,9 +82,13 @@ function New-ReplaceRefusal([string]$Problem, [string]$Advice) {
 # The path a replacement of $Path must be made at. A plain file is itself. A symbolic link
 # resolves to the file it points at, so the replacement lands on that file and the link stays
 # a link (replacing the link itself would turn it into a regular file and leave the original
-# it pointed at behind). A link whose target is missing is refused. A hard link is refused,
-# whether it is the file itself or what a symbolic link points at: a replacement would give
-# this name new content and leave every other name for the old file with the old content.
+# it pointed at behind). Refused, each with its own message: a link whose target is missing, a
+# circular or otherwise unfollowable chain of links, a link to a folder, a plain folder, and a
+# hard link, whether it is the file itself or what a symbolic link points at (a replacement
+# would give this name new content and leave every other name for the old file with the old
+# content). Before Codex has registered the plugin a refusal changes nothing and says so; found
+# after registration it leads with the "already registered" sentence instead (see
+# New-ReplaceRefusal).
 function Resolve-ReplaceTarget([string]$Path, [string]$What) {
   $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
   if (-not $item) { return $Path }
