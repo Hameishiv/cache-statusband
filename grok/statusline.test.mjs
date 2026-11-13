@@ -122,6 +122,7 @@ describe("segments", () => {
     assert.equal(contextLabel({ used_percentage: 0, context_tokens: 0, context_window_size: 2e6 }), "ctx 0% · 0/2M");
     assert.equal(contextLabel({ used_percentage: 100, context_tokens: 1992000, context_window_size: 2e6 }), "ctx >99% · 2M/2M");
     assert.equal(contextLabel({ used_percentage: 100, context_tokens: 2e6, context_window_size: 2e6 }), "ctx 100% · 2M/2M");
+    assert.equal(contextLabel({ used_percentage: 100, context_tokens: 300000, context_window_size: 256000 }), "ctx >100% · 300k/256k");
   });
 
   it("does not invent rate limits, cache age, or a rewrite price", () => {
@@ -381,7 +382,10 @@ describe("weekly usage", () => {
     const dir = tempDir(join(tmpdir(), "csb-week-"));
     assert.deepEqual(readSources(join(dir, "missing.json")), {});
     writeFileSync(join(dir, "bad.json"), "not json");
-    assert.deepEqual(readSources(join(dir, "bad.json")), {});
+    assert.equal(readSources(join(dir, "bad.json")), null);
+    // a file of some other shape, say from a mistyped CSB_USAGE_CACHE, is not ours to rewrite
+    writeFileSync(join(dir, "other.json"), '{"name":"something else"}');
+    assert.equal(readSources(join(dir, "other.json")), null);
     mkdirSync(join(dir, "folder.json"));
     assert.equal(readSources(join(dir, "folder.json")), null);
   });

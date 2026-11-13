@@ -114,6 +114,7 @@ export function contextLabel(window) {
     let text = percentText(pct);
     if (pct === 0 && used !== null && used > 0) text = "<1";
     else if (pct === 100 && used !== null && size !== null && used < size) text = ">99";
+    else if (pct === 100 && used !== null && size !== null && used > size) text = ">100";
     label += ` ${text}%`;
   }
   if (used !== null) {
@@ -454,9 +455,10 @@ function storedRecord(entry) {
 
 /**
  * Per-log entries of the cache file, or null when the file exists but cannot
- * be read (locked, no permission, not a regular file) or is in a newer format
- * (v above 2): it is then neither used nor rewritten. A missing file, unparseable text, or the old
- * single-entry format counts as empty.
+ * be read (locked, no permission, not a regular file), is in a newer format
+ * (v above 2), or is not this cache at all (text that is not JSON, or JSON of
+ * another shape, say from a mistyped CSB_USAGE_CACHE): it is then neither used
+ * nor rewritten. A missing file or the old single-entry format counts as empty.
  */
 export function readSources(cachePath) {
   if (!cachePath) return {};
@@ -472,10 +474,16 @@ export function readSources(cachePath) {
     const body = JSON.parse(text);
     // a newer format written by a newer copy: leave it as it is
     if (body && typeof body.v === "number" && body.v > 2) return null;
-    const sources = body && body.v === 2 ? body.sources : null;
-    return sources && typeof sources === "object" && !Array.isArray(sources) ? sources : {};
+    if (body && body.v === 2) {
+      const sources = body.sources;
+      return sources && typeof sources === "object" && !Array.isArray(sources) ? sources : {};
+    }
+    // the old single-entry format of this cache is replaced; any other file is not ours to rewrite
+    if (body && typeof body === "object" && "source" in body && "record" in body) return {};
+    return null;
   } catch {
-    return {};
+    // not JSON at all: not a file this script wrote (its writes are atomic)
+    return null;
   }
 }
 
