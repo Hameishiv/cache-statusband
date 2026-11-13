@@ -4,8 +4,9 @@
  * Grok writes one JSON object to stdin. This prints at most one coloured line.
  * A missing field is left out. Nothing here is invented.
  *
- * Weekly usage is not in that JSON. /usage reads it from the credits config
- * Grok logs as "billing: fetched credits config". This script reads the last
+ * Weekly usage is not in that JSON. Grok logs its credits config as
+ * "billing: fetched credits config" (seen while a session starts; it carries
+ * the percentage /usage shows). This script reads the last
  * of those lines and shows the percent and reset only when the period is
  * weekly and still open. It does not use the network and does not read a token.
  */
@@ -206,7 +207,10 @@ export function weeklyLabel(record, nowMs) {
   if (!type || !/_WEEKLY$/.test(type)) return null;
   const pct = finite(record.percent);
   if (pct === null || pct < 0) return null;
-  const end = Date.parse(record.periodEnd);
+  // only an end that names its offset: one without would be read as local time
+  const endText = text(record.periodEnd);
+  if (!endText || !/(Z|[+-]\d{2}:?\d{2})$/i.test(endText)) return null;
+  const end = Date.parse(endText);
   const now = finite(nowMs);
   if (!Number.isFinite(end) || now === null || end <= now) return null;
   const left = remaining(end - now);
@@ -233,6 +237,8 @@ export function segments(payload, extras = {}) {
   if (!payload || typeof payload !== "object") return [];
   const now = finite(extras.now) ?? Date.now();
   const effort = text(payload.effort && payload.effort.level);
+  // a model id is shown exactly as Grok sent it; only a display name is capitalised
+  const modelFromId = Boolean(payload.model && typeof payload.model === "object" && !text(payload.model.display_name) && text(payload.model.id));
   const parts = [
     ["model", modelLabel(payload.model)],
     ["effort", effort],
@@ -244,7 +250,7 @@ export function segments(payload, extras = {}) {
   return parts
     .map(([kind, label]) => [kind, label && label.replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ").replace(/ {2,}/g, " ").trim()])
     .filter(([, label]) => label)
-    .map(([kind, label]) => ({ kind, label: capFirst(label) }));
+    .map(([kind, label]) => ({ kind, label: kind === "model" && modelFromId ? label : capFirst(label) }));
 }
 
 function ansi(fg, bg) {

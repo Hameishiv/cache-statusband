@@ -89,7 +89,9 @@ describe("segments", () => {
     assert.deepEqual(labels, ["Grok 4.7 [2J", "High"]);
     assert.equal(segments({ model: { display_name: "\u001b\n" } }).length, 0);
     // a display name made only of control characters falls back to the id
-    assert.deepEqual(segments({ model: { display_name: "\u001b", id: "grok-x" } }).map((p) => p.label), ["Grok-x"]);
+    assert.deepEqual(segments({ model: { display_name: "\u001b", id: "grok-x" } }).map((p) => p.label), ["grok-x"]);
+    // a model id is shown as sent; a display name and the effort are still capitalised
+    assert.deepEqual(segments({ model: { id: "xAI/grok" }, effort: { level: "xhigh" } }).map((p) => p.label), ["xAI/grok", "Xhigh"]);
   });
 
   it("rounds a fractional context percent to a tenth", () => {
@@ -166,6 +168,9 @@ describe("weekly usage", () => {
   it("shows the weekly percent and the time until reset", () => {
     assert.equal(weeklyLabel(weekly, now), "week 23% · 4d11h");
     assert.equal(weeklyLabel({ ...weekly, percent: 0 }, now), "week 0% · 4d11h");
+    assert.equal(weeklyLabel({ ...weekly, percent: -1 }, now), null);
+    // a period end with no offset would be read as local time: no reading
+    assert.equal(weeklyLabel({ ...weekly, periodEnd: "2026-11-02T22:57:09" }, now), null);
     assert.equal(weeklyLabel({ ...weekly, percent: 23.4 }, now), "week 23.4% · 4d11h");
   });
 
@@ -454,6 +459,9 @@ describe("weekly usage", () => {
     const dir = tempDir(join(tmpdir(), "csb-week-"));
     const cachePath = join(dir, "usage.json");
     writeFileSync(cachePath, JSON.stringify({ v: 3, other: {} }));
+    assert.equal(readSources(cachePath), null);
+    // even when it also looks like an earlier single-entry format
+    writeFileSync(cachePath, JSON.stringify({ v: 3, record: {}, scannedAt: 1 }));
     assert.equal(readSources(cachePath), null);
   });
 
@@ -855,6 +863,16 @@ describe("cli", () => {
     });
     assert.equal(run.status, 1);
     assert.match(run.stderr, /not a JSON object/);
+  });
+
+  it("keeps node's exit code when an ERRORLEVEL variable is set", { skip: process.platform !== "win32" }, () => {
+    const run = spawnSync(process.env.ComSpec || "cmd.exe", ["/d", "/c", join(import.meta.dirname, "statusline.cmd")], {
+      cwd: import.meta.dirname,
+      env: { ...process.env, CSB_BILLING_LOG: "", ERRORLEVEL: "0" },
+      input: "not json",
+      encoding: "utf8",
+    });
+    assert.equal(run.status, 1);
   });
 
   it("starts through the windows cmd wrapper", { skip: process.platform !== "win32" }, () => {
