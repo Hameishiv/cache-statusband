@@ -328,7 +328,8 @@ function trackDisposal(finished) {
 // unrelated process.
 // A grandchild that cmd.exe starts in the instant between taskkill's snapshot of the tree and the
 // kill is not in that snapshot; that one relies on the real Codex app-server exiting when its stdin
-// closes, which the stdin.end() below and the closed pipes bring about.
+// closes, which the stdin.end() below and the closed pipes bring about. (Observed in round 20: the
+// real Codex 0.169 app-server exits on its own about 1.5 s after its stdin closes.)
 // Returns a promise that settles once taskkill (if any) has finished.
 function disposeChild(child, { platform = process.platform, spawnKiller = spawn } = {}) {
   const gone = child.exitCode != null || child.signalCode != null;

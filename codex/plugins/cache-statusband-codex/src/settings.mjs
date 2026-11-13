@@ -60,7 +60,7 @@ function isSeatLabel(identity) {
 }
 
 // Resolves to the configured seat label file, or null when none is configured (no
-// settings.json at all, or one without a seatFile). Anything else that stops the setting
+// settings.json at all (ENOENT, or ENOTDIR when a part of its path is not a folder), or one without a seatFile). Anything else that stops the setting
 // being read, or a seatFile that is not a non-empty string, throws: a seat that may have been
 // configured but cannot be read must never fall back to showing the account email.
 // The installer replaces settings.json while sessions may be starting, and an editor may save
@@ -93,7 +93,8 @@ export async function configuredSeatFile(codexHome, {
       settings = JSON.parse(raw.charCodeAt(0) === 0xFEFF ? raw.slice(1) : raw);
       break;
     } catch (error) {
-      if (error?.code === "ENOENT") {
+      // ENOTDIR (a part of the path is not a folder, as on POSIX when the cache folder is a file) is as missing as ENOENT.
+      if (error?.code === "ENOENT" || error?.code === "ENOTDIR") {
         if (missing >= missingRetries || !await replacementMayBeUnderway(directory, lister)) return null;
         missing += 1;
       } else if (attempt - missing >= retries) {

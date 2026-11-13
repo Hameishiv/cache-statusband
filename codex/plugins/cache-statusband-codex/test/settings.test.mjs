@@ -123,6 +123,26 @@ test("a settings.json read that fails once, is caught half-written or is briefly
   const noFolder = sequence(enoent());
   assert.equal(await configuredSeatFile("home", { retryMs: 200, lister: async () => { throw enoent(); }, reader: noFolder.reader }), null);
   assert.equal(noFolder.calls.length, 1);
+  // ENOTDIR (a path part that is not a folder) is a missing file as well: no seat, no retry without a temporary file.
+  const enotdir = () => Object.assign(new Error("ENOTDIR"), { code: "ENOTDIR" });
+  const notDir = sequence(enotdir());
+  const startedNotDir = performance.now();
+  assert.equal(await configuredSeatFile("home", { retryMs: 200, lister: async () => ["rate-limits.json"], reader: notDir.reader }), null);
+  assert.ok(performance.now() - startedNotDir < 30, "an ENOTDIR must not wait");
+  assert.equal(notDir.calls.length, 1);
+  const notDirSwapping = sequence(enotdir());
+  assert.equal(await configuredSeatFile("home", { ...fast, ...swapping, reader: notDirSwapping.reader }), null);
+  assert.equal(notDirSwapping.calls.length, 3);
+  const notDirAppears = sequence(enotdir(), good);
+  assert.equal(await configuredSeatFile("home", { ...fast, ...swapping, reader: notDirAppears.reader }), "seat.txt");
+  // A real path whose parent is a file, no injection.
+  const dirRoot = await mkdtemp(join(tmpdir(), "csb-enotdir-"));
+  try {
+    await writeFile(join(dirRoot, "cache-statusband-codex"), "a file where the folder should be");
+    assert.equal(await configuredSeatFile(dirRoot), null);
+  } finally {
+    await rm(dirRoot, { recursive: true, force: true });
+  }
   // A real missing folder, no injection.
   assert.equal(await configuredSeatFile(join(tmpdir(), "csb-no-such-home-r9")), null);
   // A well-formed file with a bad value is an answer, not a glitch.
