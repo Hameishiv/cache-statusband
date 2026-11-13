@@ -1,8 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import { link, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { acquireLock } from "./lock.mjs";
 
 const STATE_VERSION = 1;
+const SAVE_LOCK_STALE_MS = 10_000;
 
 export async function getSessionIdentity(codexHome, sessionId, capture) {
   if (!codexHome || !sessionId) return null;
@@ -13,7 +15,14 @@ export async function getSessionIdentity(codexHome, sessionId, capture) {
     // An unreadable/corrupt record must not silently adopt today's account.
     if (error.code !== "ENOENT") throw error;
   }
-  const identity = await capture(codexHome);
+  let identity;
+  try {
+    identity = await capture(codexHome);
+  } catch {
+    // A failed capture (reader error, seat change, unreadable seat) is not "no account":
+    // record nothing so a later start can try again.
+    return null;
+  }
   const record = { version: STATE_VERSION, identity };
   // Validate and whitelist the persisted shape; never retain account/read responses.
   const safeIdentity = parseIdentity(JSON.stringify(record));
@@ -50,17 +59,24 @@ export async function saveSessionState(codexHome, sessionId, summary, savedAt = 
   const state = stateFromSummary(summary, savedAt);
   if (!codexHome || !sessionId || !state) return false;
   const path = sessionStatePath(codexHome, sessionId);
-  const previous = await loadSessionState(codexHome, sessionId);
-  if (previous && timestamp(previous.contextAt) > timestamp(state.contextAt)) return false;
   await mkdir(join(codexHome, "cache-statusband-codex", "sessions"), { recursive: true });
-  const temporary = `${path}.${process.pid}.tmp`;
+  // One writer per session; a fresh lock means another Stop hook is saving right now.
+  const lock = await acquireLock(`${path}.lock`, { staleMs: SAVE_LOCK_STALE_MS });
+  if (!lock) return false;
   try {
-    await writeFile(temporary, `${JSON.stringify(state)}\n`, { encoding: "utf8", mode: 0o600 });
-    await rename(temporary, path);
+    const previous = await loadSessionState(codexHome, sessionId);
+    if (previous && timestamp(previous.contextAt) > timestamp(state.contextAt)) return false;
+    const temporary = `${path}.${process.pid}.tmp`;
+    try {
+      await writeFile(temporary, `${JSON.stringify(state)}\n`, { encoding: "utf8", mode: 0o600 });
+      await rename(temporary, path);
+    } finally {
+      await unlink(temporary).catch(() => {});
+    }
+    return true;
   } finally {
-    await unlink(temporary).catch(() => {});
+    await lock.release();
   }
-  return true;
 }
 
 export async function loadSessionState(codexHome, sessionId) {

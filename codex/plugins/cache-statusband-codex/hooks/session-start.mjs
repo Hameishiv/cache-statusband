@@ -7,6 +7,9 @@ import { getSessionIdentity, loadSessionState, mergeSavedContext } from "../src/
 import { usagePresentation } from "../src/settings.mjs";
 import { captureUsageIdentity, getUsageSnapshot } from "../src/usage.mjs";
 
+// hooks.json gives SessionStart 15s; stay inside it so what is already built is emitted.
+const DEFAULT_DEADLINE_MS = 12_000;
+
 export async function handleSessionStart(input, {
   usageGetter = getUsageSnapshot,
   identityGetter = captureUsageIdentity,
@@ -14,34 +17,56 @@ export async function handleSessionStart(input, {
   stateLoader = loadSessionState,
   codexHome = null,
   now = Date.now(),
+  deadlineMs = DEFAULT_DEADLINE_MS,
 } = {}) {
   const source = input?.source;
-  if (!input?.transcript_path || !["startup", "resume", "fork"].includes(source)) return {};
+  if (!["startup", "resume", "fork"].includes(source)) return {};
+  const started = Date.now();
+  const remaining = () => Math.max(1000, deadlineMs - (Date.now() - started));
   const messages = [];
   let home = codexHome;
   try {
     home ??= defaultCodexHome();
   } catch {}
-  try {
-    let summary = null;
+  if (input.transcript_path) {
     try {
-      summary = await rolloutParser(input.transcript_path);
+      let summary = null;
+      try {
+        summary = await rolloutParser(input.transcript_path);
+      } catch {}
+      if (home && input.session_id) summary = mergeSavedContext(summary, await stateLoader(home, input.session_id));
+      const message = resumeMessage(summary, now);
+      if (message) messages.push(message);
     } catch {}
-    if (home && input.session_id) summary = mergeSavedContext(summary, await stateLoader(home, input.session_id));
-    const message = resumeMessage(summary, now);
-    if (message) messages.push(message);
-  } catch {}
+  }
+
+  const usageMessages = [];
+  const usagePart = (async () => {
+    try {
+      if (!home) throw new Error("CODEX_HOME is unavailable");
+      // Earlier versions did not retain the original login. Today's login cannot
+      // establish a resumed session's historical identity when its record is absent.
+      // A new session records its login only when the read actually succeeded.
+      const capture = source === "resume"
+        ? async () => null
+        : (target) => identityGetter(target, { throwOnFailure: true, timeoutMs: remaining() });
+      const identity = await getSessionIdentity(home, input.session_id, capture);
+      const usage = await usageGetter({ codexHome: home, now, identity, timeoutMs: remaining() });
+      const presented = await usagePresentation(usage, { codexHome: home, identity });
+      const built = [];
+      if (Number.isFinite(presented.snapshot.availableCount)) built.push(formatUsageLines(presented.snapshot, now)[0]);
+      if (presented.identity) built.push(presented.identity.startsWith("Seat ") ? `${presented.identity}.` : `Account: ${presented.identity}.`);
+      usageMessages.push(...built);
+    } catch {}
+  })();
+  let timer;
+  const expired = new Promise((resolve) => { timer = setTimeout(resolve, deadlineMs); });
   try {
-    if (!home) throw new Error("CODEX_HOME is unavailable");
-    // Earlier versions did not retain the original login. Today's login cannot
-    // establish a resumed session's historical identity when its record is absent.
-    const capture = source === "resume" ? async () => null : identityGetter;
-    const identity = await getSessionIdentity(home, input.session_id, capture);
-    const usage = await usageGetter({ codexHome: home, now, identity });
-    const presented = await usagePresentation(usage, { codexHome: home, identity });
-    if (Number.isFinite(presented.snapshot.availableCount)) messages.push(formatUsageLines(presented.snapshot, now)[0]);
-    if (presented.identity) messages.push(presented.identity.startsWith("Seat ") ? `${presented.identity}.` : `Account: ${presented.identity}.`);
-  } catch {}
+    await Promise.race([usagePart, expired]);
+  } finally {
+    clearTimeout(timer);
+  }
+  messages.push(...usageMessages.splice(0));
   return messages.length ? { systemMessage: messages.join(" ") } : {};
 }
 

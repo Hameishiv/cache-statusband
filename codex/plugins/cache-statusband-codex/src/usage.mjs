@@ -1,14 +1,17 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { statSync } from "node:fs";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { delimiter, dirname, join } from "node:path";
 import { createInterface } from "node:readline";
+import { acquireLock } from "./lock.mjs";
 import { configuredSeatIdentity } from "./settings.mjs";
 
 const CACHE_VERSION = 3;
 export const MIN_POLL_INTERVAL_MS = 5 * 60 * 1000;
 export const MAX_RETRY_AFTER_MS = 60 * 60 * 1000;
 const LOCK_STALE_MS = 30 * 1000;
+const CLIENT_VERSION = "0.4.2";
 
 export async function getUsageSnapshot({
   codexHome,
@@ -16,6 +19,7 @@ export async function getUsageSnapshot({
   fetcher = fetchRateLimitsViaAppServer,
   env = process.env,
   identity: suppliedIdentity,
+  timeoutMs,
 } = {}) {
   if (!codexHome) throw new Error("codexHome is required");
   const dataDir = join(codexHome, "cache-statusband-codex");
@@ -35,7 +39,7 @@ export async function getUsageSnapshot({
   let cached = aligned.cache;
   if (fresh(cached, now) && !cached?.migrateSeatDeadline) return present(cached, aligned.mismatch ? "identity-changed" : "cache");
 
-  const lock = await acquireLock(lockPath, now);
+  const lock = await acquireLock(lockPath, { now, staleMs: LOCK_STALE_MS });
   if (!lock) return present(cached, aligned.mismatch ? "identity-changed" : "cache-busy");
   try {
     aligned = alignCache(await readScopedCache(cachePath, legacyPath, identity), identity);
@@ -57,9 +61,12 @@ export async function getUsageSnapshot({
     await writeCache(cachePath, attempted);
 
     try {
-      const raw = await fetcher({ codexHome, env });
+      const raw = await fetcher({ codexHome, env, ...(timeoutMs === undefined ? {} : { timeoutMs }) });
       const safe = sanitizeRateLimits(raw);
       if (safe.accountEmail !== expectedEmail) {
+        // The read is verified, just for a different account. Keep it for that account
+        // (never for this one), so the next caller on that login need not poll again.
+        if (safe.accountEmail) await storeVerifiedAccount(dataDir, safe, now).catch(() => {});
         throw new Error("Codex account changed during the usage read");
       }
       const saved = {
@@ -83,41 +90,112 @@ export async function getUsageSnapshot({
       return present(failed, "stale");
     }
   } finally {
-    await lock.close();
-    await unlink(lockPath).catch(() => {});
+    await lock.release();
+  }
+}
+
+async function storeVerifiedAccount(dataDir, safe, now) {
+  const identity = { key: `account:${safe.accountEmail}` };
+  const suffix = cacheSuffix(identity);
+  const path = join(dataDir, `rate-limits${suffix}.json`);
+  if (fresh(await readCache(path), now)) return;
+  const lock = await acquireLock(join(dataDir, `rate-limits${suffix}.lock`), { now, staleMs: LOCK_STALE_MS });
+  if (!lock) return;
+  try {
+    if (fresh(await readCache(path), now)) return;
+    await writeCache(path, {
+      ...emptyCache(),
+      ...safe,
+      identityKey: identity.key,
+      fetchedAt: now,
+      attemptedAt: now,
+      nextAllowedAt: now + MIN_POLL_INTERVAL_MS,
+    });
+  } finally {
+    await lock.release();
   }
 }
 
 export async function captureUsageIdentity(codexHome, {
   env = process.env,
   accountReader = readAccountViaAppServer,
+  throwOnFailure = false,
+  timeoutMs,
 } = {}) {
+  const fail = (message) => {
+    if (throwOnFailure) throw new Error(message);
+    return null;
+  };
   const seat = await configuredSeatIdentity(codexHome, env);
+  // A configured seat that cannot be read must never fall back to the account email.
+  if (seat?.unavailable) return fail("The configured seat label is unavailable");
+  let account;
   try {
-    const account = await accountReader({ codexHome, env });
-    const email = safeEmail(account?.email);
-    const seatAfter = await configuredSeatIdentity(codexHome, env);
-    if (seat?.key !== seatAfter?.key) return null;
-    return email ? { key: `account:${email}`, label: seat?.label ?? email, unavailable: false } : null;
-  } catch {
+    account = await accountReader({ codexHome, env, ...(timeoutMs === undefined ? {} : { timeoutMs }) });
+  } catch (error) {
+    if (throwOnFailure) throw error;
     return null;
   }
+  const email = safeEmail(account?.email);
+  const seatAfter = await configuredSeatIdentity(codexHome, env);
+  if (seat?.key !== seatAfter?.key) return fail("The seat changed during the account read");
+  // No signed-in account is a real answer (null), not a failure.
+  return email ? { key: `account:${email}`, label: seat ? seat.label : email, unavailable: false } : null;
+}
+
+// Node cannot spawn codex.cmd (npm installs) without a shell and refuses .cmd/.bat
+// directly. Resolve what to run: CODEX_BIN, else a codex executable found on PATH,
+// with .cmd/.bat wrapped through cmd.exe.
+export function resolveCodexLaunch(env = process.env, platform = process.platform, args = ["app-server"]) {
+  const configured = env.CODEX_BIN || null;
+  const windows = platform === "win32";
+  let target = configured;
+  if (!target && windows) target = findOnWindowsPath(env);
+  if (!target) return { command: "codex", args };
+  if (windows && /\.(cmd|bat)$/i.test(target)) {
+    const line = [`"${target}"`, ...args].join(" ");
+    return {
+      command: env.ComSpec || "cmd.exe",
+      args: ["/d", "/s", "/c", `"${line}"`],
+      windowsVerbatimArguments: true,
+    };
+  }
+  return { command: target, args };
+}
+
+function findOnWindowsPath(env) {
+  const pathKey = Object.keys(env).find((key) => key.toLowerCase() === "path");
+  const directories = String(pathKey ? env[pathKey] : "").split(delimiter).map((value) => value.trim().replace(/^"|"$/g, "")).filter(Boolean);
+  for (const directory of directories) {
+    for (const extension of [".exe", ".cmd", ".bat"]) {
+      const candidate = join(directory, `codex${extension}`);
+      try {
+        if (statSync(candidate).isFile()) return candidate;
+      } catch {}
+    }
+  }
+  return null;
 }
 
 export async function readAccountViaAppServer({
   codexHome,
-  command = process.env.CODEX_BIN || "codex",
-  args = ["app-server"],
+  command,
+  args,
   timeoutMs = 10_000,
   spawnImpl = spawn,
   env = process.env,
+  platform = process.platform,
 } = {}) {
   const childEnv = { ...env };
   if (codexHome) childEnv.CODEX_HOME = codexHome;
-  const child = spawnImpl(command, args, {
+  const launch = command === undefined
+    ? resolveCodexLaunch(env, platform, args)
+    : { command, args: args ?? ["app-server"] };
+  const child = spawnImpl(launch.command, launch.args, {
     env: childEnv,
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
+    ...(launch.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
   });
   const lines = createInterface({ input: child.stdout });
   let settled = false;
@@ -145,7 +223,8 @@ export async function readAccountViaAppServer({
       } catch {
         return;
       }
-      if (message.id !== 2) return;
+      // Server notifications/requests may reuse ids; only a bare response is ours.
+      if (message.method !== undefined || message.id !== 2) return;
       if (message.error) finish(reject, new Error("Codex account read failed"));
       else finish(resolve, message.result?.account ?? null);
     });
@@ -153,7 +232,7 @@ export async function readAccountViaAppServer({
     send({
       method: "initialize",
       id: 1,
-      params: { clientInfo: { name: "cache_statusband_codex", title: "Cache Statusband Codex", version: "0.4.1" } },
+      params: { clientInfo: { name: "cache_statusband_codex", title: "Cache Statusband Codex", version: CLIENT_VERSION } },
     });
     send({ method: "initialized", params: {} });
     send({ method: "account/read", id: 2, params: { refreshToken: false } });
@@ -162,18 +241,23 @@ export async function readAccountViaAppServer({
 
 export async function fetchRateLimitsViaAppServer({
   codexHome,
-  command = process.env.CODEX_BIN || "codex",
-  args = ["app-server"],
+  command,
+  args,
   timeoutMs = 10_000,
   spawnImpl = spawn,
   env = process.env,
+  platform = process.platform,
 } = {}) {
   const childEnv = { ...env };
   if (codexHome) childEnv.CODEX_HOME = codexHome;
-  const child = spawnImpl(command, args, {
+  const launch = command === undefined
+    ? resolveCodexLaunch(env, platform, args)
+    : { command, args: args ?? ["app-server"] };
+  const child = spawnImpl(launch.command, launch.args, {
     env: childEnv,
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
+    ...(launch.windowsVerbatimArguments ? { windowsVerbatimArguments: true } : {}),
   });
   const lines = createInterface({ input: child.stdout });
   let settled = false;
@@ -210,6 +294,7 @@ export async function fetchRateLimitsViaAppServer({
       } catch {
         return;
       }
+      if (message.method !== undefined) return;
       if (message.id === 2) {
         accountDone = true;
         account = message.error ? null : message.result?.account ?? null;
@@ -233,7 +318,7 @@ export async function fetchRateLimitsViaAppServer({
     send({
       method: "initialize",
       id: 1,
-      params: { clientInfo: { name: "cache_statusband_codex", title: "Cache Statusband Codex", version: "0.4.1" } },
+      params: { clientInfo: { name: "cache_statusband_codex", title: "Cache Statusband Codex", version: CLIENT_VERSION } },
     });
     send({ method: "initialized", params: {} });
     send({ method: "account/read", id: 2, params: { refreshToken: false } });
@@ -288,8 +373,15 @@ export function retryAfterMilliseconds(error, now = Date.now()) {
   }
   const message = error?.rpcMessage ?? error?.message;
   if (typeof message === "string") {
-    const match = message.match(/retry[\s_-]*after[^0-9]*(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|sec(?:ond)?s?)?/i);
-    if (match) candidates.push(Number(match[1]) * (/^m/i.test(match[2] ?? "s") ? 1 : 1000));
+    const match = message.match(/retry[\s_-]*after(?:[\s_-]*(ms|milliseconds?)\b)?[^0-9]*(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?)?(?![a-z])/i);
+    if (match) {
+      const unit = (match[1] ?? match[3] ?? "s").toLowerCase();
+      const scale = unit.startsWith("ms") || unit.startsWith("milli") ? 1
+        : unit.startsWith("h") ? 3_600_000
+        : unit.startsWith("m") ? 60_000
+        : 1000;
+      candidates.push(Number(match[2]) * scale);
+    }
   }
   return candidates.length ? Math.max(...candidates.filter((value) => value >= 0)) : null;
 }
@@ -329,7 +421,8 @@ function present(cache, source) {
 }
 
 function fresh(cache, now) {
-  return Number.isFinite(cache?.nextAllowedAt) && now < cache.nextAllowedAt;
+  // A deadline further out than any backoff we would write is corrupt, not a backoff.
+  return Number.isFinite(cache?.nextAllowedAt) && now < cache.nextAllowedAt && cache.nextAllowedAt <= now + MAX_RETRY_AFTER_MS;
 }
 
 async function readCache(path) {
@@ -375,22 +468,6 @@ async function writeCache(path, value) {
     await rename(temporary, path);
   } finally {
     await unlink(temporary).catch(() => {});
-  }
-}
-
-async function acquireLock(path, now) {
-  try {
-    return await open(path, "wx", 0o600);
-  } catch (error) {
-    if (error.code !== "EEXIST") throw error;
-  }
-  try {
-    const info = await stat(path);
-    if (now - info.mtimeMs <= LOCK_STALE_MS) return null;
-    await unlink(path);
-    return await open(path, "wx", 0o600);
-  } catch {
-    return null;
   }
 }
 
