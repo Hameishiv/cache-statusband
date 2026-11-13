@@ -503,11 +503,18 @@ export async function fetchRateLimitsViaAppServer({
 export function sanitizeRateLimits(raw) {
   const bank = raw?.rateLimitResetCredits;
   const availableCount = finiteNonnegative(bank?.availableCount);
+  // Only reset credits that can still be used are kept: a row with a status other than
+  // "available" (a used or expired one) is dropped, and the count of those is kept apart
+  // (creditsNotAvailable, never shown) so it is not mistaken for the cap below. A row with no
+  // status is kept, as Codex's rows have not always carried one.
+  const rawRows = Array.isArray(bank?.credits) ? bank.credits : null;
+  const usable = rawRows ? rawRows.filter((credit) => credit?.status === undefined || credit?.status === null || credit.status === "available") : null;
+  const creditsNotAvailable = rawRows ? rawRows.length - usable.length : 0;
   // Rows beyond the cap are cut here, so how many were cut is recorded: "not shown" (this
   // plugin cut them) is a different statement from "not supplied" (Codex sent fewer).
-  const creditsOmitted = Array.isArray(bank?.credits) ? Math.max(0, bank.credits.length - MAX_CREDIT_ROWS) : 0;
-  const credits = Array.isArray(bank?.credits)
-    ? bank.credits.slice(0, MAX_CREDIT_ROWS).map((credit) => ({
+  const creditsOmitted = usable ? Math.max(0, usable.length - MAX_CREDIT_ROWS) : 0;
+  const credits = usable
+    ? usable.slice(0, MAX_CREDIT_ROWS).map((credit) => ({
         title: safeText(credit?.title),
         expiresAt: finiteNonnegative(credit?.expiresAt),
         // An explicit null is Codex saying the reset does not expire; a missing or invalid
@@ -521,6 +528,7 @@ export function sanitizeRateLimits(raw) {
     availableCount,
     credits,
     creditsOmitted,
+    creditsNotAvailable,
     primary: safeWindow(rateLimits?.primary),
     secondary: safeWindow(rateLimits?.secondary),
   };

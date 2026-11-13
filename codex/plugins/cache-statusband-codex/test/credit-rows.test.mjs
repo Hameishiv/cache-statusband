@@ -65,3 +65,30 @@ test("rows Codex sent beyond its own count are described against that count", ()
   const one = details({ ...sanitizeRateLimits({ rateLimitResetCredits: { availableCount: 20, credits: rows(21) } }), source: "live", fetchedAt: NOW });
   assert.match(one, /1 more row beyond Codex's count of 20 not shown\./);
 });
+
+test("reset rows whose status is not 'available' are dropped and counted apart from the 20-row cap", () => {
+  const credits = [
+    { title: "Usable", expiresAt: 1_793_302_971, status: "available" },
+    { title: "No status", expiresAt: 1_793_302_972 },
+    { title: "Null status", expiresAt: 1_793_302_973, status: null },
+    { title: "Spent", expiresAt: 1_793_302_974, status: "used" },
+    { title: "Lapsed", expiresAt: 1_793_302_975, status: "expired" },
+    { title: "Odd", expiresAt: 1_793_302_976, status: 7 },
+  ];
+  const safe = sanitizeRateLimits({ rateLimitResetCredits: { availableCount: 3, credits } });
+  assert.deepEqual(safe.credits.map((credit) => credit.title), ["Usable", "No status", "Null status"]);
+  assert.equal(safe.creditsNotAvailable, 3);
+  assert.equal(safe.creditsOmitted, 0);
+  const text = details({ ...safe, source: "live", fetchedAt: NOW });
+  assert.doesNotMatch(text, /Spent|Lapsed|Odd/);
+  // Dropped for status is not "cut by the cap" and not "not supplied by Codex".
+  assert.doesNotMatch(text, /not shown|not supplied by Codex/);
+
+  // With many unusable rows and few usable ones, nothing is reported as cut by the cap.
+  const many = [...rows(5), ...Array.from({ length: 30 }, () => ({ title: "Spent", status: "used" }))];
+  const capped = sanitizeRateLimits({ rateLimitResetCredits: { availableCount: 5, credits: many } });
+  assert.equal(capped.credits.length, 5);
+  assert.equal(capped.creditsOmitted, 0);
+  assert.equal(capped.creditsNotAvailable, 30);
+  assert.doesNotMatch(details({ ...capped, source: "live", fetchedAt: NOW }), /not shown/);
+});

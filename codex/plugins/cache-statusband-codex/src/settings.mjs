@@ -43,6 +43,7 @@ export async function usagePresentation(snapshot, {
       availableCount: null,
       credits: null,
       creditsOmitted: null,
+      creditsNotAvailable: null,
       primary: null,
       secondary: null,
       source: "identity-changed",
