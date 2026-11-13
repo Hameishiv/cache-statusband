@@ -10,10 +10,10 @@
  * weekly and still open. It does not use the network and does not read a token.
  */
 
-import { closeSync, mkdirSync, openSync, readFileSync, readSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
 /** Each family is [dark, light], the same pairs the Claude Code band already checked. */
 export const HUES = {
@@ -151,13 +151,15 @@ export function remaining(ms) {
 
 /**
  * Weekly percent and reset, or null.
- * `record` is `{ percent, periodType, periodEnd }`. A monthly period, a
- * missing percent, or a reset that has already passed is left out.
+ * `record` is `{ percent, periodType, periodEnd, fetchedAt }`. A monthly period,
+ * a missing percent, or a reset that has already passed is left out.
+ * Grok logs the reading only when the user runs /usage, so once it is an hour
+ * old the age is shown. A missing or unreadable fetch time shows no age.
  */
 export function weeklyLabel(record, nowMs) {
   if (!record || typeof record !== "object") return null;
   const type = text(record.periodType);
-  if (!type || !type.includes("WEEKLY")) return null;
+  if (!type || !/_WEEKLY$/.test(type)) return null;
   const pct = finite(record.percent);
   if (pct === null || pct < 0) return null;
   const end = Date.parse(record.periodEnd);
@@ -165,7 +167,9 @@ export function weeklyLabel(record, nowMs) {
   if (!Number.isFinite(end) || now === null || end <= now) return null;
   const left = remaining(end - now);
   if (!left) return null;
-  return `week ${percentText(pct)}% · ${left}`;
+  const fetched = Date.parse(record.fetchedAt);
+  const age = Number.isFinite(fetched) && now - fetched >= 3600000 ? remaining(now - fetched) : null;
+  return `week ${percentText(pct)}%${age ? ` (read ${age} ago)` : ""} · ${left}`;
 }
 
 /**
@@ -231,18 +235,25 @@ export function billingLogPath() {
 /** Shared cache of the last weekly reading. Never holds a token or the raw line. */
 export function usageCachePath() {
   if (process.env.CSB_USAGE_CACHE) return process.env.CSB_USAGE_CACHE;
-  const base = process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local");
+  let base;
+  if (process.platform === "win32") base = process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local");
+  else base = process.env.XDG_CACHE_HOME || join(homedir(), ".cache");
   return join(base, "cache-statusband-grok", "usage.json");
 }
 
+/**
+ * undefined: not a credits line. null: a credits line that cannot be used.
+ * Otherwise the reading.
+ */
 function billingRecord(line) {
-  if (!line.includes(BILLING_MARKER)) return null;
+  if (!line.includes(BILLING_MARKER)) return undefined;
   let obj;
   try {
     obj = JSON.parse(line);
   } catch {
-    return null;
+    return undefined;
   }
+  if (!obj || obj.msg !== BILLING_MARKER) return undefined;
   const cfg = obj && obj.ctx && obj.ctx.config;
   if (!cfg || typeof cfg !== "object") return null;
   const period = cfg.currentPeriod && typeof cfg.currentPeriod === "object" ? cfg.currentPeriod : {};
@@ -258,7 +269,10 @@ function billingRecord(line) {
   };
 }
 
-/** Last credits reading in the file, scanning at most `maxBytes` from the end. */
+/**
+ * Last credits reading in the file, scanning at most `maxBytes` from the end.
+ * The newest credits line decides: if it cannot be used, there is no reading.
+ */
 export function readLastBilling(path, maxBytes = 4 * 1024 * 1024) {
   let st;
   try {
@@ -288,12 +302,12 @@ export function readLastBilling(path, maxBytes = 4 * 1024 * 1024) {
       pending = offset > 0 ? lines.shift() ?? "" : "";
       for (let i = lines.length - 1; i >= 0; i--) {
         const found = billingRecord(lines[i].replace(/\r$/, ""));
-        if (found) return { ...found, sourceMtimeMs: st.mtimeMs, sourceSize: st.size };
+        if (found !== undefined) return found && { ...found, sourceMtimeMs: st.mtimeMs, sourceSize: st.size };
       }
     }
     if (offset === 0 && pending) {
       const found = billingRecord(pending.replace(/\r$/, ""));
-      if (found) return { ...found, sourceMtimeMs: st.mtimeMs, sourceSize: st.size };
+      if (found !== undefined) return found && { ...found, sourceMtimeMs: st.mtimeMs, sourceSize: st.size };
     }
     return null;
   } finally {
@@ -301,8 +315,8 @@ export function readLastBilling(path, maxBytes = 4 * 1024 * 1024) {
   }
 }
 
-function storedRecord(cached) {
-  const record = cached && cached.record;
+function storedRecord(entry) {
+  const record = entry && entry.record;
   if (!record || typeof record !== "object") return null;
   const percent = finite(record.percent);
   const periodType = text(record.periodType);
@@ -311,37 +325,42 @@ function storedRecord(cached) {
   return { percent, periodType, periodEnd, fetchedAt: text(record.fetchedAt) };
 }
 
-function readCache(cachePath) {
-  if (!cachePath) return null;
+/** Per-log entries of the cache file. The old single-entry format counts as empty. */
+function readSources(cachePath) {
+  if (!cachePath) return {};
   try {
-    return JSON.parse(readFileSync(cachePath, "utf8"));
+    const body = JSON.parse(readFileSync(cachePath, "utf8"));
+    const sources = body && body.v === 2 ? body.sources : null;
+    return sources && typeof sources === "object" && !Array.isArray(sources) ? sources : {};
   } catch {
-    return null;
+    return {};
   }
 }
 
-function writeCache(cachePath, body) {
+function writeSources(cachePath, sources) {
   if (!cachePath) return;
   try {
     mkdirSync(dirname(cachePath), { recursive: true });
-    writeFileSync(cachePath, JSON.stringify(body));
+    writeFileSync(cachePath, JSON.stringify({ v: 2, sources }));
   } catch {
     // This run can still show the reading it already has.
   }
 }
 
 /**
- * Last weekly reading. Re-reads the log at most once per five minutes.
- * A failed re-read keeps the last good record and only moves the next check.
- * The cache stores the log it read, the percent, period type, period end, and fetch time.
+ * Last weekly reading. Re-reads each log at most once per five minutes, even
+ * when it has no credits line. A re-read that finds no credits line keeps the
+ * last good record and only moves the next check.
+ * The cache holds one entry per log: the log's size and time, when it was read,
+ * and the percent, period type, period end, and fetch time.
  */
 export function loadWeekly(logPath, cachePath, nowMs = Date.now()) {
   // one cache file serves every log: a reading from another log (another GROK_HOME) is not this one's
-  const stored = readCache(cachePath);
-  const cached = stored && stored.source === logPath ? stored : null;
-  const prior = storedRecord(cached);
-  const freshScan = cached && finite(cached.scannedAt) !== null && nowMs - cached.scannedAt < RESCAN_MS;
-  if (freshScan && prior) return prior;
+  const sources = readSources(cachePath);
+  const raw = logPath && Object.hasOwn(sources, logPath) ? sources[logPath] : null;
+  const entry = raw && typeof raw === "object" ? raw : null;
+  const prior = storedRecord(entry);
+  if (entry && finite(entry.scannedAt) !== null && nowMs - entry.scannedAt < RESCAN_MS) return prior;
 
   let st = null;
   if (logPath) {
@@ -351,34 +370,21 @@ export function loadWeekly(logPath, cachePath, nowMs = Date.now()) {
       st = null;
     }
   }
-  const sameFile = st && cached && cached.sourceMtimeMs === st.mtimeMs && cached.sourceSize === st.size;
-  if (sameFile && prior) return prior;
+  if (!st) return prior;
+  if (entry && entry.sourceMtimeMs === st.mtimeMs && entry.sourceSize === st.size) return prior;
 
-  const found = st ? readLastBilling(logPath) : null;
-  if (!found) {
-    if (prior) {
-      writeCache(cachePath, {
-        source: logPath,
-        sourceMtimeMs: cached.sourceMtimeMs,
-        sourceSize: cached.sourceSize,
-        scannedAt: nowMs,
-        record: prior,
-      });
-    }
-    return prior;
-  }
-  const record = {
-    percent: found.percent,
-    periodType: found.periodType,
-    periodEnd: found.periodEnd,
-    fetchedAt: found.fetchedAt,
-  };
-  writeCache(cachePath, {
-    source: logPath,
-    sourceMtimeMs: found.sourceMtimeMs,
-    sourceSize: found.sourceSize,
-    scannedAt: nowMs,
-    record,
+  const found = readLastBilling(logPath);
+  const record = found
+    ? { percent: found.percent, periodType: found.periodType, periodEnd: found.periodEnd, fetchedAt: found.fetchedAt }
+    : prior;
+  writeSources(cachePath, {
+    ...sources,
+    [logPath]: {
+      sourceMtimeMs: found ? found.sourceMtimeMs : st.mtimeMs,
+      sourceSize: found ? found.sourceSize : st.size,
+      scannedAt: nowMs,
+      record,
+    },
   });
   return record;
 }
@@ -386,7 +392,12 @@ export function loadWeekly(logPath, cachePath, nowMs = Date.now()) {
 function isDirectRun() {
   const entry = process.argv[1];
   if (!entry) return false;
-  return import.meta.url === pathToFileURL(entry).href;
+  // a junction or symlink makes the typed path differ from the real one
+  try {
+    return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(entry);
+  } catch {
+    return false;
+  }
 }
 
 if (isDirectRun()) {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -13,6 +13,7 @@ import {
   formatTokens,
   HUES,
   loadWeekly,
+  readLastBilling,
   remaining,
   render,
   segments,
@@ -80,6 +81,22 @@ describe("segments", () => {
 
 describe("weekly usage", () => {
   const now = Date.parse("2026-10-29T11:46:00Z");
+  // a credits line as Grok logs it; `pad` lengthens the line without adding fields the script reads
+  const creditsLine = (percent, pad = "") =>
+    JSON.stringify({
+      ts: "2026-10-29T11:37:35.772Z",
+      msg: "billing: fetched credits config",
+      ctx: {
+        config: { creditUsagePercent: percent, currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", end: "2026-11-02T22:57:09.651+00:00" } },
+        pad,
+      },
+    });
+  // make the entry for one log look six minutes old, so the next call re-reads it
+  const ageCache = (cachePath, logPath) => {
+    const body = JSON.parse(readFileSync(cachePath, "utf8"));
+    body.sources[logPath].scannedAt = now - 6 * 60 * 1000;
+    writeFileSync(cachePath, JSON.stringify(body));
+  };
   const weekly = {
     percent: 23,
     periodType: "USAGE_PERIOD_TYPE_WEEKLY",
@@ -90,6 +107,23 @@ describe("weekly usage", () => {
     assert.equal(weeklyLabel(weekly, now), "week 23% · 4d11h");
     assert.equal(weeklyLabel({ ...weekly, percent: 0 }, now), "week 0% · 4d11h");
     assert.equal(weeklyLabel({ ...weekly, percent: 23.4 }, now), "week 23.4% · 4d11h");
+  });
+
+  it("shows how old the reading is once it is an hour old, and never invents an age", () => {
+    const at = (iso) => ({ ...weekly, fetchedAt: iso });
+    assert.equal(weeklyLabel(at("2026-10-29T11:00:00Z"), now), "week 23% · 4d11h");
+    assert.equal(weeklyLabel(at("2026-10-29T10:46:00Z"), now), "week 23% (read 60m ago) · 4d11h");
+    assert.equal(weeklyLabel(at("2026-10-29T10:45:00Z"), now), "week 23% (read 1h01m ago) · 4d11h");
+    assert.equal(weeklyLabel(at("2026-10-28T19:46:00Z"), now), "week 23% (read 16h00m ago) · 4d11h");
+    assert.equal(weeklyLabel(at("2026-10-26T01:46:00Z"), now), "week 23% (read 3d10h ago) · 4d11h");
+    assert.equal(weeklyLabel(weekly, now), "week 23% · 4d11h");
+    assert.equal(weeklyLabel(at("not a time"), now), "week 23% · 4d11h");
+    assert.equal(weeklyLabel(at("2026-10-29T13:00:00Z"), now), "week 23% · 4d11h");
+  });
+
+  it("accepts only a period type that ends in _WEEKLY", () => {
+    assert.equal(weeklyLabel({ ...weekly, periodType: "USAGE_PERIOD_TYPE_BIWEEKLY" }, now), null);
+    assert.equal(weeklyLabel({ ...weekly, periodType: "USAGE_PERIOD_TYPE_WEEKLY_EXTRA" }, now), null);
   });
 
   it("omits a monthly period, a finished week, and a missing reading", () => {
@@ -123,8 +157,12 @@ describe("weekly usage", () => {
     const first = loadWeekly(logPath, cachePath, now);
     assert.equal(weeklyLabel(first, now), "week 23% · 4d11h");
     const cached = JSON.parse(readFileSync(cachePath, "utf8"));
-    assert.deepEqual(Object.keys(cached).sort(), ["record", "scannedAt", "source", "sourceMtimeMs", "sourceSize"]);
-    assert.deepEqual(Object.keys(cached.record).sort(), ["fetchedAt", "percent", "periodEnd", "periodType"]);
+    assert.deepEqual(Object.keys(cached).sort(), ["sources", "v"]);
+    assert.equal(cached.v, 2);
+    assert.deepEqual(Object.keys(cached.sources), [logPath]);
+    const entry = cached.sources[logPath];
+    assert.deepEqual(Object.keys(entry).sort(), ["record", "scannedAt", "sourceMtimeMs", "sourceSize"]);
+    assert.deepEqual(Object.keys(entry.record).sort(), ["fetchedAt", "percent", "periodEnd", "periodType"]);
     assert.equal(JSON.stringify(cached).includes("super-secret-tier"), false);
     assert.equal(JSON.stringify(cached).includes("user@example.com"), false);
 
@@ -142,14 +180,76 @@ describe("weekly usage", () => {
       })}\n`,
     );
     assert.equal(loadWeekly(logPath, cachePath, now + 1000).percent, 23);
-    cached.scannedAt = now - 6 * 60 * 1000;
-    writeFileSync(cachePath, JSON.stringify(cached));
+    ageCache(cachePath, logPath);
     assert.equal(loadWeekly(logPath, cachePath, now + 1000).percent, 40);
     writeFileSync(logPath, "no credits line\n");
-    const aged = JSON.parse(readFileSync(cachePath, "utf8"));
-    aged.scannedAt = now - 6 * 60 * 1000;
-    writeFileSync(cachePath, JSON.stringify(aged));
+    ageCache(cachePath, logPath);
     assert.equal(loadWeekly(logPath, cachePath, now + 2000).percent, 40);
+  });
+
+  it("scans a log with no credits line once per five minutes", () => {
+    const dir = mkdtempSync(join(tmpdir(), "csb-week-"));
+    const logPath = join(dir, "unified.jsonl");
+    const cachePath = join(dir, "usage.json");
+    writeFileSync(logPath, "no credits line\n");
+    assert.equal(loadWeekly(logPath, cachePath, now), null);
+    const entry = JSON.parse(readFileSync(cachePath, "utf8")).sources[logPath];
+    assert.equal(entry.scannedAt, now);
+    assert.equal(entry.record, null);
+    // a credits line that shows up inside the window is not seen: the log was not re-read
+    writeFileSync(logPath, `${creditsLine(61)}\n`);
+    assert.equal(loadWeekly(logPath, cachePath, now + 60 * 1000), null);
+    assert.equal(loadWeekly(logPath, cachePath, now + 6 * 60 * 1000).percent, 61);
+  });
+
+  it("does not re-read an unchanged log with no credits line after the window", () => {
+    const dir = mkdtempSync(join(tmpdir(), "csb-week-"));
+    const logPath = join(dir, "unified.jsonl");
+    const cachePath = join(dir, "usage.json");
+    writeFileSync(logPath, "no credits line\n");
+    assert.equal(loadWeekly(logPath, cachePath, now), null);
+    assert.equal(loadWeekly(logPath, cachePath, now + 6 * 60 * 1000), null);
+    // same size and time as at the first scan: the entry is not rewritten
+    assert.equal(JSON.parse(readFileSync(cachePath, "utf8")).sources[logPath].scannedAt, now);
+  });
+
+  it("keeps a separate entry for each log in one cache file", () => {
+    const dir = mkdtempSync(join(tmpdir(), "csb-week-"));
+    const cachePath = join(dir, "usage.json");
+    const a = join(dir, "a.jsonl");
+    const b = join(dir, "b.jsonl");
+    writeFileSync(a, `${creditsLine(23)}\n`);
+    writeFileSync(b, `${creditsLine(61)}\n`);
+    assert.equal(loadWeekly(a, cachePath, now).percent, 23);
+    assert.equal(loadWeekly(b, cachePath, now + 1000).percent, 61);
+    const sources = JSON.parse(readFileSync(cachePath, "utf8")).sources;
+    assert.deepEqual(Object.keys(sources).sort(), [a, b].sort());
+    assert.equal(sources[a].record.percent, 23);
+    assert.equal(sources[b].record.percent, 61);
+    // both are served from the cache while it is fresh
+    writeFileSync(a, "gone\n");
+    writeFileSync(b, "gone\n");
+    assert.equal(loadWeekly(a, cachePath, now + 2000).percent, 23);
+    assert.equal(loadWeekly(b, cachePath, now + 3000).percent, 61);
+  });
+
+  it("treats the old single-entry cache file as empty", () => {
+    const dir = mkdtempSync(join(tmpdir(), "csb-week-"));
+    const logPath = join(dir, "unified.jsonl");
+    const cachePath = join(dir, "usage.json");
+    writeFileSync(logPath, "no credits line\n");
+    writeFileSync(
+      cachePath,
+      JSON.stringify({
+        source: logPath,
+        sourceMtimeMs: 1,
+        sourceSize: 1,
+        scannedAt: now,
+        record: { percent: 99, periodType: "USAGE_PERIOD_TYPE_WEEKLY", periodEnd: "2026-11-02T22:57:09.651+00:00", fetchedAt: null },
+      }),
+    );
+    assert.equal(loadWeekly(logPath, cachePath, now + 1000), null);
+    assert.equal(JSON.parse(readFileSync(cachePath, "utf8")).v, 2);
   });
 
   it("does not show one log's reading for another log that shares the cache", () => {
@@ -168,8 +268,57 @@ describe("weekly usage", () => {
     assert.equal(loadWeekly(a, cachePath, now).percent, 23);
     assert.equal(loadWeekly(b, cachePath, now + 1000), null);
     writeFileSync(b, credits(61));
-    assert.equal(loadWeekly(b, cachePath, now + 2000).percent, 61);
-    assert.equal(loadWeekly(a, cachePath, now + 3000).percent, 23);
+    assert.equal(loadWeekly(b, cachePath, now + 6 * 60 * 1000).percent, 61);
+    assert.equal(loadWeekly(a, cachePath, now + 6 * 60 * 1000 + 1000).percent, 23);
+  });
+});
+
+describe("readLastBilling", () => {
+  const credits = (percent, pad = "") =>
+    JSON.stringify({
+      ts: "2026-10-29T11:37:35.772Z",
+      msg: "billing: fetched credits config",
+      ctx: {
+        config: { creditUsagePercent: percent, currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", end: "2026-11-02T22:57:09.651+00:00" } },
+        pad,
+      },
+    });
+  const log = (body) => {
+    const path = join(mkdtempSync(join(tmpdir(), "csb-bill-")), "unified.jsonl");
+    writeFileSync(path, body);
+    return path;
+  };
+
+  it("stops at the newest credits line even when it cannot be used", () => {
+    const noPercent = JSON.stringify({
+      ts: "2026-10-29T12:00:00Z",
+      msg: "billing: fetched credits config",
+      ctx: { config: { currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", end: "2026-11-02T22:57:09.651+00:00" } } },
+    });
+    assert.equal(readLastBilling(log(`${credits(23)}\n${noPercent}\nnoise\n`)), null);
+  });
+
+  it("skips a line that only mentions the marker text", () => {
+    const mention = JSON.stringify({ ts: "2026-10-29T12:00:00Z", msg: "other", ctx: { note: "billing: fetched credits config" } });
+    assert.equal(readLastBilling(log(`${credits(23)}\n${mention}\n`)).percent, 23);
+  });
+
+  it("finds a credits line that straddles the chunk boundary", () => {
+    const chunk = 256 * 1024;
+    const line = credits(37, "p".repeat(400));
+    const before = `${"a".repeat(999)}\n`;
+    // the file ends so that size - chunk falls in the middle of the credits line
+    const after = `${"z".repeat(chunk + Math.floor(line.length / 2) - line.length - 2)}\n`;
+    const body = `${before}${line}\n${after}`;
+    const boundary = body.length - chunk;
+    assert.ok(boundary > before.length && boundary < before.length + line.length);
+    assert.equal(readLastBilling(log(body)).percent, 37);
+  });
+
+  it("does not look past maxBytes", () => {
+    const path = log(`${credits(23)}\n${"z".repeat(10000)}\n`);
+    assert.equal(readLastBilling(path).percent, 23);
+    assert.equal(readLastBilling(path, 2048), null);
   });
 });
 
@@ -258,7 +407,7 @@ describe("cli", () => {
   });
 
   it("starts through the windows cmd wrapper", { skip: process.platform !== "win32" }, () => {
-    const run = spawnSync(process.env.ComSpec || "cmd.exe", ["/d", "/s", "/c", join(import.meta.dirname, "statusline.cmd")], {
+    const run = spawnSync(process.env.ComSpec || "cmd.exe", ["/d", "/c", join(import.meta.dirname, "statusline.cmd")], {
       cwd: import.meta.dirname,
       env: { ...process.env, CSB_BILLING_LOG: "" },
       input: JSON.stringify({
@@ -270,6 +419,25 @@ describe("cli", () => {
     assert.equal(run.status, 0);
     assert.match(run.stdout, /Grok 4\.7/);
     assert.equal(run.stdout.includes("secret-token"), false);
+  });
+
+  it("prints the band when started through a junction or symlink to the folder", () => {
+    const dir = mkdtempSync(join(tmpdir(), "csb-link-"));
+    const link = join(dir, "grok-link");
+    symlinkSync(import.meta.dirname, link, process.platform === "win32" ? "junction" : "dir");
+    try {
+      const run = spawnSync(process.execPath, [join(link, "statusline.mjs")], {
+        env: { ...process.env, CSB_BILLING_LOG: "", CSB_USAGE_CACHE: join(dir, "usage.json") },
+        input: JSON.stringify({ model: { display_name: "Grok 4.7" } }),
+        encoding: "utf8",
+      });
+      assert.equal(run.status, 0);
+      assert.match(run.stdout, /Grok 4\.7/);
+    } finally {
+      // remove the link only, never the folder it points to
+      unlinkSync(link);
+    }
+    assert.ok(existsSync(join(import.meta.dirname, "statusline.mjs")));
   });
 
   it("fails closed on stdin that is not JSON", () => {
