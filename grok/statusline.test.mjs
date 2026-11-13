@@ -345,6 +345,21 @@ describe("weekly usage", () => {
     assert.doesNotMatch(run.stdout, /Week/);
   });
 
+  it("does not read a named pipe as the cache", { skip: process.platform === "win32" }, (t) => {
+    const dir = tempDir(join(tmpdir(), "csb-week-"));
+    const cachePath = join(dir, "usage.json");
+    if (spawnSync("mkfifo", [cachePath]).status !== 0) return t.skip("mkfifo is not available");
+    writeFileSync(join(dir, "unified.jsonl"), "");
+    const run = spawnSync(process.execPath, [join(import.meta.dirname, "statusline.mjs")], {
+      env: { ...process.env, CSB_BILLING_LOG: join(dir, "unified.jsonl"), CSB_USAGE_CACHE: cachePath },
+      input: JSON.stringify({ model: { display_name: "Grok 4.7" } }),
+      encoding: "utf8",
+      timeout: 10000,
+    });
+    assert.equal(run.signal, null);
+    assert.equal(run.status, 0);
+  });
+
   it("tells a missing cache from one it cannot read", () => {
     const dir = tempDir(join(tmpdir(), "csb-week-"));
     assert.deepEqual(readSources(join(dir, "missing.json")), {});

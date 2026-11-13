@@ -350,8 +350,8 @@ function billingRecord(line, finished = true) {
 /**
  * Last credits reading in the file, scanning at most `maxBytes` from the end.
  * The newest finished credits line decides: if it cannot be parsed or used,
- * there is no reading. Only an unfinished last line (Grok still writing it) is
- * passed over.
+ * there is no reading. Only an unparseable last line with no newline after it
+ * (one Grok is still writing) is passed over.
  */
 export function readLastBilling(path, maxBytes = 4 * 1024 * 1024) {
   const found = scanBilling(path, maxBytes);
@@ -363,7 +363,8 @@ const READ_FAILED = Symbol("read failed");
 /**
  * READ_FAILED: the log could not be read. undefined: no credits line in range.
  * null: the newest finished credits line cannot be parsed or used (an
- * unfinished last line is passed over). Otherwise the reading.
+ * unparseable last line with no newline after it, one Grok is still writing,
+ * is passed over). Otherwise the reading.
  */
 function scanBilling(path, maxBytes = 4 * 1024 * 1024) {
   // opening a named pipe would wait for a writer: check before opening as well as after
@@ -430,13 +431,15 @@ function storedRecord(entry) {
 
 /**
  * Per-log entries of the cache file, or null when the file exists but cannot
- * be read (locked, no permission). A missing file, unparseable text, or the old
+ * be read (locked, no permission, not a regular file). A missing file, unparseable text, or the old
  * single-entry format counts as empty.
  */
 export function readSources(cachePath) {
   if (!cachePath) return {};
   let text;
   try {
+    // reading a named pipe would wait for a writer
+    if (!statSync(cachePath).isFile()) return null;
     text = readFileSync(cachePath, "utf8");
   } catch (err) {
     return err && err.code === "ENOENT" ? {} : null;
