@@ -8,6 +8,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# A profile or caller may set this to $true, which would turn every non-zero exit from Codex
+# or npm into a terminating error. The installer reads those exit codes itself.
+$PSNativeCommandUseErrorActionPreference = $false
 
 # The installer calls .NET methods and compiles a small native call, neither of which
 # PowerShell's Constrained Language Mode allows; stop before anything is touched.
@@ -128,19 +131,6 @@ function Get-RegisteredMarketplaceSource([AllowNull()][string]$Text, [string]$Na
   return $null
 }
 
-# Whether two folder paths name the same place (ignoring a \\?\ prefix, a trailing slash and,
-# on Windows, case).
-function Test-SameFolder([string]$A, [string]$B) {
-  $normalize = {
-    param([string]$Path)
-    if ($Path.StartsWith('\\?\UNC\')) { $Path = '\\' + $Path.Substring(8) } elseif ($Path.StartsWith('\\?\')) { $Path = $Path.Substring(4) }
-    try { $Path = [IO.Path]::GetFullPath($Path) } catch { }
-    return $Path.TrimEnd('\', '/')
-  }
-  $comparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
-  return (& $normalize $A).Equals((& $normalize $B), $comparison)
-}
-
 # The text of a file, or $null when there is none; and whether two such readings are the same.
 function Read-TextOrNull([string]$Path) {
   if (Test-Path -LiteralPath $Path) { return [IO.File]::ReadAllText($Path) }
@@ -160,7 +150,7 @@ function Set-TomlKey {
   )
 
   if ($Text.Contains("'''") -or $Text.Contains('"""')) {
-    throw "Cannot safely edit config.toml because it contains TOML multiline strings; configure hooks/footer manually or remove the multiline string first"
+    throw "Cannot safely edit config.toml because it contains a TOML multi-line string (written with three quote marks in a row). Nothing was installed or registered, and config.toml was not changed. Remove the multi-line string or rewrite it as a single-line string, then run the installer again."
   }
 
   $lines = [Collections.Generic.List[string]]::new()
@@ -303,7 +293,7 @@ function Find-TomlValueEnd {
       }
     }
     if ($quote -ne [char]0) {
-      throw "Cannot safely replace [$Section].$Key because multiline strings are not supported"
+      throw "Cannot safely replace [$Section].$Key because it contains a multi-line string, which the installer cannot edit. Nothing was installed or registered, and config.toml was not changed. Rewrite that value on one line (or remove it), then run the installer again."
     }
   }
   throw "Unterminated array in [$Section].$Key"
@@ -487,17 +477,27 @@ try {
   try {
     $env:CODEX_HOME = $CodexHome
     # Codex refuses to add a marketplace name that is already registered from another folder.
-    # Re-running from a moved or re-cloned checkout re-points the registration: the old one is
-    # removed first (Codex keeps the plugin's own enabled setting).
+    # So the add is tried first, and only that refusal triggers a re-point: the old registration
+    # is removed and the add repeated (Codex keeps the plugin's own enabled setting). Paths are
+    # never compared here, so a junction, symbolic link or subst drive to the same checkout
+    # never re-points falsely.
     $registeredSource = Get-RegisteredMarketplaceSource (Read-TextOrNull $configPath) "cache-statusband-codex-local"
-    if ($registeredSource -and -not (Test-SameFolder $registeredSource $repositoryRoot)) {
-      $registeredShown = if ($registeredSource.StartsWith('\\?\')) { $registeredSource.Substring(4) } else { $registeredSource }
-      Write-Host "Re-pointing the cache-statusband-codex-local marketplace registration: $registeredShown -> $repositoryRoot"
+    $addOutput = @(& $codexCommand plugin marketplace add $repositoryRoot 2>&1 | ForEach-Object { "$_" })
+    $addExit = $LASTEXITCODE
+    $addOutput
+    if ($addExit -ne 0 -and (($addOutput -join "`n") -match 'already added from a different source')) {
+      if ($registeredSource) {
+        $registeredShown = if ($registeredSource.StartsWith('\\?\')) { $registeredSource.Substring(4) } else { $registeredSource }
+        Write-Host "Re-pointing the cache-statusband-codex-local marketplace registration: $registeredShown -> $repositoryRoot"
+      } else {
+        Write-Host "Re-pointing the cache-statusband-codex-local marketplace registration to $repositoryRoot"
+      }
       & $codexCommand plugin marketplace remove cache-statusband-codex-local
       if ($LASTEXITCODE -ne 0) { throw "codex plugin marketplace remove failed ($LASTEXITCODE)" }
+      & $codexCommand plugin marketplace add $repositoryRoot
+      $addExit = $LASTEXITCODE
     }
-    & $codexCommand plugin marketplace add $repositoryRoot
-    if ($LASTEXITCODE -ne 0) { throw "codex plugin marketplace add failed ($LASTEXITCODE)" }
+    if ($addExit -ne 0) { throw "codex plugin marketplace add failed ($addExit)" }
     & $codexCommand plugin add "cache-statusband-codex@cache-statusband-codex-local"
     if ($LASTEXITCODE -ne 0) { throw "codex plugin add failed ($LASTEXITCODE)" }
   } finally {
@@ -588,41 +588,17 @@ try {
       }
     }
   } else {
-    Write-Warning "Installation failed after Codex registered the plugin; there was no earlier config.toml to restore, so $configPath is left as Codex wrote it."
+    if ($registrationDone) {
+      Write-Warning "Installation failed after Codex registered the plugin; there was no earlier config.toml to restore, so $configPath is left as Codex wrote it."
+    } else {
+      Write-Warning "Installation failed during Codex's own registration step; there was no earlier config.toml to restore, so $configPath (if Codex created it) is left as Codex wrote it."
+    }
   }
   throw
 }
 
 if ($PSBoundParameters.ContainsKey("SeatFile")) {
   Write-Host "Configured optional seat label file: $expandedSeatFile"
-}
-
-if (-not $SkipCliLink) {
-  $reuseExistingLink = $false
-  $npmRoot = (& npm root -g 2>$null | Select-Object -Last 1)
-  if ($LASTEXITCODE -eq 0 -and $npmRoot) {
-    $globalPackage = Join-Path ([string]$npmRoot).Trim() "cache-statusband-codex"
-    if (Test-Path -LiteralPath $globalPackage) {
-      $globalItem = Get-Item -LiteralPath $globalPackage -Force
-      $linkTarget = if ($globalItem.Target) { [string](@($globalItem.Target)[0]) } else { "" }
-      if ($linkTarget) {
-        $expected = [IO.Path]::GetFullPath($pluginRoot).TrimEnd('\')
-        $actual = [IO.Path]::GetFullPath($linkTarget).TrimEnd('\')
-        $reuseExistingLink = $expected.Equals($actual, [StringComparison]::OrdinalIgnoreCase)
-      }
-    }
-  }
-  if ($reuseExistingLink) {
-    Write-Host "CLI link already points to this checkout; keeping it."
-  } else {
-    Push-Location $pluginRoot
-    try {
-      & npm link
-      if ($LASTEXITCODE -ne 0) { throw "npm link failed ($LASTEXITCODE). The plugin is already installed and config.toml and settings.json are as updated: only the terminal command link was not made, and nothing is rolled back. If another package owns the launcher, rerun with -SkipCliLink and inspect 'Get-Command cache-statusband-codex -All'." }
-    } finally {
-      Pop-Location
-    }
-  }
 }
 
 Write-Host "Installed the local Codex plugin and enabled hooks."
@@ -633,3 +609,44 @@ if ($KeepExistingFooter) {
   Write-Host "Configured the native Codex CLI status footer. Run /statusline to customize it."
 }
 Write-Host "The resume hook also runs in the Codex desktop app. Restart Codex to load the plugin."
+
+# The terminal command link comes last and is not part of the install proper: it cannot undo
+# anything above, and every failure in it is reported as only the link step failing.
+if (-not $SkipCliLink) {
+  $linkAsUpdated = if ($PSBoundParameters.ContainsKey("SeatFile")) { "config.toml and settings.json are as updated" } else { "config.toml is as updated" }
+  $linkFailure = {
+    param([string]$Detail)
+    "$Detail. The plugin is already installed and ${linkAsUpdated}: only the terminal command link was not made, and nothing is rolled back. If another package owns the launcher, rerun with -SkipCliLink and inspect 'Get-Command cache-statusband-codex -All'."
+  }
+  $reuseExistingLink = $false
+  try {
+    $npmRoot = (& npm root -g 2>$null | Select-Object -Last 1)
+    if ($LASTEXITCODE -eq 0 -and $npmRoot) {
+      $globalPackage = Join-Path ([string]$npmRoot).Trim() "cache-statusband-codex"
+      if (Test-Path -LiteralPath $globalPackage) {
+        $globalItem = Get-Item -LiteralPath $globalPackage -Force
+        $linkTarget = if ($globalItem.Target) { [string](@($globalItem.Target)[0]) } else { "" }
+        if ($linkTarget) {
+          $expected = [IO.Path]::GetFullPath($pluginRoot).TrimEnd('\')
+          $actual = [IO.Path]::GetFullPath($linkTarget).TrimEnd('\')
+          $reuseExistingLink = $expected.Equals($actual, [StringComparison]::OrdinalIgnoreCase)
+        }
+      }
+    }
+  } catch {
+    throw (& $linkFailure "Could not check for an existing terminal command link ($($_.Exception.Message))")
+  }
+  if ($reuseExistingLink) {
+    Write-Host "CLI link already points to this checkout; keeping it."
+  } else {
+    Push-Location $pluginRoot
+    try {
+      & npm link
+      if ($LASTEXITCODE -ne 0) { throw (& $linkFailure "npm link failed ($LASTEXITCODE)") }
+    } catch [System.Management.Automation.CommandNotFoundException] {
+      throw (& $linkFailure "npm link could not be run ($($_.Exception.Message))")
+    } finally {
+      Pop-Location
+    }
+  }
+}

@@ -68,12 +68,17 @@ status_line_use_colors = false
 '@
   [IO.File]::WriteAllText((Join-Path $testHome "config.toml"), $instructions, [Text.UTF8Encoding]::new($false))
   $rejected = $false
+  $multilineMessage = ""
   try {
     & (Join-Path $root "install.ps1") -CodexHome $testHome -SkipCliLink | Out-Null
   } catch {
     $rejected = $true
+    $multilineMessage = $_.Exception.Message
   }
   if (-not $rejected) { throw "TOML-looking lines inside a multiline string were not rejected" }
+  if ($multilineMessage -notmatch "Nothing was installed or registered" -or $multilineMessage -notmatch "then run the installer again") {
+    throw "The multi-line string refusal did not say nothing was installed and how to proceed: $multilineMessage"
+  }
   if ([IO.File]::ReadAllText((Join-Path $testHome "config.toml")) -ne $instructions) {
     throw "Multiline instructions changed during candidate rejection"
   }
@@ -176,6 +181,18 @@ status_line_use_colors = false
     if ($null -eq $previousCodexHome) { Remove-Item Env:CODEX_HOME -ErrorAction SilentlyContinue } else { $env:CODEX_HOME = $previousCodexHome }
   }
   if ($plainExit -ne 0) { throw "The installed config.toml with a retired key does not pass plain Codex startup" }
+
+  # A caller or profile that sets $PSNativeCommandUseErrorActionPreference to $true must not
+  # turn Codex's non-zero strict-check exit into "could not run": the retired-key config still
+  # installs with the warning.
+  $nativeHome = Join-Path $testHome "native-pref-home"
+  New-Item -ItemType Directory -Path $nativeHome | Out-Null
+  [IO.File]::WriteAllText((Join-Path $nativeHome "config.toml"), $retired, [Text.UTF8Encoding]::new($false))
+  $nativeScript = Join-Path $testHome "native-pref.ps1"
+  [IO.File]::WriteAllText($nativeScript, "`$PSNativeCommandUseErrorActionPreference = `$true`n& '$(Join-Path $root "install.ps1")' -CodexHome '$nativeHome' -SkipCliLink *>&1 | Out-String`n", [Text.UTF8Encoding]::new($false))
+  $nativeOutput = (& (Get-Process -Id $PID).Path -NoProfile -File $nativeScript 2>&1 | Out-String)
+  if ($nativeOutput -notmatch "strict config check already rejects" -or $nativeOutput -match "could not run") { throw "With PSNativeCommandUseErrorActionPreference set to true, the retired-key config was not installed with the warning: $nativeOutput" }
+  if ([IO.File]::ReadAllText((Join-Path $nativeHome "config.toml")) -notmatch '(?m)^status_line_use_colors = true$') { throw "The install did not proceed with PSNativeCommandUseErrorActionPreference set to true" }
 
   # The same retired key plus a footer written with dotted keys: the plugin cannot add a
   # [tui] table without duplicating it, so the install is refused and config.toml untouched.
@@ -420,6 +437,49 @@ exit /b 0
   if ([IO.File]::ReadAllText((Join-Path $seatFirstHome "config.toml")) -ne $original) { throw "config.toml changed although settings.json could not be written" }
   if (Test-Path -LiteralPath (Join-Path $seatFirstHome "plugins")) { throw "The plugin was registered although settings.json could not be written" }
 
+  # A failed registration with no earlier config.toml says so without claiming that Codex
+  # registered the plugin.
+  $noBackupHome = Join-Path $testHome "no-backup-home"
+  $noBackupWarnings = @()
+  $previousPath = $env:PATH
+  $noBackupFailed = $false
+  try {
+    $env:PATH = "$fakeBin$([IO.Path]::PathSeparator)$previousPath"
+    try {
+      & (Join-Path $root "install.ps1") -CodexHome $noBackupHome -SkipCliLink -WarningVariable noBackupWarnings 3>$null | Out-Null
+    } catch {
+      $noBackupFailed = $true
+    }
+  } finally {
+    $env:PATH = $previousPath
+  }
+  if (-not $noBackupFailed) { throw "A failed registration into a fresh home was not reported" }
+  if (-not ($noBackupWarnings | Where-Object { "$_" -match "during Codex's own registration step" -and "$_" -match "no earlier config.toml" })) { throw "The no-backup warning did not say the registration step failed: $($noBackupWarnings -join ' | ')" }
+  if ($noBackupWarnings | Where-Object { "$_" -match "after Codex registered the plugin" }) { throw "The no-backup warning claimed Codex registered the plugin although registration failed: $($noBackupWarnings -join ' | ')" }
+
+  # When npm cannot even be run (not on PATH), the failure is still reported as only the link
+  # step failing, and the hooks-review and restart lines were already printed before it.
+  $noNpmBin = Join-Path $testHome "no-npm-bin"
+  New-Item -ItemType Directory -Path $noNpmBin | Out-Null
+  [IO.File]::WriteAllText((Join-Path $noNpmBin "codex.cmd"), "@echo off`r`nexit /b 0`r`n", [Text.Encoding]::ASCII)
+  $noNpmHome = Join-Path $testHome "no-npm-home"
+  $noNpmMessage = ""
+  $noNpmOutput = @()
+  $previousPath = $env:PATH
+  try {
+    $env:PATH = "$noNpmBin$([IO.Path]::PathSeparator)$env:SystemRoot/System32"
+    try {
+      & (Join-Path $root "install.ps1") -CodexHome $noNpmHome 3>$null *>&1 | ForEach-Object { $noNpmOutput += "$_" }
+    } catch {
+      $noNpmMessage = $_.Exception.Message
+    }
+  } finally {
+    $env:PATH = $previousPath
+  }
+  if ($noNpmMessage -notmatch "only the terminal command link was not made" -or $noNpmMessage -notmatch "nothing is rolled back") { throw "A missing npm was not described as only the link step failing: '$noNpmMessage'" }
+  if ($noNpmMessage -match "settings.json") { throw "The link-step message mentioned settings.json although -SeatFile was not used: $noNpmMessage" }
+  if (-not (($noNpmOutput -join "`n") -match "open /hooks in Codex to review and trust them") -or -not (($noNpmOutput -join "`n") -match "Restart Codex to load the plugin")) { throw "The hooks-review and restart lines were not printed before the link step: $($noNpmOutput -join ' | ')" }
+
   # A failing `npm link` is reported as only the link step failing: the plugin stays installed
   # and config.toml keeps its update (nothing is rolled back).
   $npmBin = Join-Path $testHome "npm-bin"
@@ -439,6 +499,7 @@ exit /b 0
     $env:PATH = $previousPath
   }
   if ($npmMessage -notmatch "npm link failed" -or $npmMessage -notmatch "plugin is already installed" -or $npmMessage -notmatch "only the terminal command link was not made") { throw "A failed npm link was not described as only the link step failing: $npmMessage" }
+  if ($npmMessage -match "settings.json") { throw "The npm link message mentioned settings.json although -SeatFile was not used: $npmMessage" }
   $npmConfig = [IO.File]::ReadAllText((Join-Path $npmHome "config.toml"))
   if ($npmConfig -notmatch '(?m)^hooks = true$' -or $npmConfig -notmatch '(?m)^enabled\s*=\s*true\s*$') { throw "A failed npm link rolled back config.toml or the plugin" }
 
@@ -461,6 +522,82 @@ exit /b 0
   # Running again from the same (new) path leaves the registration alone.
   $outputB2 = (& (Join-Path $copyRoot "install.ps1") -CodexHome $repointHome -SkipCliLink *>&1 | Out-String)
   if ($outputB2 -match "Re-pointing") { throw "Re-running from the registered checkout re-pointed the registration: $outputB2" }
+
+  # Codex's own refusal ("already added from a different source") is what triggers a re-point,
+  # not a comparison of paths: a junction to the same checkout is the same source and must not
+  # say it is re-pointing.
+  $junctionPath = Join-Path $testHome "junction-codex"
+  $junctionMade = $false
+  try {
+    New-Item -ItemType Junction -Path $junctionPath -Target $root | Out-Null
+    $junctionMade = $true
+  } catch {
+    Write-Host "Skipped the junction re-point check: a junction could not be created ($($_.Exception.Message))"
+  }
+  if ($junctionMade) {
+    try {
+      $junctionHome = Join-Path $testHome "junction-home"
+      $junctionFirst = (& (Join-Path $root "install.ps1") -CodexHome $junctionHome -SkipCliLink *>&1 | Out-String)
+      $junctionSecond = (& (Join-Path $junctionPath "install.ps1") -CodexHome $junctionHome -SkipCliLink *>&1 | Out-String)
+      if ($junctionSecond -match "Re-pointing") { throw "Installing again through a junction to the same checkout said it was re-pointing: $junctionSecond" }
+      if ([regex]::Matches([IO.File]::ReadAllText((Join-Path $junctionHome "config.toml")), '(?m)^\[marketplaces\.cache-statusband-codex-local\]').Count -ne 1) { throw "The junction install registered the marketplace more than once" }
+    } finally {
+      [IO.Directory]::Delete($junctionPath)
+    }
+  }
+
+  # A re-point whose remove succeeds but whose second add fails: the original config.toml
+  # (with the old marketplace source) is back, and settings.json is put back as it was. The fake
+  # codex refuses the first add as "already added from a different source", the remove
+  # deletes the registration from config.toml, and the second add fails.
+  $failAddBin = Join-Path $testHome "fail-add-bin"
+  New-Item -ItemType Directory -Path $failAddBin | Out-Null
+  $failAddCodex = @'
+@echo off
+if "%1"=="app-server" exit /b 0
+if not "%1"=="plugin" exit /b 0
+if not "%2"=="marketplace" exit /b 0
+if "%3"=="remove" goto remove
+if not "%3"=="add" exit /b 0
+if exist "%FAKE_STATE%\removed" goto secondadd
+echo Error: marketplace 'cache-statusband-codex-local' is already added from a different source; remove it before adding this source 1>&2
+exit /b 1
+:secondadd
+echo Error: second add failed 1>&2
+exit /b 1
+:remove
+echo [history]> "%CODEX_HOME%\config.toml"
+echo.> "%FAKE_STATE%\removed"
+exit /b 0
+'@
+  [IO.File]::WriteAllText((Join-Path $failAddBin "codex.cmd"), $failAddCodex, [Text.Encoding]::ASCII)
+  $failAddHome = Join-Path $testHome "fail-add-home"
+  $failAddState = Join-Path $testHome "fail-add-state"
+  New-Item -ItemType Directory -Path (Join-Path $failAddHome "cache-statusband-codex"), $failAddState | Out-Null
+  $oldSourceConfig = "[history]`npersistence = `"save-all`"`n`n[marketplaces.cache-statusband-codex-local]`nsource_type = `"local`"`nsource = '\\?\C:\old\checkout'`n"
+  [IO.File]::WriteAllText((Join-Path $failAddHome "config.toml"), $oldSourceConfig, [Text.UTF8Encoding]::new($false))
+  $failAddSettingsPath = Join-Path $failAddHome "cache-statusband-codex\settings.json"
+  $failAddEarlier = "{`"version`":1,`"seatFile`":`"earlier-seat.txt`"}`n"
+  [IO.File]::WriteAllText($failAddSettingsPath, $failAddEarlier, [Text.UTF8Encoding]::new($false))
+  $failAddOutput = @()
+  $failAddFailed = $false
+  $previousPath = $env:PATH
+  try {
+    $env:PATH = "$failAddBin$([IO.Path]::PathSeparator)$previousPath"
+    $env:FAKE_STATE = $failAddState
+    try {
+      & (Join-Path $root "install.ps1") -CodexHome $failAddHome -SkipCliLink -SeatFile (Join-Path $testHome "new-seat.txt") -WarningVariable failAddWarnings *>&1 | ForEach-Object { $failAddOutput += "$_" }
+    } catch {
+      $failAddFailed = $true
+    }
+  } finally {
+    $env:PATH = $previousPath
+    Remove-Item Env:FAKE_STATE -ErrorAction SilentlyContinue
+  }
+  if (-not $failAddFailed) { throw "A re-point whose second add failed was not reported" }
+  if (-not (($failAddOutput -join "`n") -match [regex]::Escape("Re-pointing the cache-statusband-codex-local marketplace registration: C:\old\checkout -> $root"))) { throw "The re-point did not name the old and new source: $($failAddOutput -join ' | ')" }
+  if ([IO.File]::ReadAllText((Join-Path $failAddHome "config.toml")) -ne $oldSourceConfig) { throw "The old marketplace source is not back in config.toml after the re-point failed" }
+  if ([IO.File]::ReadAllText($failAddSettingsPath) -ne $failAddEarlier) { throw "settings.json was not put back after the re-point failed" }
 
   # A config.toml that is a symbolic link stays a link: the edit lands on the file it points
   # at. The same for settings.json. (Skipped, with a message, where a link cannot be made.)
