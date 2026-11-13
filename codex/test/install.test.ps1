@@ -140,6 +140,55 @@ status_line_use_colors = false
     if (Test-Path -LiteralPath $blankHome) { throw "A rejected -SeatFile still created or changed the Codex home" }
   }
 
+  # A config.toml Codex's strict check already rejects (a retired key passes plain startup
+  # but fails --strict-config) must not block the install: it installs with a warning.
+  $retiredHome = Join-Path $testHome "retired-key-home"
+  New-Item -ItemType Directory -Path $retiredHome | Out-Null
+  $retired = "[features]`nhooks = true`nbogus_retired_key = true`n"
+  [IO.File]::WriteAllText((Join-Path $retiredHome "config.toml"), $retired, [Text.UTF8Encoding]::new($false))
+  $retiredWarnings = @()
+  & (Join-Path $root "install.ps1") -CodexHome $retiredHome -SkipCliLink -WarningVariable retiredWarnings 3>$null | Out-Null
+  if (-not ($retiredWarnings | Where-Object { "$_" -match "strict config check already rejects" })) {
+    throw "A config.toml with a retired key did not produce the could-not-validate warning"
+  }
+  $retiredAfter = [IO.File]::ReadAllText((Join-Path $retiredHome "config.toml"))
+  if ($retiredAfter -notmatch '(?m)^bogus_retired_key = true$') { throw "The retired key was removed from config.toml" }
+  if ($retiredAfter -notmatch '(?m)^status_line_use_colors = true$') { throw "The install did not proceed past the retired key" }
+
+  # A candidate that WE break (the original passes the strict check, the edit does not)
+  # still throws and leaves config.toml untouched.
+  $strictBin = Join-Path $testHome "strict-bin"
+  New-Item -ItemType Directory -Path $strictBin | Out-Null
+  $strictCodex = @'
+@echo off
+if not "%1"=="app-server" exit /b 0
+findstr /C:"status_line_use_colors" "%CODEX_HOME%\config.toml" >nul
+if errorlevel 1 exit /b 0
+echo unknown field status_line_use_colors
+exit /b 1
+'@
+  [IO.File]::WriteAllText((Join-Path $strictBin "codex.cmd"), $strictCodex, [Text.Encoding]::ASCII)
+  $strictHome = Join-Path $testHome "strict-home"
+  New-Item -ItemType Directory -Path $strictHome | Out-Null
+  $strictOriginal = "[history]`npersistence = `"save-all`"`n"
+  [IO.File]::WriteAllText((Join-Path $strictHome "config.toml"), $strictOriginal, [Text.UTF8Encoding]::new($false))
+  $previousPath = $env:PATH
+  $rejected = $false
+  try {
+    $env:PATH = "$strictBin$([IO.Path]::PathSeparator)$previousPath"
+    try {
+      & (Join-Path $root "install.ps1") -CodexHome $strictHome -SkipCliLink 3>$null | Out-Null
+    } catch {
+      $rejected = $_.Exception.Message -match "rejected the candidate"
+    }
+  } finally {
+    $env:PATH = $previousPath
+  }
+  if (-not $rejected) { throw "A candidate broken by the plugin's own edit was not rejected" }
+  if ([IO.File]::ReadAllText((Join-Path $strictHome "config.toml")) -ne $strictOriginal) {
+    throw "The live config changed after the plugin's own edit was rejected"
+  }
+
   # A failure after Codex registered the plugin must put the original config.toml back.
   $fakeBin = Join-Path $testHome "fake-bin"
   New-Item -ItemType Directory -Path $fakeBin | Out-Null

@@ -126,9 +126,12 @@ function Find-TomlValueEnd {
   throw "Unterminated array in [$Section].$Key"
 }
 
-function Assert-CodexConfig {
+# Runs Codex's strict config check on $Text in a throwaway CODEX_HOME. Returns
+# Passed, CouldNotRun (the check itself did not run: spawn failure or Codex does not know
+# the flag, which says nothing about the config) and Detail (Codex's reason line).
+function Test-CodexStrictConfig {
   param(
-    [Parameter(Mandatory)][string]$Text,
+    [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
     [Parameter(Mandatory)][string]$CodexCommand
   )
 
@@ -138,12 +141,16 @@ function Assert-CodexConfig {
   try {
     [IO.File]::WriteAllText((Join-Path $validationHome "config.toml"), $Text, [Text.UTF8Encoding]::new($false))
     $env:CODEX_HOME = $validationHome
-    $validationOutput = & $CodexCommand app-server --strict-config --print-startup-config 2>&1
-    if ($LASTEXITCODE -ne 0) {
-      $detail = (($validationOutput | Out-String).Trim() -replace '\s+', ' ')
-      if ($detail.Length -gt 500) { $detail = $detail.Substring(0, 500) }
-      throw "Codex rejected the candidate config.toml: $detail"
+    try {
+      $validationOutput = & $CodexCommand app-server --strict-config --print-startup-config 2>&1
+    } catch {
+      return [pscustomobject]@{ Passed = $false; CouldNotRun = $true; Detail = $_.Exception.Message }
     }
+    if ($LASTEXITCODE -eq 0) { return [pscustomobject]@{ Passed = $true; CouldNotRun = $false; Detail = "" } }
+    $detail = (($validationOutput | Out-String).Trim() -replace '\s+', ' ')
+    if ($detail.Length -gt 500) { $detail = $detail.Substring(0, 500) }
+    $couldNotRun = $detail -match 'unexpected argument|unrecognized (option|subcommand)|Usage: codex'
+    return [pscustomobject]@{ Passed = $false; CouldNotRun = $couldNotRun; Detail = $detail }
   } finally {
     $env:CODEX_HOME = $previousCodexHome
     if (Test-Path -LiteralPath $validationHome) {
@@ -151,6 +158,30 @@ function Assert-CodexConfig {
       if ($resolved -eq $validationHome) { [IO.Directory]::Delete($resolved, $true) }
     }
   }
+}
+
+# Validates by difference. A config.toml that Codex's strict check already rejects (for
+# example one holding a retired key, which plain startup tolerates) must not block the
+# install, so the original is checked first: when it passes, the candidate has to pass
+# too; when it already fails, the plugin's edit cannot be validated and we warn instead.
+function Assert-CodexConfig {
+  param(
+    [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
+    [Parameter(Mandatory)][string]$CodexCommand,
+    [AllowNull()]$Original
+  )
+
+  if ($null -ne $Original) {
+    $before = Test-CodexStrictConfig -Text $Original -CodexCommand $CodexCommand
+    if ($before.CouldNotRun) { throw "Codex could not run its strict config check, so config.toml was not validated: $($before.Detail)" }
+    if (-not $before.Passed) {
+      Write-Warning "Codex's strict config check already rejects the current config.toml, so the plugin's edit to it could not be validated: $($before.Detail)"
+      return
+    }
+  }
+  $after = Test-CodexStrictConfig -Text $Text -CodexCommand $CodexCommand
+  if ($after.CouldNotRun) { throw "Codex could not run its strict config check, so the candidate config.toml was not validated: $($after.Detail)" }
+  if (-not $after.Passed) { throw "Codex rejected the candidate config.toml: $($after.Detail)" }
 }
 
 $repositoryRoot = $PSScriptRoot
@@ -188,9 +219,9 @@ function Set-StatusbandPreferences([string]$Text) {
   return $Text
 }
 New-Item -ItemType Directory -Force -Path $CodexHome | Out-Null
-$configText = if (Test-Path -LiteralPath $configPath) { [IO.File]::ReadAllText($configPath) } else { "" }
-$configText = Set-StatusbandPreferences -Text $configText
-Assert-CodexConfig -Text $configText -CodexCommand $codexCommand
+$originalConfigText = if (Test-Path -LiteralPath $configPath) { [IO.File]::ReadAllText($configPath) } else { $null }
+$configText = Set-StatusbandPreferences -Text $(if ($null -ne $originalConfigText) { $originalConfigText } else { "" })
+Assert-CodexConfig -Text $configText -CodexCommand $codexCommand -Original $originalConfigText
 
 $backupConfig = $null
 if (Test-Path -LiteralPath $configPath) {
@@ -216,9 +247,9 @@ try {
 
   # Registration writes marketplace/plugin settings. Merge into its result rather
   # than overwriting those writes with the pre-registration configuration.
-  $configText = if (Test-Path -LiteralPath $configPath) { [IO.File]::ReadAllText($configPath) } else { "" }
-  $configText = Set-StatusbandPreferences -Text $configText
-  Assert-CodexConfig -Text $configText -CodexCommand $codexCommand
+  $registeredConfigText = if (Test-Path -LiteralPath $configPath) { [IO.File]::ReadAllText($configPath) } else { $null }
+  $configText = Set-StatusbandPreferences -Text $(if ($null -ne $registeredConfigText) { $registeredConfigText } else { "" })
+  Assert-CodexConfig -Text $configText -CodexCommand $codexCommand -Original $registeredConfigText
   $configCandidate = Join-Path $CodexHome (".config.toml.cache-statusband-" + [guid]::NewGuid().ToString("N") + ".tmp")
   try {
     [IO.File]::WriteAllText($configCandidate, $configText, [Text.UTF8Encoding]::new($false))
