@@ -586,7 +586,7 @@ test("parses retry-after units from error text", () => {
   assert.equal(ms("retry after in 90 seconds"), 90_000);
 });
 
-test("a retry-after date in an error message is a moment, and a number must directly follow the words", () => {
+test("a retry-after date in an error message is a moment; only what directly follows the words is read", () => {
   const now = Date.parse("2026-10-29T12:00:00.000Z");
   const ms = (message) => retryAfterMilliseconds({ message }, now);
   assert.equal(ms("rate limited. Retry after 2026-10-29T12:20:00Z"), 20 * 60_000);
@@ -594,16 +594,17 @@ test("a retry-after date in an error message is a moment, and a number must dire
   assert.equal(ms("retry after 2026-10-29T14:00:00+02:00"), 0);
   // An ISO date is never read as "2026 seconds".
   assert.notEqual(ms("retry after 2026-10-29T12:20:00Z"), 2026_000);
-  // The 5h is a window name, not the wait: the 40 minutes is what the message states for the retry.
-  assert.equal(ms("retry after the 5h window (in 40 minutes)"), 40 * 60_000);
-  assert.equal(ms("retry after the 5h window"), null);
+  // Words after the key are not a wait, and nothing is searched for one further on: the key was
+  // there, its length is unknown, so the answer is the longest wait the caller honours.
+  assert.equal(ms("retry after the 5h window (in 40 minutes)"), MAX_RETRY_AFTER_MS);
+  assert.equal(ms("retry after the 5h window"), MAX_RETRY_AFTER_MS);
   // A date-time with no zone is UTC, whatever zone this machine is in.
   assert.equal(ms("retry after 2026-10-29T12:20:00"), 20 * 60_000);
   assert.equal(ms("retry after 2026-10-29 12:20:00"), 20 * 60_000);
   assert.equal(ms("retry after 2026-10-29T12:20:00.500"), 20 * 60_000 + 500);
 });
 
-test("retry-after wording in an error message: filler words, key suffixes, and a number a few words away", () => {
+test("retry-after wording in an error message: filler words and key suffixes directly after the key", () => {
   const ms = (message) => retryAfterMilliseconds({ message }, 0);
   const rows = [
     ["retry after approximately 30 minutes", 1.8e6],
@@ -617,13 +618,13 @@ test("retry-after wording in an error message: filler words, key suffixes, and a
     ["retry_after_seconds: 30", 3e4],
     ["retry-after-secs: 3", 3e3],
     ["retry-after-ms: 250", 250],
-    ["retry after the window resets in 3 hours", 1.08e7],
-    ["retry after the 5h window (in 40 minutes)", 2.4e6],
+    ["retry after the window resets in 3 hours", MAX_RETRY_AFTER_MS],
+    ["retry after the 5h window (in 40 minutes)", MAX_RETRY_AFTER_MS],
   ];
   for (const [message, expected] of rows) assert.equal(ms(message), expected, message);
-  // A message with no number near the words states no wait.
-  assert.equal(ms("retry after the window resets"), null);
-  assert.equal(ms("retry after the 5h window"), null);
+  // A key with no wait directly after it is unparsed, which is the cap, not nothing.
+  assert.equal(ms("retry after the window resets"), MAX_RETRY_AFTER_MS);
+  assert.equal(ms("retry after the 5h window"), MAX_RETRY_AFTER_MS);
 });
 
 test("the missing-home line carries the path with control characters removed", async (t) => {
@@ -673,7 +674,7 @@ test("a seat that becomes configured but unreadable during the account read is f
   );
 });
 
-test("retry-after: one parser, and when the input is ambiguous the LONGEST wait it states", () => {
+test("retry-after: one strict grammar; a key with no readable wait after it is the cap", () => {
   const now = Date.parse("2026-11-13T12:00:00.000Z");
   const ms = (message) => retryAfterMilliseconds({ message }, now);
   const rows = [
@@ -682,7 +683,7 @@ test("retry-after: one parser, and when the input is ambiguous the LONGEST wait 
     ["retry after 2 days", 1.728e8],
     ["retry after 1 week", 6.048e8],
     ["retry after 5 (minutes)", 3e5],
-    ["rate limited; retry after 5-hour window ends in 10m", 6e5],
+    ["rate limited; retry after 5-hour window ends in 10m", MAX_RETRY_AFTER_MS],
     ["retry after 1h30m", 5.4e6],
     ["retry after 1 hour 30 minutes", 5.4e6],
     ["retry after 1 hour and 30 minutes", 5.4e6],
@@ -690,19 +691,37 @@ test("retry-after: one parser, and when the input is ambiguous the LONGEST wait 
     ["retry after 1,500 ms", 1500],
     ["retry after .5 s", 500],
     ["retry after 1.5 hours", 5.4e6],
-    ["retry after the 5h limit resets in 3 hours", 1.08e7],
-    ["retry after the 5 hour quota resets in 20 minutes", 1.2e6],
-    // Two different waits in one clause: the longer one.
-    ["retry after 30s or in 10 minutes", 6e5],
-    ["retry after 5-10 minutes", 6e5],
+    ["retry after the 5h limit resets in 3 hours", MAX_RETRY_AFTER_MS],
+    ["retry after the 5 hour quota resets in 20 minutes", MAX_RETRY_AFTER_MS],
+    // Only the first duration after the key is read; a range is not one.
+    ["retry after 30s or in 10 minutes", 3e4],
+    ["retry after 5-10 minutes", MAX_RETRY_AFTER_MS],
     // A bare number is seconds only when no number with a unit is stated.
     ["retry after 90", 9e4],
     ["retry after 30 (attempt 3 of 5)", 3e4],
     ["retry after 30s (attempt 300)", 3e4],
-    // Clock times and window names are not waits.
-    ["retry after 12:30", null],
-    ["retry after the 5-hour window", null],
-    ["retry after the 5 hour window", null],
+    // Clock times, window names, words, a year and a hyphenated noun are not waits: unparsed.
+    ["retry after 12:30", MAX_RETRY_AFTER_MS],
+    ["retry after the 5-hour window", MAX_RETRY_AFTER_MS],
+    ["retry after the 5 hour window", MAX_RETRY_AFTER_MS],
+    ["retry after a 2-hour cooldown", MAX_RETRY_AFTER_MS],
+    ["retry after 2-hour cooldown", MAX_RETRY_AFTER_MS],
+    ["retry after Nov 14, 2026", MAX_RETRY_AFTER_MS],
+    ["retry after soon", MAX_RETRY_AFTER_MS],
+    // A unit glued to more letters or digits is not a unit (ids, hashes), and the key still counts.
+    ["retry after 7d9f3", MAX_RETRY_AFTER_MS],
+    ["retry after 41d4", MAX_RETRY_AFTER_MS],
+    ["retry after 8d1e", MAX_RETRY_AFTER_MS],
+    ["retry after 5m10h", MAX_RETRY_AFTER_MS],
+    ["retry after 3 more messages", MAX_RETRY_AFTER_MS],
+    ["retry after 1.5", MAX_RETRY_AFTER_MS],
+    // What follows a complete wait is not read: ids, years, other windows and other counts.
+    ["retry after 20s (request id 7d9f3a-41d4-8d1e-9b2c)", 2e4],
+    ["retry after 20 seconds, request_id req_41d4e8d1e", 2e4],
+    ["retry after 20s; trace 8d1e7d9f3 2026 attempt 5", 2e4],
+    ["retry after 1 minute (id 41d4-8d1e-7d9f3)", 6e4],
+    ["retry after 20 minutes; your 5 hour usage is high", 1.2e6],
+    ["retry after 20 minutes 2026", 1.2e6],
     // A moment: ISO with a zone, ISO with none (UTC), a zone after a space, an HTTP-date.
     ["retry after 2026-11-13T12:20:00Z", 1.2e6],
     ["retry after 2026-11-13T14:20:00+02:00", 1.2e6],
@@ -715,11 +734,11 @@ test("retry-after: one parser, and when the input is ambiguous the LONGEST wait 
     ["retry after 2026-11-13T11:00:00Z", 0],
     ["Retry-After: Fri, 13 Nov 2026 11:00:00 GMT", 0],
     // A moment and a count: the longer.
-    ["retry after 2026-11-13T12:05:00Z or in 20 minutes", 1.2e6],
+    ["retry after 2026-11-13T12:05:00Z or in 20 minutes", 3e5],
     ["retry after 2026-11-13T12:40:00Z or in 20 minutes", 2.4e6],
     // Several mentions: the longest.
     ["retry after 30s. Later: retry-after 2 minutes", 1.2e5],
-    ["retry at your convenience", null],
+    ["retry at your convenience", MAX_RETRY_AFTER_MS],
     ["retry attempt 5 failed", null],
   ];
   for (const [message, expected] of rows) assert.equal(ms(message), expected, message);
@@ -761,6 +780,30 @@ test("retry-after in structured error data: keys with unit suffixes in any case,
   for (const [rpcData, expected] of rows) assert.equal(data(rpcData), expected, JSON.stringify(rpcData));
   // Data and message together: the longer.
   assert.equal(retryAfterMilliseconds({ rpcData: { retry_after: 60 }, message: "retry after 10 minutes" }, now), 6e5);
+  // A retry key whose string value is not a wait is the cap, in data as in text.
+  assert.equal(data({ retry_after: "soon" }), MAX_RETRY_AFTER_MS);
+  assert.equal(data({ retryAfter: "a 2-hour cooldown" }), MAX_RETRY_AFTER_MS);
+  assert.equal(data({ retry_after: "7d9f3" }), MAX_RETRY_AFTER_MS);
+  assert.equal(data({ retry_after: "20s (request 41d4)" }), 2e4);
+  // Depth is limited, a cycle ends, and a long string is cut.
+  let deep = { retry_after: 9999 };
+  for (let i = 0; i < 12; i += 1) deep = { nested: deep };
+  assert.equal(data(deep), null);
+  const loop = { retry_after: 30 };
+  loop.self = loop;
+  assert.equal(data(loop), 3e4);
+  assert.equal(data({ retry_after: `${"x".repeat(300)} 20s` }), MAX_RETRY_AFTER_MS);
+});
+
+test("retry-after: hostile messages finish quickly and never throw", () => {
+  const started = Date.now();
+  const big = retryAfterMilliseconds({ message: "retry after ".repeat(300_000) }, 0);
+  assert.equal(big, MAX_RETRY_AFTER_MS);
+  assert.equal(retryAfterMilliseconds({ message: `retry after ${"Mon".repeat(30_000)}` }, 0), MAX_RETRY_AFTER_MS);
+  assert.equal(retryAfterMilliseconds({ message: "retry after ".repeat(30_000) + "Mon ".repeat(30_000) }, 0), MAX_RETRY_AFTER_MS);
+  assert.equal(retryAfterMilliseconds({ message: `retry after${" ".repeat(300_000)}5` }, 0), MAX_RETRY_AFTER_MS);
+  assert.equal(retryAfterMilliseconds({ message: `retry after ${"1,".repeat(100_000)}` }, 0), MAX_RETRY_AFTER_MS);
+  assert.ok(Date.now() - started < 3000, `took ${Date.now() - started} ms`);
 });
 
 test("a message-stated wait of hours is capped at one hour by the caller", async (t) => {
@@ -770,7 +813,7 @@ test("a message-stated wait of hours is capped at one hour by the caller", async
     codexHome: root,
     now,
     identity: ACCOUNT_IDENTITY,
-    fetcher: async () => { throw new Error("limited; retry after the window resets in 3 hours"); },
+    fetcher: async () => { throw new Error("limited; retry after 3 hours"); },
   });
   assert.equal(failed.nextAllowedAt, now + MAX_RETRY_AFTER_MS);
 });

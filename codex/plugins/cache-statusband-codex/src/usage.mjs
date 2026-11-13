@@ -5,16 +5,15 @@ import { readFile, unlink, writeFile } from "node:fs/promises";
 import { delimiter, dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { makeFolder, renameWithRetry } from "./atomic.mjs";
-import { retryAfterMilliseconds } from "./retry-after.mjs";
+import { MAX_RETRY_AFTER_MS, retryAfterMilliseconds } from "./retry-after.mjs";
 import { acquireLock } from "./lock.mjs";
 import { hasControl, stripControls } from "./sanitize.mjs";
 import { configuredSeatIdentity } from "./settings.mjs";
 
-export { retryAfterMilliseconds };
+export { MAX_RETRY_AFTER_MS, retryAfterMilliseconds };
 
 const CACHE_VERSION = 3;
 export const MIN_POLL_INTERVAL_MS = 5 * 60 * 1000;
-export const MAX_RETRY_AFTER_MS = 60 * 60 * 1000;
 // A writer's clock may be a little ahead of a reader that started earlier; a backoff written
 // at the longest allowed length is still a backoff when read by such a caller.
 const CLOCK_SLACK_MS = 60 * 1000;
