@@ -95,6 +95,52 @@ function Resolve-ReplaceTarget([string]$Path, [string]$What) {
   return $final
 }
 
+# Writes $Bytes to $Path through a temporary file beside it and one atomic replace
+# (Move-FileOverExisting); a symbolic link is replaced at its target, so it stays a link.
+function Write-FileBytesAtomically([string]$Path, [string]$What, [byte[]]$Bytes) {
+  $target = Resolve-ReplaceTarget $Path $What
+  $candidate = Join-Path (Split-Path -Parent $target) (".$(Split-Path -Leaf $target).cache-statusband-" + [guid]::NewGuid().ToString("N") + ".tmp")
+  try {
+    [IO.File]::WriteAllBytes($candidate, $Bytes)
+    Move-FileOverExisting $candidate $target
+  } finally {
+    if (Test-Path -LiteralPath $candidate) { Remove-Item -LiteralPath $candidate -Force }
+  }
+}
+
+# The `source` of [marketplaces.<Name>] in config.toml text, or $null when there is no such
+# table or its source cannot be read as a plain string. Codex writes a local source as a
+# literal string, with a \\?\ prefix on Windows.
+function Get-RegisteredMarketplaceSource([AllowNull()][string]$Text, [string]$Name) {
+  if ($null -eq $Text) { return $null }
+  $escaped = [Regex]::Escape($Name)
+  $single = [string][char]39
+  $headerPattern = '^\s*\[\s*marketplaces\s*\.\s*(?:' + $escaped + '|"' + $escaped + '"|' + $single + $escaped + $single + ')\s*\]\s*(?:#.*)?$'
+  $sourcePattern = '^\s*source\s*=\s*(?:' + $single + '([^' + $single + ']*)' + $single + '|"((?:[^"\\]|\\.)*)")'
+  $inSection = $false
+  foreach ($line in ($Text -split "`r?`n")) {
+    if ($line -match '^\s*\[') { $inSection = $line -match $headerPattern; continue }
+    if ($inSection -and $line -match $sourcePattern) {
+      if ($Matches.ContainsKey(1)) { return $Matches[1] }
+      return ($Matches[2] -replace '\\(.)', '$1')
+    }
+  }
+  return $null
+}
+
+# Whether two folder paths name the same place (ignoring a \\?\ prefix, a trailing slash and,
+# on Windows, case).
+function Test-SameFolder([string]$A, [string]$B) {
+  $normalize = {
+    param([string]$Path)
+    if ($Path.StartsWith('\\?\UNC\')) { $Path = '\\' + $Path.Substring(8) } elseif ($Path.StartsWith('\\?\')) { $Path = $Path.Substring(4) }
+    try { $Path = [IO.Path]::GetFullPath($Path) } catch { }
+    return $Path.TrimEnd('\', '/')
+  }
+  $comparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+  return (& $normalize $A).Equals((& $normalize $B), $comparison)
+}
+
 # The text of a file, or $null when there is none; and whether two such readings are the same.
 function Read-TextOrNull([string]$Path) {
   if (Test-Path -LiteralPath $Path) { return [IO.File]::ReadAllText($Path) }
@@ -412,8 +458,27 @@ if (Test-Path -LiteralPath $configPath) {
   Write-Host "Backed up config.toml to $backupRoot"
 }
 
+# settings.json (with -SeatFile) is written before Codex's configuration is touched, so a
+# failure writing it changes nothing in config.toml. It is written to a temporary file beside it
+# and replaced in one step (Move-FileOverExisting), so a session starting at that moment reads
+# either the old settings.json or the new one, never a half-written or missing file. A
+# symbolic link is replaced at its target. If a later step fails, it is put back below.
+$settingsPath = Join-Path (Join-Path $CodexHome "cache-statusband-codex") "settings.json"
+$settingsWrittenText = $null
+$settingsBackupFile = $null
+if ($PSBoundParameters.ContainsKey("SeatFile")) {
+  New-Item -ItemType Directory -Force -Path (Split-Path -Parent $settingsPath) | Out-Null
+  if (Test-Path -LiteralPath $settingsPath) {
+    $settingsBackupFile = Join-Path (New-BackupFolder "cache-statusband-codex-settings") "settings.json"
+    Copy-Item -LiteralPath $settingsPath -Destination $settingsBackupFile
+  }
+  $settingsWrittenText = (@{ version = 1; seatFile = $expandedSeatFile } | ConvertTo-Json) + "`n"
+  Write-FileBytesAtomically $settingsPath "settings.json" ([Text.UTF8Encoding]::new($false).GetBytes($settingsWrittenText))
+}
+
 # Registration writes the live config.toml before the final merge is validated.
-# If anything fails from here until the merged file is in place, put the original back.
+# If anything fails from here until the merged file is in place, put the original back (unless
+# something else has changed config.toml since: see the catch below), and put settings.json back.
 $registrationDone = $false
 $lastSeenConfigText = $null
 $foreignEditSeen = $false
@@ -421,6 +486,16 @@ try {
   $previousCodexHome = $env:CODEX_HOME
   try {
     $env:CODEX_HOME = $CodexHome
+    # Codex refuses to add a marketplace name that is already registered from another folder.
+    # Re-running from a moved or re-cloned checkout re-points the registration: the old one is
+    # removed first (Codex keeps the plugin's own enabled setting).
+    $registeredSource = Get-RegisteredMarketplaceSource (Read-TextOrNull $configPath) "cache-statusband-codex-local"
+    if ($registeredSource -and -not (Test-SameFolder $registeredSource $repositoryRoot)) {
+      $registeredShown = if ($registeredSource.StartsWith('\\?\')) { $registeredSource.Substring(4) } else { $registeredSource }
+      Write-Host "Re-pointing the cache-statusband-codex-local marketplace registration: $registeredShown -> $repositoryRoot"
+      & $codexCommand plugin marketplace remove cache-statusband-codex-local
+      if ($LASTEXITCODE -ne 0) { throw "codex plugin marketplace remove failed ($LASTEXITCODE)" }
+    }
     & $codexCommand plugin marketplace add $repositoryRoot
     if ($LASTEXITCODE -ne 0) { throw "codex plugin marketplace add failed ($LASTEXITCODE)" }
     & $codexCommand plugin add "cache-statusband-codex@cache-statusband-codex-local"
@@ -428,10 +503,13 @@ try {
   } finally {
     $env:CODEX_HOME = $previousCodexHome
   }
-  $registrationDone = $true
   # What config.toml holds once Codex has finished registering. Any later read that differs
-  # from the previous one is an edit by something else, which a failure must not undo.
+  # from the previous one is an edit by something else, which a failure must not undo. It is
+  # also the first "last seen" text, and is taken before $registrationDone is set, so a read
+  # that fails is never mistaken for an edit by something else.
   $expectedConfigText = Read-TextOrNull $configPath
+  $lastSeenConfigText = $expectedConfigText
+  $registrationDone = $true
 
   # Registration writes marketplace/plugin settings. Merge into its result rather than
   # overwriting those writes with the pre-registration configuration. Validating takes a
@@ -465,6 +543,24 @@ try {
     throw "config.toml kept changing while the installer was checking it (3 attempts), so the plugin's edit to it was not written and the file is left as it is now. Rerun the installer when nothing else is editing config.toml."
   }
 } catch {
+  if ($null -ne $settingsWrittenText) {
+    $earlierSettings = if ($settingsBackupFile) { " The earlier copy is at $settingsBackupFile" } else { "" }
+    try {
+      if (Test-SameText (Read-TextOrNull $settingsPath) $settingsWrittenText) {
+        if ($settingsBackupFile) {
+          Write-FileBytesAtomically $settingsPath "settings.json" ([IO.File]::ReadAllBytes($settingsBackupFile))
+          Write-Warning "Installation failed; settings.json was put back as it was before the install.$earlierSettings"
+        } else {
+          Remove-Item -LiteralPath (Resolve-ReplaceTarget $settingsPath "settings.json") -Force
+          Write-Warning "Installation failed; settings.json did not exist before the install, so the one the installer wrote was removed."
+        }
+      } else {
+        Write-Warning "Installation failed, and settings.json was changed by something else since the installer wrote it, so it was left as it is.$earlierSettings"
+      }
+    } catch {
+      Write-Warning "Installation failed and settings.json could not be put back automatically.$earlierSettings"
+    }
+  }
   if ($backupConfig) {
     # The original goes back only when nothing but the installer and Codex's own registration
     # has written config.toml since. A file changed by someone else is theirs: it is left as
@@ -498,26 +594,6 @@ try {
 }
 
 if ($PSBoundParameters.ContainsKey("SeatFile")) {
-  $settingsRoot = Join-Path $CodexHome "cache-statusband-codex"
-  $settingsPath = Join-Path $settingsRoot "settings.json"
-  New-Item -ItemType Directory -Force -Path $settingsRoot | Out-Null
-  if (Test-Path -LiteralPath $settingsPath) {
-    $settingsBackup = New-BackupFolder "cache-statusband-codex-settings"
-    Copy-Item -LiteralPath $settingsPath -Destination (Join-Path $settingsBackup "settings.json")
-  }
-  $settingsJson = @{ version = 1; seatFile = $expandedSeatFile } | ConvertTo-Json
-  # Written to a temporary file beside it and replaced in one step (Move-FileOverExisting), so a
-  # session starting at that moment reads either the old settings.json or the new one, never a
-  # half-written or missing file.
-  # (A symbolic link is replaced at its target, with the temporary file beside that.)
-  $settingsTarget = Resolve-ReplaceTarget $settingsPath "settings.json"
-  $settingsCandidate = Join-Path (Split-Path -Parent $settingsTarget) (".settings.json.cache-statusband-" + [guid]::NewGuid().ToString("N") + ".tmp")
-  try {
-    [IO.File]::WriteAllText($settingsCandidate, $settingsJson + "`n", [Text.UTF8Encoding]::new($false))
-    Move-FileOverExisting $settingsCandidate $settingsTarget
-  } finally {
-    if (Test-Path -LiteralPath $settingsCandidate) { Remove-Item -LiteralPath $settingsCandidate -Force }
-  }
   Write-Host "Configured optional seat label file: $expandedSeatFile"
 }
 
@@ -542,7 +618,7 @@ if (-not $SkipCliLink) {
     Push-Location $pluginRoot
     try {
       & npm link
-      if ($LASTEXITCODE -ne 0) { throw "npm link failed ($LASTEXITCODE). If another package owns the launcher, rerun with -SkipCliLink and inspect 'Get-Command cache-statusband-codex -All'." }
+      if ($LASTEXITCODE -ne 0) { throw "npm link failed ($LASTEXITCODE). The plugin is already installed and config.toml and settings.json are as updated: only the terminal command link was not made, and nothing is rolled back. If another package owns the launcher, rerun with -SkipCliLink and inspect 'Get-Command cache-statusband-codex -All'." }
     } finally {
       Pop-Location
     }

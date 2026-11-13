@@ -370,6 +370,98 @@ exit /b 0
     throw "A restore after a failed registration did not say it came from Codex's own registration step: $($restoreWarnings -join ' | ')"
   }
 
+  # With -SeatFile, a failure in Codex's registration puts settings.json back too: as it was
+  # (its earlier contents), or removed when there was none before.
+  foreach ($hadSettings in @($true, $false)) {
+    $seatRestoreHome = Join-Path $testHome "seat-restore-home-$hadSettings"
+    New-Item -ItemType Directory -Path (Join-Path $seatRestoreHome "cache-statusband-codex") | Out-Null
+    [IO.File]::WriteAllText((Join-Path $seatRestoreHome "config.toml"), $original, [Text.UTF8Encoding]::new($false))
+    $seatSettingsPath = Join-Path $seatRestoreHome "cache-statusband-codex\settings.json"
+    $earlierSettings = "{`"version`":1,`"seatFile`":`"earlier-seat.txt`"}`n"
+    if ($hadSettings) { [IO.File]::WriteAllText($seatSettingsPath, $earlierSettings, [Text.UTF8Encoding]::new($false)) }
+    $seatWarnings = @()
+    $previousPath = $env:PATH
+    $seatRejected = $false
+    try {
+      $env:PATH = "$fakeBin$([IO.Path]::PathSeparator)$previousPath"
+      try {
+        & (Join-Path $root "install.ps1") -CodexHome $seatRestoreHome -SkipCliLink -SeatFile (Join-Path $testHome "new-seat.txt") -WarningVariable seatWarnings 3>$null | Out-Null
+      } catch {
+        $seatRejected = $true
+      }
+    } finally {
+      $env:PATH = $previousPath
+    }
+    if (-not $seatRejected) { throw "A failed registration with -SeatFile was not reported" }
+    if ([IO.File]::ReadAllText((Join-Path $seatRestoreHome "config.toml")) -ne $original) { throw "config.toml was not restored after a failed registration with -SeatFile" }
+    if ($hadSettings) {
+      if ([IO.File]::ReadAllText($seatSettingsPath) -ne $earlierSettings) { throw "settings.json was not put back after a failed registration" }
+      if (-not ($seatWarnings | Where-Object { "$_" -match "settings.json was put back as it was" })) { throw "No warning said settings.json was put back: $($seatWarnings -join ' | ')" }
+    } else {
+      if (Test-Path -LiteralPath $seatSettingsPath) { throw "A settings.json that did not exist before the failed install was left behind" }
+      if (-not ($seatWarnings | Where-Object { "$_" -match "settings.json did not exist before the install" })) { throw "No warning said the new settings.json was removed: $($seatWarnings -join ' | ')" }
+    }
+    if (@(Get-ChildItem -LiteralPath (Join-Path $seatRestoreHome "cache-statusband-codex") -Force -File | Where-Object { $_.Name -ne "settings.json" }).Count -ne 0) { throw "A temporary file was left beside settings.json" }
+  }
+
+  # settings.json is written before Codex's configuration is touched: when that write fails
+  # (here a folder stands where settings.json belongs), config.toml is unchanged and nothing
+  # was registered.
+  $seatFirstHome = Join-Path $testHome "seat-first-home"
+  New-Item -ItemType Directory -Path (Join-Path $seatFirstHome "cache-statusband-codex\settings.json") | Out-Null
+  [IO.File]::WriteAllText((Join-Path $seatFirstHome "config.toml"), $original, [Text.UTF8Encoding]::new($false))
+  $seatFirstFailed = $false
+  try {
+    & (Join-Path $root "install.ps1") -CodexHome $seatFirstHome -SkipCliLink -SeatFile (Join-Path $testHome "new-seat.txt") 3>$null | Out-Null
+  } catch {
+    $seatFirstFailed = $true
+  }
+  if (-not $seatFirstFailed) { throw "A settings.json that could not be written did not fail the install" }
+  if ([IO.File]::ReadAllText((Join-Path $seatFirstHome "config.toml")) -ne $original) { throw "config.toml changed although settings.json could not be written" }
+  if (Test-Path -LiteralPath (Join-Path $seatFirstHome "plugins")) { throw "The plugin was registered although settings.json could not be written" }
+
+  # A failing `npm link` is reported as only the link step failing: the plugin stays installed
+  # and config.toml keeps its update (nothing is rolled back).
+  $npmBin = Join-Path $testHome "npm-bin"
+  New-Item -ItemType Directory -Path $npmBin | Out-Null
+  [IO.File]::WriteAllText((Join-Path $npmBin "npm.cmd"), "@echo off`r`nif `"%1`"==`"root`" (`r`n  echo %~dp0no-global-root`r`n  exit /b 0`r`n)`r`nexit /b 1`r`n", [Text.Encoding]::ASCII)
+  $npmHome = Join-Path $testHome "npm-home"
+  $npmMessage = ""
+  $previousPath = $env:PATH
+  try {
+    $env:PATH = "$npmBin$([IO.Path]::PathSeparator)$previousPath"
+    try {
+      & (Join-Path $root "install.ps1") -CodexHome $npmHome 3>$null | Out-Null
+    } catch {
+      $npmMessage = $_.Exception.Message
+    }
+  } finally {
+    $env:PATH = $previousPath
+  }
+  if ($npmMessage -notmatch "npm link failed" -or $npmMessage -notmatch "plugin is already installed" -or $npmMessage -notmatch "only the terminal command link was not made") { throw "A failed npm link was not described as only the link step failing: $npmMessage" }
+  $npmConfig = [IO.File]::ReadAllText((Join-Path $npmHome "config.toml"))
+  if ($npmConfig -notmatch '(?m)^hooks = true$' -or $npmConfig -notmatch '(?m)^enabled\s*=\s*true\s*$') { throw "A failed npm link rolled back config.toml or the plugin" }
+
+  # Re-running from another checkout path (a move or a fresh clone) re-points the marketplace
+  # registration instead of failing with "already added from a different source".
+  $copyRoot = Join-Path $testHome "checkout-b\codex"
+  New-Item -ItemType Directory -Path (Split-Path -Parent $copyRoot) | Out-Null
+  Copy-Item -LiteralPath $root -Destination $copyRoot -Recurse
+  $repointHome = Join-Path $testHome "repoint-home"
+  $outputA = (& (Join-Path $root "install.ps1") -CodexHome $repointHome -SkipCliLink *>&1 | Out-String)
+  if ($outputA -match "Re-pointing") { throw "A first install said it was re-pointing a registration: $outputA" }
+  $outputB = (& (Join-Path $copyRoot "install.ps1") -CodexHome $repointHome -SkipCliLink *>&1 | Out-String)
+  if ($outputB -notmatch [regex]::Escape("Re-pointing the cache-statusband-codex-local marketplace registration: $root -> $copyRoot")) { throw "Moving the checkout did not say it was re-pointing the registration (old -> new): $outputB" }
+  $repointed = [IO.File]::ReadAllText((Join-Path $repointHome "config.toml"))
+  $sourceLine = [regex]::Match($repointed, '(?m)^\[marketplaces\.cache-statusband-codex-local\]\s*\r?\n(?:.*\r?\n)*?source\s*=\s*(?<value>.+?)\s*$').Groups['value'].Value
+  if (-not $sourceLine.ToLowerInvariant().Contains("checkout-b")) { throw "The marketplace source is not the new checkout: $sourceLine" }
+  $repointedPlugin = [regex]::Match($repointed, '(?ms)^\[plugins\."cache-statusband-codex@cache-statusband-codex-local"\]\s*\r?\n(?<body>.*?)(?=^\[|\z)')
+  if (-not $repointedPlugin.Success -or $repointedPlugin.Groups['body'].Value -notmatch '(?m)^enabled\s*=\s*true\s*$') { throw "The plugin is not enabled after re-pointing the registration" }
+  if ([regex]::Matches($repointed, '(?m)^\[marketplaces\.cache-statusband-codex-local\]').Count -ne 1) { throw "Re-pointing left the marketplace registered more than once" }
+  # Running again from the same (new) path leaves the registration alone.
+  $outputB2 = (& (Join-Path $copyRoot "install.ps1") -CodexHome $repointHome -SkipCliLink *>&1 | Out-String)
+  if ($outputB2 -match "Re-pointing") { throw "Re-running from the registered checkout re-pointed the registration: $outputB2" }
+
   # A config.toml that is a symbolic link stays a link: the edit lands on the file it points
   # at. The same for settings.json. (Skipped, with a message, where a link cannot be made.)
   $linkHome = Join-Path $testHome "link-home"
