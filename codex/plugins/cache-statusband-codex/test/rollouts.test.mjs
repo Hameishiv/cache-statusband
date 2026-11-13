@@ -440,24 +440,26 @@ test("the SessionStart hook process prints its answer and exits", async () => {
   assert.equal(stdout, "{}\n");
 });
 
-// 400ms ends before the 500ms floor a read is given, so the hook (not the reader) has to
-// stop the server; a slow machine may not have started it by then, so that variant checks
-// that the hook still answered inside its deadline with valid JSON and, only if the server
-// did record its pid, that nothing is left running. At 2500ms the first read, the account
-// capture (told to give up half a second before the deadline, counted from the start of the
-// hook process), times out first, and the reader's own cleanup stops the server; that variant
-// leaves it well over a second to start a server behind a slow cmd shim, so it must find its
-// pid. (With under 3.5 s left, the usage read that follows only reads the cache.)
+// 400ms ends before the 500ms floor a read is given, so the hook (not the reader) has to stop the
+// server: it must have started (its pid file appears) and be gone once the hook has exited. At
+// 2500ms the first read, the account capture (told to give up half a second before the deadline,
+// counted from the start of the hook process), times out first, and the reader's own cleanup
+// stops the server; that variant leaves it well over a second to start a server behind a slow cmd
+// shim. (With under 3.5 s left, the usage read that follows only reads the cache.)
 // On Windows the 400ms variant launches the hung server WITHOUT cmd.exe (a copy of node.exe named
-// codex.exe, which a preload turns into the hung server): the hook kills at a moment when cmd.exe
-// may be starting its child, and taskkill /T's snapshot of the tree can miss a grandchild born in
-// that instant. The real Codex app-server exits when its stdin closes, which happens as the hook
-// lets go of its pipes, so in the product that grandchild does not outlive the hook; the hung
-// fixture ignores stdin EOF, so a test that raced this would report an orphan the product does not
-// leave. The 2500ms variant keeps the codex.cmd shim, where the start is long over by the kill.
-for (const [deadline, mustStart, direct, title] of [
-  ["400", false, true, "the hook, at its deadline, stops a Codex app-server whose read is still running (400ms)"],
-  ["2500", true, false, "a read that times out before the hook deadline stops its own Codex app-server (2500ms)"],
+// codex.exe, held by a preload that writes the pid and then blocks the main thread for good, so the
+// hung server really hangs and node never tries to load the app-server arguments as a script):
+// the hook kills at a moment when cmd.exe may be starting its child, and taskkill /T's snapshot of
+// the tree can miss a grandchild born in that instant. The real Codex app-server exits when its
+// stdin closes (observed in round 20 with the real 0.169 app-server, about 1.5 s), which happens as
+// the hook lets go of its pipes, so in the product that grandchild does not outlive the hook; this
+// fixture ignores stdin EOF, so a test that raced it would report an orphan the product does not
+// leave. The copy of node.exe is run once first so the first-run virus scan of a new executable
+// does not use up the 400ms. The 2500ms variant keeps the codex.cmd shim, where the start is long
+// over by the kill.
+for (const [deadline, direct, allowance, title] of [
+  ["400", true, 5_000, "the hook, at its deadline, stops a Codex app-server whose read is still running (400ms)"],
+  ["2500", false, 3_000, "a read that times out before the hook deadline stops its own Codex app-server (2500ms)"],
 ]) test(title, async (t) => {
   const root = await fixtureRoot(t);
   const here = dirname(fileURLToPath(import.meta.url));
@@ -471,15 +473,18 @@ for (const [deadline, mustStart, direct, title] of [
   if (noShell) {
     const preload = join(root, "hung-preload.cjs");
     // Only the copy named codex.exe hangs: NODE_OPTIONS also reaches the hook's own node.exe.
+    // The pid is written first; then the main thread blocks for good (nothing ever wakes it).
     await writeFile(preload, [
       'if (/codex\\.exe$/i.test(process.execPath)) {',
       '  require("node:fs").writeFileSync(process.env.HUNG_PID_FILE, String(process.pid));',
-      '  process.stdin.resume();',
-      '  setInterval(() => {}, 1000);',
+      '  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);',
       '}',
       '',
     ].join("\n"), "utf8");
     await copyFile(process.execPath, launcher);
+    // Warm the copy (the first run of a new executable is scanned): --version exits before any
+    // preload runs, so it neither hangs nor writes the pid file.
+    await promisify(execFile)(launcher, ["--version"], { timeout: 20_000 });
     extra.NODE_OPTIONS = `--require "${preload.replaceAll("\\", "/")}"`;
   } else {
     await writeFile(launcher, process.platform === "win32"
@@ -496,7 +501,7 @@ for (const [deadline, mustStart, direct, title] of [
   const elapsed = Date.now() - began;
   assert.equal(code, 0);
   // The hook answers by its deadline (plus process start-up and cleanup) whatever the server did.
-  assert.ok(elapsed < Number(deadline) + 5_000, `the hook took ${elapsed}ms against a ${deadline}ms deadline`);
+  assert.ok(elapsed < Number(deadline) + allowance, `the hook took ${elapsed}ms against a ${deadline}ms deadline`);
   assert.doesNotThrow(() => JSON.parse(stdout), `the hook printed invalid JSON: ${stdout}`);
   const until = async (condition, ms) => {
     const end = Date.now() + ms;
@@ -504,12 +509,11 @@ for (const [deadline, mustStart, direct, title] of [
     return condition();
   };
   const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
-  // The server records its pid once it is up. It must have started (the hook's own read
-  // launches it before the deadline); a pid file that never appears means the launch itself
-  // failed, which must not pass as "nothing left running".
-  const started = await until(async () => (await readFile(pidFile, "utf8").catch(() => "")) !== "", 5_000);
-  if (mustStart) assert.ok(started, "the Codex app-server never started (no pid file), so the cleanup was not exercised");
-  if (!started) return;
+  // The server records its pid once it is up. It must have started (the hook's own read launches it
+  // before the deadline, and the start gets a generous allowance on a slow machine); a pid file that
+  // never appears means the launch itself failed, which must not pass as "nothing left running".
+  const started = await until(async () => (await readFile(pidFile, "utf8").catch(() => "")) !== "", 10_000);
+  assert.ok(started, "the Codex app-server never started (no pid file), so the cleanup was not exercised");
   const pid = Number(await readFile(pidFile, "utf8"));
   try {
     assert.ok(await until(() => !alive(pid), 5_000), "the hook left the Codex app-server running");
