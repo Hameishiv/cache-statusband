@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
-import { configuredSeatFile, configuredSeatIdentity, usagePresentation } from "../src/settings.mjs";
+import { configuredSeatFile, configuredSeatIdentity, readSeatLabel, usagePresentation } from "../src/settings.mjs";
 
 const EMAIL = ["test", "example.invalid"].join("@");
 
@@ -129,4 +129,52 @@ test("a settings.json read that fails once, is caught half-written or is briefly
   const badValue = sequence(JSON.stringify({ seatFile: 5 }));
   await assert.rejects(configuredSeatFile("home", { ...fast, reader: badValue.reader }), /non-empty string/);
   assert.equal(badValue.calls.length, 1);
+});
+
+test("a seat file that reads empty or fails once is retried before the seat is unavailable", async () => {
+  const sequence = (...steps) => {
+    const calls = [];
+    const reader = async () => {
+      calls.push(1);
+      const step = steps[Math.min(calls.length - 1, steps.length - 1)];
+      if (step instanceof Error) throw step;
+      return step;
+    };
+    return { reader, calls };
+  };
+  const busy = Object.assign(new Error("EBUSY: simulated"), { code: "EBUSY" });
+  const fast = { retryMs: 1 };
+
+  // Caught between the truncate and the write, or briefly locked: the next read finds the label.
+  const emptyOnce = sequence("", "alpha\n");
+  assert.equal(await readSeatLabel("seat.txt", { ...fast, reader: emptyOnce.reader }), "alpha");
+  assert.equal(emptyOnce.calls.length, 2);
+  const blankOnce = sequence("  \n", "alpha");
+  assert.equal(await readSeatLabel("seat.txt", { ...fast, reader: blankOnce.reader }), "alpha");
+  const failedOnce = sequence(busy, busy, "beta");
+  assert.equal(await readSeatLabel("seat.txt", { ...fast, reader: failedOnce.reader }), "beta");
+  assert.equal(failedOnce.calls.length, 3);
+  // A good first read is not retried.
+  const good = sequence("gamma");
+  assert.equal(await readSeatLabel("seat.txt", { ...fast, reader: good.reader }), "gamma");
+  assert.equal(good.calls.length, 1);
+
+  // Three retries after the first read, then the seat is unavailable.
+  const empty = sequence("");
+  assert.equal(await readSeatLabel("seat.txt", { ...fast, reader: empty.reader }), null);
+  assert.equal(empty.calls.length, 4);
+  const stuck = sequence(busy);
+  assert.equal(await readSeatLabel("seat.txt", { ...fast, reader: stuck.reader }), null);
+  assert.equal(stuck.calls.length, 4);
+
+  // End to end through the identity: a persistently empty seat file is unavailable.
+  const identity = { key: "seat:unavailable", label: null, unavailable: true };
+  const root = await mkdtemp(join(tmpdir(), "cache-statusband-codex-seat-"));
+  try {
+    const seat = join(root, "seat.txt");
+    await writeFile(seat, "");
+    assert.deepEqual(await configuredSeatIdentity(root, { CACHE_STATUSBAND_CODEX_SEAT_FILE: seat }), identity);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

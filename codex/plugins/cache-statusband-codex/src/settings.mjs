@@ -115,12 +115,22 @@ async function replacementMayBeUnderway(directory, lister) {
   }
 }
 
-export async function readSeatLabel(path) {
-  try {
-    const value = await readFile(path, "utf8");
-    return sanitizeLabel(value);
-  } catch {
-    return null;
+// The seat file is rewritten by whatever manages the seat, possibly in two steps (truncate,
+// then write), so a read that fails or finds nothing is tried again, as settings.json's is
+// (up to SETTINGS_RETRIES more times, SETTINGS_RETRY_MS apart), before the seat counts as
+// unavailable. A seat file that is still empty or unreadable after that is unavailable.
+export async function readSeatLabel(path, {
+  reader = readFile,
+  retryMs = SETTINGS_RETRY_MS,
+  retries = SETTINGS_RETRIES,
+} = {}) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      const label = sanitizeLabel(await reader(path, "utf8"));
+      if (label) return label;
+    } catch {}
+    if (attempt >= retries) return null;
+    await new Promise((done) => setTimeout(done, retryMs));
   }
 }
 
