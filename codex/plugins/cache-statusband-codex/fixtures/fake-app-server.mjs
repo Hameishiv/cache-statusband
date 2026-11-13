@@ -1,3 +1,4 @@
+import { appendFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
 if (process.env.EXPECT_CODEX_HOME && process.env.CODEX_HOME !== process.env.EXPECT_CODEX_HOME) {
@@ -6,9 +7,11 @@ if (process.env.EXPECT_CODEX_HOME && process.env.CODEX_HOME !== process.env.EXPE
 }
 
 const lines = createInterface({ input: process.stdin });
-const testEmail = ["test", "example.invalid"].join("@");
+// FAKE_SERVER_EMAIL picks the signed-in login; FAKE_SERVER_LOG collects one line per request.
+const testEmail = process.env.FAKE_SERVER_EMAIL || ["test", "example.invalid"].join("@");
 lines.on("line", (line) => {
   const message = JSON.parse(line);
+  if (process.env.FAKE_SERVER_LOG && message.method) appendFileSync(process.env.FAKE_SERVER_LOG, `${message.method}\n`);
   if (message.id === 1) process.stdout.write(`${JSON.stringify({ id: 1, result: { userAgent: "test" } })}\n`);
   if (message.id === 1 && process.env.FAKE_SERVER_NOISE) {
     // Server-initiated messages may reuse small ids; they are not responses.

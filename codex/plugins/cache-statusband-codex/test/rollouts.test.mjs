@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 import test from "node:test";
 import { handleSessionStart } from "../hooks/session-start.mjs";
 import { handleStop } from "../hooks/stop.mjs";
-import { parseRollout, scanSessions } from "../src/rollouts.mjs";
+import { parseRollout, projectName, scanSessions } from "../src/rollouts.mjs";
 import { getSessionIdentity, loadSessionState, saveSessionState } from "../src/session-state.mjs";
 
 const FIXTURE = [
@@ -326,18 +326,20 @@ test("the hook process stops a Codex app-server whose read is still running at t
     return condition();
   };
   const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
-  // The server records its pid once it is up; one that was stopped before then has nothing to check.
-  if (await until(async () => (await readFile(pidFile, "utf8").catch(() => "")) !== "", 2_000)) {
-    const pid = Number(await readFile(pidFile, "utf8"));
-    try {
-      assert.ok(await until(() => !alive(pid), 5_000), "the hook left the Codex app-server running");
-    } finally {
-      if (alive(pid)) process.kill(pid);
-    }
+  // The server records its pid once it is up. It must have started (the hook's own read
+  // launches it before the deadline); a pid file that never appears means the launch itself
+  // failed, which must not pass as "nothing left running".
+  const started = await until(async () => (await readFile(pidFile, "utf8").catch(() => "")) !== "", 5_000);
+  assert.ok(started, "the Codex app-server never started (no pid file), so the cleanup was not exercised");
+  const pid = Number(await readFile(pidFile, "utf8"));
+  try {
+    assert.ok(await until(() => !alive(pid), 5_000), "the hook left the Codex app-server running");
+  } finally {
+    if (alive(pid)) process.kill(pid);
   }
 });
 
-test("with under three seconds left SessionStart asks for the cache only", async (t) => {
+test("with too little time left for a full three-second read SessionStart asks for the cache only", async (t) => {
   const root = await fixtureRoot(t);
   const email = ["person", "example.invalid"].join("@");
   const run = async (deadlineMs) => {
@@ -350,8 +352,15 @@ test("with under three seconds left SessionStart asks for the cache only", async
     });
     return received;
   };
+  // The read itself must get at least MIN_FETCH_BUDGET_MS (3s) after the 500ms margin.
   assert.equal((await run(2_500)).cacheOnly, true);
-  assert.equal((await run(5_000)).cacheOnly, undefined);
+  assert.equal((await run(3_400)).cacheOnly, true);
+  const full = await run(5_000);
+  assert.equal(full.cacheOnly, undefined);
+  assert.ok(full.timeoutMs >= 3_000);
+  const edge = await run(3_700);
+  assert.equal(edge.cacheOnly, undefined);
+  assert.ok(edge.timeoutMs >= 3_000, `a read was given only ${edge.timeoutMs}ms`);
 });
 
 test("usage still shows when the hook input has no transcript path", async (t) => {
@@ -492,6 +501,52 @@ test("the CLI strips terminal control characters from transcript-derived fields"
   assert.match(stdout, /model/i);
 });
 
+test("transcript fields of the wrong type are ignored, so one odd session cannot break the board", async (t) => {
+  const root = await fixtureRoot(t);
+  const sessions = join(root, "sessions");
+  await mkdir(sessions);
+  const line = (item) => `${JSON.stringify(item)}\n`;
+  const odd = { timestamp: "2026-10-29T12:00:00.000Z", type: "session_meta", payload: { id: 7, cwd: { not: "a path" }, source: "cli" } };
+  const oddContext = { timestamp: "2026-10-29T12:01:00.000Z", type: "turn_context", payload: { cwd: ["x"], model: { n: 1 }, effort: 5 } };
+  await writeFile(join(sessions, "odd-session.jsonl"), line(odd) + line(oddContext), "utf8");
+  await writeFile(join(sessions, "good-session.jsonl"), FIXTURE.filter((item) => typeof item !== "string").map(line).join(""), "utf8");
+  const summary = await parseRollout(join(sessions, "odd-session.jsonl"));
+  assert.equal(summary.id, "odd-session");
+  assert.equal(summary.cwd, null);
+  assert.equal(summary.model, null);
+  assert.equal(summary.effort, null);
+  assert.equal(projectName({ not: "a path" }), "?");
+
+  const { run } = cliRunner(root);
+  const plain = await run(["board"]);
+  assert.match(plain, /good-session|session-1/);
+  assert.match(plain, /example/);
+  const json = JSON.parse(await run(["board", "--json"]));
+  assert.ok(json.sessions.some((item) => item.id === "session-1" && item.cwd === "/workspace/example"));
+});
+
+test("--json output escapes C1, line/paragraph separator and bidi controls", async (t) => {
+  const root = await fixtureRoot(t);
+  const sessions = join(root, "sessions");
+  await mkdir(sessions);
+  const nasty = "a\u0085b\u009bc\u2028d\u2029e\u202ef\u2066g";
+  const meta = { timestamp: "2026-10-29T12:00:00.000Z", type: "session_meta", payload: { id: "evil", cwd: `/w/${nasty}`, source: "cli" } };
+  const context = { timestamp: "2026-10-29T12:01:00.000Z", type: "turn_context", payload: { model: nasty, effort: "high" } };
+  const path = join(sessions, "evil.jsonl");
+  await writeFile(path, `${JSON.stringify(meta)}\n${JSON.stringify(context)}\n`, "utf8");
+  const { run } = cliRunner(root);
+  for (const [args, pick] of [[["session", path, "--json"], (value) => value], [["board", "--json"], (value) => value.sessions[0]]]) {
+    const stdout = await run(args);
+    assert.doesNotMatch(stdout, /[\u0080-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/, args[0]);
+    assert.match(stdout, /\\u0085/);
+    assert.match(stdout, /\\u202e/);
+    // The escapes are still the same string once parsed.
+    const parsed = pick(JSON.parse(stdout));
+    assert.equal(parsed.cwd, `/w/${nasty}`);
+    assert.equal(parsed.model, nasty);
+  }
+});
+
 test("usage --json and board --json omit the email and account key when a seat is configured", async (t) => {
   const root = await fixtureRoot(t);
   const here = dirname(fileURLToPath(import.meta.url));
@@ -522,6 +577,24 @@ test("usage --json and board --json omit the email and account key when a seat i
   const plain = JSON.parse(await run(["usage"], { CACHE_STATUSBAND_CODEX_SEAT_FILE: "" }));
   assert.equal(plain.accountEmail, email);
 });
+
+// Runs the CLI against a scratch Codex home, with a fake app-server standing in for codex.
+function cliRunner(root) {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const bin = join(here, "..", "bin", "cache-statusband-codex.mjs");
+  const server = join(here, "..", "fixtures", "fake-app-server.mjs");
+  const windows = process.platform === "win32";
+  const wrapper = join(root, windows ? "codex.cmd" : "codex");
+  return {
+    async run(args, env = {}) {
+      await writeFile(wrapper, windows
+        ? `@echo off\r\n"${process.execPath}" "${server}" %*\r\n`
+        : `#!/bin/sh\nexec "${process.execPath}" "${server}" "$@"\n`, { mode: 0o755 });
+      const { stdout } = await promisify(execFile)(process.execPath, [bin, ...args, "--codex-home", root], { env: { ...process.env, CODEX_BIN: wrapper, ...env }, timeout: 20_000 });
+      return stdout;
+    },
+  };
+}
 
 async function fixtureRoot(t) {
   const root = await mkdtemp(join(tmpdir(), "cache-statusband-codex-"));

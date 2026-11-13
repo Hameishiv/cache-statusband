@@ -9,7 +9,7 @@ import { captureUsageIdentity, disposeAllAppServers, getUsageSnapshot } from "..
 
 // hooks.json gives SessionStart 15s; stay inside it so what is already built is emitted.
 const DEFAULT_DEADLINE_MS = 12_000;
-// A usage read needs a few seconds; with less than this left, use the cache only.
+// A usage read needs a few seconds of its own.
 const MIN_FETCH_BUDGET_MS = 3_000;
 // A read is told to give up this long before the hook deadline, so that its own cleanup
 // (which stops the Codex app-server it started) normally runs before the hook exits.
@@ -56,8 +56,9 @@ export async function handleSessionStart(input, {
         ? async () => null
         : (target) => identityGetter(target, { throwOnFailure: true, timeoutMs: readBudget() });
       const identity = await getSessionIdentity(home, input.session_id, capture);
-      // Too little of the deadline left for a read to finish: show what is cached.
-      const cacheOnly = deadlineMs - (Date.now() - started) < MIN_FETCH_BUDGET_MS;
+      // The read's own budget is what remains less the margin; unless that is at least
+      // MIN_FETCH_BUDGET_MS, show what is cached rather than start a read that cannot finish.
+      const cacheOnly = deadlineMs - (Date.now() - started) < MIN_FETCH_BUDGET_MS + READ_MARGIN_MS;
       const usage = await usageGetter({ codexHome: home, now, identity, timeoutMs: readBudget(), ...(cacheOnly ? { cacheOnly: true } : {}) });
       const presented = await usagePresentation(usage, { codexHome: home, identity });
       const built = [];

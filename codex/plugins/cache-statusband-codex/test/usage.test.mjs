@@ -478,6 +478,31 @@ test("identity capture can fail loudly and never labels an unreadable seat with 
   }), /seat/i);
 });
 
+test("with a seat configured, a signed-out or changing login is a failure, not a binding", async (t) => {
+  const root = await fixtureRoot(t);
+  const seatPath = join(root, "seat.txt");
+  await writeFile(seatPath, FIRST_SEAT);
+  const env = { CACHE_STATUSBAND_CODEX_SEAT_FILE: seatPath };
+  // Signed out under a seat label: nothing to bind the label to.
+  await assert.rejects(captureUsageIdentity(root, { env, throwOnFailure: true, accountReader: async () => ({ account: null }) }), /signed in/i);
+  assert.equal(await captureUsageIdentity(root, { env, accountReader: async () => ({ account: null }) }), null);
+  // The login is read again after the seat was last checked; a change fails the capture.
+  const emails = [TEST_EMAIL, OTHER_EMAIL];
+  await assert.rejects(captureUsageIdentity(root, { env, throwOnFailure: true, accountReader: async () => ({ email: emails.shift() }) }), /changed/i);
+  const again = [TEST_EMAIL, null];
+  assert.equal(await captureUsageIdentity(root, { env, accountReader: async () => ({ email: again.shift() }) }), null);
+  // A stable login under a seat is bound, after exactly two reads.
+  let reads = 0;
+  const identity = await captureUsageIdentity(root, { env, throwOnFailure: true, accountReader: async () => { reads += 1; return { email: TEST_EMAIL }; } });
+  assert.equal(identity.key, `account:${TEST_EMAIL}`);
+  assert.equal(identity.label, `${SEAT_PREFIX} ${FIRST_SEAT}`);
+  assert.equal(reads, 2);
+  // Without a seat the login is the label: signed out stays an answer, and one read suffices.
+  reads = 0;
+  assert.equal((await captureUsageIdentity(root, { env: {}, accountReader: async () => { reads += 1; return { email: TEST_EMAIL }; } })).label, TEST_EMAIL);
+  assert.equal(reads, 1);
+});
+
 test("a per-call timeout reaches the identity reader and the usage fetcher", async (t) => {
   const root = await fixtureRoot(t);
   let readerTimeout;
@@ -514,27 +539,35 @@ test("a cache deadline beyond the longest possible backoff does not suppress pol
   assert.equal(snapshot.availableCount, 2);
 });
 
-test("a verified reading for a different login is kept for that login, never for the expected one", async (t) => {
+test("a different login is detected before any rate-limit request is made", async (t) => {
   const root = await fixtureRoot(t);
   const now = Date.parse("2026-10-29T12:00:00.000Z");
-  const otherIdentity = { key: `account:${OTHER_EMAIL}`, label: OTHER_EMAIL, unavailable: false };
-  const seated = { ...ACCOUNT_IDENTITY, label: `${SEAT_PREFIX} ${FIRST_SEAT}` };
-  const otherRaw = { ...RAW, account: { email: OTHER_EMAIL }, rateLimitResetCredits: { availableCount: 6 }, rateLimits: { primary: { usedPercent: 91 } } };
-  const expected = await getUsageSnapshot({ codexHome: root, now, identity: seated, fetcher: async () => otherRaw });
-  assert.equal(expected.source, "stale");
-  assert.equal(expected.availableCount, null);
-  assert.equal(expected.accountEmail, null);
-  const other = await getUsageSnapshot({ codexHome: root, now: now + 1_000, identity: otherIdentity, fetcher: async () => { throw new Error("must reuse the verified reading"); } });
-  assert.equal(other.source, "cache");
-  assert.equal(other.availableCount, 6);
-  assert.equal(other.primary.usedPercent, 91);
-  assert.equal(other.identityKey, otherIdentity.key);
+  const log = join(root, "requests.log");
+  const fakeFetcher = (email) => (options) => fetchRateLimitsViaAppServer({
+    ...options,
+    command: process.execPath,
+    args: [FAKE_SERVER],
+    timeoutMs: 5_000,
+    env: { ...process.env, FAKE_SERVER_EMAIL: email, FAKE_SERVER_LOG: log },
+  });
+  const requests = async () => (await readFile(log, "utf8").catch(() => "")).split("\n").filter(Boolean);
 
-  // A fresh cache for that login is left alone.
-  const newer = { ...otherRaw, rateLimitResetCredits: { availableCount: 7 } };
-  await getUsageSnapshot({ codexHome: root, now: now + 2_000, identity: seated, fetcher: async () => newer });
-  const stillOther = await getUsageSnapshot({ codexHome: root, now: now + 3_000, identity: otherIdentity, fetcher: async () => { throw new Error("cache is fresh"); } });
-  assert.equal(stillOther.availableCount, 6);
+  // The expected account (A) is signed out in favour of B: only the account is read.
+  const mismatched = await getUsageSnapshot({ codexHome: root, now, identity: ACCOUNT_IDENTITY, fetcher: fakeFetcher(OTHER_EMAIL) });
+  assert.equal(mismatched.source, "stale");
+  assert.equal(mismatched.availableCount, null);
+  assert.equal(mismatched.accountEmail, null);
+  assert.deepEqual(await requests(), ["initialize", "initialized", "account/read"]);
+  // Nothing was stored for B, and A is backed off for the usual interval.
+  assert.equal((await readdir(join(root, "cache-statusband-codex"))).filter((name) => name.endsWith(".json")).length, 1);
+  assert.equal(mismatched.nextAllowedAt, now + MIN_POLL_INTERVAL_MS);
+
+  // The same login, spelled in a different case, is the same account.
+  await rm(log);
+  const matched = await getUsageSnapshot({ codexHome: root, now: now + MIN_POLL_INTERVAL_MS, identity: ACCOUNT_IDENTITY, fetcher: fakeFetcher(TEST_EMAIL.toUpperCase()) });
+  assert.equal(matched.source, "live");
+  assert.equal(matched.availableCount, 2);
+  assert.deepEqual((await requests()).filter((name) => name === "account/rateLimits/read"), ["account/rateLimits/read"]);
 });
 
 test("banked-reset lines say how old a non-live reading is", () => {
@@ -641,7 +674,13 @@ test("a server that has already exited is not signalled again, but a live one is
     assert.deepEqual(killed[0][0], "taskkill");
     assert.deepEqual(killed[0][1].slice(2), ["/T", "/F"]);
   } finally {
+    // The faked killer never stopped the real server, and it may still be starting up:
+    // wait for its pid file, then take it down so it cannot outlive the test.
+    await waitUntil(async () => (await readFile(pidFile, "utf8").catch(() => "")) !== "", 3_000);
     const pid = Number(await readFile(pidFile, "utf8").catch(() => 0));
-    if (pid && alive(pid)) process.kill(pid);
+    if (pid && alive(pid)) {
+      if (process.platform === "win32") await promisify(execFile)("taskkill", ["/PID", String(pid), "/T", "/F"]).catch(() => {});
+      else process.kill(pid);
+    }
   }
 });

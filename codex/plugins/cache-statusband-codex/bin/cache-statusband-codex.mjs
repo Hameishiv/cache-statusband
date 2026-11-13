@@ -50,7 +50,7 @@ async function board(argv) {
   const usageSnapshot = await getUsageSnapshot({ codexHome: home, identity });
   const presented = await usagePresentation(usageSnapshot, { codexHome: home, identity });
   if (options.json) {
-    process.stdout.write(`${JSON.stringify({ usage: await publicSnapshot(presented.snapshot, home), sessions: summaries }, null, 2)}\n`);
+    process.stdout.write(`${json({ usage: await publicSnapshot(presented.snapshot, home), sessions: summaries })}\n`);
     return;
   }
   process.stdout.write(`${formatUsageLines(presented.snapshot, Date.now(), { identity: presented.identity }).join(" | ")}\n\n`);
@@ -79,7 +79,7 @@ async function usage(argv) {
   const identity = await captureUsageIdentity(home);
   const snapshot = await getUsageSnapshot({ codexHome: home, identity });
   const presented = await usagePresentation(snapshot, { codexHome: home, identity });
-  if (options.json) process.stdout.write(`${JSON.stringify(await publicSnapshot(presented.snapshot, home), null, 2)}\n`);
+  if (options.json) process.stdout.write(`${json(await publicSnapshot(presented.snapshot, home))}\n`);
   else process.stdout.write(`${formatUsageLines(presented.snapshot, Date.now(), { includeResetDetails: true, identity: presented.identity }).join("\n")}\n`);
 }
 
@@ -109,7 +109,7 @@ async function session(argv) {
   if (!existsSync(path)) throw new Error(`file not found: ${path}`);
   const summary = await parseRollout(path);
   if (options.json) {
-    process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
+    process.stdout.write(`${json(summary)}\n`);
     return;
   }
   const values = {
@@ -161,6 +161,13 @@ function integer(value, name) {
 // Transcript fields are untrusted: drop C0/C1 control characters (terminal escapes).
 function clean(value) {
   return stripControls(value);
+}
+
+// JSON.stringify escapes C0 controls but passes C1 controls (8-bit terminal escape
+// introducers), the line/paragraph separators and the bidirectional controls through, so a
+// transcript string could still act on a terminal that prints the JSON. Escape those too.
+function json(value) {
+  return JSON.stringify(value, null, 2).replace(/[\u0080-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g, (character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`);
 }
 
 function shorten(value, length) {

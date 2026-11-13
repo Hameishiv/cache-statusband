@@ -69,14 +69,11 @@ export async function getUsageSnapshot({
     await writeCache(cachePath, attempted);
 
     try {
-      const raw = await fetcher({ codexHome, env, ...(timeoutMs === undefined ? {} : { timeoutMs }) });
+      // The fetcher is told whose usage is wanted so it can check the login first and
+      // send no rate-limit request for any other account (see fetchRateLimitsViaAppServer).
+      const raw = await fetcher({ codexHome, env, expectedEmail, ...(timeoutMs === undefined ? {} : { timeoutMs }) });
       const safe = sanitizeRateLimits(raw);
-      if (safe.accountEmail !== expectedEmail) {
-        // The read is verified, just for a different account. Keep it for that account
-        // (never for this one), so the next caller on that login need not poll again.
-        if (safe.accountEmail) await storeVerifiedAccount(dataDir, safe, now).catch(() => {});
-        throw new Error("Codex account changed during the usage read");
-      }
+      if (!sameEmail(safe.accountEmail, expectedEmail)) throw new Error("Codex account changed during the usage read");
       const saved = {
         ...emptyCache(),
         ...safe,
@@ -102,28 +99,6 @@ export async function getUsageSnapshot({
   }
 }
 
-async function storeVerifiedAccount(dataDir, safe, now) {
-  const identity = { key: `account:${safe.accountEmail}` };
-  const suffix = cacheSuffix(identity);
-  const path = join(dataDir, `rate-limits${suffix}.json`);
-  if (fresh(await readCache(path), now)) return;
-  const lock = await acquireLock(join(dataDir, `rate-limits${suffix}.lock`), { now, staleMs: LOCK_STALE_MS });
-  if (!lock) return;
-  try {
-    if (fresh(await readCache(path), now)) return;
-    await writeCache(path, {
-      ...emptyCache(),
-      ...safe,
-      identityKey: identity.key,
-      fetchedAt: now,
-      attemptedAt: now,
-      nextAllowedAt: now + MIN_POLL_INTERVAL_MS,
-    });
-  } finally {
-    await lock.release();
-  }
-}
-
 export async function captureUsageIdentity(codexHome, {
   env = process.env,
   accountReader = readAccountViaAppServer,
@@ -137,18 +112,37 @@ export async function captureUsageIdentity(codexHome, {
   const seat = await configuredSeatIdentity(codexHome, env);
   // A configured seat that cannot be read must never fall back to the account email.
   if (seat?.unavailable) return fail("The configured seat label is unavailable");
-  let account;
+  const started = Date.now();
+  const read = async (budget) => {
+    const account = await accountReader({ codexHome, env, ...(budget === undefined ? {} : { timeoutMs: budget }) });
+    return safeEmail(account?.email);
+  };
+  let email;
   try {
-    account = await accountReader({ codexHome, env, ...(timeoutMs === undefined ? {} : { timeoutMs }) });
+    email = await read(timeoutMs);
   } catch (error) {
     if (throwOnFailure) throw error;
     return null;
   }
-  const email = safeEmail(account?.email);
   const seatAfter = await configuredSeatIdentity(codexHome, env);
   if (seat?.key !== seatAfter?.key) return fail("The seat changed during the account read");
-  // No signed-in account is a real answer (null), not a failure.
-  return email ? { key: `account:${email}`, label: seat ? seat.label : email, unavailable: false } : null;
+  if (!seat) {
+    // No signed-in account is a real answer (null), not a failure.
+    return email ? { key: `account:${email}`, label: email, unavailable: false } : null;
+  }
+  // A seat label asserts which login this session runs under, so a signed-out reading is
+  // not an answer. Read the login once more, after the seat was last checked: the pair is
+  // trusted only if the login did not change while the seat was being confirmed.
+  if (!email) return fail("No account is signed in for the configured seat");
+  let again;
+  try {
+    again = await read(timeoutMs === undefined ? undefined : Math.max(500, timeoutMs - (Date.now() - started)));
+  } catch (error) {
+    if (throwOnFailure) throw error;
+    return null;
+  }
+  if (again !== email) return fail("The Codex account changed while the seat was being confirmed");
+  return { key: `account:${email}`, label: seat.label, unavailable: false };
 }
 
 // Node cannot spawn codex.cmd (npm installs) without a shell and refuses .cmd/.bat
@@ -207,7 +201,8 @@ const liveChildren = new Set();
 // server is a grandchild that child.kill() does not reach, so on Windows take the whole
 // tree. Killing cmd.exe first would orphan the server before taskkill could see it, so
 // child.kill() is only the fallback when taskkill cannot run or fails. A child that has
-// already exited is never signalled: its pid may be reused by an unrelated process.
+// already exited is not signalled once its exit is known: its pid may be reused by an
+// unrelated process.
 // Returns a promise that settles once taskkill (if any) has finished.
 function disposeChild(child, { platform = process.platform, spawnKiller = spawn } = {}) {
   const gone = child.exitCode != null || child.signalCode != null;
@@ -325,6 +320,7 @@ export async function fetchRateLimitsViaAppServer({
   env = process.env,
   platform = process.platform,
   spawnKiller,
+  expectedEmail,
 } = {}) {
   const childEnv = { ...env };
   if (codexHome) childEnv.CODEX_HOME = codexHome;
@@ -340,10 +336,7 @@ export async function fetchRateLimitsViaAppServer({
   liveChildren.add(child);
   const lines = createInterface({ input: child.stdout });
   let settled = false;
-  let accountDone = false;
-  let rateLimitsDone = false;
   let account = null;
-  let rateLimits = null;
 
   return await new Promise((resolve, reject) => {
     const finish = (callback, value) => {
@@ -363,9 +356,6 @@ export async function fetchRateLimitsViaAppServer({
       if (!settled) finish(reject, new Error(`Codex app-server exited before the rate-limit response (${code ?? "unknown"})`));
     });
     child.stderr.on("data", () => {});
-    const maybeFinish = () => {
-      if (accountDone && rateLimitsDone) finish(resolve, { ...rateLimits, account });
-    };
     lines.on("line", (line) => {
       let message;
       try {
@@ -375,9 +365,20 @@ export async function fetchRateLimitsViaAppServer({
       }
       if (message.method !== undefined) return;
       if (message.id === 2) {
-        accountDone = true;
-        account = message.error ? null : message.result?.account ?? null;
-        maybeFinish();
+        if (account !== null) return;
+        account = message.error ? {} : message.result?.account ?? {};
+        // Only the account the caller wants is read: a rate-limit request made while a
+        // different login is active would spend that account's quota, and any Retry-After
+        // would be its, not ours. On a mismatch answer with the account alone.
+        if (expectedEmail !== undefined && !sameEmail(safeEmail(account.email), expectedEmail)) {
+          finish(resolve, { account });
+          return;
+        }
+        try {
+          send({ method: "account/rateLimits/read", id: 3, params: {} });
+        } catch (error) {
+          finish(reject, error);
+        }
         return;
       }
       if (message.id !== 3) return;
@@ -387,9 +388,7 @@ export async function fetchRateLimitsViaAppServer({
         error.rpcMessage = message.error.message;
         finish(reject, error);
       } else {
-        rateLimitsDone = true;
-        rateLimits = message.result ?? {};
-        maybeFinish();
+        finish(resolve, { ...(message.result ?? {}), account });
       }
     });
 
@@ -401,7 +400,6 @@ export async function fetchRateLimitsViaAppServer({
     });
     send({ method: "initialized", params: {} });
     send({ method: "account/read", id: 2, params: { refreshToken: false } });
-    send({ method: "account/rateLimits/read", id: 3, params: {} });
   });
 }
 
@@ -567,6 +565,10 @@ function finiteNonnegative(value) {
 
 function safeText(value) {
   return typeof value === "string" ? stripControls(value).slice(0, 200) : null;
+}
+
+function sameEmail(a, b) {
+  return typeof a === "string" && typeof b === "string" && a.toLowerCase() === b.toLowerCase();
 }
 
 function safeEmail(value) {

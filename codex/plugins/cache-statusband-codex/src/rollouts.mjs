@@ -80,8 +80,8 @@ function consume(item, summary, fromHead = false) {
   if (!fromHead && typeof item?.timestamp === "string") summary.updatedAt = item.timestamp;
 
   if (item?.type === "session_meta" && payload) {
-    summary.id = payload.id ?? summary.id;
-    summary.cwd = payload.cwd ?? summary.cwd;
+    summary.id = text(payload.id) ?? summary.id;
+    summary.cwd = text(payload.cwd) ?? summary.cwd;
     summary.source = scalarSource(payload.source) ?? summary.source;
     summary.createdAt = payload.timestamp ?? item.timestamp ?? summary.createdAt;
     summary.contextWindow = number(payload.context_window) ?? summary.contextWindow;
@@ -89,9 +89,9 @@ function consume(item, summary, fromHead = false) {
   }
 
   if (item?.type === "turn_context" && payload) {
-    summary.cwd = payload.cwd ?? summary.cwd;
-    summary.model = payload.model ?? summary.model;
-    summary.effort = payload.effort ?? payload.reasoning_effort ?? summary.effort;
+    summary.cwd = text(payload.cwd) ?? summary.cwd;
+    summary.model = text(payload.model) ?? summary.model;
+    summary.effort = text(payload.effort) ?? text(payload.reasoning_effort) ?? summary.effort;
     return;
   }
 
@@ -132,6 +132,11 @@ function usage(value) {
     reasoningOutputTokens: number(value.reasoning_output_tokens ?? value.reasoningOutputTokens),
     totalTokens: number(value.total_tokens ?? value.totalTokens),
   };
+}
+
+// Transcript fields are untrusted: a field of the wrong type is ignored, never displayed.
+function text(value) {
+  return typeof value === "string" ? value : null;
 }
 
 function number(value) {
@@ -181,7 +186,7 @@ async function findJsonl(root) {
 }
 
 export function projectName(cwd) {
-  if (!cwd) return "?";
+  if (typeof cwd !== "string" || !cwd) return "?";
   const pieces = cwd.split(/[\\/]/).filter(Boolean);
   return pieces.at(-1) || sep;
 }
