@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -65,6 +65,11 @@ describe("segments", () => {
     assert.equal(render({}), "");
   });
 
+  it("rounds a fractional context percent to a tenth", () => {
+    assert.equal(contextLabel({ used_percentage: 28.699999999999996 }), "ctx 28.7%");
+    assert.equal(contextLabel({ used_percentage: 29 }), "ctx 29%");
+  });
+
   it("keeps a real zero", () => {
     assert.equal(contextLabel({ used_percentage: 0, context_tokens: 0 }), "ctx 0% · 0");
     assert.equal(cacheLabel({ cache_read_input_tokens: 0 }), "cache read 0");
@@ -101,6 +106,7 @@ describe("weekly usage", () => {
     percent: 23,
     periodType: "USAGE_PERIOD_TYPE_WEEKLY",
     periodEnd: "2026-11-02T22:57:09.651+00:00",
+    fetchedAt: "2026-10-29T11:00:00Z",
   };
 
   it("shows the weekly percent and the time until reset", () => {
@@ -117,7 +123,8 @@ describe("weekly usage", () => {
     assert.equal(weeklyLabel(at("2026-10-28T19:46:00Z"), now), "week 23% (read 16h00m ago) · 4d11h");
     assert.equal(weeklyLabel(at("2026-10-26T01:46:00Z"), now), "week 23% (read 3d10h ago) · 4d11h");
     assert.equal(weeklyLabel(weekly, now), "week 23% · 4d11h");
-    assert.equal(weeklyLabel(at("not a time"), now), "week 23% · 4d11h");
+    assert.equal(weeklyLabel(at("not a time"), now), "week 23% (read time unknown) · 4d11h");
+    assert.equal(weeklyLabel({ ...weekly, fetchedAt: null }, now), "week 23% (read time unknown) · 4d11h");
     assert.equal(weeklyLabel(at("2026-10-29T13:00:00Z"), now), "week 23% · 4d11h");
   });
 
@@ -229,6 +236,30 @@ describe("weekly usage", () => {
     // the clock went back an hour: the stored scan time must not hold the throttle
     assert.equal(loadWeekly(logPath, cachePath, now).percent, 61);
     assert.deepEqual(readdirSync(dir).sort(), ["unified.jsonl", "usage.json"]);
+  });
+
+  it("keeps the reading, and does not re-date the cache, when the log cannot be read", () => {
+    const dir = mkdtempSync(join(tmpdir(), "csb-week-"));
+    const logPath = join(dir, "unified.jsonl");
+    const cachePath = join(dir, "usage.json");
+    writeFileSync(logPath, `${creditsLine(23)}\n`);
+    assert.equal(loadWeekly(logPath, cachePath, now).percent, 23);
+    ageCache(cachePath, logPath);
+    const before = JSON.parse(readFileSync(cachePath, "utf8")).sources[logPath];
+    // a directory where the log should be: stat works, reading it does not
+    rmSync(logPath);
+    mkdirSync(logPath);
+    assert.equal(loadWeekly(logPath, cachePath, now + 1000).percent, 23);
+    assert.deepEqual(JSON.parse(readFileSync(cachePath, "utf8")).sources[logPath], before);
+  });
+
+  it("writes no cache entry for a log it could not read", () => {
+    const dir = mkdtempSync(join(tmpdir(), "csb-week-"));
+    const logPath = join(dir, "unified.jsonl");
+    const cachePath = join(dir, "usage.json");
+    mkdirSync(logPath);
+    assert.equal(loadWeekly(logPath, cachePath, now), null);
+    assert.equal(existsSync(cachePath), false);
   });
 
   it("does not re-read an unchanged log with no credits line after the window", () => {

@@ -97,7 +97,7 @@ export function contextLabel(window) {
   const size = finite(window.context_window_size);
   if (pct === null && used === null) return null;
   let label = "ctx";
-  if (pct !== null) label += ` ${pct}%`;
+  if (pct !== null) label += ` ${percentText(pct)}%`;
   if (used !== null) {
     label += pct !== null ? " · " : " ";
     label += formatTokens(used);
@@ -154,7 +154,7 @@ export function remaining(ms) {
  * `record` is `{ percent, periodType, periodEnd, fetchedAt }`. A monthly period,
  * a missing percent, or a reset that has already passed is left out.
  * The reading is as old as the credits line Grok last logged, so once it is an
- * hour old the age is shown. A missing or unreadable fetch time shows no age.
+ * hour old the age is shown. A missing or unreadable fetch time is shown as unknown.
  */
 export function weeklyLabel(record, nowMs) {
   if (!record || typeof record !== "object") return null;
@@ -168,8 +168,10 @@ export function weeklyLabel(record, nowMs) {
   const left = remaining(end - now);
   if (!left) return null;
   const fetched = Date.parse(record.fetchedAt);
-  const age = Number.isFinite(fetched) && now - fetched >= 3600000 ? remaining(now - fetched) : null;
-  return `week ${percentText(pct)}%${age ? ` (read ${age} ago)` : ""} · ${left}`;
+  let age = "";
+  if (!Number.isFinite(fetched)) age = " (read time unknown)";
+  else if (now - fetched >= 3600000) age = ` (read ${remaining(now - fetched)} ago)`;
+  return `week ${percentText(pct)}%${age} · ${left}`;
 }
 
 /**
@@ -274,11 +276,14 @@ function billingRecord(line) {
  * The newest credits line decides: if it cannot be used, there is no reading.
  */
 export function readLastBilling(path, maxBytes = 4 * 1024 * 1024) {
-  return scanBilling(path, maxBytes) ?? null;
+  const found = scanBilling(path, maxBytes);
+  return found === READ_FAILED ? null : found ?? null;
 }
 
+const READ_FAILED = Symbol("read failed");
+
 /**
- * undefined: no credits line in range, or the log cannot be read.
+ * READ_FAILED: the log could not be read. undefined: no credits line in range.
  * null: the newest credits line cannot be used. Otherwise the reading.
  */
 function scanBilling(path, maxBytes = 4 * 1024 * 1024) {
@@ -286,13 +291,14 @@ function scanBilling(path, maxBytes = 4 * 1024 * 1024) {
   try {
     st = statSync(path);
   } catch {
-    return undefined;
+    return READ_FAILED;
   }
+  if (!st.isFile()) return READ_FAILED;
   let fh;
   try {
     fh = openSync(path, "r");
   } catch {
-    return undefined;
+    return READ_FAILED;
   }
   try {
     let offset = st.size;
@@ -318,8 +324,14 @@ function scanBilling(path, maxBytes = 4 * 1024 * 1024) {
       if (found !== undefined) return found && { ...found, sourceMtimeMs: st.mtimeMs, sourceSize: st.size };
     }
     return undefined;
+  } catch {
+    return READ_FAILED;
   } finally {
-    closeSync(fh);
+    try {
+      closeSync(fh);
+    } catch {
+      // the handle is gone either way
+    }
   }
 }
 
@@ -367,7 +379,8 @@ function writeSources(cachePath, sources) {
  * Last weekly reading. Re-reads each log at most once per five minutes, even
  * when it has no credits line. A re-read that finds no credits line keeps the
  * last good record and only moves the next check. A re-read whose newest
- * credits line cannot be used drops it.
+ * credits line cannot be used drops it. A log that cannot be read keeps the
+ * last good record and is tried again on the next run.
  * The cache holds one entry per log: the log's size and time, when it was read,
  * and the percent, period type, period end, and fetch time.
  */
@@ -394,6 +407,8 @@ export function loadWeekly(logPath, cachePath, nowMs = Date.now()) {
 
   // no credits line keeps the last reading; an unusable newest line shows none
   const found = scanBilling(logPath);
+  // a failed read says nothing about the log: keep the reading and try again next run
+  if (found === READ_FAILED) return prior;
   const record =
     found === undefined
       ? prior
@@ -430,7 +445,12 @@ if (isDirectRun()) {
     process.exit(1);
   }
   const logPath = billingLogPath();
-  const weekly = logPath ? loadWeekly(logPath, usageCachePath()) : null;
+  let weekly = null;
+  try {
+    weekly = logPath ? loadWeekly(logPath, usageCachePath()) : null;
+  } catch {
+    // the other segments do not depend on the log
+  }
   const line = render(payload, { weekly });
   if (line) process.stdout.write(`${line}\n`);
 }

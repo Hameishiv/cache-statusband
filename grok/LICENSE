@@ -2,7 +2,6 @@ MIT License
 
 Copyright (c) 2026 Nate Herk
 Copyright (c) 2026 Hameishiv (status band, usage readings and reopened-chat measurement)
-Copyright (c) 2025 Matthew Breedlove
 
 The status band's design follows ccstatusline, Copyright (c) 2025 Matthew Breedlove
 (https://github.com/sirmalloc/ccstatusline), MIT License. No ccstatusline code is included.
