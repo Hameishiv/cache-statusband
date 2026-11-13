@@ -400,6 +400,8 @@ describe("weekly usage", () => {
     assert.equal(readSources(join(dir, "marker")), null);
     writeFileSync(join(dir, "other-old.json"), '{"source":"x","record":1,"other":"keep me"}');
     assert.equal(readSources(join(dir, "other-old.json")), null);
+    writeFileSync(join(dir, "settings.json"), '{"v":2,"name":"my settings","keep":true}');
+    assert.equal(readSources(join(dir, "settings.json")), null);
     mkdirSync(join(dir, "folder.json"));
     assert.equal(readSources(join(dir, "folder.json")), null);
   });
@@ -440,6 +442,18 @@ describe("weekly usage", () => {
     const cachePath = join(dir, "usage.json");
     writeFileSync(cachePath, JSON.stringify({ v: 3, other: {} }));
     assert.equal(readSources(cachePath), null);
+  });
+
+  it("never writes through a file already sitting at the temporary name", () => {
+    const dir = tempDir(join(tmpdir(), "csb-week-"));
+    const logPath = join(dir, "unified.jsonl");
+    const cachePath = join(dir, "usage.json");
+    writeFileSync(logPath, "no credits line\n");
+    const planted = `${cachePath}.${process.pid}.tmp`;
+    writeFileSync(planted, "planted");
+    assert.equal(loadWeekly(logPath, cachePath, now), null);
+    assert.equal(readFileSync(planted, "utf8"), "planted");
+    assert.equal(existsSync(cachePath), false);
   });
 
   it("treats the old single-entry cache file as empty", () => {

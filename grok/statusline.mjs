@@ -491,7 +491,9 @@ export function readSources(cachePath) {
     if (body && typeof body.v === "number" && body.v > 2) return null;
     if (body && body.v === 2) {
       const sources = body.sources;
-      return sources && typeof sources === "object" && !Array.isArray(sources) ? sources : {};
+      if (sources && typeof sources === "object" && !Array.isArray(sources)) return sources;
+      // a v of 2 without this cache's entries is some other file, unless it carries this cache's name
+      return ownName ? {} : null;
     }
     // the old single-entry format of this cache is replaced; any other file is not ours to rewrite
     if (ownName && body && typeof body === "object" && "source" in body && "record" in body) return {};
@@ -508,9 +510,12 @@ function writeSources(cachePath, sources) {
   if (!cachePath) return;
   // write then rename, so a reader never sees a half-written file
   const tmp = `${cachePath}.${process.pid}.tmp`;
+  let created = false;
   try {
     mkdirSync(dirname(cachePath), { recursive: true });
-    const fd = openSync(tmp, "w");
+    // create it fresh: never follow a link or open a pipe already sitting at that name
+    const fd = openSync(tmp, "wx");
+    created = true;
     try {
       writeFileSync(fd, JSON.stringify({ v: 2, sources }));
       // on disk before the rename, so a crash cannot leave the name pointing at nothing
@@ -521,6 +526,7 @@ function writeSources(cachePath, sources) {
     renameSync(tmp, cachePath);
   } catch {
     // This run can still show the reading it already has.
+    if (!created) return;
     try {
       unlinkSync(tmp);
     } catch {
