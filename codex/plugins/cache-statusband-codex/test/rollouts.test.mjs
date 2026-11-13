@@ -286,6 +286,16 @@ test("a record that cannot be linked is tried again, then yields to a concurrent
   };
   assert.deepEqual(await getSessionIdentity(second, "s", async () => identityOf("loser"), { linkImpl: winnerThenRefuse }), identityOf("winner"));
 
+  // A refusal that persists while a record that cannot be parsed sits there: unknown, never today's login.
+  const corrupt = await fixtureRoot(t);
+  const corruptDir = join(corrupt, "cache-statusband-codex", "sessions");
+  const corruptThenRefuse = async () => {
+    const [name] = (await readdir(corruptDir)).filter((file) => file.endsWith(".tmp"));
+    await writeFile(join(corruptDir, name.replace(/\.[0-9a-f-]+\.tmp$/, "")), "{not json");
+    throw refused("ENOSPC");
+  };
+  assert.equal(await getSessionIdentity(corrupt, "s", async () => identityOf("today"), { linkImpl: corruptThenRefuse }), null);
+
   // A refusal that persists with nothing there: the login is used now, unrecorded.
   const third = await fixtureRoot(t);
   let attempts = 0;
@@ -649,6 +659,21 @@ test("Stop saves once a briefly held lock is released", async (t) => {
   const newer = { ...summary, contextUsed: 20, tokenReportAt: "2026-10-29T13:00:00.000Z" };
   assert.equal(await saveSessionState(root, "busy-session", newer), true);
   assert.equal((await loadSessionState(root, "busy-session")).contextUsed, 20);
+});
+
+test("a Stop report with no model or effort keeps the ones saved before", async (t) => {
+  const root = await fixtureRoot(t);
+  const first = { contextUsed: 10, contextWindow: 100, tokenReportAt: "2026-10-29T12:00:00.000Z", model: "model-X", effort: "high" };
+  assert.equal(await saveSessionState(root, "keep-session", first), true);
+  const later = { contextUsed: 20, contextWindow: 100, tokenReportAt: "2026-10-29T13:00:00.000Z", model: null, effort: null };
+  assert.equal(await saveSessionState(root, "keep-session", later), true);
+  const saved = await loadSessionState(root, "keep-session");
+  assert.equal(saved.contextUsed, 20);
+  assert.equal(saved.model, "model-X");
+  assert.equal(saved.effort, "high");
+  // A newer, named model still replaces it.
+  assert.equal(await saveSessionState(root, "keep-session", { ...later, tokenReportAt: "2026-10-29T14:00:00.000Z", model: "model-Y", effort: "low" }), true);
+  assert.equal((await loadSessionState(root, "keep-session")).model, "model-Y");
 });
 
 test("a truncated rollout takes only identity from its head and everything else from its tail", async (t) => {

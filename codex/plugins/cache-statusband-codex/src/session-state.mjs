@@ -60,8 +60,11 @@ export async function getSessionIdentity(codexHome, sessionId, capture, { linkIm
     // later resume of this session finds no record and shows it as unknown.
     try {
       return parseIdentity(await readFile(path, "utf8"));
-    } catch {
-      return safeIdentity;
+    } catch (readError) {
+      // No record at all: use the login just read. A record that exists but cannot be read or
+      // parsed is a corrupt one, and (as in the first read above) it must not be replaced by
+      // today's account: the session is unknown.
+      return readError?.code === "ENOENT" ? safeIdentity : null;
     }
   } finally {
     await unlink(temporary).catch(() => {});
@@ -100,6 +103,12 @@ export async function saveSessionState(codexHome, sessionId, summary, savedAt = 
   try {
     const previous = await loadSessionState(codexHome, sessionId);
     if (previous && timestamp(previous.contextAt) > timestamp(state.contextAt)) return false;
+    // A report that names no model or effort (a rollout whose latest turn is out of reach)
+    // does not erase what was saved before.
+    if (previous) {
+      state.model ??= previous.model ?? null;
+      state.effort ??= previous.effort ?? null;
+    }
     const temporary = `${path}.${process.pid}.tmp`;
     try {
       await writeFile(temporary, `${JSON.stringify(state)}\n`, { encoding: "utf8", mode: 0o600 });
