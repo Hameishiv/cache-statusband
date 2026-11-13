@@ -12,7 +12,7 @@
 
 import { closeSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /** Each family is [dark, light], the same pairs the Claude Code band already checked. */
@@ -230,22 +230,36 @@ export function render(payload, extras) {
 }
 
 /**
+ * A path setting, or null when it is unset or relative. The script runs in the
+ * repository Grok has open, so a relative path would point inside it.
+ */
+function absoluteSetting(name) {
+  const value = process.env[name];
+  return value && isAbsolute(value) ? value : null;
+}
+
+/**
  * Grok's billing log as a full path, or null when CSB_BILLING_LOG is set to an
- * empty string. The path is the cache key, so a relative setting is resolved.
+ * empty string. A relative CSB_BILLING_LOG or GROK_HOME is ignored.
  */
 export function billingLogPath() {
   if (process.env.CSB_BILLING_LOG === "") return null;
-  if (process.env.CSB_BILLING_LOG) return resolve(process.env.CSB_BILLING_LOG);
-  const home = process.env.GROK_HOME || join(homedir(), ".grok");
-  return resolve(home, "logs", "unified.jsonl");
+  const log = absoluteSetting("CSB_BILLING_LOG");
+  if (log) return log;
+  const home = absoluteSetting("GROK_HOME") || join(homedir(), ".grok");
+  return join(home, "logs", "unified.jsonl");
 }
 
-/** Cache of the last weekly reading, one entry per log. Never holds a token or the raw line. */
+/**
+ * Cache of the last weekly reading, one entry per log. Never holds a token or
+ * the raw line. A relative CSB_USAGE_CACHE or XDG_CACHE_HOME is ignored.
+ */
 export function usageCachePath() {
-  if (process.env.CSB_USAGE_CACHE) return process.env.CSB_USAGE_CACHE;
+  const set = absoluteSetting("CSB_USAGE_CACHE");
+  if (set) return set;
   let base;
-  if (process.platform === "win32") base = process.env.LOCALAPPDATA || join(homedir(), "AppData", "Local");
-  else base = process.env.XDG_CACHE_HOME || join(homedir(), ".cache");
+  if (process.platform === "win32") base = absoluteSetting("LOCALAPPDATA") || join(homedir(), "AppData", "Local");
+  else base = absoluteSetting("XDG_CACHE_HOME") || join(homedir(), ".cache");
   return join(base, "cache-statusband-grok", "usage.json");
 }
 
@@ -294,6 +308,12 @@ const READ_FAILED = Symbol("read failed");
  * null: the newest credits line cannot be used. Otherwise the reading.
  */
 function scanBilling(path, maxBytes = 4 * 1024 * 1024) {
+  // opening a named pipe would wait for a writer: check before opening as well as after
+  try {
+    if (!statSync(path).isFile()) return READ_FAILED;
+  } catch {
+    return READ_FAILED;
+  }
   let fh;
   try {
     fh = openSync(path, "r");
@@ -349,11 +369,21 @@ function storedRecord(entry) {
   return { percent, periodType, periodEnd, fetchedAt: text(record.fetchedAt) };
 }
 
-/** Per-log entries of the cache file. The old single-entry format counts as empty. */
-function readSources(cachePath) {
+/**
+ * Per-log entries of the cache file, or null when the file exists but cannot
+ * be read (locked, no permission). A missing file, unparseable text, or the old
+ * single-entry format counts as empty.
+ */
+export function readSources(cachePath) {
   if (!cachePath) return {};
+  let text;
   try {
-    const body = JSON.parse(readFileSync(cachePath, "utf8"));
+    text = readFileSync(cachePath, "utf8");
+  } catch (err) {
+    return err && err.code === "ENOENT" ? {} : null;
+  }
+  try {
+    const body = JSON.parse(text);
     const sources = body && body.v === 2 ? body.sources : null;
     return sources && typeof sources === "object" && !Array.isArray(sources) ? sources : {};
   } catch {
@@ -385,13 +415,17 @@ function writeSources(cachePath, sources) {
  * written. A re-read that finds no credits line keeps the last good record
  * and only moves the next check. A re-read whose newest
  * credits line cannot be used drops it. A log that cannot be read keeps the
- * last good record and is tried again on the next run.
+ * last good record and is tried again on the next run. A cache file that
+ * exists but cannot be read is left as it is.
  * The cache holds one entry per log: the log's size and time, when it was read,
  * and the percent, period type, period end, and fetch time.
  */
 export function loadWeekly(logPath, cachePath, nowMs = Date.now()) {
   // one cache file serves every log: a reading from another log (another GROK_HOME) is not this one's
-  const sources = readSources(cachePath);
+  const read = readSources(cachePath);
+  // a cache that cannot be read is not rewritten: that would drop every entry in it
+  const canWrite = read !== null;
+  const sources = read || {};
   const raw = logPath && Object.hasOwn(sources, logPath) ? sources[logPath] : null;
   const entry = raw && typeof raw === "object" ? raw : null;
   const prior = storedRecord(entry);
@@ -418,6 +452,7 @@ export function loadWeekly(logPath, cachePath, nowMs = Date.now()) {
     found === undefined
       ? prior
       : found && { percent: found.percent, periodType: found.periodType, periodEnd: found.periodEnd, fetchedAt: found.fetchedAt };
+  if (!canWrite) return record;
   writeSources(cachePath, {
     ...sources,
     [logPath]: {
@@ -442,9 +477,16 @@ function isDirectRun() {
 }
 
 if (isDirectRun()) {
+  let input;
+  try {
+    input = readFileSync(0, "utf8");
+  } catch (err) {
+    process.stderr.write(`statusline: could not read stdin (${(err && err.code) || "error"})\n`);
+    process.exit(1);
+  }
   let payload;
   try {
-    payload = JSON.parse(readFileSync(0, "utf8"));
+    payload = JSON.parse(input);
   } catch {
     process.stderr.write("statusline: stdin is not a JSON object\n");
     process.exit(1);

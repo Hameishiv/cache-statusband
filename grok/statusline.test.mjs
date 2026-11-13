@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { after, describe, it } from "node:test";
 import {
   billingLogPath,
@@ -15,10 +15,12 @@ import {
   HUES,
   loadWeekly,
   readLastBilling,
+  readSources,
   remaining,
   render,
   segments,
   shade,
+  usageCachePath,
   weeklyLabel,
 } from "./statusline.mjs";
 
@@ -283,6 +285,28 @@ describe("weekly usage", () => {
     assert.equal(existsSync(cachePath), false);
   });
 
+  it("leaves a cache file it cannot read as it is", () => {
+    const dir = tempDir(join(tmpdir(), "csb-week-"));
+    const logPath = join(dir, "unified.jsonl");
+    // a folder where the cache file should be: it exists but cannot be read as a file
+    const cachePath = join(dir, "usage.json");
+    mkdirSync(cachePath);
+    writeFileSync(join(cachePath, "keep"), "x");
+    writeFileSync(logPath, `${creditsLine(23)}\n`);
+    assert.equal(loadWeekly(logPath, cachePath, now).percent, 23);
+    assert.deepEqual(readdirSync(cachePath), ["keep"]);
+    assert.deepEqual(readdirSync(dir).sort(), ["unified.jsonl", "usage.json"]);
+  });
+
+  it("tells a missing cache from one it cannot read", () => {
+    const dir = tempDir(join(tmpdir(), "csb-week-"));
+    assert.deepEqual(readSources(join(dir, "missing.json")), {});
+    writeFileSync(join(dir, "bad.json"), "not json");
+    assert.deepEqual(readSources(join(dir, "bad.json")), {});
+    mkdirSync(join(dir, "folder.json"));
+    assert.equal(readSources(join(dir, "folder.json")), null);
+  });
+
   it("does not re-read an unchanged log with no credits line after the window", () => {
     const dir = tempDir(join(tmpdir(), "csb-week-"));
     const logPath = join(dir, "unified.jsonl");
@@ -363,19 +387,38 @@ describe("billingLogPath", () => {
     }
   };
 
-  it("resolves a relative setting, since the path is the cache key", () => {
+  it("ignores a relative setting, which would point inside the open repository", () => {
     try {
+      delete process.env.CSB_BILLING_LOG;
+      delete process.env.GROK_HOME;
+      const fallback = billingLogPath();
+      assert.equal(isAbsolute(fallback), true);
       process.env.CSB_BILLING_LOG = join("rel", "unified.jsonl");
-      assert.equal(billingLogPath(), resolve("rel", "unified.jsonl"));
+      assert.equal(billingLogPath(), fallback);
       delete process.env.CSB_BILLING_LOG;
       process.env.GROK_HOME = "relhome";
-      assert.equal(billingLogPath(), resolve("relhome", "logs", "unified.jsonl"));
-      delete process.env.GROK_HOME;
-      assert.equal(isAbsolute(billingLogPath()), true);
+      assert.equal(billingLogPath(), fallback);
+      const abs = join(tmpdir(), "grok-home");
+      process.env.GROK_HOME = abs;
+      assert.equal(billingLogPath(), join(abs, "logs", "unified.jsonl"));
       process.env.CSB_BILLING_LOG = "";
       assert.equal(billingLogPath(), null);
     } finally {
       restore();
+    }
+  });
+
+  it("ignores a relative cache setting", () => {
+    const keepCache = process.env.CSB_USAGE_CACHE;
+    try {
+      delete process.env.CSB_USAGE_CACHE;
+      const fallback = usageCachePath();
+      assert.equal(isAbsolute(fallback), true);
+      process.env.CSB_USAGE_CACHE = join("rel", "usage.json");
+      assert.equal(usageCachePath(), fallback);
+    } finally {
+      if (keepCache === undefined) delete process.env.CSB_USAGE_CACHE;
+      else process.env.CSB_USAGE_CACHE = keepCache;
     }
   });
 });
