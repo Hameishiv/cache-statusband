@@ -1,7 +1,7 @@
 #Requires -Version 7.2
 [CmdletBinding()]
 param(
-  [string]$CodexHome = $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE ".codex" }),
+  [string]$CodexHome = $(if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $(if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }) ".codex" }),
   [string]$SeatFile,
   [switch]$SkipCliLink,
   [switch]$KeepExistingFooter
@@ -428,7 +428,7 @@ if ($PSBoundParameters.ContainsKey("SeatFile")) {
   if ([string]::IsNullOrWhiteSpace($SeatFile)) { throw "-SeatFile requires a non-empty path" }
   $expandedSeatFile = $SeatFile
   if ($expandedSeatFile -match '^~[\\/]') {
-    $expandedSeatFile = Join-Path $env:USERPROFILE $expandedSeatFile.Substring(2)
+    $expandedSeatFile = Join-Path $(if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }) $expandedSeatFile.Substring(2)
   }
   $expandedSeatFile = $PSCmdlet.GetUnresolvedProviderPathFromPSPath($expandedSeatFile)
   if (-not (Test-Path -LiteralPath $expandedSeatFile -PathType Leaf)) {

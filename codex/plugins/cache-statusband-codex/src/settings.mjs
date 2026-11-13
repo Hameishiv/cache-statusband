@@ -34,8 +34,9 @@ export async function usagePresentation(snapshot, {
     return { snapshot: rest, identity: null };
   }
   if (!identity) return { snapshot, identity: sanitizeEmail(snapshot?.accountEmail) };
-  // A snapshot that names no identity at all (an empty result from a busy or unwritable
-  // cache made before an identity was known) is not a different account's.
+  // A snapshot with a null or missing identityKey now comes only from an "identity-unavailable"
+  // result (no verified account, so no reading was looked up); every other empty result names
+  // its account. It names no other account either, so it is not "a different account's".
   if (!identity.unavailable && snapshot && (snapshot.identityKey === null || snapshot.identityKey === undefined || snapshot.identityKey === identity.key)) return { snapshot, identity: identity.label };
   return {
     identity: identity.label,
