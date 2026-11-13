@@ -876,6 +876,65 @@ test("a turn_context that names an effort but no valid model names neither, and 
   assert.equal(largeSummary.effort, "low");
 });
 
+test("a turn_context that names no model leaves the folder alone too, wherever it sits in the file", async (t) => {
+  const root = await fixtureRoot(t);
+  const line = (value) => `${JSON.stringify(value)}
+`;
+  const filler = (count) => line({ type: "response_item", payload: { type: "message", content: "x".repeat(2048) } }).repeat(count);
+  const context = (payload, hour = 12) => ({ timestamp: `2026-10-29T${hour}:01:00.000Z`, type: "turn_context", payload });
+  const first = context({ cwd: "/workspace/A", model: "model-A", effort: "low" });
+  const odd = context({ cwd: "/workspace/B", effort: "high" }, 13);
+  const tokens = FIXTURE.at(-1);
+
+  // Small file: {model A, cwd A} then {effort only, cwd B}: the folder stays A.
+  const small = join(root, "small.jsonl");
+  await writeFile(small, line(FIXTURE[0]) + line(first) + line(odd), "utf8");
+  const smallSummary = await parseRollout(small);
+  assert.equal(smallSummary.cwd, "/workspace/A");
+  assert.equal(smallSummary.model, "model-A");
+  assert.equal(smallSummary.effort, "low");
+
+  // Large file, the model-less record in the tail, nothing naming a model within reach: the model
+  // is unknown and the folder is the session's own (session_meta), never the odd record's.
+  const tail = join(root, "tail.jsonl");
+  await writeFile(tail, line(FIXTURE[0]) + line(first) + filler(2600) + line(odd) + filler(100) + line(tokens), "utf8");
+  assert.ok((await stat(tail)).size > 3_407_872);
+  const tailSummary = await parseRollout(tail);
+  assert.equal(tailSummary.model, null);
+  assert.equal(tailSummary.effort, null);
+  assert.equal(tailSummary.cwd, "/workspace/example");
+
+  // Large file, the model-less record in the tail, the look-back reaching the head: the head's turn.
+  const reach = join(root, "reach.jsonl");
+  await writeFile(reach, line(FIXTURE[0]) + line(first) + filler(600) + line(odd) + filler(600) + line(tokens), "utf8");
+  const reachSize = (await stat(reach)).size;
+  assert.ok(reachSize > 256 * 1024 + 2 * 1024 * 1024 && reachSize <= 3_407_872);
+  const reachSummary = await parseRollout(reach);
+  assert.equal(reachSummary.cwd, "/workspace/A");
+  assert.equal(reachSummary.model, "model-A");
+  assert.equal(reachSummary.effort, "low");
+
+  // The model-less record in the head window, after the first turn: it changes nothing.
+  const head = join(root, "head.jsonl");
+  await writeFile(head, line(FIXTURE[0]) + line(first) + line(odd) + filler(1200) + line(tokens), "utf8");
+  assert.ok((await stat(head)).size > 256 * 1024 + 2 * 1024 * 1024);
+  const headSummary = await parseRollout(head);
+  assert.equal(headSummary.cwd, "/workspace/A");
+  assert.equal(headSummary.model, "model-A");
+  assert.equal(headSummary.effort, "low");
+
+  // A model-bearing record in an earlier look-back chunk, a model-less one after it (also in the
+  // look-back): the look-back passes over the model-less one and returns the earlier turn.
+  const back = join(root, "back.jsonl");
+  const later = context({ cwd: "/workspace/B2", model: "model-B", effort: "high" }, 14);
+  await writeFile(back, line(FIXTURE[0]) + line(first) + filler(300) + line(later) + filler(300) + line(odd) + filler(50) + filler(1000) + line(tokens), "utf8");
+  assert.ok((await stat(back)).size > 256 * 1024 + 2 * 1024 * 1024);
+  const backSummary = await parseRollout(back);
+  assert.equal(backSummary.cwd, "/workspace/B2");
+  assert.equal(backSummary.model, "model-B");
+  assert.equal(backSummary.effort, "high");
+});
+
 test("rate limits are reduced to numeric primary/secondary window fields", async (t) => {
   const root = await fixtureRoot(t);
   const path = join(root, "limits.jsonl");

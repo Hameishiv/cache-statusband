@@ -3,7 +3,7 @@ import { basename, join, resolve, sep } from "node:path";
 
 const HEAD_BYTES = 256 * 1024;
 const TAIL_BYTES = 2 * 1024 * 1024;
-// How far back past the tail we look for the session's latest turn_context when the tail has none.
+// How far back past the tail we look for the session's latest turn record that names a model when the tail has none.
 const CONTEXT_CHUNK_BYTES = 256 * 1024;
 const CONTEXT_CHUNKS = 4;
 // The look-back's last chunk reaches this far below the head window, so a turn_context line
@@ -63,7 +63,7 @@ export async function parseRollout(path) {
     }
   }
   if (edges.truncated && !tailHasContext) {
-    // The tail window did not include a turn_context. Look in the stretch just before it; if
+    // The tail window did not include a turn record that names a model. Look in the stretch just before it; if
     // that stretch reaches the head, the head's context is the latest there is. Otherwise the
     // model and effort are unknown, which is better than showing a first-turn value.
     const found = await edges.findEarlierContext();
@@ -125,11 +125,12 @@ function consume(item, summary, fromHead = false) {
   }
 
   if (item?.type === "turn_context" && payload) {
-    summary.cwd = text(payload.cwd) ?? summary.cwd;
-    // A turn record that names no valid model is treated as naming neither model nor effort:
-    // an effort with no model would pair a new effort with an old (or unknown) model, so the
-    // earlier pair stands. A record that names a model sets both from itself alone.
+    // A turn record that names no valid model is ignored altogether: an effort with no model
+    // would pair a new effort with an old (or unknown) model, and its folder would pair a new
+    // folder with the earlier model, so the earlier turn stands. A record that names a model
+    // sets folder, model and effort from itself alone.
     if (namesModel(payload)) {
+      summary.cwd = text(payload.cwd) ?? summary.cwd;
       summary.model = text(payload.model);
       summary.effort = text(payload.effort) ?? text(payload.reasoning_effort);
     }
@@ -213,7 +214,7 @@ async function readEdges(path, size) {
 // Reads fixed-size chunks backwards from just before the tail window, down to a little below
 // the head window's end (HEAD_OVERLAP_BYTES) -- a chunk that starts within the head window
 // itself is extended to that floor and counts as reaching the head -- and returns { payload } for the latest
-// turn_context found, { reachedHead: true } if the chunks ran all the way back to the head
+// turn record that names a model found, { reachedHead: true } if the chunks ran all the way back to the head
 // without finding one, or null.
 async function findEarlierContext(path, size) {
   const handle = await open(path, "r");

@@ -113,9 +113,10 @@ export async function saveSessionState(codexHome, sessionId, summary, savedAt = 
   try {
     const previous = await loadSessionState(codexHome, sessionId);
     if (previous && timestamp(previous.contextAt) > timestamp(state.contextAt)) return false;
-    // One rule for the kept model: a report that names neither model nor effort (a rollout
-    // whose latest turn is out of reach) does not erase what was saved before. A report that
-    // names either one replaces both, so a new model is never paired with an old effort.
+    // One rule for the kept pair: a report that names neither model nor effort (a rollout
+    // whose latest turn is out of reach; a turn record counts only if it names a model, so a
+    // rollout never reports an effort alone) does not erase what was saved before. A report
+    // that names a model replaces both, so a new model is never paired with an old effort.
     if (previous && state.model === null && state.effort === null) {
       state.model = safeText(previous.model);
       state.effort = safeText(previous.effort);
