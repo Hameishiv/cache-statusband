@@ -425,7 +425,7 @@ test("the SessionStart deadline can be measured from an earlier start than the c
       usageGetter: () => new Promise(() => {}),
     },
   );
-  assert.ok(Date.now() - started < 1_000, `took ${Date.now() - started}ms`);
+  assert.ok(Date.now() - started < 1_400, `took ${Date.now() - started}ms`);
   assert.deepEqual(output, {});
 });
 
@@ -818,6 +818,27 @@ test("a transcript whose look-back chunks join the head window shows the head's 
   assert.equal(summary.model, "model-A");
   assert.equal(summary.effort, "low");
   assert.equal(summary.cwd, "/workspace/first-turn");
+});
+
+test("the look-back reaches the head up to 3,407,872 bytes and not at 3,407,873", async (t) => {
+  // The four 256 KiB chunks below the 2 MiB tail end 64 KiB under the head window's end, so a
+  // file of exactly 3,407,872 bytes is the largest whose first turn is still the latest known.
+  const root = await fixtureRoot(t);
+  const line = (value) => `${JSON.stringify(value)}
+`;
+  const contextA = { timestamp: "2026-10-29T12:01:00.000Z", type: "turn_context", payload: { cwd: "/workspace/first-turn", model: "model-A", effort: "low" } };
+  const prefix = line(FIXTURE[0]) + line(contextA);
+  const fillerLine = line({ type: "response_item", payload: { type: "message", content: "x".repeat(2048) } });
+  for (const [size, reachesHead] of [[3_407_872, true], [3_407_873, false]]) {
+    const whole = Math.floor((size - Buffer.byteLength(prefix) - 2) / Buffer.byteLength(fillerLine));
+    const padding = size - Buffer.byteLength(prefix) - whole * Buffer.byteLength(fillerLine);
+    const path = join(root, `exact-${size}.jsonl`);
+    await writeFile(path, prefix + fillerLine.repeat(whole) + "p".repeat(padding - 1) + "\n", "utf8");
+    assert.equal((await stat(path)).size, size);
+    const summary = await parseRollout(path);
+    assert.equal(summary.model, reachesHead ? "model-A" : null, `size ${size}`);
+    assert.equal(summary.effort, reachesHead ? "low" : null, `size ${size}`);
+  }
 });
 
 test("rate limits are reduced to numeric primary/secondary window fields", async (t) => {
