@@ -16,13 +16,13 @@ Grok Build 1.0.70 can run a script as the bottom row (`[ui.status_line]` `type =
 | --- | --- |
 | Model, effort, context size, session cost | Shown when Grok puts them on the status-line payload. |
 | Cache token counts (`cache read`, `write`) | Shown when `session_usage` includes them. These are cumulative counts, not a warm/cold flag. |
-| Warm/cold cache, keep-warm pings, cold-send warning | Not ported. xAI prompt caching is automatic. Cache entries can be evicted at any time. There is no 5-minute or 1-hour lifetime you pay to rewrite, so there is nothing to keep warm and nothing to warn is cold. |
-| Weekly usage and reset countdown | Shown when Grok's log has a current weekly credits reading: `creditUsagePercent` and a period whose type is weekly and whose end is still in the future. `/usage` shows this percentage. The status-line payload does not include it, so the script reads the last `billing: fetched credits config` line Grok wrote and keeps only the percent, period type, period end, and fetch time. |
+| Warm/cold cache, keep-warm pings, cold-send guard | Not ported. xAI prompt caching is automatic. Cache entries can be evicted at any time. There is no 5-minute or 1-hour lifetime you pay to rewrite, so there is nothing to keep warm and nothing to compact before a cold send. |
+| Weekly usage and reset countdown | Shown when Grok's log has a current weekly credits reading: `creditUsagePercent` and a period whose type is weekly and whose end is still in the future. `/usage` shows this percentage. The status-line payload does not include it, so the script reads the newest `billing: fetched credits config` line Grok wrote and keeps only the percent, period type, period end, and fetch time. Grok logs that line only when you run `/usage`, so the figure updates only then. Once the reading is an hour old the band shows its age, for example `Week 24% (read 16h00m ago) · 3d10h`. |
 | 5-hour usage | Not ported. The credits reading this script understands is the weekly period `/usage` shows. There is no 5-hour window in that reading. |
 | Context measured from a reopened transcript | Not ported. The line uses `context_window.context_tokens` when Grok sends it. It does not parse the transcript. |
 | `/board` of every local session | Not ported. Grok already lists sessions with `grok sessions list` and `/dashboard`. |
 
-The script never reads, prints, or stores an auth token. It does not call a usage endpoint. A re-read of the local log waits at least five minutes, shared through `%LOCALAPPDATA%\cache-statusband-grok\usage.json`. A reset that has already passed drops the weekly segment until Grok logs a new one.
+The script never reads, prints, or stores an auth token. It does not call a usage endpoint. Each log is re-read at most once every five minutes, even when it has no credits line, and the result is kept per log in `cache-statusband-grok/usage.json` (under `%LOCALAPPDATA%` on Windows, under `$XDG_CACHE_HOME` or `~/.cache` elsewhere). If the newest credits line cannot be used, no weekly segment is shown. A reset that has already passed drops the weekly segment until Grok logs a new one.
 
 ## Credits
 
@@ -34,7 +34,7 @@ The Claude Code mod this is ported from, and the two projects it is built on, ar
 
 ## Install
 
-Requires Node.js on `PATH` (tested on Node v24.16.0) and Grok Build with the status-line command (this port was checked against `grok 1.0.70`).
+Requires Node.js on `PATH` (tested on Node v24.16.0; the tests need Node 20.11 or later, because they use `import.meta.dirname`) and Grok Build with the status-line command (this port was checked against `grok 1.0.70`).
 
 Add this to `~/.grok/config.toml`. A repository config cannot set the row. Leave any existing keys in that file as they are. If `[ui.status_line]` is already there, this replaces that table only. `command` is the full path to `statusline.cmd` in your clone.
 
@@ -45,9 +45,9 @@ command = "C:/path/to/cache-statusband/grok/statusline.cmd"
 refresh_interval = 300
 ```
 
-The command is the `.cmd` file alone. On Windows, a command string that joins `node` and a `C:/...` path is one filename, and starting it fails with `os error 123`. `statusline.cmd` runs Node and forwards the payload. Node still has to be on `PATH`.
+The command is the `.cmd` file alone. With grok 1.0.70 on Windows, a command string that joins `node` and a `C:/...` path is one filename, and starting it fails with `os error 123`. `statusline.cmd` runs Node and forwards the payload. Node still has to be on `PATH`.
 
-`refresh_interval` re-runs the script while the session is idle, so the countdown moves and a newer credits line can show up. That run reads the local log. It does not call the network. Restart Grok after editing `config.toml`. The row is hidden on the welcome screen and while a subagent is full screen.
+`refresh_interval` re-runs the script while the session is idle, so the countdown moves, and a newer credits line shows up once you run `/usage` (the percent does not refresh on its own). That run reads the local log. It does not call the network. Restart Grok after editing `config.toml`. The row is hidden on the welcome screen and while a subagent is full screen.
 
 To turn the row off later, set `type = "disabled"` and restart.
 
