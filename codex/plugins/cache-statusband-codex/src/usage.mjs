@@ -5,9 +5,12 @@ import { readFile, unlink, writeFile } from "node:fs/promises";
 import { delimiter, dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { makeFolder, renameWithRetry } from "./atomic.mjs";
+import { retryAfterMilliseconds } from "./retry-after.mjs";
 import { acquireLock } from "./lock.mjs";
 import { hasControl, stripControls } from "./sanitize.mjs";
 import { configuredSeatIdentity } from "./settings.mjs";
+
+export { retryAfterMilliseconds };
 
 const CACHE_VERSION = 3;
 export const MIN_POLL_INTERVAL_MS = 5 * 60 * 1000;
@@ -564,84 +567,6 @@ export function sanitizeRateLimits(raw) {
   };
 }
 
-export function retryAfterMilliseconds(error, now = Date.now()) {
-  const data = error?.rpcData ?? error?.data ?? null;
-  const candidates = [];
-  if (data && typeof data === "object") {
-    walk(data, (key, value) => {
-      const normalized = key.toLowerCase().replaceAll("_", "").replaceAll("-", "");
-      if (normalized === "retryafterms" && Number.isFinite(Number(value))) candidates.push(Number(value));
-      if (normalized === "retryafter") {
-        if (Number.isFinite(Number(value))) candidates.push(Number(value) * 1000);
-        else {
-          const at = Date.parse(value);
-          if (Number.isFinite(at)) candidates.push(Math.max(0, at - now));
-        }
-      }
-      if (normalized === "retryat" || normalized === "retryatms") {
-        const numeric = Number(value);
-        if (Number.isFinite(numeric)) {
-          const timestamp = normalized === "retryatms" || numeric > 10_000_000_000 ? numeric : numeric * 1000;
-          candidates.push(Math.max(0, timestamp - now));
-        } else {
-          const at = Date.parse(value);
-          if (Number.isFinite(at)) candidates.push(Math.max(0, at - now));
-        }
-      }
-    });
-  }
-  const message = error?.rpcMessage ?? error?.message;
-  if (typeof message === "string") {
-    const stated = retryAfterFromMessage(message, now);
-    if (stated !== null) candidates.push(stated);
-  }
-  return candidates.length ? Math.max(...candidates.filter((value) => value >= 0)) : null;
-}
-
-// Words that may sit between "retry after" and the number ("retry after about 20 minutes",
-// "retry after: ~30s", 'Retry-After: "30"', "retry after (30s)", "retry after - 30s").
-const RETRY_FILLER = String.raw`(?:[\s:="'(~-]|(?:about|approximately|approx\.?|around|roughly|at\s+least|in)\b)*`;
-const RETRY_UNIT = String.raw`(ms|milliseconds?|secs?|seconds?|s|mins?|minutes?|m|hrs?|hours?|h)(?![a-z])`;
-// "retry after", optionally with a unit in the key name (retry_after_seconds, retry-after-ms).
-const RETRY_KEY = String.raw`retry[\s_-]*after(?:(?:[_-]+|\s+(?=ms\b|milliseconds?\b))(ms|milliseconds?|secs?|seconds?|mins?|minutes?|hrs?|hours?|s|m|h)\b)?`;
-const RETRY_ISO = String.raw`(\d{4}-\d{2}-\d{2})(?:[T ](\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?))?(Z|[+-]\d{2}:?\d{2})?`;
-const RETRY_NUMBER = String.raw`(\d+(?:\.\d+)?)`;
-// How far past "retry after" a number with a unit is looked for when none directly follows it.
-const RETRY_LOOKAHEAD_CHARS = 40;
-
-function unitScale(unit) {
-  const name = unit.toLowerCase();
-  return name.startsWith("ms") || name.startsWith("milli") ? 1
-    : name.startsWith("h") ? 3_600_000
-    : name.startsWith("m") ? 60_000
-    : 1000;
-}
-
-// The wait a message states for its own retry, in milliseconds, or null. A date is a moment
-// (a date-time with no zone is UTC, as a server's timestamps are), not a count. Otherwise the
-// number is read directly after "retry after" (past filler words, and with the unit taken from
-// the key name as in retry_after_seconds=30); failing that, the first number with a unit
-// within a short window after it ("retry after the window resets in 3 hours"). A number that
-// names a window ("the 5h window") is the window's length, not the wait.
-function retryAfterFromMessage(message, now) {
-  const iso = message.match(new RegExp(`${RETRY_KEY}${RETRY_FILLER}${RETRY_ISO}`, "i"));
-  if (iso) {
-    const [, , date, time, zone] = iso;
-    const at = Date.parse(time ? `${date}T${time}${zone ?? "Z"}` : `${date}${zone ?? ""}`);
-    return Number.isFinite(at) ? Math.max(0, at - now) : null;
-  }
-  const direct = message.match(new RegExp(`${RETRY_KEY}${RETRY_FILLER}${RETRY_NUMBER}(?:\\s*${RETRY_UNIT})?`, "i"));
-  if (direct) return Number(direct[2]) * unitScale(direct[3] ?? direct[1] ?? "s");
-  const key = message.match(new RegExp(RETRY_KEY, "i"));
-  if (!key) return null;
-  const start = key.index + key[0].length;
-  const after = message.slice(start, start + RETRY_LOOKAHEAD_CHARS);
-  for (const found of after.matchAll(new RegExp(`${RETRY_NUMBER}\\s*${RETRY_UNIT}(?!\\s+window)`, "gi"))) {
-    return Number(found[1]) * unitScale(found[2]);
-  }
-  return null;
-}
-
 function emptyCache() {
   return {
     version: CACHE_VERSION,
@@ -766,10 +691,3 @@ function safeEmail(value) {
   return !hasControl(text) && /^[^\s@]+@[^\s@]+$/.test(text) ? text.slice(0, 320) : null;
 }
 
-function walk(value, callback) {
-  if (!value || typeof value !== "object") return;
-  for (const [key, child] of Object.entries(value)) {
-    callback(key, child);
-    if (child && typeof child === "object") walk(child, callback);
-  }
-}

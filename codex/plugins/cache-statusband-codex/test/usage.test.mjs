@@ -626,6 +626,96 @@ test("retry-after wording in an error message: filler words, key suffixes, and a
   assert.equal(ms("retry after the 5h window"), null);
 });
 
+test("retry-after: one parser, and when the input is ambiguous the LONGEST wait it states", () => {
+  const now = Date.parse("2026-11-13T12:00:00.000Z");
+  const ms = (message) => retryAfterMilliseconds({ message }, now);
+  const rows = [
+    ["retry after 5 more minutes", 3e5],
+    ["retry after 10 more minutes", 6e5],
+    ["retry after 2 days", 1.728e8],
+    ["retry after 1 week", 6.048e8],
+    ["retry after 5 (minutes)", 3e5],
+    ["rate limited; retry after 5-hour window ends in 10m", 6e5],
+    ["retry after 1h30m", 5.4e6],
+    ["retry after 1 hour 30 minutes", 5.4e6],
+    ["retry after 1 hour and 30 minutes", 5.4e6],
+    ["retry after 2 min 30 s", 1.5e5],
+    ["retry after 1,500 ms", 1500],
+    ["retry after .5 s", 500],
+    ["retry after 1.5 hours", 5.4e6],
+    ["retry after the 5h limit resets in 3 hours", 1.08e7],
+    ["retry after the 5 hour quota resets in 20 minutes", 1.2e6],
+    // Two different waits in one clause: the longer one.
+    ["retry after 30s or in 10 minutes", 6e5],
+    ["retry after 5-10 minutes", 6e5],
+    // A bare number is seconds only when no number with a unit is stated.
+    ["retry after 90", 9e4],
+    ["retry after 30 (attempt 3 of 5)", 3e4],
+    ["retry after 30s (attempt 300)", 3e4],
+    // Clock times and window names are not waits.
+    ["retry after 12:30", null],
+    ["retry after the 5-hour window", null],
+    ["retry after the 5 hour window", null],
+    // A moment: ISO with a zone, ISO with none (UTC), a zone after a space, an HTTP-date.
+    ["retry after 2026-11-13T12:20:00Z", 1.2e6],
+    ["retry after 2026-11-13T14:20:00+02:00", 1.2e6],
+    ["retry after 2026-11-13 14:20:00 +02:00", 1.2e6],
+    ["retry after 2026-11-13 14:20:00 +0200", 1.2e6],
+    ["retry after 2026-11-13T12:20:00", 1.2e6],
+    ["Retry-After: Fri, 13 Nov 2026 12:30:00 GMT", 1.8e6],
+    ["retry after Fri, 13 Nov 2026 12:30:00", 1.8e6],
+    // A moment already past is 0, never negative.
+    ["retry after 2026-11-13T11:00:00Z", 0],
+    ["Retry-After: Fri, 13 Nov 2026 11:00:00 GMT", 0],
+    // A moment and a count: the longer.
+    ["retry after 2026-11-13T12:05:00Z or in 20 minutes", 1.2e6],
+    ["retry after 2026-11-13T12:40:00Z or in 20 minutes", 2.4e6],
+    // Several mentions: the longest.
+    ["retry after 30s. Later: retry-after 2 minutes", 1.2e5],
+    ["retry at your convenience", null],
+    ["retry attempt 5 failed", null],
+  ];
+  for (const [message, expected] of rows) assert.equal(ms(message), expected, message);
+  assert.equal(ms("retry after 9".concat("9".repeat(400))), Number.MAX_SAFE_INTEGER);
+});
+
+test("retry-after in structured error data: keys with unit suffixes in any case, and moments as strings", () => {
+  const now = Date.parse("2026-11-13T12:00:00.000Z");
+  const data = (rpcData) => retryAfterMilliseconds({ rpcData }, now);
+  const rows = [
+    [{ retry_after_seconds: 1800 }, 1.8e6],
+    [{ retryAfterSeconds: 1800 }, 1.8e6],
+    [{ retry_after_secs: 30 }, 3e4],
+    [{ "retry-after-ms": 250 }, 250],
+    [{ retryAfterMs: 45_000 }, 45_000],
+    [{ retry_after_minutes: 5 }, 3e5],
+    [{ retryAfterHours: 2 }, 7.2e6],
+    [{ retry_after: 900 }, 9e5],
+    [{ retry_after: "900" }, 9e5],
+    [{ retry_after: "5 minutes" }, 3e5],
+    [{ retry_after: "1h30m" }, 5.4e6],
+    [{ retry_after: "2026-11-13T12:20:00Z" }, 1.2e6],
+    [{ retry_after: "2026-11-13T12:20:00" }, 1.2e6],
+    [{ retry_after: "2026-11-13 14:20:00 +02:00" }, 1.2e6],
+    [{ retryAfter: "Fri, 13 Nov 2026 12:30:00 GMT" }, 1.8e6],
+    [{ retry_at: "2026-11-13T12:20:00Z" }, 1.2e6],
+    [{ retry_at: Date.parse("2026-11-13T12:10:00Z") / 1000 }, 6e5],
+    [{ retry_at: Date.parse("2026-11-13T12:10:00Z") }, 6e5],
+    [{ retry_at_ms: Date.parse("2026-11-13T12:10:00Z") }, 6e5],
+    [{ retry_after: -5 }, 0],
+    [{ error: { details: [{ retryAfterSeconds: 120 }] } }, 1.2e5],
+    // Two keys: the longer.
+    [{ retry_after: 60, retryAfterSeconds: 600 }, 6e5],
+    [{ retry_after: "" }, null],
+    [{ retry_after: null }, null],
+    [{ retry_after: {} }, null],
+    [{ unrelated: 5 }, null],
+  ];
+  for (const [rpcData, expected] of rows) assert.equal(data(rpcData), expected, JSON.stringify(rpcData));
+  // Data and message together: the longer.
+  assert.equal(retryAfterMilliseconds({ rpcData: { retry_after: 60 }, message: "retry after 10 minutes" }, now), 6e5);
+});
+
 test("a message-stated wait of hours is capped at one hour by the caller", async (t) => {
   const root = await fixtureRoot(t);
   const now = Date.parse("2026-10-29T12:00:00.000Z");
