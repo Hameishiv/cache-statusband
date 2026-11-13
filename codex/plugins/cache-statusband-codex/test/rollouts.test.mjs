@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmod, mkdtemp, mkdir, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, mkdir, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { execFile } from "node:child_process";
 import { dirname, join } from "node:path";
@@ -679,7 +679,7 @@ test("a truncated rollout shows the latest turn_context it can find, or none, ne
   const root = await fixtureRoot(t);
   const line = (value) => `${JSON.stringify(value)}\n`;
   const filler = (count) => line({ type: "response_item", payload: { type: "message", content: "x".repeat(2048) } }).repeat(count);
-  const contextA = { timestamp: "2026-10-29T12:01:00.000Z", type: "turn_context", payload: { cwd: "/workspace/example", model: "model-A", effort: "low" } };
+  const contextA = { timestamp: "2026-10-29T12:01:00.000Z", type: "turn_context", payload: { cwd: "/workspace/first-turn", model: "model-A", effort: "low" } };
   const contextB = { timestamp: "2026-10-29T13:01:00.000Z", type: "turn_context", payload: { cwd: "/workspace/later", model: "model-B", effort: "high" } };
   const tokens = FIXTURE.at(-1);
 
@@ -698,8 +698,28 @@ test("a truncated rollout shows the latest turn_context it can find, or none, ne
   const farSummary = await parseRollout(far);
   assert.equal(farSummary.model, null);
   assert.equal(farSummary.effort, null);
+  // The first turn's directory is not paired with the unknown model: the session's own
+  // starting directory (session_meta) is kept.
+  assert.equal(farSummary.cwd, "/workspace/example");
   assert.equal(farSummary.id, "session-1");
   assert.equal(farSummary.contextUsed, 25000);
+
+  // B crosses the head window's cut-off (byte 262144): it is whole in neither the head nor the
+  // look-back above the head, but it is still the latest turn and is shown.
+  const straddle = join(root, "straddle.jsonl");
+  const HEAD = 256 * 1024;
+  const prefix = line(FIXTURE[0]) + line(contextA);
+  const blank = Buffer.byteLength(line({ type: "response_item", payload: { type: "message", content: "" } }));
+  const pad = line({ type: "response_item", payload: { type: "message", content: "p".repeat(HEAD - 60 - Buffer.byteLength(prefix) - blank) } });
+  const before = Buffer.byteLength(prefix + pad);
+  assert.ok(before < HEAD && before + Buffer.byteLength(line(contextB)) > HEAD, "contextB must cross the head cut-off");
+  await writeFile(straddle, prefix + pad + line(contextB) + filler(1100) + line(tokens), "utf8");
+  assert.ok((await stat(straddle)).size > 256 * 1024 + 2 * 1024 * 1024);
+  const straddleSummary = await parseRollout(straddle);
+  assert.equal(straddleSummary.model, "model-B");
+  assert.equal(straddleSummary.effort, "high");
+  assert.equal(straddleSummary.cwd, "/workspace/later");
+  assert.equal(straddleSummary.contextUsed, 25000);
 });
 
 test("rate limits are reduced to numeric primary/secondary window fields", async (t) => {

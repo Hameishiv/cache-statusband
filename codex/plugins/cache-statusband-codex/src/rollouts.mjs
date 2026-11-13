@@ -6,6 +6,10 @@ const TAIL_BYTES = 2 * 1024 * 1024;
 // How far back past the tail we look for the session's latest turn_context when the tail has none.
 const CONTEXT_CHUNK_BYTES = 256 * 1024;
 const CONTEXT_CHUNKS = 4;
+// The look-back's last chunk reaches this far below the head window, so a turn_context line
+// that crosses the head's cut-off (and so is whole in neither the head nor the chunks above
+// it) is still seen. A line longer than this that crosses the cut is not.
+const HEAD_OVERLAP_BYTES = 64 * 1024;
 
 export function defaultCodexHome(env = process.env) {
   if (env.CODEX_HOME) return resolve(env.CODEX_HOME);
@@ -33,10 +37,11 @@ export async function parseRollout(path) {
     rateLimits: null,
   };
 
-  // The head of a truncated file only says who/where the session is; its timestamps
-  // and token counts are old news and must not outrank the tail.
-  // On a truncated file the head's model and effort may be many turns out of date, so they
-  // are held back and used only if nothing later is found (see below).
+  // The head of a truncated file only says who the session is and where it started (its
+  // session_meta); its timestamps and token counts are old news and must not outrank the tail.
+  // A turn_context in the head is held back whole, model, effort and cwd alike, because it may
+  // be many turns out of date: it is used only if the look-back reaches the head without
+  // finding anything later (see below), and never lends its cwd to an unknown model.
   let headContext = null;
   let tailHasContext = false;
   for (const [chunk, fromHead] of [[edges.head, true], [edges.tail, false]]) {
@@ -51,7 +56,6 @@ export async function parseRollout(path) {
       }
       if (fromHead && item?.type === "turn_context" && item.payload) {
         headContext = item.payload;
-        summary.cwd = text(item.payload.cwd) ?? summary.cwd;
         continue;
       }
       if (!fromHead && item?.type === "turn_context" && item.payload) tailHasContext = true;
@@ -68,6 +72,7 @@ export async function parseRollout(path) {
       summary.model = text(found.payload.model) ?? summary.model;
       summary.effort = text(found.payload.effort) ?? text(found.payload.reasoning_effort) ?? summary.effort;
     } else if (found?.reachedHead && headContext) {
+      summary.cwd = text(headContext.cwd) ?? summary.cwd;
       summary.model = text(headContext.model) ?? summary.model;
       summary.effort = text(headContext.effort) ?? text(headContext.reasoning_effort) ?? summary.effort;
     }
@@ -196,9 +201,10 @@ async function readEdges(path, size) {
   }
 }
 
-// Reads fixed-size chunks backwards from just before the tail window (never into the head
-// window) and returns { payload } for the latest turn_context found, { reachedHead: true }
-// if the chunks ran all the way back to the head window without finding one, or null.
+// Reads fixed-size chunks backwards from just before the tail window, down to a little below
+// the head window's end (HEAD_OVERLAP_BYTES), and returns { payload } for the latest
+// turn_context found, { reachedHead: true } if the chunks ran all the way back to the head
+// without finding one, or null.
 async function findEarlierContext(path, size) {
   const handle = await open(path, "r");
   try {
@@ -209,8 +215,9 @@ async function findEarlierContext(path, size) {
     await handle.read(probe, 0, probe.length, end);
     const probeNewline = probe.indexOf(0x0a);
     let carry = probeNewline >= 0 ? probe.subarray(0, probeNewline) : probe;
+    const floor = Math.max(0, HEAD_BYTES - HEAD_OVERLAP_BYTES);
     for (let i = 0; i < CONTEXT_CHUNKS; i += 1) {
-      const start = Math.max(HEAD_BYTES, end - CONTEXT_CHUNK_BYTES);
+      const start = Math.max(floor, end - CONTEXT_CHUNK_BYTES);
       if (start >= end) return { reachedHead: true };
       const chunk = Buffer.alloc(end - start);
       await handle.read(chunk, 0, chunk.length, start);
@@ -231,7 +238,7 @@ async function findEarlierContext(path, size) {
       }
       carry = firstNewline >= 0 ? whole.subarray(0, firstNewline) : whole;
       end = start;
-      if (start <= HEAD_BYTES) return { reachedHead: true };
+      if (start <= floor) return { reachedHead: true };
     }
     return null;
   } finally {
