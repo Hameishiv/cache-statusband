@@ -260,10 +260,6 @@ export function render(payload, extras) {
   return parts.map((part, i) => paint(part.label, part.kind, i, parts[i + 1]?.kind)).join("");
 }
 
-/**
- * A path setting, or null when it is unset or relative. The script runs in the
- * repository Grok has open, so a relative path would point inside it.
- */
 /** The home folder, or null when it is unknown or relative (it would point inside the open repository). */
 function homeDir() {
   try {
@@ -274,6 +270,10 @@ function homeDir() {
   }
 }
 
+/**
+ * A path setting, or null when it is unset or relative. The script runs in the
+ * repository Grok has open, so a relative path would point inside it.
+ */
 function absoluteSetting(name) {
   const value = process.env[name];
   if (!value || !isAbsolute(value)) return null;
@@ -349,7 +349,9 @@ function billingRecord(line, finished = true) {
 
 /**
  * Last credits reading in the file, scanning at most `maxBytes` from the end.
- * The newest credits line decides: if it cannot be used, there is no reading.
+ * The newest finished credits line decides: if it cannot be parsed or used,
+ * there is no reading. Only an unfinished last line (Grok still writing it) is
+ * passed over.
  */
 export function readLastBilling(path, maxBytes = 4 * 1024 * 1024) {
   const found = scanBilling(path, maxBytes);
@@ -360,7 +362,8 @@ const READ_FAILED = Symbol("read failed");
 
 /**
  * READ_FAILED: the log could not be read. undefined: no credits line in range.
- * null: the newest credits line cannot be used. Otherwise the reading.
+ * null: the newest finished credits line cannot be parsed or used (an
+ * unfinished last line is passed over). Otherwise the reading.
  */
 function scanBilling(path, maxBytes = 4 * 1024 * 1024) {
   // opening a named pipe would wait for a writer: check before opening as well as after
@@ -382,6 +385,8 @@ function scanBilling(path, maxBytes = 4 * 1024 * 1024) {
     let offset = st.size;
     let pending = "";
     let readTotal = 0;
+    // until a newline is seen, the last piece of the text read is the end of the file
+    let sawNewline = false;
     const chunkSize = 256 * 1024;
     while (offset > 0 && readTotal < maxBytes) {
       const len = Math.min(chunkSize, offset, maxBytes - readTotal);
@@ -393,16 +398,13 @@ function scanBilling(path, maxBytes = 4 * 1024 * 1024) {
       const text = buf.toString("utf8") + pending;
       const lines = text.split("\n");
       pending = offset > 0 ? lines.shift() ?? "" : "";
-      // the last piece of the first chunk read is the end of the file: it has no newline after it
-      const tailIndex = readTotal === len ? lines.length - 1 : -1;
+      // the end-of-file piece has no newline after it, however many chunks it spans
+      const tailIndex = sawNewline ? -1 : lines.length - 1;
+      if (text.includes("\n")) sawNewline = true;
       for (let i = lines.length - 1; i >= 0; i--) {
         const found = billingRecord(lines[i].replace(/\r$/, ""), i !== tailIndex);
         if (found !== undefined) return found && { ...found, sourceMtimeMs: st.mtimeMs, sourceSize: st.size };
       }
-    }
-    if (offset === 0 && pending) {
-      const found = billingRecord(pending.replace(/\r$/, ""), true);
-      if (found !== undefined) return found && { ...found, sourceMtimeMs: st.mtimeMs, sourceSize: st.size };
     }
     return undefined;
   } catch {
@@ -501,7 +503,7 @@ export function loadWeekly(logPath, cachePath, nowMs = Date.now(), readCache = r
   if (!st) return prior;
   if (entry && entry.sourceMtimeMs === st.mtimeMs && entry.sourceSize === st.size) return prior;
 
-  // no credits line keeps the last reading; an unusable newest line shows none
+  // no credits line keeps the last reading; an unusable or broken newest finished line shows none
   const found = scanBilling(logPath);
   // a failed read says nothing about the log: keep the reading and try again next run
   if (found === READ_FAILED) return prior;

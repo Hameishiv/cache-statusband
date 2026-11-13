@@ -572,6 +572,11 @@ describe("readLastBilling", () => {
     assert.equal(readLastBilling(log(`${credits(24)}\n${partial}`)).percent, 24);
   });
 
+  it("passes over an unfinished last line longer than one read chunk", () => {
+    const partial = '{"ts":"2026-10-29T12:00:00Z","msg":"billing: fetched credits config","pad":"' + "x".repeat(300 * 1024);
+    assert.equal(readLastBilling(log(`${credits(24)}\n${partial}`)).percent, 24);
+  });
+
   it("does not take the weekly reset from the billing period", () => {
     const billingOnly = JSON.stringify({
       ts: "2026-10-29T12:00:00Z",
