@@ -174,7 +174,7 @@ if ($PSBoundParameters.ContainsKey("SeatFile")) {
   }
   $expandedSeatFile = $PSCmdlet.GetUnresolvedProviderPathFromPSPath($expandedSeatFile)
   if (-not (Test-Path -LiteralPath $expandedSeatFile -PathType Leaf)) {
-    Write-Warning "Seat label file does not exist yet: $expandedSeatFile (no seat is shown until it holds a label)"
+    Write-Warning "Seat label file does not exist yet: $expandedSeatFile (until it holds a label no account, email or usage is shown, and sessions started in the meantime never show usage)"
   }
 }
 
