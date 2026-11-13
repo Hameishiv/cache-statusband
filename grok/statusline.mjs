@@ -104,7 +104,9 @@ export function contextLabel(window) {
   if (!window || typeof window !== "object") return null;
   const pct = nonNegative(window.used_percentage);
   const used = nonNegative(window.context_tokens);
-  const size = nonNegative(window.context_window_size);
+  const rawSize = nonNegative(window.context_window_size);
+  // a window of zero tokens is not a known size
+  const size = rawSize ? rawSize : null;
   if (pct === null && used === null) return null;
   let label = "ctx";
   if (pct !== null) label += ` ${percentText(pct)}%`;
@@ -130,18 +132,17 @@ export function cacheLabel(usage) {
 export function costLabel(usd) {
   const v = nonNegative(usd);
   if (v === null) return null;
-  const abs = v;
-  if (abs === 0) return "session $0";
-  if (abs < 0.01) return "session <$0.01";
+  if (v === 0) return "session $0";
+  if (v < 0.01) return "session <$0.01";
   // compare the amount as it will print, so $9.999 shows as "$10", not "$10.00"
-  if (Math.round(abs * 100) < 1000) return `session $${v.toFixed(2)}`;
+  if (Math.round(v * 100) < 1000) return `session $${v.toFixed(2)}`;
   return `session $${v.toFixed(0)}`;
 }
 
 /**
  * Whole percents stay whole. A tenth is kept. Non-finite or negative input returns null.
- * Rounding never shows a figure the input is not: above 0 is never "0", below
- * 100 is never "100".
+ * Rounding never shows a figure the input is not: above 0 is never "0", and
+ * anything but 100 is never "100".
  */
 export function percentText(value) {
   const v = finite(value);
@@ -149,6 +150,7 @@ export function percentText(value) {
   const tenths = Math.round(v * 10) / 10;
   if (v > 0 && tenths === 0) return "<0.1";
   if (v < 100 && tenths === 100) return ">99.9";
+  if (v > 100 && tenths === 100) return ">100";
   return Number.isInteger(tenths) ? String(tenths) : tenths.toFixed(1);
 }
 
@@ -446,7 +448,8 @@ function storedRecord(entry) {
 
 /**
  * Per-log entries of the cache file, or null when the file exists but cannot
- * be read (locked, no permission, not a regular file). A missing file, unparseable text, or the old
+ * be read (locked, no permission, not a regular file) or is in a newer format
+ * (v above 2): it is then neither used nor rewritten. A missing file, unparseable text, or the old
  * single-entry format counts as empty.
  */
 export function readSources(cachePath) {
@@ -495,7 +498,8 @@ function writeSources(cachePath, sources) {
  * and only moves the next check. A re-read whose newest
  * credits line cannot be used drops it. A log that cannot be read keeps the
  * last good record and is tried again on the next run. A cache file that
- * exists but cannot be read is left as it is, and its entries are not used.
+ * exists but cannot be read, or is in a newer format, is left as it is, and
+ * its entries are not used.
  * The cache holds one entry per log: the log's size and time, when it was read,
  * and the percent, period type, period end, and fetch time.
  */

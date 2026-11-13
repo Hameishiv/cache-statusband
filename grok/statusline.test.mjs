@@ -116,6 +116,7 @@ describe("segments", () => {
     assert.equal(cacheLabel({ cache_read_input_tokens: -80000 }), null);
     assert.equal(contextLabel({ context_tokens: -1500, context_window_size: 1e6 }), null);
     assert.equal(contextLabel({ used_percentage: 29, context_tokens: -1500 }), "ctx 29%");
+    assert.equal(contextLabel({ context_tokens: 1500, context_window_size: 0 }), "ctx 1.5k");
   });
 
   it("does not invent rate limits, cache age, or a rewrite price", () => {
@@ -867,7 +868,8 @@ describe("percentText", () => {
     assert.equal(percentText(99.96), ">99.9");
     assert.equal(percentText(99.95), ">99.9");
     assert.equal(percentText(100), "100");
-    assert.equal(percentText(100.04), "100");
+    assert.equal(percentText(100.04), ">100");
+    assert.equal(percentText(100.05), "100.1");
     assert.equal(percentText(-0.04), null);
   });
 });
