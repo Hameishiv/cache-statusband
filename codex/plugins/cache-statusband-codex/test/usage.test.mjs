@@ -626,6 +626,53 @@ test("retry-after wording in an error message: filler words, key suffixes, and a
   assert.equal(ms("retry after the 5h window"), null);
 });
 
+test("the missing-home line carries the path with control characters removed", async (t) => {
+  const parent = await fixtureRoot(t);
+  const here = dirname(fileURLToPath(import.meta.url));
+  const bin = join(here, "..", "bin", "cache-statusband-codex.mjs");
+  const home = join(parent, "no-such\u001b[31m-home");
+  const { stderr } = await promisify(execFile)(process.execPath, [bin, "usage", "--codex-home", home], {
+    env: { ...process.env, CACHE_STATUSBAND_CODEX_SEAT_FILE: "" },
+    timeout: 20_000,
+  });
+  assert.doesNotMatch(stderr, /\u001b/);
+  assert.match(stderr, /usage not read: the Codex home .*no-such.*-home does not exist\n$/);
+});
+
+test("a seat that becomes configured but unreadable during the account read is flagged seatUnavailable", async (t) => {
+  const root = await fixtureRoot(t);
+  const seatFile = join(root, "seat.txt");
+  const account = { type: "chatgpt", email: TEST_EMAIL };
+
+  // No seat at the start, a seat whose file reads empty by the end: flagged (the CLI stays silent).
+  const env = {};
+  await writeFile(seatFile, "");
+  await assert.rejects(
+    captureUsageIdentity(root, { env, throwOnFailure: true, accountReader: async () => { env.CACHE_STATUSBAND_CODEX_SEAT_FILE = seatFile; return account; } }),
+    (error) => error.seatUnavailable === true && /seat changed during the account read/.test(error.message),
+  );
+  // ...and a seat that became available is a plain change, not flagged.
+  const env2 = {};
+  await writeFile(seatFile, "alpha");
+  await assert.rejects(
+    captureUsageIdentity(root, { env: env2, throwOnFailure: true, accountReader: async () => { env2.CACHE_STATUSBAND_CODEX_SEAT_FILE = seatFile; return account; } }),
+    (error) => error.seatUnavailable === undefined && /seat changed during the account read/.test(error.message),
+  );
+  // A configured seat whose file empties while the login is read twice: flagged.
+  const env3 = { CACHE_STATUSBAND_CODEX_SEAT_FILE: seatFile };
+  await writeFile(seatFile, "alpha");
+  await assert.rejects(
+    captureUsageIdentity(root, { env: env3, throwOnFailure: true, accountReader: async () => { await writeFile(seatFile, ""); return account; } }),
+    (error) => error.seatUnavailable === true,
+  );
+  // A seat that merely changed to another readable label is not flagged.
+  await writeFile(seatFile, "alpha");
+  await assert.rejects(
+    captureUsageIdentity(root, { env: env3, throwOnFailure: true, accountReader: async () => { await writeFile(seatFile, "beta"); return account; } }),
+    (error) => error.seatUnavailable === undefined && /seat changed/.test(error.message),
+  );
+});
+
 test("retry-after: one parser, and when the input is ambiguous the LONGEST wait it states", () => {
   const now = Date.parse("2026-11-13T12:00:00.000Z");
   const ms = (message) => retryAfterMilliseconds({ message }, now);
@@ -917,7 +964,7 @@ test("a Codex home that does not exist is never created by usage, board or the s
   await assert.rejects(saveSessionState(home, "missing-home-session", summary), { code: "ENOENT" });
   await stillMissing("saveSessionState");
 
-  // The CLI, with a fake app-server that signs in an account.
+  // The CLI, with a fake app-server that signs in an account (the CLI must not even ask it).
   const here = dirname(fileURLToPath(import.meta.url));
   const bin = join(here, "..", "bin", "cache-statusband-codex.mjs");
   const server = join(here, "..", "fixtures", "fake-app-server.mjs");
@@ -926,12 +973,17 @@ test("a Codex home that does not exist is never created by usage, board or the s
   await writeFile(wrapper, windows
     ? `@echo off\r\n"${process.execPath}" "${server}" %*\r\n`
     : `#!/bin/sh\nexec "${process.execPath}" "${server}" "$@"\n`, { mode: 0o755 });
+  const requestLog = join(parent, "requests.log");
   for (const args of [["usage"], ["usage", "--json"], ["board"], ["board", "--json"]]) {
     const { stdout, stderr } = await promisify(execFile)(process.execPath, [bin, ...args, "--codex-home", home], {
-      env: { ...process.env, CODEX_BIN: wrapper, CACHE_STATUSBAND_CODEX_SEAT_FILE: "" },
+      env: { ...process.env, CODEX_BIN: wrapper, CACHE_STATUSBAND_CODEX_SEAT_FILE: "", FAKE_SERVER_LOG: requestLog },
       timeout: 20_000,
     });
-    assert.match(stderr, /cannot update the cache/, `${args.join(" ")}: ${stderr}`);
+    await assert.rejects(access(requestLog), `${args.join(" ")}: the app-server was asked something`);
+    // One line says the home is missing (the app-server is never started for it), and nothing
+    // says the cache cannot be updated.
+    assert.equal(stderr, `cache-statusband-codex: usage not read: the Codex home ${home} does not exist
+`, `${args.join(" ")}: ${stderr}`);
     assert.ok(stdout.length > 0);
     await stillMissing(`cache-statusband-codex ${args.join(" ")}`);
   }

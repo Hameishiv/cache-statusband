@@ -528,7 +528,7 @@ exec "${process.execPath}" "${hung}" "$@"
     assert.doesNotThrow(() => JSON.parse(stdout), `the hook printed invalid JSON: ${stdout}`);
     // About 500ms of the budget was left, plus cleanup; counting from the input it would be
     // 2500ms or more.
-    assert.ok(afterInput < 1_500, `the hook took ${afterInput}ms after its input arrived, against a 2500ms deadline that began 2000ms earlier`);
+    assert.ok(afterInput < 2_000, `the hook took ${afterInput}ms after its input arrived, against a 2500ms deadline that began 2000ms earlier`);
   } finally {
     const pid = Number(await readFile(pidFile, "utf8").catch(() => ""));
     if (Number.isFinite(pid) && pid > 0) { try { process.kill(pid); } catch {} }

@@ -180,7 +180,11 @@ export async function captureUsageIdentity(codexHome, {
     }
     const email = safeEmail(account?.email);
     const seatAfter = await configuredSeatIdentity(codexHome, env);
-    if (seatAfter?.key !== undefined) return fail("The seat changed during the account read");
+    // A seat that became configured during the read. If it is configured but unreadable the CLI
+    // stays silent about it, as for any unavailable seat.
+    if (seatAfter?.key !== undefined) {
+      return fail("The seat changed during the account read", seatAfter.unavailable ? { seatUnavailable: true } : {});
+    }
     // No signed-in account is a real answer (null), not a failure. A login with no usable
     // email (an API key, say) is a different answer: someone IS signed in, but usage is
     // read per ChatGPT account, so there is nothing to read it for.
@@ -193,7 +197,7 @@ export async function captureUsageIdentity(codexHome, {
   // was being confirmed. (A custom accountReader is called twice, as before.)
   const between = async (account) => {
     const seatAfter = await configuredSeatIdentity(codexHome, env);
-    if (seat.key !== seatAfter?.key) throw new Error("The seat changed during the account read");
+    if (seat.key !== seatAfter?.key) throw Object.assign(new Error("The seat changed during the account read"), seatAfter?.unavailable ? { seatUnavailable: true } : {});
     if (account == null) throw Object.assign(new Error("No account is signed in for the configured seat"), { signedOut: true });
     if (!safeEmail(account.email)) throw Object.assign(new Error("The signed-in Codex login has no ChatGPT account email"), noEmailFlags(account));
   };

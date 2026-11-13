@@ -101,6 +101,12 @@ async function usage(argv) {
 // the same as before). A configured seat that is unavailable stays silent: it is a deliberate
 // fail-closed state, not a fault.
 async function captureIdentityOrSay(home) {
+  // A Codex home that does not exist has no login to read, and is never created: say so before
+  // starting an app-server for it.
+  if (!existsSync(home)) {
+    if (!codexUnlaunchableSaid) say(`the Codex home ${stripControls(home)} does not exist`);
+    return null;
+  }
   try {
     const identity = await captureUsageIdentity(home, { throwOnFailure: true });
     if (!identity) say("no Codex account is signed in");
