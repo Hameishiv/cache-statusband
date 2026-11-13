@@ -645,13 +645,16 @@ exit /b 0
   New-Item -ItemType Directory -Path $swapFolder | Out-Null
   $swapTarget = Join-Path $swapFolder "target.json"
   [IO.File]::WriteAllText($swapTarget, "0")
-  $swapReader = Start-ThreadJob -ArgumentList $swapTarget -ScriptBlock {
-    param($path)
+  # The reader runs until the writer says it is finished (a safety deadline only stops a hang),
+  # and counts only the opens made while the replacements were running.
+  $swapState = [hashtable]::Synchronized(@{ Writing = $false; Done = $false })
+  $swapReader = Start-ThreadJob -ArgumentList $swapTarget, $swapState -ScriptBlock {
+    param($path, $state)
     $missing = 0
     $attempts = 0
-    $deadline = [DateTime]::UtcNow.AddSeconds(8)
-    while ([DateTime]::UtcNow -lt $deadline) {
-      $attempts += 1
+    $deadline = [DateTime]::UtcNow.AddSeconds(120)
+    while (-not $state.Done -and [DateTime]::UtcNow -lt $deadline) {
+      if ($state.Writing) { $attempts += 1 }
       try {
         # Opened the way Node and Codex open files: allowing the file to be replaced under it.
         $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
@@ -661,16 +664,21 @@ exit /b 0
     [pscustomobject]@{ Missing = $missing; Attempts = $attempts }
   }
   Start-Sleep -Milliseconds 200
-  for ($n = 1; $n -le 1500; $n += 1) {
-    $swapCandidate = Join-Path $swapFolder "candidate-$n.tmp"
-    [IO.File]::WriteAllText($swapCandidate, "$n")
-    Move-FileOverExisting $swapCandidate $swapTarget
+  $swapState.Writing = $true
+  try {
+    for ($n = 1; $n -le 1500; $n += 1) {
+      $swapCandidate = Join-Path $swapFolder "candidate-$n.tmp"
+      [IO.File]::WriteAllText($swapCandidate, "$n")
+      Move-FileOverExisting $swapCandidate $swapTarget
+    }
+  } finally {
+    $swapState.Done = $true
   }
   $swapResult = Receive-Job -Job $swapReader -Wait -AutoRemoveJob
   if ($swapResult.Missing -ne 0) { throw "A reader found the replaced file missing $($swapResult.Missing) time(s)" }
   # The reader must have been opening the file the whole time the replacements ran: a loop
   # that barely opened it could not have caught a gap, so a low count is a failed test.
-  if ($swapResult.Attempts -lt 100) { throw "The reader opened the file only $($swapResult.Attempts) times, too few to show the replacements never left a gap" }
+  if ($swapResult.Attempts -le 100) { throw "The reader opened the file only $($swapResult.Attempts) times while the replacements ran, too few to show the replacements never left a gap" }
   if ([IO.File]::ReadAllText($swapTarget) -ne "1500") { throw "The last replacement did not land" }
 
   # Something else edits config.toml while the installer is validating its candidate (the fake
