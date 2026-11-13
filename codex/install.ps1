@@ -23,17 +23,21 @@ function New-BackupFolder([string]$Name) {
 }
 
 # Replaces $Destination with $Source in one step, so a reader opening $Destination at any
-# moment finds the old file or the new one and never a missing file. On Windows that is
-# MoveFileEx with MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH, the call Node's
-# fs.rename makes; PowerShell's Move-Item -Force deletes the destination first, and a reader
-# in that gap gets "file not found" (measured). Elsewhere a rename already replaces atomically.
+# moment finds the old file or the new one and never a missing file. On Windows that is an
+# atomic replace (MoveFileEx with MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+# PowerShell's Move-Item -Force deletes the destination first, and a reader in that gap gets
+# "file not found" (measured). Elsewhere a rename already replaces atomically. When the
+# native call cannot be compiled (PowerShell's Constrained Language Mode refuses Add-Type)
+# it falls back to Move-Item -Force and says once that the replace is then not atomic.
+$script:nativeMoveWarned = $false
 function Move-FileOverExisting([string]$Source, [string]$Destination) {
   if (-not $IsWindows) {
     Move-Item -LiteralPath $Source -Destination $Destination -Force
     return
   }
-  if (-not ('CacheStatusband.NativeMove' -as [type])) {
-    Add-Type -Namespace CacheStatusband -Name NativeMove -MemberDefinition @'
+  try {
+    if (-not ('CacheStatusband.NativeMove' -as [type])) {
+      Add-Type -Namespace CacheStatusband -Name NativeMove -MemberDefinition @'
 [System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
 private static extern bool MoveFileExW(string existing, string replacement, uint flags);
 public static void Replace(string source, string destination) {
@@ -47,8 +51,34 @@ public static void Replace(string source, string destination) {
   }
 }
 '@
+    }
+  } catch {
+    if (-not $script:nativeMoveWarned) {
+      $script:nativeMoveWarned = $true
+      Write-Warning "Could not set up an atomic file replace ($($_.Exception.Message)); replacing files with Move-Item -Force instead, which is not atomic: a program opening the file at that very moment could briefly find it missing."
+    }
+    Move-Item -LiteralPath $Source -Destination $Destination -Force
+    return
   }
   [CacheStatusband.NativeMove]::Replace($Source, $Destination)
+}
+
+# The path a replacement of $Path must be made at. A plain file is itself. A symbolic link
+# resolves to the file it points at, so the replacement lands on that file and the link stays
+# a link (replacing the link itself would turn it into a regular file and leave the original
+# it pointed at behind). A hard link is refused: a replacement would give this name new
+# content and leave every other name for the old file with the old content.
+function Resolve-ReplaceTarget([string]$Path, [string]$What) {
+  $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+  if (-not $item) { return $Path }
+  if ($item.LinkType -eq "HardLink") {
+    throw "$What ($Path) is a hard link, so it has more than one name. Replacing it would leave the other names with the old content. Nothing was changed. Replace it with a regular file (or keep only the name you edit) and run the installer again."
+  }
+  if ($item.LinkType -eq "SymbolicLink") {
+    $target = [IO.File]::ResolveLinkTarget($Path, $true)
+    if ($target) { return $target.FullName }
+  }
+  return $Path
 }
 
 # The text of a file, or $null when there is none; and whether two such readings are the same.
@@ -339,6 +369,13 @@ if ($PSBoundParameters.ContainsKey("SeatFile")) {
   }
 }
 
+# A hard-linked config.toml or settings.json cannot be replaced safely; refuse before anything
+# is changed or registered.
+[void](Resolve-ReplaceTarget $configPath "config.toml")
+if ($PSBoundParameters.ContainsKey("SeatFile")) {
+  [void](Resolve-ReplaceTarget (Join-Path $CodexHome "cache-statusband-codex\settings.json") "settings.json")
+}
+
 function Set-StatusbandPreferences([string]$Text) {
   $Text = Set-TomlKey -Text $Text -Section "features" -Key "hooks" -Value "true"
   if (-not $KeepExistingFooter) {
@@ -365,6 +402,7 @@ if (Test-Path -LiteralPath $configPath) {
 # If anything fails from here until the merged file is in place, put the original back.
 $registrationDone = $false
 $lastSeenConfigText = $null
+$foreignEditSeen = $false
 try {
   $previousCodexHome = $env:CODEX_HOME
   try {
@@ -377,6 +415,9 @@ try {
     $env:CODEX_HOME = $previousCodexHome
   }
   $registrationDone = $true
+  # What config.toml holds once Codex has finished registering. Any later read that differs
+  # from the previous one is an edit by something else, which a failure must not undo.
+  $expectedConfigText = Read-TextOrNull $configPath
 
   # Registration writes marketplace/plugin settings. Merge into its result rather than
   # overwriting those writes with the pre-registration configuration. Validating takes a
@@ -388,13 +429,18 @@ try {
   for ($attempt = 1; $attempt -le 3 -and -not $replaced; $attempt += 1) {
     $registeredConfigText = Read-TextOrNull $configPath
     $lastSeenConfigText = $registeredConfigText
+    if (-not (Test-SameText $registeredConfigText $expectedConfigText)) { $foreignEditSeen = $true }
+    $expectedConfigText = $registeredConfigText
     $configText = Set-StatusbandPreferences -Text $(if ($null -ne $registeredConfigText) { $registeredConfigText } else { "" })
     Assert-CodexConfig -Text $configText -CodexCommand $codexCommand -Original $registeredConfigText
-    $configCandidate = Join-Path $CodexHome (".config.toml.cache-statusband-" + [guid]::NewGuid().ToString("N") + ".tmp")
+    # A symbolic link is replaced at its target, with the candidate beside it (same folder,
+    # so the replace stays atomic); the link remains a link.
+    $configTarget = Resolve-ReplaceTarget $configPath "config.toml"
+    $configCandidate = Join-Path (Split-Path -Parent $configTarget) (".config.toml.cache-statusband-" + [guid]::NewGuid().ToString("N") + ".tmp")
     try {
       [IO.File]::WriteAllText($configCandidate, $configText, [Text.UTF8Encoding]::new($false))
       if (Test-SameText (Read-TextOrNull $configPath) $registeredConfigText) {
-        Move-FileOverExisting $configCandidate $configPath
+        Move-FileOverExisting $configCandidate $configTarget
         $replaced = $true
       }
     } finally {
@@ -406,22 +452,27 @@ try {
   }
 } catch {
   if ($backupConfig) {
-    # Put the original back only while config.toml is still what the installer last saw
-    # (Codex's own registration writes included). A file someone else changed since then is
-    # theirs, and is not overwritten.
+    # The original goes back only when nothing but the installer and Codex's own registration
+    # has written config.toml since. A file changed by someone else is theirs: it is left as
+    # it is, and the backup is named.
     $liveConfigText = Read-TextOrNull $configPath
-    if ($registrationDone -and -not (Test-SameText $liveConfigText $lastSeenConfigText)) {
+    if ($registrationDone -and ($foreignEditSeen -or -not (Test-SameText $liveConfigText $lastSeenConfigText))) {
       Write-Warning "Installation failed, and config.toml was changed by something else while the installer ran, so it was not restored. It is left as it is now; your original is at $backupConfig"
     } else {
       try {
-        $restoreCandidate = Join-Path $CodexHome (".config.toml.cache-statusband-" + [guid]::NewGuid().ToString("N") + ".tmp")
+        $restoreTarget = Resolve-ReplaceTarget $configPath "config.toml"
+        $restoreCandidate = Join-Path (Split-Path -Parent $restoreTarget) (".config.toml.cache-statusband-" + [guid]::NewGuid().ToString("N") + ".tmp")
         try {
           Copy-Item -LiteralPath $backupConfig -Destination $restoreCandidate
-          Move-FileOverExisting $restoreCandidate $configPath
+          Move-FileOverExisting $restoreCandidate $restoreTarget
         } finally {
           if (Test-Path -LiteralPath $restoreCandidate) { Remove-Item -LiteralPath $restoreCandidate -Force }
         }
-        Write-Warning "Installation failed; restored the original config.toml from $backupConfig"
+        if ($registrationDone) {
+          Write-Warning "Installation failed; restored the original config.toml from $backupConfig"
+        } else {
+          Write-Warning "Installation failed during Codex's own registration step. Its writes to config.toml cannot be told apart from anyone else's, so the original config.toml was restored from $backupConfig, and any change made to config.toml since that backup is gone."
+        }
       } catch {
         Write-Warning "Installation failed and config.toml could not be restored automatically. Your original is at $backupConfig"
       }
@@ -444,10 +495,12 @@ if ($PSBoundParameters.ContainsKey("SeatFile")) {
   # Written to a temporary file beside it and replaced in one step (Move-FileOverExisting), so a
   # session starting at that moment reads either the old settings.json or the new one, never a
   # half-written or missing file.
-  $settingsCandidate = Join-Path $settingsRoot (".settings.json.cache-statusband-" + [guid]::NewGuid().ToString("N") + ".tmp")
+  # (A symbolic link is replaced at its target, with the temporary file beside that.)
+  $settingsTarget = Resolve-ReplaceTarget $settingsPath "settings.json"
+  $settingsCandidate = Join-Path (Split-Path -Parent $settingsTarget) (".settings.json.cache-statusband-" + [guid]::NewGuid().ToString("N") + ".tmp")
   try {
     [IO.File]::WriteAllText($settingsCandidate, $settingsJson + "`n", [Text.UTF8Encoding]::new($false))
-    Move-FileOverExisting $settingsCandidate $settingsPath
+    Move-FileOverExisting $settingsCandidate $settingsTarget
   } finally {
     if (Test-Path -LiteralPath $settingsCandidate) { Remove-Item -LiteralPath $settingsCandidate -Force }
   }

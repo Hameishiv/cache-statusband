@@ -353,7 +353,7 @@ exit /b 0
   try {
     $env:PATH = "$fakeBin$([IO.Path]::PathSeparator)$previousPath"
     try {
-      & (Join-Path $root "install.ps1") -CodexHome $restoreHome -SkipCliLink 3>$null | Out-Null
+      & (Join-Path $root "install.ps1") -CodexHome $restoreHome -SkipCliLink -WarningVariable restoreWarnings 3>$null | Out-Null
     } catch {
       $rejected = $true
     }
@@ -363,6 +363,132 @@ exit /b 0
   if (-not $rejected) { throw "A failed registration was not reported" }
   if ([IO.File]::ReadAllText((Join-Path $restoreHome "config.toml")) -ne $original) {
     throw "The original config.toml was not restored after a failed registration"
+  }
+  # The warning says why it restored: Codex's own registration writes cannot be told apart
+  # from anyone else's, so this case restores regardless.
+  if (-not ($restoreWarnings | Where-Object { "$_" -match "Codex's own registration step" -and "$_" -match "original config.toml was restored" })) {
+    throw "A restore after a failed registration did not say it came from Codex's own registration step: $($restoreWarnings -join ' | ')"
+  }
+
+  # A config.toml that is a symbolic link stays a link: the edit lands on the file it points
+  # at. The same for settings.json. (Skipped, with a message, where a link cannot be made.)
+  $linkHome = Join-Path $testHome "link-home"
+  $linkReal = Join-Path $testHome "link-real"
+  New-Item -ItemType Directory -Path $linkHome, $linkReal, (Join-Path $linkHome "cache-statusband-codex") | Out-Null
+  $realConfig = Join-Path $linkReal "real-config.toml"
+  $realSettings = Join-Path $linkReal "real-settings.json"
+  [IO.File]::WriteAllText($realConfig, "[history]`npersistence = `"save-all`"`n", [Text.UTF8Encoding]::new($false))
+  [IO.File]::WriteAllText($realSettings, "{`"version`":1,`"seatFile`":`"old-seat.txt`"}`n", [Text.UTF8Encoding]::new($false))
+  $linksMade = $true
+  try {
+    New-Item -ItemType SymbolicLink -Path (Join-Path $linkHome "config.toml") -Target $realConfig -ErrorAction Stop | Out-Null
+    New-Item -ItemType SymbolicLink -Path (Join-Path $linkHome "cache-statusband-codex\settings.json") -Target $realSettings -ErrorAction Stop | Out-Null
+  } catch {
+    $linksMade = $false
+    Write-Host "SKIPPED the symbolic-link test: a symbolic link cannot be created here ($($_.Exception.Message))"
+  }
+  if ($linksMade) {
+    & (Join-Path $root "install.ps1") -CodexHome $linkHome -SkipCliLink -SeatFile (Join-Path $linkReal "link-seat.txt") 3>$null | Out-Null
+    foreach ($linkName in @("config.toml", "cache-statusband-codex\settings.json")) {
+      if ((Get-Item -LiteralPath (Join-Path $linkHome $linkName) -Force).LinkType -ne "SymbolicLink") { throw "$linkName stopped being a symbolic link after the install" }
+    }
+    $linkedConfig = [IO.File]::ReadAllText($realConfig)
+    if ($linkedConfig -notmatch '(?m)^hooks = true$' -or $linkedConfig -notmatch '(?m)^status_line_use_colors = true$') {
+      throw "The file config.toml links to did not get the plugin's edit"
+    }
+    if ([IO.File]::ReadAllText($realSettings) -notmatch "link-seat\.txt") { throw "The file settings.json links to did not get the new seat" }
+    if (@(Get-ChildItem -LiteralPath $linkReal -Force -File | Where-Object { $_.Name -like "*.tmp" }).Count -ne 0) { throw "A temporary file was left beside the link targets" }
+  }
+
+  # A hard-linked config.toml is refused before anything is changed or registered.
+  $hardHome = Join-Path $testHome "hard-home"
+  New-Item -ItemType Directory -Path $hardHome | Out-Null
+  $hardOriginal = "[history]`npersistence = `"save-all`"`n"
+  $hardOther = Join-Path $testHome "hard-other.toml"
+  [IO.File]::WriteAllText($hardOther, $hardOriginal, [Text.UTF8Encoding]::new($false))
+  New-Item -ItemType HardLink -Path (Join-Path $hardHome "config.toml") -Target $hardOther | Out-Null
+  $hardMessage = ""
+  try {
+    & (Join-Path $root "install.ps1") -CodexHome $hardHome -SkipCliLink 3>$null | Out-Null
+  } catch {
+    $hardMessage = $_.Exception.Message
+  }
+  if ($hardMessage -notmatch "hard link") { throw "A hard-linked config.toml was not refused with a hard-link message: $hardMessage" }
+  if ([IO.File]::ReadAllText((Join-Path $hardHome "config.toml")) -ne $hardOriginal -or [IO.File]::ReadAllText($hardOther) -ne $hardOriginal) { throw "A refused hard-linked config.toml was changed" }
+  if (Test-Path -LiteralPath (Join-Path $hardHome "backups")) { throw "A refused hard-linked config.toml still took a backup (something was changed)" }
+
+  # When Windows cannot compile the native replace (Constrained Language Mode refuses
+  # Add-Type), Move-FileOverExisting falls back to Move-Item -Force and warns once.
+  $moveDefinition = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq "Move-FileOverExisting" }, $true)
+  $fallbackScript = Join-Path $testHome "move-fallback.ps1"
+  [IO.File]::WriteAllText($fallbackScript, "function Add-Type { throw 'simulated: Add-Type is not allowed' }`n" + $moveDefinition.Extent.Text + @'
+
+$folder = $args[0]
+foreach ($n in 1..2) {
+  [IO.File]::WriteAllText("$folder\from-$n.txt", "new-$n")
+  [IO.File]::WriteAllText("$folder\to.txt", "old")
+  Move-FileOverExisting "$folder\from-$n.txt" "$folder\to.txt"
+}
+[IO.File]::ReadAllText("$folder\to.txt")
+'@)
+  $fallbackFolder = Join-Path $testHome "move-fallback"
+  New-Item -ItemType Directory -Path $fallbackFolder | Out-Null
+  $fallbackOutput = @(& (Get-Process -Id $PID).Path -NoProfile -File $fallbackScript $fallbackFolder 3>&1 | ForEach-Object { "$_" })
+  if ($fallbackOutput[-1] -ne "new-2") { throw "The Move-Item fallback did not replace the file: $($fallbackOutput -join ' | ')" }
+  if (@($fallbackOutput | Where-Object { $_ -match "not atomic" }).Count -ne 1) { throw "The fallback did not warn exactly once that the replace is not atomic: $($fallbackOutput -join ' | ')" }
+
+  # A foreign edit seen on the retry, then a failed validation: config.toml is NOT put back
+  # to the backup (that would erase the other program's edit); the warning names the backup.
+  $foreignBin = Join-Path $testHome "foreign-bin"
+  New-Item -ItemType Directory -Path $foreignBin | Out-Null
+  $foreignCodex = @'
+@echo off
+if "%1"=="plugin" if "%2"=="add" (
+  echo.> "%FAKE_STATE%\armed"
+  exit /b 0
+)
+if not "%1"=="app-server" exit /b 0
+if not exist "%FAKE_STATE%\armed" exit /b 0
+if exist "%FAKE_STATE%\done" (
+  findstr /C:"edited by someone else" "%CODEX_HOME%\config.toml" >nul
+  if errorlevel 1 exit /b 0
+  findstr /C:"status_line_use_colors" "%CODEX_HOME%\config.toml" >nul
+  if errorlevel 1 exit /b 0
+  echo unknown field status_line_use_colors
+  exit /b 1
+)
+echo.> "%FAKE_STATE%\done"
+echo # edited by someone else>> "%FAKE_LIVE%"
+exit /b 0
+'@
+  [IO.File]::WriteAllText((Join-Path $foreignBin "codex.cmd"), $foreignCodex, [Text.Encoding]::ASCII)
+  $foreignHome = Join-Path $testHome "foreign-home"
+  $foreignState = Join-Path $testHome "foreign-state"
+  New-Item -ItemType Directory -Path $foreignHome, $foreignState | Out-Null
+  $foreignOriginal = "[history]`npersistence = `"save-all`"`n"
+  [IO.File]::WriteAllText((Join-Path $foreignHome "config.toml"), $foreignOriginal, [Text.UTF8Encoding]::new($false))
+  $previousPath = $env:PATH
+  $foreignMessage = ""
+  $foreignWarnings = @()
+  try {
+    $env:PATH = "$foreignBin$([IO.Path]::PathSeparator)$previousPath"
+    $env:FAKE_STATE = $foreignState
+    $env:FAKE_LIVE = Join-Path $foreignHome "config.toml"
+    try {
+      & (Join-Path $root "install.ps1") -CodexHome $foreignHome -SkipCliLink -WarningVariable foreignWarnings 3>$null | Out-Null
+    } catch {
+      $foreignMessage = $_.Exception.Message
+    }
+  } finally {
+    $env:PATH = $previousPath
+    Remove-Item Env:FAKE_STATE, Env:FAKE_LIVE -ErrorAction SilentlyContinue
+  }
+  if ($foreignMessage -notmatch "rejected the candidate") { throw "The retried candidate was expected to fail validation: $foreignMessage" }
+  $foreignAfter = [IO.File]::ReadAllText((Join-Path $foreignHome "config.toml"))
+  if ($foreignAfter -notmatch '(?m)^# edited by someone else\r?$') { throw "A failure after an absorbed foreign edit restored the backup over that edit" }
+  $foreignBackup = @(Get-ChildItem -LiteralPath (Join-Path $foreignHome "backups") -Recurse -Filter config.toml | Select-Object -First 1)
+  if (-not ($foreignWarnings | Where-Object { "$_" -match "was not restored" -and "$_" -match [regex]::Escape($foreignBackup[0].FullName) })) {
+    throw "The warning did not say config.toml was not restored and name the backup: $($foreignWarnings -join ' | ')"
   }
   # Replacing a file must never leave a gap in which it does not exist: a reader hammering
   # the file while it is replaced over and over must always find it.
@@ -377,15 +503,17 @@ exit /b 0
   $swapReader = Start-ThreadJob -ArgumentList $swapTarget -ScriptBlock {
     param($path)
     $missing = 0
+    $attempts = 0
     $deadline = [DateTime]::UtcNow.AddSeconds(8)
     while ([DateTime]::UtcNow -lt $deadline) {
+      $attempts += 1
       try {
         # Opened the way Node and Codex open files: allowing the file to be replaced under it.
         $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
         $stream.Dispose()
       } catch [IO.FileNotFoundException] { $missing += 1 } catch { }
     }
-    $missing
+    [pscustomobject]@{ Missing = $missing; Attempts = $attempts }
   }
   Start-Sleep -Milliseconds 200
   for ($n = 1; $n -le 1500; $n += 1) {
@@ -393,8 +521,11 @@ exit /b 0
     [IO.File]::WriteAllText($swapCandidate, "$n")
     Move-FileOverExisting $swapCandidate $swapTarget
   }
-  $swapMissing = [int](Receive-Job -Job $swapReader -Wait -AutoRemoveJob)
-  if ($swapMissing -ne 0) { throw "A reader found the replaced file missing $swapMissing time(s)" }
+  $swapResult = Receive-Job -Job $swapReader -Wait -AutoRemoveJob
+  if ($swapResult.Missing -ne 0) { throw "A reader found the replaced file missing $($swapResult.Missing) time(s)" }
+  # The reader must have been opening the file the whole time the replacements ran: a loop
+  # that barely opened it could not have caught a gap, so a low count is a failed test.
+  if ($swapResult.Attempts -lt 100) { throw "The reader opened the file only $($swapResult.Attempts) times, too few to show the replacements never left a gap" }
   if ([IO.File]::ReadAllText($swapTarget) -ne "1500") { throw "The last replacement did not land" }
 
   # Something else edits config.toml while the installer is validating its candidate (the fake
