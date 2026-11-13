@@ -202,6 +202,26 @@ describe("weekly usage", () => {
     assert.equal(loadWeekly(logPath, cachePath, now + 6 * 60 * 1000).percent, 61);
   });
 
+  it("drops the cached reading when the newest credits line cannot be used", () => {
+    const dir = mkdtempSync(join(tmpdir(), "csb-week-"));
+    const logPath = join(dir, "unified.jsonl");
+    const cachePath = join(dir, "usage.json");
+    writeFileSync(logPath, `${creditsLine(23)}
+`);
+    assert.equal(loadWeekly(logPath, cachePath, now).percent, 23);
+    const noPercent = JSON.stringify({
+      ts: "2026-10-29T12:00:00Z",
+      msg: "billing: fetched credits config",
+      ctx: { config: { currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", end: "2026-11-02T22:57:09.651+00:00" } } },
+    });
+    writeFileSync(logPath, `${creditsLine(23)}
+${noPercent}
+`);
+    ageCache(cachePath, logPath);
+    assert.equal(loadWeekly(logPath, cachePath, now + 1000), null);
+    assert.equal(JSON.parse(readFileSync(cachePath, "utf8")).sources[logPath].record, null);
+  });
+
   it("does not re-read an unchanged log with no credits line after the window", () => {
     const dir = mkdtempSync(join(tmpdir(), "csb-week-"));
     const logPath = join(dir, "unified.jsonl");

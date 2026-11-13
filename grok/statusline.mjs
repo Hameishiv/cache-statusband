@@ -274,17 +274,25 @@ function billingRecord(line) {
  * The newest credits line decides: if it cannot be used, there is no reading.
  */
 export function readLastBilling(path, maxBytes = 4 * 1024 * 1024) {
+  return scanBilling(path, maxBytes) ?? null;
+}
+
+/**
+ * undefined: no credits line in range, or the log cannot be read.
+ * null: the newest credits line cannot be used. Otherwise the reading.
+ */
+function scanBilling(path, maxBytes = 4 * 1024 * 1024) {
   let st;
   try {
     st = statSync(path);
   } catch {
-    return null;
+    return undefined;
   }
   let fh;
   try {
     fh = openSync(path, "r");
   } catch {
-    return null;
+    return undefined;
   }
   try {
     let offset = st.size;
@@ -309,7 +317,7 @@ export function readLastBilling(path, maxBytes = 4 * 1024 * 1024) {
       const found = billingRecord(pending.replace(/\r$/, ""));
       if (found !== undefined) return found && { ...found, sourceMtimeMs: st.mtimeMs, sourceSize: st.size };
     }
-    return null;
+    return undefined;
   } finally {
     closeSync(fh);
   }
@@ -350,7 +358,8 @@ function writeSources(cachePath, sources) {
 /**
  * Last weekly reading. Re-reads each log at most once per five minutes, even
  * when it has no credits line. A re-read that finds no credits line keeps the
- * last good record and only moves the next check.
+ * last good record and only moves the next check. A re-read whose newest
+ * credits line cannot be used drops it.
  * The cache holds one entry per log: the log's size and time, when it was read,
  * and the percent, period type, period end, and fetch time.
  */
@@ -373,10 +382,12 @@ export function loadWeekly(logPath, cachePath, nowMs = Date.now()) {
   if (!st) return prior;
   if (entry && entry.sourceMtimeMs === st.mtimeMs && entry.sourceSize === st.size) return prior;
 
-  const found = readLastBilling(logPath);
-  const record = found
-    ? { percent: found.percent, periodType: found.periodType, periodEnd: found.periodEnd, fetchedAt: found.fetchedAt }
-    : prior;
+  // no credits line keeps the last reading; an unusable newest line shows none
+  const found = scanBilling(logPath);
+  const record =
+    found === undefined
+      ? prior
+      : found && { percent: found.percent, periodType: found.periodType, periodEnd: found.periodEnd, fetchedAt: found.fetchedAt };
   writeSources(cachePath, {
     ...sources,
     [logPath]: {
