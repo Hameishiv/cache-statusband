@@ -154,8 +154,10 @@ export async function captureUsageIdentity(codexHome, {
   timeoutMs,
 } = {}) {
   // The thrown errors carry a flag the CLI reads: `seatUnavailable` (a configured seat that
-  // cannot be read, which the CLI keeps silent about) and `signedOut` (a login read that
-  // confirmed no one is signed in).
+  // cannot be read, which the CLI keeps silent about), `signedOut` (a login read that
+  // confirmed no one is signed in) and `noAccountEmail` (someone IS signed in, but with a
+  // login that has no usable ChatGPT account email, such as an API key; `accountType` carries
+  // its sanitized type).
   const fail = (message, flags = {}) => {
     if (throwOnFailure) throw Object.assign(new Error(message), flags);
     return null;
@@ -165,16 +167,20 @@ export async function captureUsageIdentity(codexHome, {
   if (seat?.unavailable) return fail("The configured seat label is unavailable", { seatUnavailable: true });
   const readOptions = { codexHome, env, ...(timeoutMs === undefined ? {} : { timeoutMs }) };
   if (!seat) {
-    let email;
+    let account;
     try {
-      email = safeEmail((await accountReader(readOptions))?.email);
+      account = await accountReader(readOptions);
     } catch (error) {
       if (throwOnFailure) throw error;
       return null;
     }
+    const email = safeEmail(account?.email);
     const seatAfter = await configuredSeatIdentity(codexHome, env);
     if (seatAfter?.key !== undefined) return fail("The seat changed during the account read");
-    // No signed-in account is a real answer (null), not a failure.
+    // No signed-in account is a real answer (null), not a failure. A login with no usable
+    // email (an API key, say) is a different answer: someone IS signed in, but usage is
+    // read per ChatGPT account, so there is nothing to read it for.
+    if (!email && account != null) return fail("The signed-in Codex login has no ChatGPT account email", noEmailFlags(account));
     return email ? { key: `account:${email}`, label: email, unavailable: false } : null;
   }
   // A seat label asserts which login this session runs under, so a signed-out reading is
@@ -184,7 +190,8 @@ export async function captureUsageIdentity(codexHome, {
   const between = async (account) => {
     const seatAfter = await configuredSeatIdentity(codexHome, env);
     if (seat.key !== seatAfter?.key) throw new Error("The seat changed during the account read");
-    if (!safeEmail(account?.email)) throw Object.assign(new Error("No account is signed in for the configured seat"), { signedOut: true });
+    if (account == null) throw Object.assign(new Error("No account is signed in for the configured seat"), { signedOut: true });
+    if (!safeEmail(account.email)) throw Object.assign(new Error("The signed-in Codex login has no ChatGPT account email"), noEmailFlags(account));
   };
   let email;
   let again;
@@ -198,6 +205,16 @@ export async function captureUsageIdentity(codexHome, {
   }
   if (!email || again !== email) return fail("The Codex account changed while the seat was being confirmed");
   return { key: `account:${email}`, label: seat.label, unavailable: false };
+}
+
+function noEmailFlags(account) {
+  return { noAccountEmail: true, accountType: safeAccountType(account?.type) };
+}
+
+// The login type (chatgpt, apiKey, amazonBedrock, ...) goes into a message, so it is
+// limited to a short plain token; anything else reads as unknown.
+function safeAccountType(value) {
+  return typeof value === "string" && /^[A-Za-z0-9_.-]{1,40}$/.test(value) ? value : "unknown type";
 }
 
 // Adapts a single-read reader to the two-read contract (reads, then between(), then reads).

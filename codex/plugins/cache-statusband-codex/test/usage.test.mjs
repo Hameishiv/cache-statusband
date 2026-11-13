@@ -491,7 +491,7 @@ test("identity capture can fail loudly and never labels an unreadable seat with 
   await assert.rejects(captureUsageIdentity(root, { env: {}, throwOnFailure: true, accountReader: async () => { throw new Error("app-server down"); } }), /app-server down/);
   assert.equal(await captureUsageIdentity(root, { env: {}, accountReader: async () => { throw new Error("app-server down"); } }), null);
   // Signed out is an answer, not a failure.
-  assert.equal(await captureUsageIdentity(root, { env: {}, throwOnFailure: true, accountReader: async () => ({ account: null }) }), null);
+  assert.equal(await captureUsageIdentity(root, { env: {}, throwOnFailure: true, accountReader: async () => null }), null);
 
   const emptySeat = join(root, "empty-seat.txt");
   await writeFile(emptySeat, "  \n");
@@ -509,14 +509,42 @@ test("identity capture can fail loudly and never labels an unreadable seat with 
   }), /seat/i);
 });
 
+test("a login with no ChatGPT email is flagged as such, never as signed out, with and without a seat", async (t) => {
+  const root = await fixtureRoot(t);
+  const noEmail = { type: "apiKey" };
+  // No seat: throws the no-email flag, quietly null without throwOnFailure.
+  const bare = await captureUsageIdentity(root, { env: {}, throwOnFailure: true, accountReader: async () => noEmail }).catch((error) => error);
+  assert.equal(bare.noAccountEmail, true);
+  assert.equal(bare.signedOut, undefined);
+  assert.equal(bare.accountType, "apiKey");
+  assert.equal(await captureUsageIdentity(root, { env: {}, accountReader: async () => noEmail }), null);
+  // An unusable type reads as unknown; an email that fails validation counts as no email.
+  const odd = await captureUsageIdentity(root, { env: {}, throwOnFailure: true, accountReader: async () => ({ type: "a\u001b[2Jb", email: "not an email" }) }).catch((error) => error);
+  assert.equal(odd.noAccountEmail, true);
+  assert.equal(odd.accountType, "unknown type");
+  // Signed out stays signed out.
+  assert.equal(await captureUsageIdentity(root, { env: {}, throwOnFailure: true, accountReader: async () => null }), null);
+
+  const seatPath = join(root, "seat.txt");
+  await writeFile(seatPath, FIRST_SEAT);
+  const env = { CACHE_STATUSBAND_CODEX_SEAT_FILE: seatPath };
+  const seated = await captureUsageIdentity(root, { env, throwOnFailure: true, accountReader: async () => ({ type: "amazonBedrock" }) }).catch((error) => error);
+  assert.equal(seated.noAccountEmail, true);
+  assert.equal(seated.signedOut, undefined);
+  assert.equal(seated.accountType, "amazonBedrock");
+  const seatedOut = await captureUsageIdentity(root, { env, throwOnFailure: true, accountReader: async () => null }).catch((error) => error);
+  assert.equal(seatedOut.signedOut, true);
+  assert.equal(seatedOut.noAccountEmail, undefined);
+});
+
 test("with a seat configured, a signed-out or changing login is a failure, not a binding", async (t) => {
   const root = await fixtureRoot(t);
   const seatPath = join(root, "seat.txt");
   await writeFile(seatPath, FIRST_SEAT);
   const env = { CACHE_STATUSBAND_CODEX_SEAT_FILE: seatPath };
   // Signed out under a seat label: nothing to bind the label to.
-  await assert.rejects(captureUsageIdentity(root, { env, throwOnFailure: true, accountReader: async () => ({ account: null }) }), /signed in/i);
-  assert.equal(await captureUsageIdentity(root, { env, accountReader: async () => ({ account: null }) }), null);
+  await assert.rejects(captureUsageIdentity(root, { env, throwOnFailure: true, accountReader: async () => null }), /signed in/i);
+  assert.equal(await captureUsageIdentity(root, { env, accountReader: async () => null }), null);
   // The login is read again after the seat was last checked; a change fails the capture.
   const emails = [TEST_EMAIL, OTHER_EMAIL];
   await assert.rejects(captureUsageIdentity(root, { env, throwOnFailure: true, accountReader: async () => ({ email: emails.shift() }) }), /changed/i);

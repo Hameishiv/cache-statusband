@@ -109,6 +109,7 @@ async function captureIdentityOrSay(home) {
     // An unlaunchable Codex was already explained by warnIfCodexUnlaunchable.
     if (error?.seatUnavailable || codexUnlaunchableSaid) return null;
     if (error?.signedOut) say("no Codex account is signed in");
+    else if (error?.noAccountEmail) say(`the signed-in Codex login (${stripControls(error.accountType ?? "unknown type")}) has no ChatGPT account email, so usage cannot be read`);
     else say(captureFailureReason(error));
     return null;
   }
@@ -118,7 +119,10 @@ function captureFailureReason(error) {
   const code = error?.code;
   const message = stripControls(error?.message ?? String(error));
   if (code === "ENOENT") return "Codex was not found (is it installed and on your PATH? CODEX_BIN can point to it)";
-  if (typeof code === "string" && /^E[A-Z]+$/.test(code)) return `Codex could not be started (${code})`;
+  // A broken pipe or reset connection (or a failed write to the child) means Codex started
+  // and then went away; only the other system codes are spawn-time failures.
+  if (code === "EPIPE" || code === "ECONNRESET" || (typeof code === "string" && code.startsWith("ERR_STREAM_")) || error?.syscall === "write") return "Codex exited before answering";
+  if (typeof code === "string" && /^E[A-Z0-9]+$/.test(code)) return `Codex could not be started (${code})`;
   return message || "the Codex account read failed";
 }
 

@@ -1075,6 +1075,44 @@ test("usage and board say once, on stderr, why no usage was read when Codex is m
   }
 });
 
+test("a login with no ChatGPT account email is not reported as signed out, with or without a seat", async (t) => {
+  const root = await fixtureRoot(t);
+  const cli = cliRunner(root);
+  const seatPath = join(root, "seat.txt");
+  await writeFile(seatPath, "alpha");
+  const cases = [
+    [{ CACHE_STATUSBAND_CODEX_SEAT_FILE: "", FAKE_SERVER_ACCOUNT_TYPE: "apiKey" }, "apiKey"],
+    [{ CACHE_STATUSBAND_CODEX_SEAT_FILE: seatPath, FAKE_SERVER_ACCOUNT_TYPE: "amazonBedrock" }, "amazonBedrock"],
+    [{ CACHE_STATUSBAND_CODEX_SEAT_FILE: "", FAKE_SERVER_ACCOUNT_TYPE: "evil\u001b[2Jtype" }, "unknown type"],
+  ];
+  for (const [env, type] of cases) {
+    for (const args of [["usage"], ["board"]]) {
+      const { stderr } = await cli.runWithStderr(args, env);
+      assert.match(stderr, new RegExp(`^cache-statusband-codex: usage not read: the signed-in Codex login \\(${type}\\) has no ChatGPT account email, so usage cannot be read$`, "m"), `${args.join(" ")}: ${stderr}`);
+      assert.doesNotMatch(stderr, /no Codex account is signed in/);
+      assert.equal(stderr.trim().split(/\r?\n/).length, 1, `${args.join(" ")}: ${stderr}`);
+    }
+  }
+});
+
+test("a broken pipe while reading the account says Codex exited; only spawn-time codes say it could not be started", async (t) => {
+  const root = await fixtureRoot(t);
+  const cli = cliRunner(root);
+  const preload = pathToFileURL(join(dirname(fileURLToPath(import.meta.url)), "..", "fixtures", "fail-account-read-error.mjs")).href;
+  const base = { CACHE_STATUSBAND_CODEX_SEAT_FILE: "", NODE_OPTIONS: `--import=${preload}`, CODEX_BIN: process.execPath };
+  const cases = [
+    [{ FAKE_ACCOUNT_ERROR_CODE: "EPIPE", FAKE_ACCOUNT_ERROR_ON: "stdin" }, /^cache-statusband-codex: usage not read: Codex exited before answering$/m],
+    [{ FAKE_ACCOUNT_ERROR_CODE: "ECONNRESET", FAKE_ACCOUNT_ERROR_ON: "stdin" }, /^cache-statusband-codex: usage not read: Codex exited before answering$/m],
+    [{ FAKE_ACCOUNT_ERROR_CODE: "ERR_STREAM_DESTROYED", FAKE_ACCOUNT_ERROR_ON: "stdin" }, /^cache-statusband-codex: usage not read: Codex exited before answering$/m],
+    [{ FAKE_ACCOUNT_ERROR_CODE: "EACCES", FAKE_ACCOUNT_ERROR_ON: "child" }, /^cache-statusband-codex: usage not read: Codex could not be started \(EACCES\)$/m],
+    [{ FAKE_ACCOUNT_ERROR_CODE: "EINVAL", FAKE_ACCOUNT_ERROR_ON: "child" }, /^cache-statusband-codex: usage not read: Codex could not be started \(EINVAL\)$/m],
+  ];
+  for (const [env, expected] of cases) {
+    const { stderr } = await cli.runWithStderr(["usage"], { ...base, ...env });
+    assert.match(stderr, expected, stderr);
+  }
+});
+
 test("a configured seat that cannot be read keeps usage and board silent on stderr", async (t) => {
   const root = await fixtureRoot(t);
   const cli = cliRunner(root);

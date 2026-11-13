@@ -23,7 +23,11 @@ lines.on("line", (line) => {
   // Ids 2 and 4 are both account/read: a client may read the login twice on one connection.
   if (message.id === 2 || message.id === 4) {
     // FAKE_SERVER_SIGNED_OUT answers with no account, as Codex does when no one is signed in.
-    const account = process.env.FAKE_SERVER_SIGNED_OUT ? null : { type: "chatgpt", email: testEmail, planType: "pro" };
+    // FAKE_SERVER_ACCOUNT_TYPE answers with a login of that type and no email, as an API-key
+    // or cloud-provider login does.
+    const account = process.env.FAKE_SERVER_SIGNED_OUT ? null
+      : process.env.FAKE_SERVER_ACCOUNT_TYPE ? { type: process.env.FAKE_SERVER_ACCOUNT_TYPE }
+        : { type: "chatgpt", email: testEmail, planType: "pro" };
     process.stdout.write(`${JSON.stringify({ id: message.id, result: { account } })}\n`);
   }
   if (message.id === 3) {
