@@ -69,12 +69,12 @@ export async function parseRollout(path) {
     const found = await edges.findEarlierContext();
     if (found?.payload) {
       summary.cwd = text(found.payload.cwd) ?? summary.cwd;
-      summary.model = text(found.payload.model) ?? summary.model;
-      summary.effort = text(found.payload.effort) ?? text(found.payload.reasoning_effort) ?? summary.effort;
+      summary.model = text(found.payload.model);
+      summary.effort = text(found.payload.effort) ?? text(found.payload.reasoning_effort);
     } else if (found?.reachedHead && headContext) {
       summary.cwd = text(headContext.cwd) ?? summary.cwd;
-      summary.model = text(headContext.model) ?? summary.model;
-      summary.effort = text(headContext.effort) ?? text(headContext.reasoning_effort) ?? summary.effort;
+      summary.model = text(headContext.model);
+      summary.effort = text(headContext.effort) ?? text(headContext.reasoning_effort);
     }
   }
   return summary;
@@ -122,8 +122,8 @@ function consume(item, summary, fromHead = false) {
 
   if (item?.type === "turn_context" && payload) {
     summary.cwd = text(payload.cwd) ?? summary.cwd;
-    summary.model = text(payload.model) ?? summary.model;
-    summary.effort = text(payload.effort) ?? text(payload.reasoning_effort) ?? summary.effort;
+    summary.model = text(payload.model);
+    summary.effort = text(payload.effort) ?? text(payload.reasoning_effort);
     return;
   }
 

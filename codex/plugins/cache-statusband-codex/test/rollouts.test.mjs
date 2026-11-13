@@ -34,6 +34,19 @@ test("parses the latest token count and ignores malformed or prompt records", as
   assert.equal(summary.totalUsage.totalTokens, 30000);
 });
 
+test("a later turn_context sets model and effort from that record alone, never keeping an earlier turn's effort", async (t) => {
+  const root = await fixtureRoot(t);
+  const path = join(root, "two-contexts.jsonl");
+  const line = (item) => `${JSON.stringify(item)}
+`;
+  const first = { timestamp: "2026-10-29T12:01:00.000Z", type: "turn_context", payload: { cwd: "/workspace/example", model: "model-A", effort: "high" } };
+  const second = { timestamp: "2026-10-29T13:01:00.000Z", type: "turn_context", payload: { cwd: "/workspace/example", model: "model-B" } };
+  await writeFile(path, line(FIXTURE[0]) + line(first) + line(second), "utf8");
+  const summary = await parseRollout(path);
+  assert.equal(summary.model, "model-B");
+  assert.equal(summary.effort, null);
+});
+
 test("reads metadata from the head and token state from the tail of a large rollout", async (t) => {
   const root = await fixtureRoot(t);
   const path = join(root, "large.jsonl");
