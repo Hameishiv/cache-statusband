@@ -24,6 +24,9 @@ import {
   weeklyLabel,
 } from "./statusline.mjs";
 
+// the shell running the suite may export COLUMNS; the spawned CLI must not fit itself to it
+delete process.env.COLUMNS;
+
 const full = {
   model: { id: "grok-4.7", display_name: "Grok 4.7" },
   effort: { level: "high" },
@@ -440,6 +443,8 @@ describe("billingLogPath", () => {
         // "\x" hangs off whichever drive is current; a UNC path is a full path
         process.env.GROK_HOME = String.raw`\grokhome`;
         assert.equal(billingLogPath(), null);
+        process.env.GROK_HOME = String.raw`\\`;
+        assert.equal(billingLogPath(), null);
         process.env.GROK_HOME = String.raw`\\srv\share\home`;
         assert.equal(billingLogPath(), String.raw`\\srv\share\home\logs\unified.jsonl`);
       }
@@ -482,6 +487,11 @@ describe("billingLogPath", () => {
 });
 
 describe("render width", () => {
+  it("prints nothing when a lone figure is wider than the row", () => {
+    const line = render({ context_window: { used_percentage: 29, context_window_size: 1e6, total_input_tokens: 287000 } }, { columns: 5 });
+    assert.equal(line, "");
+  });
+
   const payload = {
     model: { display_name: "Grok 4.7" },
     effort: { level: "high" },
@@ -651,6 +661,18 @@ describe("cli", () => {
     assert.equal(run.stdout.includes("super-secret-tier"), false);
     assert.equal(run.stdout.includes("user@example.com"), false);
     assert.equal(run.stdout.includes("secret-token"), false);
+  });
+
+  it("fits the row Grok reports in COLUMNS", () => {
+    const run = spawnSync(process.execPath, ["statusline.mjs"], {
+      cwd: import.meta.dirname,
+      env: { ...process.env, CSB_BILLING_LOG: "", COLUMNS: "20" },
+      input: JSON.stringify({ model: { display_name: "Grok 4.7" }, effort: { level: "high" }, cost: { total_cost_usd: 12.5 } }),
+      encoding: "utf8",
+    });
+    assert.equal(run.status, 0);
+    assert.match(run.stdout, /Grok 4\.7/);
+    assert.doesNotMatch(run.stdout, /Session/);
   });
 
   it("starts through the windows cmd wrapper", { skip: process.platform !== "win32" }, () => {

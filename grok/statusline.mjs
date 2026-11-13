@@ -136,8 +136,8 @@ export function percentText(value) {
 }
 
 /**
- * Time left, matching the Claude Code band.
- * Under an hour: "40m". Under a day: "23h05m". Past a day: "7d9h".
+ * Time left, in the Claude Code band's format, rounded to the minute first.
+ * Up to an hour: "40m". Under a day: "23h05m". A day or more: "7d9h".
  * A non-positive duration returns null.
  */
 export function remaining(ms) {
@@ -226,7 +226,11 @@ function paint(label, kind, index, nextKind) {
   return out;
 }
 
-/** Visible columns of the painted band: a space either side of each label, and one arrow between. */
+/**
+ * Visible columns of the painted band: a space either side of each label, and
+ * one arrow between. Counts code points, so a wide character (an emoji or CJK
+ * in a model name) counts as one column.
+ */
 export function bandWidth(parts) {
   return parts.reduce((sum, part, i) => sum + [...part.label].length + 2 + (i < parts.length - 1 ? 1 : 0), 0);
 }
@@ -242,6 +246,8 @@ export function render(payload, extras) {
   const columns = finite(extras && extras.columns);
   if (columns !== null && columns > 0) {
     while (parts.length > 1 && bandWidth(parts) > columns) parts.pop();
+    // a lone figure that still does not fit would be cut; only a model name may be
+    if (bandWidth(parts) > columns && parts[0].kind !== "model") return "";
   }
   return parts.map((part, i) => paint(part.label, part.kind, i, parts[i + 1]?.kind)).join("");
 }
@@ -254,7 +260,7 @@ function absoluteSetting(name) {
   const value = process.env[name];
   if (!value || !isAbsolute(value)) return null;
   // on Windows "\x" is relative to the current drive: require a drive letter or a UNC path
-  if (process.platform === "win32" && !/^([a-zA-Z]:[\\/]|[\\/]{2})/.test(value)) return null;
+  if (process.platform === "win32" && !/^([a-zA-Z]:[\\/]|[\\/]{2}[^\\/])/.test(value)) return null;
   return normalize(value);
 }
 
