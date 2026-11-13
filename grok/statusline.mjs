@@ -503,8 +503,10 @@ export function readSources(cachePath) {
       // any other v of 2 is some other file, unless it carries this cache's name
       return ownName ? {} : null;
     }
-    // the old single-entry format of this cache is replaced; any other file is not ours to rewrite
-    if (ownName && body && typeof body === "object" && "source" in body && "record" in body) return {};
+    // the earlier single-entry formats of this cache ({source, record}, and before it
+    // {record, scannedAt} with no source) are replaced; any other file is not ours to rewrite
+    const oldShape = body && typeof body === "object" && !Array.isArray(body) && "record" in body && ("source" in body || "scannedAt" in body);
+    if (ownName && oldShape) return {};
     return null;
   } catch {
     // empty or NUL-filled: what a crash right after a write can leave to this cache, so replace it

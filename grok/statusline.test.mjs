@@ -493,6 +493,20 @@ describe("weekly usage", () => {
     assert.equal(JSON.parse(readFileSync(cachePath, "utf8")).v, 2);
   });
 
+  it("treats the first cache format, with no source key, as empty", () => {
+    const dir = tempDir(join(tmpdir(), "csb-week-"));
+    const logPath = join(dir, "unified.jsonl");
+    const cachePath = join(dir, "usage.json");
+    writeFileSync(logPath, "no credits line\n");
+    writeFileSync(cachePath, JSON.stringify({ sourceMtimeMs: 1, sourceSize: 1, scannedAt: now, record: null }));
+    assert.equal(loadWeekly(logPath, cachePath, now + 1000), null);
+    assert.equal(JSON.parse(readFileSync(cachePath, "utf8")).v, 2);
+    // under another name the same shape is left alone
+    const other = join(dir, "other.json");
+    writeFileSync(other, JSON.stringify({ scannedAt: now, record: null }));
+    assert.equal(readSources(other), null);
+  });
+
   it("does not show one log's reading for another log that shares the cache", () => {
     const dir = tempDir(join(tmpdir(), "csb-week-"));
     const cachePath = join(dir, "usage.json");
