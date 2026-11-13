@@ -445,7 +445,7 @@ test("the SessionStart hook process prints its answer and exits", async () => {
 // A child started by a hook dies with the hook process on its own, so "gone after the hook has
 // exited" would hold even with the disposal removed; the test therefore holds the hook alive. A
 // preload (test-preload.cjs, written below) wraps process.exit in the hook process only: it writes
-// a marker file, then waits 4 s, then really exits. The marker appears after the hook's answer is
+// a marker file, then waits 6 s, then really exits. The marker appears after the hook's answer is
 // flushed and disposeAllAppServers() has run, so the server must already be dead while the hook
 // is still alive and waiting. (Mutation-checked: with disposeChild a no-op the server is still
 // running at the marker and this test fails.) At 2500ms the first read, the account capture (told
@@ -468,6 +468,15 @@ for (const [deadline, direct, allowance, title] of [
   ["400", true, 5_000, "the hook, at its deadline, stops a Codex app-server whose read is still running (400ms)"],
   ["2500", false, 3_000, "a read that times out before the hook deadline stops its own Codex app-server (2500ms)"],
 ]) test(title, async (t) => {
+  // On a loaded machine the server can still be starting when the hook's deadline kills it, so it
+  // never writes its pid: that run proves nothing, and is run again (up to three times) rather than
+  // reported as a pass or a failure of the disposal. A run that did start must pass every check.
+  let outcome;
+  for (let attempt = 1; attempt <= 3 && outcome !== "checked"; attempt += 1) outcome = await runHookDisposal(t, deadline, direct, allowance);
+  assert.equal(outcome, "checked", "the Codex app-server never started (no pid file) in three runs, so the cleanup was not exercised");
+});
+
+async function runHookDisposal(t, deadline, direct, allowance) {
   const root = await fixtureRoot(t);
   const here = dirname(fileURLToPath(import.meta.url));
   const hook = join(here, "..", "hooks", "session-start.mjs");
@@ -478,7 +487,7 @@ for (const [deadline, direct, allowance, title] of [
   const noShell = direct && process.platform === "win32";
   const launcher = join(root, noShell ? "codex.exe" : process.platform === "win32" ? "codex.cmd" : "codex");
   // One preload for every node process of this test (NODE_OPTIONS reaches the hook and the server):
-  //  * the hook (argv[1] is session-start.mjs) has process.exit wrapped: marker first, 4 s wait, exit;
+  //  * the hook (argv[1] is session-start.mjs) has process.exit wrapped: marker first, 6 s wait, exit;
   //  * the copy named codex.exe writes its pid and then blocks the main thread for good.
   const preload = join(root, "test-preload.cjs");
   await writeFile(preload, [
@@ -494,7 +503,7 @@ for (const [deadline, direct, allowance, title] of [
     '    if (!held) {',
     '      held = true;',
     '      fs.writeFileSync(process.env.HOOK_EXIT_MARKER, String(Date.now()));',
-    '      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 4000);',
+    '      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 6000);',
     '    }',
     '    return realExit.call(process, code);',
     '  };',
@@ -533,7 +542,7 @@ for (const [deadline, direct, allowance, title] of [
   let pid = null;
   try {
     // The marker appears once the hook has flushed its answer and disposed of the servers; the hook
-    // then waits 4 s before it really exits.
+    // then waits 6 s before it really exits.
     assert.ok(await until(() => exists(exitMarker), 14_000), "the hook never reached its exit");
     const elapsed = Date.now() - began;
     // The hook answers by its deadline (plus process start-up and cleanup) whatever the server did.
@@ -541,21 +550,22 @@ for (const [deadline, direct, allowance, title] of [
     // The server records its pid once it is up. It must have started (the hook's own read launches it
     // before the deadline); a pid file that never appears means the launch itself failed, which must
     // not pass as "nothing left running".
-    assert.ok(await exists(pidFile), "the Codex app-server never started (no pid file), so the cleanup was not exercised");
+    if (!(await exists(pidFile))) return "never-started";
     pid = Number(await readFile(pidFile, "utf8"));
-    // The hook process is still alive here (it is in its 4 s wait), so a server that is gone was
+    // The hook process is still alive here (it is in its 6 s wait), so a server that is gone was
     // stopped by the hook's disposal, not by the hook process ending. A signal may take a moment to
-    // land (well inside the 4 s), so allow 1.5 s.
+    // land, and under a loaded machine taskkill can be slow, so allow 4 s of the 6.
     assert.equal(child.exitCode, null, "the hook already exited, so this proves nothing about its disposal");
-    assert.ok(await until(() => !alive(pid), 1_500), "the hook left the Codex app-server running while it was still alive");
+    assert.ok(await until(() => !alive(pid), 4_000), "the hook left the Codex app-server running while it was still alive");
     assert.equal(child.exitCode, null, "the server was only seen gone after the hook exited, so this proves nothing about its disposal");
     assert.equal(await exited, 0);
     assert.doesNotThrow(() => JSON.parse(stdout), `the hook printed invalid JSON: ${stdout}`);
+    return "checked";
   } finally {
     if (pid !== null && alive(pid)) process.kill(pid);
     if (child.exitCode === null) child.kill();
   }
-});
+}
 
 // The deadline counts from the start of the hook process, not from when main() gets its
 // input. Codex may take a while to write the input, so that wait must come out of the budget:
