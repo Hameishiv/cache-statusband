@@ -38,6 +38,23 @@ function Set-TomlKey {
   foreach ($line in ($Text -split "`r?`n")) { $lines.Add($line) }
   while ($lines.Count -gt 0 -and $lines[$lines.Count - 1] -eq "") { $lines.RemoveAt($lines.Count - 1) }
 
+  # A table written some other way than a plain [Section] header (dotted keys or an inline
+  # table at the top level, a quoted header) would make the [Section] we append a duplicate
+  # table, which Codex rejects. Refuse rather than guess how to merge into it.
+  $sectionName = '(?:' + [Regex]::Escape($Section) + '|"' + [Regex]::Escape($Section) + '"|''' + [Regex]::Escape($Section) + ''')'
+  $quotedHeaderPattern = '^\s*\[\s*["'']' + [Regex]::Escape($Section) + '["'']\s*\]'
+  $topLevelPattern = '^\s*' + $sectionName + '\s*(?:\.|=)'
+  $inRootTable = $true
+  foreach ($line in $lines) {
+    if ($line -match $quotedHeaderPattern) {
+      throw "config.toml defines [$Section] with a quoted header; configure the footer and hooks manually, or rewrite it as a plain [$Section] table first"
+    }
+    if ($line -match '^\s*\[') { $inRootTable = $false }
+    if ($inRootTable -and $line -match $topLevelPattern) {
+      throw "config.toml defines the $Section table with dotted keys or an inline table; configure the footer and hooks manually, or rewrite it as a plain [$Section] table first"
+    }
+  }
+
   $header = "[$Section]"
   $sectionPattern = '^\s*\[\s*' + [Regex]::Escape($Section) + '\s*\]\s*(?:#.*)?$'
   $sectionStarts = @()
@@ -126,13 +143,35 @@ function Find-TomlValueEnd {
   throw "Unterminated array in [$Section].$Key"
 }
 
-# Runs Codex's strict config check on $Text in a throwaway CODEX_HOME. Returns
-# Passed, CouldNotRun (the check itself did not run: spawn failure or Codex does not know
-# the flag, which says nothing about the config) and Detail (Codex's reason line).
-function Test-CodexStrictConfig {
+# Codex's reason for a failed startup check: its JSON error's data.detail (else message)
+# when the output holds one, otherwise the output itself minus "WARNING:" lines; only then
+# shortened to 500 characters.
+function Get-CodexFailureDetail {
+  param([AllowNull()]$Output)
+
+  $lines = @(@($Output) | ForEach-Object { "$_" } | Where-Object { $_ -notmatch '^\s*WARNING:' })
+  foreach ($line in $lines) {
+    if ($line -notmatch '^\s*\{') { continue }
+    try {
+      $parsed = $line | ConvertFrom-Json -ErrorAction Stop
+      $reason = if ($parsed.error.data.detail) { [string]$parsed.error.data.detail } elseif ($parsed.error.message) { [string]$parsed.error.message } else { "" }
+      if ($reason.Trim()) { return ($reason.Trim() -replace '\s+', ' ') }
+    } catch { }
+  }
+  $detail = (($lines | Out-String).Trim() -replace '\s+', ' ')
+  if ($detail.Length -gt 500) { $detail = $detail.Substring(0, 500) }
+  return $detail
+}
+
+# Runs Codex's startup config check on $Text in a throwaway CODEX_HOME: strict
+# (--strict-config, which also rejects unknown keys) or plain. Returns Passed, CouldNotRun
+# (the check itself did not run: spawn failure or Codex does not know the flag, which says
+# nothing about the config) and Detail (Codex's reason).
+function Test-CodexConfig {
   param(
     [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
-    [Parameter(Mandatory)][string]$CodexCommand
+    [Parameter(Mandatory)][string]$CodexCommand,
+    [switch]$Strict
   )
 
   $validationHome = Join-Path ([IO.Path]::GetTempPath()) ("cache-statusband-config-" + [guid]::NewGuid().ToString("N"))
@@ -142,13 +181,13 @@ function Test-CodexStrictConfig {
     [IO.File]::WriteAllText((Join-Path $validationHome "config.toml"), $Text, [Text.UTF8Encoding]::new($false))
     $env:CODEX_HOME = $validationHome
     try {
-      $validationOutput = & $CodexCommand app-server --strict-config --print-startup-config 2>&1
+      $checkArguments = @("app-server") + $(if ($Strict) { @("--strict-config") } else { @() }) + @("--print-startup-config")
+      $validationOutput = & $CodexCommand @checkArguments 2>&1
     } catch {
       return [pscustomobject]@{ Passed = $false; CouldNotRun = $true; Detail = $_.Exception.Message }
     }
     if ($LASTEXITCODE -eq 0) { return [pscustomobject]@{ Passed = $true; CouldNotRun = $false; Detail = "" } }
-    $detail = (($validationOutput | Out-String).Trim() -replace '\s+', ' ')
-    if ($detail.Length -gt 500) { $detail = $detail.Substring(0, 500) }
+    $detail = Get-CodexFailureDetail -Output $validationOutput
     $couldNotRun = $detail -match 'unexpected argument|unrecognized (option|subcommand)|Usage: codex'
     return [pscustomobject]@{ Passed = $false; CouldNotRun = $couldNotRun; Detail = $detail }
   } finally {
@@ -162,8 +201,11 @@ function Test-CodexStrictConfig {
 
 # Validates by difference. A config.toml that Codex's strict check already rejects (for
 # example one holding a retired key, which plain startup tolerates) must not block the
-# install, so the original is checked first: when it passes, the candidate has to pass
-# too; when it already fails, the plugin's edit cannot be validated and we warn instead.
+# install, so the original is checked first: when it passes, the candidate has to pass the
+# strict check too. When the original already fails the strict check, the candidate is
+# checked with plain startup instead (no --strict-config): a candidate Codex cannot even
+# load, such as a duplicate table, is still refused when the original loaded.
+$script:strictCheckWarned = $false
 function Assert-CodexConfig {
   param(
     [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
@@ -172,14 +214,26 @@ function Assert-CodexConfig {
   )
 
   if ($null -ne $Original) {
-    $before = Test-CodexStrictConfig -Text $Original -CodexCommand $CodexCommand
+    $before = Test-CodexConfig -Text $Original -CodexCommand $CodexCommand -Strict
     if ($before.CouldNotRun) { throw "Codex could not run its strict config check, so config.toml was not validated: $($before.Detail)" }
     if (-not $before.Passed) {
-      Write-Warning "Codex's strict config check already rejects the current config.toml, so the plugin's edit to it could not be validated: $($before.Detail)"
+      if (-not $script:strictCheckWarned) {
+        $script:strictCheckWarned = $true
+        Write-Warning "Codex's strict config check already rejects the current config.toml, so the plugin's edit to it is only checked against plain Codex startup: $($before.Detail)"
+      }
+      $plainBefore = Test-CodexConfig -Text $Original -CodexCommand $CodexCommand
+      $plainAfter = Test-CodexConfig -Text $Text -CodexCommand $CodexCommand
+      if ($plainBefore.CouldNotRun -or $plainAfter.CouldNotRun) {
+        throw "Codex could not run its startup config check, so the candidate config.toml was not validated: $($plainAfter.Detail)"
+      }
+      if ($plainBefore.Passed -and -not $plainAfter.Passed) { throw "Codex rejected the candidate config.toml: $($plainAfter.Detail)" }
+      if (-not $plainBefore.Passed) {
+        Write-Warning "Codex cannot load the current config.toml at all, so the plugin's edit to it could not be validated: $($plainBefore.Detail)"
+      }
       return
     }
   }
-  $after = Test-CodexStrictConfig -Text $Text -CodexCommand $CodexCommand
+  $after = Test-CodexConfig -Text $Text -CodexCommand $CodexCommand -Strict
   if ($after.CouldNotRun) { throw "Codex could not run its strict config check, so the candidate config.toml was not validated: $($after.Detail)" }
   if (-not $after.Passed) { throw "Codex rejected the candidate config.toml: $($after.Detail)" }
 }

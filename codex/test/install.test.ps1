@@ -154,6 +154,92 @@ status_line_use_colors = false
   $retiredAfter = [IO.File]::ReadAllText((Join-Path $retiredHome "config.toml"))
   if ($retiredAfter -notmatch '(?m)^bogus_retired_key = true$') { throw "The retired key was removed from config.toml" }
   if ($retiredAfter -notmatch '(?m)^status_line_use_colors = true$') { throw "The install did not proceed past the retired key" }
+  if (@($retiredWarnings | Where-Object { "$_" -match "strict config check already rejects" }).Count -ne 1) {
+    throw "The strict-check warning was not printed exactly once"
+  }
+  $realCodex = Get-Command codex -All | Where-Object { $_.CommandType -eq "Application" } | Select-Object -First 1 -ExpandProperty Source
+  $env:CODEX_HOME = $retiredHome
+  try {
+    & $realCodex app-server --print-startup-config *> $null
+    $plainExit = $LASTEXITCODE
+  } finally {
+    Remove-Item Env:CODEX_HOME
+  }
+  if ($plainExit -ne 0) { throw "The installed config.toml with a retired key does not pass plain Codex startup" }
+
+  # The same retired key plus a footer written with dotted keys: the plugin cannot add a
+  # [tui] table without duplicating it, so the install is refused and config.toml untouched.
+  $dottedHome = Join-Path $testHome "dotted-home"
+  New-Item -ItemType Directory -Path $dottedHome | Out-Null
+  $dotted = "[features]`nhooks = true`nbogus_retired_key = true`n"
+  foreach ($head in @("tui.status_line = [`"model`"]`n", "tui = { status_line = [`"model`"] }`n")) {
+    $dottedText = $head + $dotted
+    [IO.File]::WriteAllText((Join-Path $dottedHome "config.toml"), $dottedText, [Text.UTF8Encoding]::new($false))
+    $rejected = $false
+    try {
+      & (Join-Path $root "install.ps1") -CodexHome $dottedHome -SkipCliLink 3>$null | Out-Null
+    } catch {
+      $rejected = $_.Exception.Message -match "tui table with dotted keys or an inline table"
+    }
+    if (-not $rejected) { throw "A footer defined with dotted keys or an inline table was not refused with a tui error: $($head.Trim())" }
+    if ([IO.File]::ReadAllText((Join-Path $dottedHome "config.toml")) -ne $dottedText) {
+      throw "The live config changed after a dotted-key footer was refused"
+    }
+  }
+  $quotedText = "[`"tui`"]`nstatus_line = [`"model`"]`n" + $dotted
+  [IO.File]::WriteAllText((Join-Path $dottedHome "config.toml"), $quotedText, [Text.UTF8Encoding]::new($false))
+  $rejected = $false
+  try {
+    & (Join-Path $root "install.ps1") -CodexHome $dottedHome -SkipCliLink 3>$null | Out-Null
+  } catch {
+    $rejected = $_.Exception.Message -match '\[tui\] with a quoted header'
+  }
+  if (-not $rejected) { throw "A quoted [`"tui`"] header was not refused" }
+  if ([IO.File]::ReadAllText((Join-Path $dottedHome "config.toml")) -ne $quotedText) {
+    throw "The live config changed after a quoted tui header was refused"
+  }
+
+  # When the ORIGINAL already fails the strict check, a candidate that Codex cannot even
+  # load (plain startup rejects it) is still refused; the fake codex fails strict for any
+  # config and plain startup only once the plugin's footer edit is present.
+  $plainBin = Join-Path $testHome "plain-bin"
+  New-Item -ItemType Directory -Path $plainBin | Out-Null
+  $plainCodex = @'
+@echo off
+if not "%1"=="app-server" exit /b 0
+if "%2"=="--strict-config" (
+  echo WARNING: noisy line that is not the reason
+  echo unknown field bogus_retired_key
+  exit /b 1
+)
+findstr /C:"status_line_use_colors" "%CODEX_HOME%\config.toml" >nul
+if errorlevel 1 exit /b 0
+echo {"error":{"code":-32600,"data":{"detail":"config.toml:5:1: duplicate key"},"message":"failed to load configuration"}}
+exit /b 1
+'@
+  [IO.File]::WriteAllText((Join-Path $plainBin "codex.cmd"), $plainCodex, [Text.Encoding]::ASCII)
+  $plainHome = Join-Path $testHome "plain-home"
+  New-Item -ItemType Directory -Path $plainHome | Out-Null
+  $plainOriginal = "[history]`npersistence = `"save-all`"`nbogus_retired_key = true`n"
+  [IO.File]::WriteAllText((Join-Path $plainHome "config.toml"), $plainOriginal, [Text.UTF8Encoding]::new($false))
+  $previousPath = $env:PATH
+  $plainMessage = ""
+  try {
+    $env:PATH = "$plainBin$([IO.Path]::PathSeparator)$previousPath"
+    try {
+      & (Join-Path $root "install.ps1") -CodexHome $plainHome -SkipCliLink 3>$null | Out-Null
+    } catch {
+      $plainMessage = $_.Exception.Message
+    }
+  } finally {
+    $env:PATH = $previousPath
+  }
+  if ($plainMessage -notmatch "rejected the candidate") { throw "A candidate plain startup rejects was not refused when the original failed strict: $plainMessage" }
+  if ($plainMessage -notmatch "duplicate key") { throw "Codex's JSON detail was not shown: $plainMessage" }
+  if ($plainMessage -match "WARNING:|\{") { throw "Codex's warning line or raw JSON was shown instead of its reason: $plainMessage" }
+  if ([IO.File]::ReadAllText((Join-Path $plainHome "config.toml")) -ne $plainOriginal) {
+    throw "The live config changed after plain startup rejected the candidate"
+  }
 
   # A candidate that WE break (the original passes the strict check, the edit does not)
   # still throws and leaves config.toml untouched.
