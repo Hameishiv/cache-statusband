@@ -238,7 +238,8 @@ export function bandWidth(parts) {
 /**
  * One status line, or "" when there is nothing we can show. With
  * extras.columns set (Grok's COLUMNS), trailing segments are dropped whole
- * until the band fits, so a cut never leaves part of a number behind.
+ * until the band fits, and a lone segment that still does not fit prints
+ * nothing, so a cut never leaves part of a number behind.
  */
 export function render(payload, extras) {
   const parts = segments(payload, extras);
@@ -246,8 +247,8 @@ export function render(payload, extras) {
   const columns = finite(extras && extras.columns);
   if (columns !== null && columns > 0) {
     while (parts.length > 1 && bandWidth(parts) > columns) parts.pop();
-    // a lone figure that still does not fit would be cut; only a model name may be
-    if (bandWidth(parts) > columns && parts[0].kind !== "model") return "";
+    // a lone segment that still does not fit would be cut: even a model name carries a version figure
+    if (bandWidth(parts) > columns) return "";
   }
   return parts.map((part, i) => paint(part.label, part.kind, i, parts[i + 1]?.kind)).join("");
 }

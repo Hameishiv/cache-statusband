@@ -6,7 +6,7 @@ A status line for [Grok Build](https://x.ai). It paints the session figures Grok
  Grok 4.7 ▶ High ▶ Ctx 29% · 287k/1M ▶ Cache read 80k · write 1.5k ▶ Week 40% · 3d2h ▶ Session $0.04
 ```
 
-Each segment is a colour block. The arrow is `▶` (U+25B6), which does not need a special font. A figure that is neither in the status-line payload nor in a current weekly credits reading is left off the line. A zero Grok did send is shown as zero. The `40%` above is a sample. When the row is narrower than the band (Grok passes its width as `COLUMNS`), segments are dropped whole from the right until it fits, so a figure is never cut part-way. A model name too wide for the row is still shown; any other figure that cannot fit leaves the line empty.
+Each segment is a colour block. The arrow is `▶` (U+25B6), which does not need a special font. A figure that is neither in the status-line payload nor in a current weekly credits reading is left off the line. A zero Grok did send is shown as zero. The `40%` above is a sample. When the row is narrower than the band (Grok passes its width as `COLUMNS`), segments are dropped whole from the right until it fits, so a figure is never cut part-way. If even the first segment cannot fit on its own, the line is left empty (a model name carries a version number too).
 
 ## What was ported
 
@@ -22,7 +22,7 @@ Grok Build 1.0.70 can run a script as the bottom row (`[ui.status_line]` `type =
 | Context measured from a reopened transcript | Not ported. The line uses `context_window.context_tokens` when Grok sends it. It does not parse the transcript. |
 | `/board` of every local session | Not ported. Grok already lists sessions with `grok sessions list` and `/dashboard`. |
 
-The script never reads, prints, or stores an auth token. It does not call a usage endpoint. Each readable log is re-read at most once every five minutes, even when it has no credits line (if the cache file cannot be read or written, every run re-reads it), and the result is kept per log in `cache-statusband-grok/usage.json` (under `%LOCALAPPDATA%` on Windows, under `$XDG_CACHE_HOME` or `~/.cache` elsewhere; a relative `XDG_CACHE_HOME`, `LOCALAPPDATA` or `CSB_USAGE_CACHE` is ignored, since the script runs in the repository Grok has open, and a relative `CSB_BILLING_LOG` or `GROK_HOME` shows no weekly segment; on Windows a path that starts with a single `\` or `/` counts as relative). A cache file that exists but cannot be read is left as it is, and every run then re-reads the log. If the newest complete credits line lacks the percent or the period, no weekly segment is shown. A log that cannot be read is not throttled: it keeps the last reading and is tried again on the next run. A reset that has already passed drops the weekly segment until Grok logs a new one.
+The script never reads, prints, or stores an auth token. It does not call a usage endpoint. Each readable log is re-read at most once every five minutes, even when it has no credits line (if the cache file cannot be read or written, every run re-reads it), and the result is kept per log in `cache-statusband-grok/usage.json` (under `%LOCALAPPDATA%` on Windows, under `$XDG_CACHE_HOME` or `~/.cache` elsewhere; a relative `XDG_CACHE_HOME`, `LOCALAPPDATA` or `CSB_USAGE_CACHE` is ignored, since the script runs in the repository Grok has open, and a relative `CSB_BILLING_LOG` or `GROK_HOME` shows no weekly segment; on Windows a path that starts with a single `\` or `/` counts as relative). A cache file that exists but cannot be read is left as it is, and every run then re-reads the log. If the newest complete credits line lacks the percent or the period, no weekly segment is shown. A log that cannot be read is not throttled: it keeps the last reading and is tried again on the next run. A reset that has already passed drops the weekly segment until Grok logs a new one. Two limits follow from reading a log: after switching account in the same Grok home, the previous account's figure can show for up to five minutes; and only the last 4 MB of the log are read, so an older reading stays in use (with its age shown) if newer credits lines have been pushed further back than that.
 
 ## Credits
 
@@ -36,7 +36,7 @@ The Claude Code mod this is ported from, and the two projects it is built on, ar
 
 Requires Node.js on `PATH` (tested on Node v24.16.0; the tests need Node 20.11 or later, because they use `import.meta.dirname`) and Grok Build with the status-line command (this port was checked against `grok 1.0.70`).
 
-Add this to `~/.grok/config.toml`. A repository config cannot set the row. Leave any existing keys in that file as they are. If `[ui.status_line]` is already there, this replaces that table only. `command` is the full path to `statusline.cmd` in your clone.
+Add this to `config.toml` in your Grok home (`$GROK_HOME`, by default `~/.grok`). A repository config cannot set the row. Leave any existing keys in that file as they are. If `[ui.status_line]` is already there, this replaces that table only. `command` is the full path to `statusline.cmd` in your clone.
 
 ```toml
 [ui.status_line]
@@ -45,7 +45,7 @@ command = "C:/path/to/cache-statusband/grok/statusline.cmd"
 refresh_interval = 300
 ```
 
-The command is the `.cmd` file alone. With grok 1.0.70 on Windows, a command string that joins `node` and a `C:/...` path is one filename, and starting it fails with `os error 123`. `statusline.cmd` moves to the `grok` folder (with `pushd`, which also works from a network path, and stops if that fails), starts the `node` on your `PATH`, and forwards the payload. It never runs a `node` program from the repository Grok has open, which is the folder Grok starts it in.
+The command is the `.cmd` file alone. With grok 1.0.70 on Windows, a command string that joins `node` and a `C:/...` path is one filename, and starting it fails with `os error 123`. `statusline.cmd` moves to the `grok` folder (with `pushd`, which also works from a network path, and stops if that fails), starts the `node` on your `PATH`, forwards the payload, then runs `popd` (which releases a drive letter mapped for a network path) and exits with Node's exit code. It never runs a `node` program from the repository Grok has open, which is the folder Grok starts it in.
 
 This port was run only on Windows. On macOS or Linux, where a `.cmd` file cannot run, set `command` to `node /path/to/cache-statusband/grok/statusline.mjs` instead, quoting a path that contains spaces as you would at a prompt; that setup is untested.
 

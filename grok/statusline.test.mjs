@@ -487,6 +487,11 @@ describe("billingLogPath", () => {
 });
 
 describe("render width", () => {
+  it("prints nothing when even the model name is wider than the row: it carries a version", () => {
+    assert.equal(render({ model: { display_name: "Grok 4.7" } }, { columns: 7 }), "");
+    assert.match(render({ model: { display_name: "Grok 4.7" } }, { columns: 10 }), /Grok 4\.7/);
+  });
+
   it("prints nothing when a lone figure is wider than the row", () => {
     const line = render({ context_window: { used_percentage: 29, context_window_size: 1e6, total_input_tokens: 287000 } }, { columns: 5 });
     assert.equal(line, "");
@@ -673,6 +678,17 @@ describe("cli", () => {
     assert.equal(run.status, 0);
     assert.match(run.stdout, /Grok 4\.7/);
     assert.doesNotMatch(run.stdout, /Session/);
+  });
+
+  it("passes node's exit code through the windows cmd wrapper", { skip: process.platform !== "win32" }, () => {
+    const run = spawnSync(process.env.ComSpec || "cmd.exe", ["/d", "/c", join(import.meta.dirname, "statusline.cmd")], {
+      cwd: import.meta.dirname,
+      env: { ...process.env, CSB_BILLING_LOG: "" },
+      input: "not json",
+      encoding: "utf8",
+    });
+    assert.equal(run.status, 1);
+    assert.match(run.stderr, /not a JSON object/);
   });
 
   it("starts through the windows cmd wrapper", { skip: process.platform !== "win32" }, () => {
