@@ -14,6 +14,9 @@ const MIN_FETCH_BUDGET_MS = 3_000;
 // A read is told to give up this long before the hook deadline, so that its own cleanup
 // (which stops the Codex app-server it started) normally runs before the hook exits.
 const READ_MARGIN_MS = 500;
+// When this process started, so Node's own start-up and the wait for stdin count against the
+// deadline too. (performance.timeOrigin is the start of the process.)
+const PROCESS_STARTED_AT = performance.timeOrigin;
 
 export async function handleSessionStart(input, {
   usageGetter = getUsageSnapshot,
@@ -23,10 +26,11 @@ export async function handleSessionStart(input, {
   codexHome = null,
   now = Date.now(),
   deadlineMs = DEFAULT_DEADLINE_MS,
+  startedAt = Date.now(),
 } = {}) {
   const source = input?.source;
   if (!["startup", "resume", "fork"].includes(source)) return {};
-  const started = Date.now();
+  const started = startedAt;
   const readBudget = () => Math.max(READ_MARGIN_MS, deadlineMs - (Date.now() - started) - READ_MARGIN_MS);
   const messages = [];
   let home = codexHome;
@@ -86,7 +90,8 @@ export async function handleSessionStart(input, {
     } catch {}
   })();
   let timer;
-  // The deadline counts from the start of the hook.
+  // The deadline counts from startedAt: the start of the hook process when run as the hook
+  // (main passes it), otherwise the moment this function was called.
   const expired = new Promise((resolve) => { timer = setTimeout(resolve, Math.max(0, deadlineMs - (Date.now() - started))); });
   try {
     await Promise.race([Promise.all([transcriptPart, usagePart]), expired]);
@@ -102,7 +107,7 @@ async function main() {
   try {
     const raw = await readStdin(1024 * 1024);
     const input = JSON.parse(raw || "{}");
-    output = `${JSON.stringify(await handleSessionStart(input, deadlineOption()))}\n`;
+    output = `${JSON.stringify(await handleSessionStart(input, { ...deadlineOption(), startedAt: PROCESS_STARTED_AT }))}\n`;
   } catch {}
   // A read that outlived the deadline may still hold handles open, and its Codex
   // app-server is still running. The hook is done once its answer is flushed: stop those

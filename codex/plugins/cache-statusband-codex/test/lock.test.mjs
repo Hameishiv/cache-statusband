@@ -102,3 +102,19 @@ test("a lock file that fails with a missing or read-only folder is not retried o
     assert.equal(calls.length, 1, code);
   }
 });
+
+test("the probe file is removed even when closing it throws", async (t) => {
+  const root = await fixtureRoot(t);
+  const path = join(root, "close.lock");
+  const impl = async (target, ...rest) => {
+    if (!target.includes(".probe.")) throw Object.assign(new Error("EPERM: simulated"), { code: "EPERM" });
+    const handle = await open(target, ...rest);
+    const close = handle.close.bind(handle);
+    handle.close = async () => { await close(); throw new Error("close failed: simulated"); };
+    return handle;
+  };
+  // The probe cannot be confirmed, so the folder counts as unwritable; what matters here is
+  // that nothing is left behind.
+  await assert.rejects(acquireLock(path, { openImpl: impl, retryDelaysMs: [1] }), { code: "EPERM" });
+  assert.deepEqual(await readdir(root), []);
+});

@@ -14,7 +14,8 @@ import { link, open, readFile, rename, stat, unlink } from "node:fs/promises";
 // the folder or an old lock file open, which shows up as EPERM, EACCES or EBUSY), so that is
 // tried again a few times and, if it keeps failing, counts as "someone else holds it" (null)
 // as long as the folder itself can be written to: a small probe file is created there to
-// tell. A folder that cannot be written at all (the probe fails too, or the folder is missing
+// tell. So null means either that another live holder owns the lock or that creating it was
+// refused for a moment in a folder that can be written to. A folder that cannot be written at all (the probe fails too, or the folder is missing
 // or read-only) throws the original error, so the caller can report an unwritable cache.
 export async function acquireLock(path, { now = Date.now(), staleMs = 30_000, openImpl = open, retryDelaysMs = CREATE_RETRY_DELAYS_MS } = {}) {
   const token = randomUUID();
@@ -82,11 +83,15 @@ async function folderAcceptsNewFiles(path, openImpl) {
   const probe = `${path}.probe.${randomUUID()}`;
   try {
     const handle = await openImpl(probe, "wx", 0o600);
-    await handle.close();
+    // The probe is removed whatever close() does: a close that throws must not leave it behind.
+    try {
+      await handle.close();
+    } finally {
+      await unlink(probe).catch(() => {});
+    }
   } catch {
     return false;
   }
-  await unlink(probe).catch(() => {});
   return true;
 }
 

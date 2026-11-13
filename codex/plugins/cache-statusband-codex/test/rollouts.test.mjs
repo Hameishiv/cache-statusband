@@ -354,6 +354,26 @@ test("a transcript read that never finishes cannot push the hook past its deadli
   assert.doesNotMatch(output.systemMessage, /restored/);
 });
 
+test("the SessionStart deadline can be measured from an earlier start than the call", async (t) => {
+  const root = await fixtureRoot(t);
+  const started = Date.now();
+  // The hook process started 1,200ms ago (Node start-up, waiting for stdin): of a 1,500ms
+  // deadline only about 300ms remain, so a read that never finishes is cut off by then.
+  const output = await handleSessionStart(
+    { source: "startup", session_id: "early-start", transcript_path: join(root, "rollout.jsonl") },
+    {
+      codexHome: root,
+      deadlineMs: 1_500,
+      startedAt: Date.now() - 1_200,
+      rolloutParser: () => new Promise(() => {}),
+      identityGetter: () => new Promise(() => {}),
+      usageGetter: () => new Promise(() => {}),
+    },
+  );
+  assert.ok(Date.now() - started < 1_000, `took ${Date.now() - started}ms`);
+  assert.deepEqual(output, {});
+});
+
 test("the SessionStart hook process prints its answer and exits", async () => {
   const hook = join(dirname(fileURLToPath(import.meta.url)), "..", "hooks", "session-start.mjs");
   const child = execFile(process.execPath, [hook], { timeout: 10_000 });

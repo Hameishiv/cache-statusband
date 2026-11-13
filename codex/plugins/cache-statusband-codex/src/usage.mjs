@@ -503,10 +503,11 @@ export async function fetchRateLimitsViaAppServer({
 export function sanitizeRateLimits(raw) {
   const bank = raw?.rateLimitResetCredits;
   const availableCount = finiteNonnegative(bank?.availableCount);
-  // Only reset credits that can still be used are kept: a row with a status other than
-  // "available" (a used or expired one) is dropped, and the count of those is kept apart
-  // (creditsNotAvailable, never shown) so it is not mistaken for the cap below. A row with no
-  // status is kept, as Codex's rows have not always carried one.
+  // Only reset credits that can still be used are kept. Codex's row status is one of
+  // "available", "redeeming", "redeemed" or "unknown": a row with any status other than
+  // "available" is dropped, and the count of those is kept apart (creditsNotAvailable) so it
+  // is not mistaken for the cap below. A row with no status is kept, as Codex's rows have not
+  // always carried one.
   const rawRows = Array.isArray(bank?.credits) ? bank.credits : null;
   const usable = rawRows ? rawRows.filter((credit) => credit?.status === undefined || credit?.status === null || credit.status === "available") : null;
   const creditsNotAvailable = rawRows ? rawRows.length - usable.length : 0;

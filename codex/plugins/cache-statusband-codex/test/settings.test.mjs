@@ -43,11 +43,12 @@ test("an unreadable or malformed settings.json fails closed instead of meaning n
   await mkdir(join(root, "cache-statusband-codex", "settings.json"));
   assert.deepEqual(await configuredSeatIdentity(root, {}), unavailable);
   // Presentation then drops the account details rather than showing them.
-  const shown = await usagePresentation({ accountEmail: EMAIL, availableCount: 2, credits: [], creditsOmitted: 3, identityKey: `account:${EMAIL}` }, { codexHome: root, env: {} });
+  const shown = await usagePresentation({ accountEmail: EMAIL, availableCount: 2, credits: [], creditsOmitted: 3, creditsNotAvailable: 4, identityKey: `account:${EMAIL}` }, { codexHome: root, env: {} });
   assert.equal(shown.identity, null);
   assert.equal(shown.snapshot.accountEmail, null);
   assert.equal(shown.snapshot.availableCount, null);
   assert.equal(shown.snapshot.creditsOmitted, null);
+  assert.equal(shown.snapshot.creditsNotAvailable, null);
 });
 
 test("a malformed settings.json never lets the CLI show or emit the account email", async (t) => {

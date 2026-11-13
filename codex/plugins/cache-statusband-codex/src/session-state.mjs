@@ -24,7 +24,8 @@ export async function getSessionIdentity(codexHome, sessionId, capture) {
     identity = await capture(codexHome);
   } catch {
     // A failed capture (reader error, seat change, unreadable seat) is not "no account":
-    // record nothing so a later start can try again.
+    // nothing is recorded now. A later resume of this session does not capture again, so it
+    // records the session as unknown; only a start can record an identity.
     return null;
   }
   const record = { version: STATE_VERSION, identity };
@@ -64,8 +65,9 @@ export async function saveSessionState(codexHome, sessionId, summary, savedAt = 
   if (!codexHome || !sessionId || !state) return false;
   const path = sessionStatePath(codexHome, sessionId);
   await mkdir(join(codexHome, "cache-statusband-codex", "sessions"), { recursive: true });
-  // One writer per session; a fresh lock means another Stop hook is saving right now.
-  // A save takes milliseconds, so wait briefly for it before giving up on this one.
+  // One writer per session; a fresh lock means another Stop hook is saving right now, and a
+  // lock file refused for a moment (acquireLock also returns null for that) takes the same
+  // path. A save takes milliseconds, so wait briefly before giving up on this one.
   let lock = await acquireLock(`${path}.lock`, { staleMs: SAVE_LOCK_STALE_MS });
   for (let retry = 0; !lock && retry < SAVE_LOCK_RETRIES; retry += 1) {
     await new Promise((resolve) => setTimeout(resolve, SAVE_LOCK_RETRY_MS));
