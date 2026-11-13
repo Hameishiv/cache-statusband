@@ -67,7 +67,7 @@ describe("segments", () => {
 
   it("keeps the line to one line with no control codes from the payload", () => {
     const labels = segments({ model: { display_name: "Grok\n4.7\u001b[2J" }, effort: { level: "\u0007high" } }).map((p) => p.label);
-    assert.deepEqual(labels, ["Grok4.7[2J", "High"]);
+    assert.deepEqual(labels, ["Grok 4.7 [2J", "High"]);
     assert.equal(segments({ model: { display_name: "\u001b\n" } }).length, 0);
   });
 
@@ -132,6 +132,9 @@ describe("weekly usage", () => {
     assert.equal(weeklyLabel(at("not a time"), now), "week 23% (read time unknown) · 4d11h");
     assert.equal(weeklyLabel({ ...weekly, fetchedAt: null }, now), "week 23% (read time unknown) · 4d11h");
     assert.equal(weeklyLabel(at("2026-10-29T13:00:00Z"), now), "week 23% (read time unknown) · 4d11h");
+    // a few minutes of clock skew is not a moved clock
+    assert.equal(weeklyLabel(at("2026-10-29T11:50:00Z"), now), "week 23% · 4d11h");
+    assert.equal(weeklyLabel(at("2026-10-29T11:52:00Z"), now), "week 23% (read time unknown) · 4d11h");
   });
 
   it("accepts only a period type that ends in _WEEKLY", () => {

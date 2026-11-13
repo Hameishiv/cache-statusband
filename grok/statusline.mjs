@@ -199,7 +199,7 @@ export function segments(payload, extras = {}) {
     ["cost", costLabel(payload.cost && payload.cost.total_cost_usd)],
   ];
   return parts
-    .map(([kind, label]) => [kind, label && label.replace(/[\u0000-\u001f\u007f-\u009f]/g, "").trim()])
+    .map(([kind, label]) => [kind, label && label.replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ").replace(/ {2,}/g, " ").trim()])
     .filter(([, label]) => label)
     .map(([kind, label]) => ({ kind, label: capFirst(label) }));
 }
@@ -381,8 +381,9 @@ function writeSources(cachePath, sources) {
 
 /**
  * Last weekly reading. Re-reads each readable log at most once per five
- * minutes, even when it has no credits line, as long as the cache can be written. A re-read that finds no credits line keeps the
- * last good record and only moves the next check. A re-read whose newest
+ * minutes, even when it has no credits line, as long as the cache can be
+ * written. A re-read that finds no credits line keeps the last good record
+ * and only moves the next check. A re-read whose newest
  * credits line cannot be used drops it. A log that cannot be read keeps the
  * last good record and is tried again on the next run.
  * The cache holds one entry per log: the log's size and time, when it was read,
