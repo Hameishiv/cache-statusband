@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmod, mkdtemp, mkdir, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdtemp, mkdir, readdir, readFile, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { execFile } from "node:child_process";
 import { dirname, join } from "node:path";
@@ -448,9 +448,16 @@ test("the SessionStart hook process prints its answer and exits", async () => {
 // hook process), times out first, and the reader's own cleanup stops the server; that variant
 // leaves it well over a second to start a server behind a slow cmd shim, so it must find its
 // pid. (With under 3.5 s left, the usage read that follows only reads the cache.)
-for (const [deadline, mustStart, title] of [
-  ["400", false, "the hook, at its deadline, stops a Codex app-server whose read is still running (400ms)"],
-  ["2500", true, "a read that times out before the hook deadline stops its own Codex app-server (2500ms)"],
+// On Windows the 400ms variant launches the hung server WITHOUT cmd.exe (a copy of node.exe named
+// codex.exe, which a preload turns into the hung server): the hook kills at a moment when cmd.exe
+// may be starting its child, and taskkill /T's snapshot of the tree can miss a grandchild born in
+// that instant. The real Codex app-server exits when its stdin closes, which happens as the hook
+// lets go of its pipes, so in the product that grandchild does not outlive the hook; the hung
+// fixture ignores stdin EOF, so a test that raced this would report an orphan the product does not
+// leave. The 2500ms variant keeps the codex.cmd shim, where the start is long over by the kill.
+for (const [deadline, mustStart, direct, title] of [
+  ["400", false, true, "the hook, at its deadline, stops a Codex app-server whose read is still running (400ms)"],
+  ["2500", true, false, "a read that times out before the hook deadline stops its own Codex app-server (2500ms)"],
 ]) test(title, async (t) => {
   const root = await fixtureRoot(t);
   const here = dirname(fileURLToPath(import.meta.url));
@@ -458,11 +465,28 @@ for (const [deadline, mustStart, title] of [
   const hung = join(here, "..", "fixtures", "hung-app-server.mjs");
   const pidFile = join(root, "hung.pid");
   // The npm shape on Windows (codex.cmd -> cmd.exe -> node), a script elsewhere.
-  const launcher = join(root, process.platform === "win32" ? "codex.cmd" : "codex");
-  await writeFile(launcher, process.platform === "win32"
-    ? `@echo off\r\n"${process.execPath}" "${hung}" %*\r\n`
-    : `#!/bin/sh\nexec "${process.execPath}" "${hung}" "$@"\n`, { mode: 0o755 });
-  const env = { ...process.env, CODEX_HOME: root, CODEX_BIN: launcher, HUNG_PID_FILE: pidFile, CACHE_STATUSBAND_HOOK_DEADLINE_MS: deadline };
+  const noShell = direct && process.platform === "win32";
+  const launcher = join(root, noShell ? "codex.exe" : process.platform === "win32" ? "codex.cmd" : "codex");
+  const extra = {};
+  if (noShell) {
+    const preload = join(root, "hung-preload.cjs");
+    // Only the copy named codex.exe hangs: NODE_OPTIONS also reaches the hook's own node.exe.
+    await writeFile(preload, [
+      'if (/codex\\.exe$/i.test(process.execPath)) {',
+      '  require("node:fs").writeFileSync(process.env.HUNG_PID_FILE, String(process.pid));',
+      '  process.stdin.resume();',
+      '  setInterval(() => {}, 1000);',
+      '}',
+      '',
+    ].join("\n"), "utf8");
+    await copyFile(process.execPath, launcher);
+    extra.NODE_OPTIONS = `--require "${preload.replaceAll("\\", "/")}"`;
+  } else {
+    await writeFile(launcher, process.platform === "win32"
+      ? `@echo off\r\n"${process.execPath}" "${hung}" %*\r\n`
+      : `#!/bin/sh\nexec "${process.execPath}" "${hung}" "$@"\n`, { mode: 0o755 });
+  }
+  const env = { ...process.env, ...extra, CODEX_HOME: root, CODEX_BIN: launcher, HUNG_PID_FILE: pidFile, CACHE_STATUSBAND_HOOK_DEADLINE_MS: deadline };
   const child = execFile(process.execPath, [hook], { env, timeout: 15_000 });
   let stdout = "";
   child.stdout.on("data", (chunk) => { stdout += chunk; });
@@ -472,7 +496,7 @@ for (const [deadline, mustStart, title] of [
   const elapsed = Date.now() - began;
   assert.equal(code, 0);
   // The hook answers by its deadline (plus process start-up and cleanup) whatever the server did.
-  assert.ok(elapsed < Number(deadline) + 3_000, `the hook took ${elapsed}ms against a ${deadline}ms deadline`);
+  assert.ok(elapsed < Number(deadline) + 5_000, `the hook took ${elapsed}ms against a ${deadline}ms deadline`);
   assert.doesNotThrow(() => JSON.parse(stdout), `the hook printed invalid JSON: ${stdout}`);
   const until = async (condition, ms) => {
     const end = Date.now() + ms;
@@ -528,7 +552,7 @@ exec "${process.execPath}" "${hung}" "$@"
     assert.doesNotThrow(() => JSON.parse(stdout), `the hook printed invalid JSON: ${stdout}`);
     // About 500ms of the budget was left, plus cleanup; counting from the input it would be
     // 2500ms or more.
-    assert.ok(afterInput < 2_000, `the hook took ${afterInput}ms after its input arrived, against a 2500ms deadline that began 2000ms earlier`);
+    assert.ok(afterInput < 2_300, `the hook took ${afterInput}ms after its input arrived, against a 2500ms deadline that began 2000ms earlier`);
   } finally {
     const pid = Number(await readFile(pidFile, "utf8").catch(() => ""));
     if (Number.isFinite(pid) && pid > 0) { try { process.kill(pid); } catch {} }

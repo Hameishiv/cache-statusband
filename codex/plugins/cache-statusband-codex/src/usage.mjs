@@ -302,6 +302,9 @@ function trackDisposal(finished) {
 // child.kill() is only the fallback when taskkill cannot run or fails. A child that has
 // already exited is not signalled once its exit is known: its pid may be reused by an
 // unrelated process.
+// A grandchild that cmd.exe starts in the instant between taskkill's snapshot of the tree and the
+// kill is not in that snapshot; that one relies on the real Codex app-server exiting when its stdin
+// closes, which the stdin.end() below and the closed pipes bring about.
 // Returns a promise that settles once taskkill (if any) has finished.
 function disposeChild(child, { platform = process.platform, spawnKiller = spawn } = {}) {
   const gone = child.exitCode != null || child.signalCode != null;
