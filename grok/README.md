@@ -45,7 +45,7 @@ command = "C:/path/to/cache-statusband/grok/statusline.cmd"
 refresh_interval = 300
 ```
 
-The command is the `.cmd` file alone. With grok 1.0.70 on Windows, a command string that joins `node` and a `C:/...` path is one filename, and starting it fails with `os error 123`. `statusline.cmd` runs Node from its own folder and forwards the payload. Node still has to be on `PATH`; a `node` program in the repository Grok has open is never used.
+The command is the `.cmd` file alone. With grok 1.0.70 on Windows, a command string that joins `node` and a `C:/...` path is one filename, and starting it fails with `os error 123`. `statusline.cmd` moves to the `grok` folder, starts the `node` on your `PATH`, and forwards the payload. It never runs a `node` program from the repository Grok has open, which is the folder Grok starts it in.
 
 This port was run only on Windows. On macOS or Linux, where a `.cmd` file cannot run, set `command` to `node /path/to/cache-statusband/grok/statusline.mjs` instead, quoting a path that contains spaces as you would at a prompt; that setup is untested.
 
