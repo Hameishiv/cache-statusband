@@ -139,9 +139,16 @@ function Get-RegisteredMarketplaceSource([AllowNull()][string]$Text, [string]$Na
 }
 
 # The text of a file, or $null when there is none; and whether two such readings are the same.
+# A symbolic link whose target is missing holds no text either: it reads as $null here, and
+# Resolve-ReplaceTarget gives it its own refusal when the install reaches a replace.
 function Read-TextOrNull([string]$Path) {
-  if (Test-Path -LiteralPath $Path) { return [IO.File]::ReadAllText($Path) }
-  return $null
+  if (-not (Test-Path -LiteralPath $Path)) { return $null }
+  $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+  if ($item -and $item.LinkType -eq "SymbolicLink") {
+    $target = [IO.File]::ResolveLinkTarget($Path, $true)
+    if ($target -and -not $target.Exists) { return $null }
+  }
+  return [IO.File]::ReadAllText($Path)
 }
 function Test-SameText([AllowNull()][string]$A, [AllowNull()][string]$B) {
   if ($null -eq $A -or $null -eq $B) { return ($null -eq $A -and $null -eq $B) }

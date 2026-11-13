@@ -523,6 +523,44 @@ exit /b 0
   if (-not $lateLinkMessage.StartsWith("Codex had already registered the plugin when this was found, so the install stopped part-way; see the warning above for what was done with config.toml.")) { throw "The hard-link refusal after registration did not lead with the fact that Codex had registered: $lateLinkMessage" }
   if ($lateLinkMessage -notmatch "is a hard link, so it has more than one name" -or $lateLinkMessage -notmatch "run the installer again") { throw "The hard-link refusal after registration lost its reason or advice: $lateLinkMessage" }
 
+  # Codex registers the plugin and leaves config.toml as a symbolic link whose target is
+  # missing. That is refused after registration with the same lead-in as the other late
+  # refusals, not a raw file-read error and not "Nothing was changed". (Skipped where symbolic
+  # links cannot be created.)
+  $danglingProbe = Join-Path $testHome "late-dangling-probe"
+  $danglingLinksWork = $true
+  try {
+    New-Item -ItemType SymbolicLink -Path $danglingProbe -Target (Join-Path $testHome "late-dangling-probe-target") -ErrorAction Stop | Out-Null
+  } catch {
+    $danglingLinksWork = $false
+    Write-Host "Skipped the after-registration dangling symbolic link test: symbolic links cannot be created here."
+  }
+  if ($danglingLinksWork) {
+    $dangleBin = Join-Path $testHome "late-dangle-bin"
+    New-Item -ItemType Directory -Path $dangleBin | Out-Null
+    $dangleCodex = "@echo off`r`nif `"%1`"==`"app-server`" exit /b 0`r`nif `"%1`"==`"plugin`" if `"%2`"==`"marketplace`" if `"%3`"==`"add`" (`r`n  del /f /q `"%CODEX_HOME%\config.toml`" >nul`r`n  mklink `"%CODEX_HOME%\config.toml`" `"%CODEX_HOME%\gone-target.toml`" >nul`r`n  exit /b 0`r`n)`r`nexit /b 0`r`n"
+    [IO.File]::WriteAllText((Join-Path $dangleBin "codex.cmd"), $dangleCodex, [Text.Encoding]::ASCII)
+    $lateDangleHome = Join-Path $testHome "late-dangle-home"
+    New-Item -ItemType Directory -Path $lateDangleHome | Out-Null
+    [IO.File]::WriteAllText((Join-Path $lateDangleHome "config.toml"), $original, [Text.UTF8Encoding]::new($false))
+    $lateDangleMessage = ""
+    $previousPath = $env:PATH
+    try {
+      $env:PATH = "$dangleBin$([IO.Path]::PathSeparator)$previousPath"
+      try {
+        & (Join-Path $root "install.ps1") -CodexHome $lateDangleHome -SkipCliLink 3>$null | Out-Null
+      } catch {
+        $lateDangleMessage = $_.Exception.Message
+      }
+    } finally {
+      $env:PATH = $previousPath
+    }
+    if (-not $lateDangleMessage) { throw "A config.toml turned into a dangling symbolic link by Codex's registration did not fail the install" }
+    if ($lateDangleMessage -match "Nothing was changed" -or $lateDangleMessage -match "Nothing was installed") { throw "The dangling-link refusal after registration still claimed nothing was changed: $lateDangleMessage" }
+    if (-not $lateDangleMessage.StartsWith("Codex had already registered the plugin when this was found, so the install stopped part-way; see the warning above for what was done with config.toml.")) { throw "The dangling-link refusal after registration did not lead with the fact that Codex had registered (a raw error?): $lateDangleMessage" }
+    if ($lateDangleMessage -notmatch "is a symbolic link to .*gone-target\.toml, which does not exist" -or $lateDangleMessage -notmatch "run the installer again") { throw "The dangling-link refusal after registration lost its reason or advice: $lateDangleMessage" }
+  }
+
   # When npm cannot even be run (not on PATH), the failure is still reported as only the link
   # step failing, and the hooks-review and restart lines were already printed before it.
   $noNpmBin = Join-Path $testHome "no-npm-bin"
