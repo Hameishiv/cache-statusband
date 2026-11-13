@@ -475,7 +475,8 @@ function storedRecord(entry) {
  * any shape but exactly {v: 2, sources}, say from a mistyped CSB_USAGE_CACHE):
  * it is then neither used nor rewritten. A missing file counts as empty, and so
  * does a file named usage.json that is empty or NUL-filled (what a crash can
- * leave), has a v of 2 without this cache's entries, or is in the old
+ * leave), has a v of 2 in any other shape (no usable sources, or an extra
+ * key; the entries of other logs are then dropped too), or is in the old
  * single-entry format; under any other name such a file is left as it is.
  */
 export function readSources(cachePath) {
@@ -513,11 +514,14 @@ export function readSources(cachePath) {
   }
 }
 
-function writeSources(cachePath, sources) {
+/**
+ * Write the cache through a fresh temporary file. `tmpName` is for tests.
+ */
+export function writeSources(cachePath, sources, tmpName) {
   if (!cachePath) return;
   // write then rename, so a reader never sees a half-written file
   // a random part too: a run killed mid-write can leave its file, and pids are reused
-  const tmp = `${cachePath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+  const tmp = tmpName || `${cachePath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
   let created = false;
   try {
     mkdirSync(dirname(cachePath), { recursive: true });
@@ -552,8 +556,8 @@ function writeSources(cachePath, sources) {
  * last good record and is tried again on the next run. A cache file that
  * exists but cannot be read, is in a newer format, or is not this cache (not
  * JSON, or JSON of another shape) is left as it is, and its entries are not used;
- * only a file named usage.json that is empty, NUL-filled, a v of 2 without this
- * cache's entries, or in the old format is replaced.
+ * only a file named usage.json that is empty, NUL-filled, a v of 2 in any other
+ * shape, or in the old format is replaced.
  * The cache holds one entry per log: the log's size and time, when it was read,
  * and the percent, period type, period end, and fetch time.
  */

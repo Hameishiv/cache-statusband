@@ -23,6 +23,7 @@ import {
   shade,
   usageCachePath,
   weeklyLabel,
+  writeSources,
 } from "./statusline.mjs";
 
 // the shell running the suite may export COLUMNS; the spawned CLI must not fit itself to it
@@ -461,11 +462,15 @@ describe("weekly usage", () => {
     const logPath = join(dir, "unified.jsonl");
     const cachePath = join(dir, "usage.json");
     writeFileSync(logPath, "no credits line\n");
-    const planted = `${cachePath}.${process.pid}.tmp`;
+    // a file at the exact temporary name is not written through, not removed, and no cache is written
+    const planted = join(dir, "planted.tmp");
     writeFileSync(planted, "planted");
-    assert.equal(loadWeekly(logPath, cachePath, now), null);
+    writeSources(cachePath, {}, planted);
     assert.equal(readFileSync(planted, "utf8"), "planted");
-    // nor in the way: the cache is still written, through a fresh name
+    assert.equal(existsSync(cachePath), false);
+    // nor is a leftover in the way of a normal run: it writes through a fresh name
+    writeFileSync(`${cachePath}.${process.pid}.tmp`, "left");
+    assert.equal(loadWeekly(logPath, cachePath, now), null);
     assert.equal(JSON.parse(readFileSync(cachePath, "utf8")).v, 2);
   });
 
@@ -705,6 +710,20 @@ describe("readLastBilling", () => {
     const boundary = body.length - chunk;
     assert.ok(boundary > before.length && boundary < before.length + line.length);
     assert.equal(readLastBilling(log(body)).percent, 37);
+  });
+
+  it("shows no reading when a broken finished credits line straddles the chunk boundary", () => {
+    const chunk = 256 * 1024;
+    const broken = `{"ts":"2026-10-29T12:00:00Z","msg":"billing: fetched credits config","pad":"${"p".repeat(400)}","ctx":{"config":{"creditUsag`;
+    const before = `${credits(24)}
+`;
+    const after = `${"z".repeat(chunk + Math.floor(broken.length / 2) - broken.length - 2)}
+`;
+    const body = `${before}${broken}
+${after}`;
+    const boundary = body.length - chunk;
+    assert.ok(boundary > before.length && boundary < before.length + broken.length);
+    assert.equal(readLastBilling(log(body)), null);
   });
 
   it("does not look past maxBytes", () => {
