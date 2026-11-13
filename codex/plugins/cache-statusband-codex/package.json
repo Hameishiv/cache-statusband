@@ -1,6 +1,6 @@
 {
   "name": "cache-statusband-codex",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Truthful status and local session tools for Codex CLI and desktop.",
   "type": "module",
   "private": true,

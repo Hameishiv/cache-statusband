@@ -56,12 +56,12 @@ async function board(argv) {
     return;
   }
   const rows = summaries.map((item) => ({
-    id: shorten(item.id, 12),
+    id: shorten(clean(item.id), 12),
     state: item.archived ? "archived" : "stored",
     age: formatAge(item.updatedAt),
-    model: shorten([item.model, item.effort].filter(Boolean).join("/") || "?", 24),
+    model: shorten(clean([item.model, item.effort].filter(Boolean).join("/")) || "?", 24),
     context: contextText(item),
-    project: shorten(projectName(item.cwd), 26),
+    project: shorten(clean(projectName(item.cwd)), 26),
   }));
   printTable(rows, [
     ["id", "SESSION"], ["state", "STATE"], ["age", "UPDATED"],
@@ -90,9 +90,9 @@ async function session(argv) {
     return;
   }
   const values = {
-    session: summary.id,
-    project: summary.cwd ?? "?",
-    model: [summary.model, summary.effort].filter(Boolean).join("/") || "?",
+    session: clean(summary.id),
+    project: clean(summary.cwd) || "?",
+    model: clean([summary.model, summary.effort].filter(Boolean).join("/")) || "?",
     context: contextText(summary),
     updated: `${formatAge(summary.updatedAt)} ago`,
     tokens: summary.totalUsage?.totalTokens == null ? "?" : formatTokens(summary.totalUsage.totalTokens),
@@ -133,6 +133,11 @@ function integer(value, name) {
   const result = Number.parseInt(value, 10);
   if (!Number.isSafeInteger(result) || result < 1 || result > 10_000) throw new Error(`${name} must be between 1 and 10000`);
   return result;
+}
+
+// Transcript fields are untrusted: drop C0/C1 control characters (terminal escapes).
+function clean(value) {
+  return String(value ?? "").replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").trim();
 }
 
 function shorten(value, length) {

@@ -1,3 +1,5 @@
+import { MIN_POLL_INTERVAL_MS } from "./usage.mjs";
+
 export function formatTokens(value) {
   if (!Number.isFinite(value)) return "?";
   const absolute = Math.abs(value);
@@ -31,7 +33,7 @@ export function formatUsageLines(snapshot, now = Date.now(), {
       .filter((value) => Number.isFinite(value) && value > now)
       .sort((a, b) => a - b);
     const expiry = expiries.length ? `; next expires in ${formatDuration(expiries[0] - now)}` : "";
-    lines.push(`Banked resets: ${snapshot.availableCount}${expiry}`);
+    lines.push(`Banked resets: ${snapshot.availableCount}${expiry}${checkedSuffix(snapshot, now)}`);
     if (includeResetDetails && snapshot.availableCount > 0) {
       const credits = Array.isArray(snapshot.credits) ? [...snapshot.credits] : [];
       credits.sort((a, b) => (epochMilliseconds(a.expiresAt) ?? Number.POSITIVE_INFINITY) - (epochMilliseconds(b.expiresAt) ?? Number.POSITIVE_INFINITY));
@@ -79,6 +81,15 @@ export function capFirst(text) {
   return value.replace(/^([^\p{L}\p{N}]*)(\p{Ll})/u, (_, lead, letter) => lead + letter.toUpperCase());
 }
 
+// A count that was not just read says how old it is, so it is not mistaken for live.
+function checkedSuffix(snapshot, now) {
+  if (!Number.isFinite(snapshot?.fetchedAt)) {
+    return snapshot?.source === "live" || snapshot?.source === "cache" ? "" : " (check time unknown)";
+  }
+  const stale = !["live", "cache"].includes(snapshot.source) || now - snapshot.fetchedAt > 2 * MIN_POLL_INTERVAL_MS;
+  return stale ? ` (checked ${formatAge(snapshot.fetchedAt, now)} ago)` : "";
+}
+
 export function formatLocalDate(value, { locale, timeZone } = {}) {
   const options = {
     year: "numeric",
@@ -89,7 +100,8 @@ export function formatLocalDate(value, { locale, timeZone } = {}) {
     timeZoneName: "short",
   };
   if (timeZone) options.timeZone = timeZone;
-  return new Intl.DateTimeFormat(locale, options).format(new Date(value));
+  // Newer ICU builds put a narrow no-break space before AM/PM; keep output plain.
+  return new Intl.DateTimeFormat(locale, options).format(new Date(value)).replace(/[\u202f\u00a0]/g, " ");
 }
 
 export function formatDuration(milliseconds) {

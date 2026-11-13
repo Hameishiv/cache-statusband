@@ -13,7 +13,7 @@ export function defaultCodexHome(env = process.env) {
 
 export async function parseRollout(path) {
   const fileStat = await stat(path);
-  const text = await readEdges(path, fileStat.size);
+  const edges = await readEdges(path, fileStat.size);
   const summary = {
     path: resolve(path),
     id: basename(path, ".jsonl"),
@@ -30,15 +30,20 @@ export async function parseRollout(path) {
     rateLimits: null,
   };
 
-  for (const line of text.split(/\r?\n/)) {
-    if (!line.trim()) continue;
-    let item;
-    try {
-      item = JSON.parse(line);
-    } catch {
-      continue;
+  // The head of a truncated file only says who/where the session is; its timestamps
+  // and token counts are old news and must not outrank the tail.
+  for (const [text, fromHead] of [[edges.head, true], [edges.tail, false]]) {
+    if (!text) continue;
+    for (const line of text.split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      let item;
+      try {
+        item = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      consume(item, summary, fromHead);
     }
-    consume(item, summary);
   }
   return summary;
 }
@@ -69,9 +74,10 @@ export async function scanSessions(codexHome, { includeArchived = false, limit =
   return summaries;
 }
 
-function consume(item, summary) {
+function consume(item, summary, fromHead = false) {
   const payload = item?.payload;
-  if (typeof item?.timestamp === "string") summary.updatedAt = item.timestamp;
+  if (fromHead && item?.type !== "session_meta" && item?.type !== "turn_context") return;
+  if (!fromHead && typeof item?.timestamp === "string") summary.updatedAt = item.timestamp;
 
   if (item?.type === "session_meta" && payload) {
     summary.id = payload.id ?? summary.id;
@@ -98,7 +104,22 @@ function consume(item, summary) {
   summary.contextUsed = number(last?.total_tokens ?? last?.totalTokens) ?? summary.contextUsed;
   summary.contextWindow = number(info.model_context_window ?? info.modelContextWindow) ?? summary.contextWindow;
   summary.totalUsage = usage(total) ?? summary.totalUsage;
-  summary.rateLimits = info.rate_limits ?? info.rateLimits ?? summary.rateLimits;
+  summary.rateLimits = safeRateLimits(info.rate_limits ?? info.rateLimits) ?? summary.rateLimits;
+}
+
+function safeRateLimits(value) {
+  if (!value || typeof value !== "object") return null;
+  const result = {};
+  for (const name of ["primary", "secondary"]) {
+    const window = value[name];
+    if (!window || typeof window !== "object") continue;
+    const numbers = {};
+    for (const [key, entry] of Object.entries(window)) {
+      if (/^[A-Za-z_]{1,40}$/.test(key) && Number.isFinite(entry)) numbers[key] = entry;
+    }
+    result[name] = numbers;
+  }
+  return Object.keys(result).length ? result : null;
 }
 
 function usage(value) {
@@ -126,14 +147,14 @@ function scalarSource(value) {
 async function readEdges(path, size) {
   const handle = await open(path, "r");
   try {
-    if (size <= HEAD_BYTES + TAIL_BYTES) return (await handle.readFile({ encoding: "utf8" }));
+    if (size <= HEAD_BYTES + TAIL_BYTES) return { head: null, tail: await handle.readFile({ encoding: "utf8" }) };
     const head = Buffer.alloc(HEAD_BYTES);
     const tail = Buffer.alloc(TAIL_BYTES);
     await handle.read(head, 0, HEAD_BYTES, 0);
     await handle.read(tail, 0, TAIL_BYTES, size - TAIL_BYTES);
     const tailText = tail.toString("utf8");
     const firstNewline = tailText.indexOf("\n");
-    return `${head.toString("utf8")}\n${firstNewline >= 0 ? tailText.slice(firstNewline + 1) : ""}`;
+    return { head: head.toString("utf8"), tail: firstNewline >= 0 ? tailText.slice(firstNewline + 1) : "" };
   } finally {
     await handle.close();
   }
