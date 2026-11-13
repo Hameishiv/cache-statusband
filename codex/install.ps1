@@ -271,6 +271,7 @@ if (-not $SkipCliLink) {
 }
 
 Write-Host "Installed the local Codex plugin and enabled hooks."
+Write-Host "Codex does not run a plugin's hooks until they are reviewed: open /hooks in Codex to review and trust them (again after an update)."
 if ($KeepExistingFooter) {
   Write-Host "Kept the existing footer. Run /statusline in Codex CLI to customize it."
 } else {
