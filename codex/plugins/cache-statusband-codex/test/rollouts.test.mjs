@@ -677,6 +677,44 @@ test("a Stop report with no model or effort keeps the ones saved before", async 
   assert.equal((await loadSessionState(root, "keep-session")).model, "model-Y");
 });
 
+test("a report naming a new model and no effort saves that model and no effort, never the old effort", async (t) => {
+  const root = await fixtureRoot(t);
+  const first = { contextUsed: 10, contextWindow: 100, tokenReportAt: "2026-10-29T12:00:00.000Z", model: "model-X", effort: "high" };
+  assert.equal(await saveSessionState(root, "mix-session", first), true);
+  const later = { contextUsed: 20, contextWindow: 100, tokenReportAt: "2026-10-29T13:00:00.000Z", model: "model-Y", effort: null };
+  assert.equal(await saveSessionState(root, "mix-session", later), true);
+  const saved = await loadSessionState(root, "mix-session");
+  assert.equal(saved.model, "model-Y");
+  assert.equal(saved.effort, null);
+});
+
+test("a resume shows the model Stop kept when the transcript's own latest turn is out of reach", async (t) => {
+  const root = await fixtureRoot(t);
+  const line = (value) => `${JSON.stringify(value)}
+`;
+  const filler = (count) => line({ type: "response_item", payload: { type: "message", content: "x".repeat(2048) } }).repeat(count);
+  const contextA = { timestamp: "2026-10-29T12:01:00.000Z", type: "turn_context", payload: { cwd: "/workspace/first-turn", model: "model-A", effort: "low" } };
+  const path = join(root, "big.jsonl");
+  // The first turn is in the head, the latest report is in the tail, and no turn record is in
+  // reach of either: the parser says unknown model.
+  await writeFile(path, line(FIXTURE[0]) + line(contextA) + filler(2600) + line(FIXTURE.at(-1)), "utf8");
+  assert.equal((await parseRollout(path)).model, null);
+  // An earlier Stop, from a smaller transcript, had recorded the model in use.
+  const earlier = { contextUsed: 10, contextWindow: 200000, tokenReportAt: "2026-10-29T12:02:00.000Z", model: "model-X", effort: "high" };
+  assert.equal(await saveSessionState(root, "big-session", earlier), true);
+  await handleStop({ session_id: "big-session", transcript_path: path }, { codexHome: root, now: Date.parse("2026-10-29T12:03:30.000Z") });
+  const saved = await loadSessionState(root, "big-session");
+  assert.equal(saved.contextUsed, 25000);
+  assert.equal(saved.model, "model-X");
+  assert.equal(saved.effort, "high");
+  const output = await handleSessionStart(
+    { source: "resume", session_id: "big-session", transcript_path: path },
+    { codexHome: root, now: Date.parse("2026-10-29T12:04:00.000Z"), identityGetter: async () => null, usageGetter: async () => ({ availableCount: null, source: "cache" }) },
+  );
+  assert.match(output.systemMessage, /model-X\/high/);
+  assert.doesNotMatch(output.systemMessage, /unknown model/);
+});
+
 test("a truncated rollout takes only identity from its head and everything else from its tail", async (t) => {
   const root = await fixtureRoot(t);
   const path = join(root, "huge.jsonl");
@@ -746,6 +784,27 @@ test("a truncated rollout shows the latest turn_context it can find, or none, ne
   assert.equal(straddleSummary.effort, "high");
   assert.equal(straddleSummary.cwd, "/workspace/later");
   assert.equal(straddleSummary.contextUsed, 25000);
+});
+
+test("a transcript whose look-back chunks join the head window shows the head's turn when nothing later exists", async (t) => {
+  // Sizes between 3,342,337 and 3,407,872 bytes: the four look-back chunks stop above the
+  // floor below the head window (64 KiB under it) but already join the head window, so the head's
+  // turn_context is the latest there is. It used to be shown as an unknown model.
+  const root = await fixtureRoot(t);
+  const line = (value) => `${JSON.stringify(value)}
+`;
+  const contextA = { timestamp: "2026-10-29T12:01:00.000Z", type: "turn_context", payload: { cwd: "/workspace/first-turn", model: "model-A", effort: "low" } };
+  const prefix = line(FIXTURE[0]) + line(contextA);
+  const fillerLine = line({ type: "response_item", payload: { type: "message", content: "x".repeat(2048) } });
+  const count = Math.ceil((3_380_000 - Buffer.byteLength(prefix)) / Buffer.byteLength(fillerLine));
+  const path = join(root, "band.jsonl");
+  await writeFile(path, prefix + fillerLine.repeat(count), "utf8");
+  const size = (await stat(path)).size;
+  assert.ok(size > 3_342_336 && size <= 3_407_872, `size ${size} must sit inside the band`);
+  const summary = await parseRollout(path);
+  assert.equal(summary.model, "model-A");
+  assert.equal(summary.effort, "low");
+  assert.equal(summary.cwd, "/workspace/first-turn");
 });
 
 test("rate limits are reduced to numeric primary/secondary window fields", async (t) => {

@@ -202,7 +202,8 @@ async function readEdges(path, size) {
 }
 
 // Reads fixed-size chunks backwards from just before the tail window, down to a little below
-// the head window's end (HEAD_OVERLAP_BYTES), and returns { payload } for the latest
+// the head window's end (HEAD_OVERLAP_BYTES) -- a chunk that starts within the head window
+// itself is extended to that floor and counts as reaching the head -- and returns { payload } for the latest
 // turn_context found, { reachedHead: true } if the chunks ran all the way back to the head
 // without finding one, or null.
 async function findEarlierContext(path, size) {
@@ -217,7 +218,10 @@ async function findEarlierContext(path, size) {
     let carry = probeNewline >= 0 ? probe.subarray(0, probeNewline) : probe;
     const floor = Math.max(0, HEAD_BYTES - HEAD_OVERLAP_BYTES);
     for (let i = 0; i < CONTEXT_CHUNKS; i += 1) {
-      const start = Math.max(floor, end - CONTEXT_CHUNK_BYTES);
+      let start = Math.max(floor, end - CONTEXT_CHUNK_BYTES);
+      // A chunk that would start inside the head window already joins it: it is read down to the
+      // floor so the line crossing the head's cut-off is whole, and the head is then reached.
+      if (end - CONTEXT_CHUNK_BYTES <= HEAD_BYTES) start = floor;
       if (start >= end) return { reachedHead: true };
       const chunk = Buffer.alloc(end - start);
       await handle.read(chunk, 0, chunk.length, start);
@@ -238,7 +242,7 @@ async function findEarlierContext(path, size) {
       }
       carry = firstNewline >= 0 ? whole.subarray(0, firstNewline) : whole;
       end = start;
-      if (start <= floor) return { reachedHead: true };
+      if (start <= HEAD_BYTES) return { reachedHead: true };
     }
     return null;
   } finally {

@@ -55,9 +55,11 @@ export async function getSessionIdentity(codexHome, sessionId, capture, { linkIm
   } catch {
     // The record could not be saved (a folder that refuses new files, a full disk, a file
     // system with no hard links...). A concurrent start may have published one meanwhile: if a
-    // valid record is there, it is the answer. Otherwise the login just read is still this
-    // session's login: use it now, unrecorded, rather than lose the whole usage display. A
-    // later resume of this session finds no record and shows it as unknown.
+    // valid record is there, it is the answer. If there is no record at all, the login just
+    // read is still this session's login: use it now, unrecorded, rather than lose the whole
+    // usage display; a later resume then finds no record and shows the session as unknown. If
+    // a record is there but corrupt, this start shows the session as unknown too (below), and a
+    // later resume finds that same corrupt record and shows it as unknown as well.
     try {
       return parseIdentity(await readFile(path, "utf8"));
     } catch (readError) {
@@ -103,11 +105,12 @@ export async function saveSessionState(codexHome, sessionId, summary, savedAt = 
   try {
     const previous = await loadSessionState(codexHome, sessionId);
     if (previous && timestamp(previous.contextAt) > timestamp(state.contextAt)) return false;
-    // A report that names no model or effort (a rollout whose latest turn is out of reach)
-    // does not erase what was saved before.
-    if (previous) {
-      state.model ??= previous.model ?? null;
-      state.effort ??= previous.effort ?? null;
+    // One rule for the kept model: a report that names neither model nor effort (a rollout
+    // whose latest turn is out of reach) does not erase what was saved before. A report that
+    // names either one replaces both, so a new model is never paired with an old effort.
+    if (previous && state.model === null && state.effort === null) {
+      state.model = safeText(previous.model);
+      state.effort = safeText(previous.effort);
     }
     const temporary = `${path}.${process.pid}.tmp`;
     try {
@@ -145,11 +148,20 @@ export function mergeSavedContext(summary, state) {
   const current = summary ?? {};
   const currentAt = timestamp(current.tokenReportAt ?? current.updatedAt);
   const savedAt = timestamp(state.contextAt);
-  if (Number.isFinite(current.contextUsed) && Number.isFinite(current.contextWindow) && currentAt >= savedAt) return current;
+  const unnamed = !current.model && !current.effort;
+  if (Number.isFinite(current.contextUsed) && Number.isFinite(current.contextWindow) && currentAt >= savedAt) {
+    // The same rule as the save: a rollout whose own latest turn is out of reach names neither
+    // model nor effort, and the report Stop saved is this very report, so Stop's model stands.
+    if (unnamed && typeof current.tokenReportAt === "string" && savedAt > 0 && currentAt === savedAt) {
+      return { ...current, model: safeText(state.model), effort: safeText(state.effort) };
+    }
+    return current;
+  }
   return {
     ...current,
-    model: current.model ?? state.model ?? null,
-    effort: current.effort ?? state.effort ?? null,
+    // The rollout's own model and effort are taken together, or the saved pair is.
+    model: unnamed ? safeText(state.model) : current.model ?? null,
+    effort: unnamed ? safeText(state.effort) : current.effort ?? null,
     tokenReportAt: state.contextAt,
     updatedAt: current.updatedAt ?? state.contextAt,
     contextUsed: state.contextUsed,
