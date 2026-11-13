@@ -10,9 +10,9 @@
  * weekly and still open. It does not use the network and does not read a token.
  */
 
-import { closeSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /** Each family is [dark, light], the same pairs the Claude Code band already checked. */
@@ -229,12 +229,15 @@ export function render(payload, extras) {
   return parts.map((part, i) => paint(part.label, part.kind, i, parts[i + 1]?.kind)).join("");
 }
 
-/** Grok's billing log, or null when CSB_BILLING_LOG is set to an empty string. */
+/**
+ * Grok's billing log as a full path, or null when CSB_BILLING_LOG is set to an
+ * empty string. The path is the cache key, so a relative setting is resolved.
+ */
 export function billingLogPath() {
   if (process.env.CSB_BILLING_LOG === "") return null;
-  if (process.env.CSB_BILLING_LOG) return process.env.CSB_BILLING_LOG;
+  if (process.env.CSB_BILLING_LOG) return resolve(process.env.CSB_BILLING_LOG);
   const home = process.env.GROK_HOME || join(homedir(), ".grok");
-  return join(home, "logs", "unified.jsonl");
+  return resolve(home, "logs", "unified.jsonl");
 }
 
 /** Cache of the last weekly reading, one entry per log. Never holds a token or the raw line. */
@@ -291,13 +294,6 @@ const READ_FAILED = Symbol("read failed");
  * null: the newest credits line cannot be used. Otherwise the reading.
  */
 function scanBilling(path, maxBytes = 4 * 1024 * 1024) {
-  let st;
-  try {
-    st = statSync(path);
-  } catch {
-    return READ_FAILED;
-  }
-  if (!st.isFile()) return READ_FAILED;
   let fh;
   try {
     fh = openSync(path, "r");
@@ -305,6 +301,9 @@ function scanBilling(path, maxBytes = 4 * 1024 * 1024) {
     return READ_FAILED;
   }
   try {
+    // the size and time are the opened file's, not a stat taken before it was opened
+    const st = fstatSync(fh);
+    if (!st.isFile()) return READ_FAILED;
     let offset = st.size;
     let pending = "";
     let readTotal = 0;
@@ -313,7 +312,8 @@ function scanBilling(path, maxBytes = 4 * 1024 * 1024) {
       const len = Math.min(chunkSize, offset, maxBytes - readTotal);
       offset -= len;
       const buf = Buffer.alloc(len);
-      readSync(fh, buf, 0, len, offset);
+      // a short read means the log shrank or was replaced while it was read
+      if (readSync(fh, buf, 0, len, offset) !== len) return READ_FAILED;
       readTotal += len;
       const text = buf.toString("utf8") + pending;
       const lines = text.split("\n");

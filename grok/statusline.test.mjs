@@ -2,9 +2,10 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { after, describe, it } from "node:test";
 import {
+  billingLogPath,
   cacheLabel,
   capFirst,
   contextLabel,
@@ -350,6 +351,32 @@ describe("weekly usage", () => {
     writeFileSync(b, credits(61));
     assert.equal(loadWeekly(b, cachePath, now + 6 * 60 * 1000).percent, 61);
     assert.equal(loadWeekly(a, cachePath, now + 6 * 60 * 1000 + 1000).percent, 23);
+  });
+});
+
+describe("billingLogPath", () => {
+  const keep = { log: process.env.CSB_BILLING_LOG, home: process.env.GROK_HOME };
+  const restore = () => {
+    for (const [key, value] of [["CSB_BILLING_LOG", keep.log], ["GROK_HOME", keep.home]]) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  };
+
+  it("resolves a relative setting, since the path is the cache key", () => {
+    try {
+      process.env.CSB_BILLING_LOG = join("rel", "unified.jsonl");
+      assert.equal(billingLogPath(), resolve("rel", "unified.jsonl"));
+      delete process.env.CSB_BILLING_LOG;
+      process.env.GROK_HOME = "relhome";
+      assert.equal(billingLogPath(), resolve("relhome", "logs", "unified.jsonl"));
+      delete process.env.GROK_HOME;
+      assert.equal(isAbsolute(billingLogPath()), true);
+      process.env.CSB_BILLING_LOG = "";
+      assert.equal(billingLogPath(), null);
+    } finally {
+      restore();
+    }
   });
 });
 
