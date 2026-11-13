@@ -74,16 +74,29 @@ test("a lock file refused once or twice with EPERM is created on a retry", async
   await lock.release();
 });
 
-test("a lock file that keeps being refused in a folder that accepts files is busy, not an error", async (t) => {
+test("a lock file refused with EPERM or EACCES in a folder that accepts files is busy, not an error", async (t) => {
   const root = await fixtureRoot(t);
   const path = join(root, "busy.lock");
   // Only the lock file itself is refused; a probe file beside it can be created.
-  for (const code of ["EPERM", "EACCES", "EBUSY"]) {
+  for (const code of ["EPERM", "EACCES"]) {
     const { impl, calls } = failing(code, { except: (p) => p.includes(".probe.") });
     assert.equal(await acquireLock(path, { openImpl: impl, retryDelaysMs: [1, 1, 1] }), null, code);
-    assert.ok(calls.filter((p) => p === path).length >= 4, `${code}: tried again before giving up`);
+    assert.equal(calls.filter((p) => p === path).length, 4, `${code}: tried again before giving up`);
+    assert.equal(calls.filter((p) => p.includes(".probe.")).length, 1, `${code}: the folder was probed once`);
   }
   assert.deepEqual(await readdir(root), [], "the probe file is removed again");
+});
+
+test("a lock file refused with EBUSY is busy after the retries, with every open refused and no probe made", async (t) => {
+  const root = await fixtureRoot(t);
+  const path = join(root, "ebusy.lock");
+  // No exception for a probe: if one were attempted it would be refused too, and the call
+  // would then throw (an unwritable cache) instead of returning null.
+  const { impl, calls } = failing("EBUSY");
+  assert.equal(await acquireLock(path, { openImpl: impl, retryDelaysMs: [1, 1, 1] }), null);
+  assert.equal(calls.length, 4, "the lock file was tried again, and nothing else was opened");
+  assert.ok(calls.every((p) => p === path), "no probe call was made");
+  assert.deepEqual(await readdir(root), []);
 });
 
 test("a lock file refused in a folder that accepts no new files throws, so the cache is reported unwritable", async (t) => {
