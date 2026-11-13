@@ -87,6 +87,8 @@ describe("segments", () => {
     const labels = segments({ model: { display_name: "Grok\n4.7\u001b[2J" }, effort: { level: "\u0007high" } }).map((p) => p.label);
     assert.deepEqual(labels, ["Grok 4.7 [2J", "High"]);
     assert.equal(segments({ model: { display_name: "\u001b\n" } }).length, 0);
+    // a display name made only of control characters falls back to the id
+    assert.deepEqual(segments({ model: { display_name: "\u001b", id: "grok-x" } }).map((p) => p.label), ["Grok-x"]);
   });
 
   it("rounds a fractional context percent to a tenth", () => {
@@ -463,7 +465,8 @@ describe("weekly usage", () => {
     writeFileSync(planted, "planted");
     assert.equal(loadWeekly(logPath, cachePath, now), null);
     assert.equal(readFileSync(planted, "utf8"), "planted");
-    assert.equal(existsSync(cachePath), false);
+    // nor in the way: the cache is still written, through a fresh name
+    assert.equal(JSON.parse(readFileSync(cachePath, "utf8")).v, 2);
   });
 
   it("treats the old single-entry cache file as empty", () => {

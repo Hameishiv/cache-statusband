@@ -11,6 +11,7 @@
  */
 
 import { closeSync, fstatSync, fsyncSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -61,7 +62,10 @@ function finite(value) {
 }
 
 function text(value) {
-  return typeof value === "string" && value.trim() ? value.trim() : null;
+  if (typeof value !== "string") return null;
+  // control characters count as nothing here, so a name made of them falls back to the next one
+  const clean = value.replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ").trim();
+  return clean ? clean : null;
 }
 
 function trimFixed(value) {
@@ -512,7 +516,8 @@ export function readSources(cachePath) {
 function writeSources(cachePath, sources) {
   if (!cachePath) return;
   // write then rename, so a reader never sees a half-written file
-  const tmp = `${cachePath}.${process.pid}.tmp`;
+  // a random part too: a run killed mid-write can leave its file, and pids are reused
+  const tmp = `${cachePath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
   let created = false;
   try {
     mkdirSync(dirname(cachePath), { recursive: true });
