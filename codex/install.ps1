@@ -523,7 +523,15 @@ try {
     $lastSeenConfigText = $registeredConfigText
     if (-not (Test-SameText $registeredConfigText $expectedConfigText)) { $foreignEditSeen = $true }
     $expectedConfigText = $registeredConfigText
-    $configText = Set-StatusbandPreferences -Text $(if ($null -ne $registeredConfigText) { $registeredConfigText } else { "" })
+    try {
+      $configText = Set-StatusbandPreferences -Text $(if ($null -ne $registeredConfigText) { $registeredConfigText } else { "" })
+    } catch {
+      # Codex has already registered the plugin here, so the refusal's "Nothing was installed or
+      # registered, and config.toml was not changed" would be untrue. Drop that sentence; the
+      # warning from the catch below says what became of config.toml.
+      $refusal = ($_.Exception.Message -replace '\s*Nothing was installed or registered, and config\.toml was not changed\.', '').Trim()
+      throw "$refusal This was found after Codex had already registered the plugin, so the install stopped part-way; the warning that follows says what was done with config.toml."
+    }
     Assert-CodexConfig -Text $configText -CodexCommand $codexCommand -Original $registeredConfigText
     # A symbolic link is replaced at its target, with the candidate beside it (same folder,
     # so the replace stays atomic); the link remains a link.
@@ -639,14 +647,18 @@ if (-not $SkipCliLink) {
   if ($reuseExistingLink) {
     Write-Host "CLI link already points to this checkout; keeping it."
   } else {
+    $linkExit = $null
     Push-Location $pluginRoot
     try {
       & npm link
-      if ($LASTEXITCODE -ne 0) { throw (& $linkFailure "npm link failed ($LASTEXITCODE)") }
-    } catch [System.Management.Automation.CommandNotFoundException] {
+      $linkExit = $LASTEXITCODE
+    } catch {
+      # Any way of failing to run it (npm missing, refused to start, a terminating error)
+      # is the link step failing.
       throw (& $linkFailure "npm link could not be run ($($_.Exception.Message))")
     } finally {
       Pop-Location
     }
+    if ($linkExit -ne 0) { throw (& $linkFailure "npm link failed ($linkExit)") }
   }
 }

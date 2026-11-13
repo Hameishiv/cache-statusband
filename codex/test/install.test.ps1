@@ -457,6 +457,43 @@ exit /b 0
   if (-not ($noBackupWarnings | Where-Object { "$_" -match "during Codex's own registration step" -and "$_" -match "no earlier config.toml" })) { throw "The no-backup warning did not say the registration step failed: $($noBackupWarnings -join ' | ')" }
   if ($noBackupWarnings | Where-Object { "$_" -match "after Codex registered the plugin" }) { throw "The no-backup warning claimed Codex registered the plugin although registration failed: $($noBackupWarnings -join ' | ')" }
 
+  # Codex registers the plugin and leaves a multi-line string in config.toml, which the
+  # installer then cannot edit. That is found after registration, so the refusal must not say
+  # that nothing was installed or registered, and the original config.toml is put back.
+  $lateBin = Join-Path $testHome "late-refusal-bin"
+  New-Item -ItemType Directory -Path $lateBin | Out-Null
+  $lateCodex = @'
+@echo off
+if "%1"=="app-server" exit /b 0
+if "%1"=="plugin" if "%2"=="marketplace" if "%3"=="add" (
+  echo note = '''x'''>> "%CODEX_HOME%\config.toml"
+  exit /b 0
+)
+exit /b 0
+'@
+  [IO.File]::WriteAllText((Join-Path $lateBin "codex.cmd"), $lateCodex, [Text.Encoding]::ASCII)
+  $lateHome = Join-Path $testHome "late-refusal-home"
+  New-Item -ItemType Directory -Path $lateHome | Out-Null
+  [IO.File]::WriteAllText((Join-Path $lateHome "config.toml"), $original, [Text.UTF8Encoding]::new($false))
+  $lateWarnings = @()
+  $lateMessage = ""
+  $previousPath = $env:PATH
+  try {
+    $env:PATH = "$lateBin$([IO.Path]::PathSeparator)$previousPath"
+    try {
+      & (Join-Path $root "install.ps1") -CodexHome $lateHome -SkipCliLink -WarningVariable lateWarnings 3>$null | Out-Null
+    } catch {
+      $lateMessage = $_.Exception.Message
+    }
+  } finally {
+    $env:PATH = $previousPath
+  }
+  if (-not $lateMessage) { throw "A multi-line string left by Codex's registration did not fail the install" }
+  if ($lateMessage -match "Nothing was installed or registered" -or $lateMessage -match "was not changed") { throw "The refusal after registration still claimed nothing was installed or changed: $lateMessage" }
+  if ($lateMessage -notmatch "multi-line string" -or $lateMessage -notmatch "after Codex had already registered the plugin") { throw "The refusal after registration did not give the reason and say Codex had registered: $lateMessage" }
+  if ([IO.File]::ReadAllText((Join-Path $lateHome "config.toml")) -ne $original) { throw "config.toml was not restored after a refusal found after registration" }
+  if (-not ($lateWarnings | Where-Object { "$_" -match "restored the original config.toml" })) { throw "No warning said config.toml was restored after a refusal found after registration: $($lateWarnings -join ' | ')" }
+
   # When npm cannot even be run (not on PATH), the failure is still reported as only the link
   # step failing, and the hooks-review and restart lines were already printed before it.
   $noNpmBin = Join-Path $testHome "no-npm-bin"
