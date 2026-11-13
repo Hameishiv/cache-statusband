@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -559,3 +559,25 @@ async function fixtureRoot(t) {
   t.after(() => rm(root, { recursive: true, force: true }));
   return root;
 }
+
+test("a cache-only snapshot reports what is stored and records no attempt", async (t) => {
+  const root = await fixtureRoot(t);
+  const now = Date.parse("2026-10-29T12:00:00.000Z");
+  const dataDir = join(root, "cache-statusband-codex");
+  const name = `rate-limits-${createHash("sha256").update(ACCOUNT_IDENTITY.key).digest("hex").slice(0, 16)}.json`;
+  const fetcher = async () => { throw new Error("must not read"); };
+
+  // Nothing stored: empty, and nothing written.
+  const empty = await getUsageSnapshot({ codexHome: root, now, identity: ACCOUNT_IDENTITY, fetcher, cacheOnly: true });
+  assert.equal(empty.availableCount, null);
+  await assert.rejects(access(join(dataDir, name)));
+
+  // An expired reading is shown as stale and the file is untouched.
+  const stored = JSON.stringify({ version: 3, identityKey: ACCOUNT_IDENTITY.key, accountEmail: TEST_EMAIL, availableCount: 4, fetchedAt: now - 3_600_000, nextAllowedAt: now - 1000, lastErrorAt: null });
+  await writeFile(join(dataDir, name), stored);
+  const stale = await getUsageSnapshot({ codexHome: root, now, identity: ACCOUNT_IDENTITY, fetcher, cacheOnly: true });
+  assert.equal(stale.availableCount, 4);
+  assert.equal(stale.source, "stale");
+  assert.equal(await readFile(join(dataDir, name), "utf8"), stored);
+  assert.deepEqual((await readdir(dataDir)).sort(), [name]);
+});

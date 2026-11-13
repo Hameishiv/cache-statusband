@@ -117,7 +117,7 @@ function safeRateLimits(value) {
     for (const [key, entry] of Object.entries(window)) {
       if (/^[A-Za-z_]{1,40}$/.test(key) && Number.isFinite(entry)) numbers[key] = entry;
     }
-    result[name] = numbers;
+    if (Object.keys(numbers).length) result[name] = numbers;
   }
   return Object.keys(result).length ? result : null;
 }

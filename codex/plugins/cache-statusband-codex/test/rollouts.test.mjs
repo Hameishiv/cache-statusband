@@ -264,6 +264,51 @@ test("each read in SessionStart gets at least a second and no more than what rem
   assert.ok(seen[1].usageTimeout >= 1_000 && seen[1].usageTimeout <= 5_000);
 });
 
+test("the SessionStart deadline counts from the hook's start, not from after the transcript read", async (t) => {
+  const root = await fixtureRoot(t);
+  const started = Date.now();
+  await handleSessionStart(
+    { source: "startup", session_id: "clock-session", transcript_path: join(root, "rollout.jsonl") },
+    {
+      codexHome: root,
+      deadlineMs: 800,
+      rolloutParser: async () => { await new Promise((resolve) => setTimeout(resolve, 500)); return null; },
+      identityGetter: async () => null,
+      usageGetter: () => new Promise(() => {}),
+    },
+  );
+  // 500ms reading plus the 300ms that remain; restarting the clock would take ~1300ms.
+  assert.ok(Date.now() - started < 1_100, `took ${Date.now() - started}ms`);
+});
+
+test("the SessionStart hook process prints its answer and exits", async () => {
+  const hook = join(dirname(fileURLToPath(import.meta.url)), "..", "hooks", "session-start.mjs");
+  const child = execFile(process.execPath, [hook], { timeout: 10_000 });
+  let stdout = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stdin.end(JSON.stringify({ source: "clear" }));
+  const code = await new Promise((resolve) => child.once("exit", resolve));
+  assert.equal(code, 0);
+  assert.equal(stdout, "{}\n");
+});
+
+test("with under three seconds left SessionStart asks for the cache only", async (t) => {
+  const root = await fixtureRoot(t);
+  const email = ["person", "example.invalid"].join("@");
+  const run = async (deadlineMs) => {
+    let received;
+    await handleSessionStart({ source: "startup", session_id: `cache-only-${deadlineMs}` }, {
+      codexHome: root,
+      deadlineMs,
+      identityGetter: async () => ({ key: `account:${email}`, label: email, unavailable: false }),
+      usageGetter: async (options) => { received = options; return { availableCount: null }; },
+    });
+    return received;
+  };
+  assert.equal((await run(2_500)).cacheOnly, true);
+  assert.equal((await run(5_000)).cacheOnly, undefined);
+});
+
 test("usage still shows when the hook input has no transcript path", async (t) => {
   const root = await fixtureRoot(t);
   const email = ["person", "example.invalid"].join("@");
@@ -379,6 +424,17 @@ test("rate limits are reduced to numeric primary/secondary window fields", async
   });
 });
 
+test("a rate-limit window with no numeric fields is omitted, and no windows means null", async (t) => {
+  const root = await fixtureRoot(t);
+  const reportWith = (rate_limits) => `${JSON.stringify({ timestamp: "2026-10-29T12:02:00.000Z", type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { total_tokens: 5 }, rate_limits } } })}\n`;
+  const some = join(root, "some.jsonl");
+  await writeFile(some, reportWith({ primary: { label: "text only", nested: { a: 1 } }, secondary: { used_percent: 3 } }), "utf8");
+  assert.deepEqual((await parseRollout(some)).rateLimits, { secondary: { used_percent: 3 } });
+  const none = join(root, "none.jsonl");
+  await writeFile(none, reportWith({ primary: { label: "text only" }, secondary: {} }), "utf8");
+  assert.equal((await parseRollout(none)).rateLimits, null);
+});
+
 test("the CLI strips terminal control characters from transcript-derived fields", async (t) => {
   const root = await fixtureRoot(t);
   const path = join(root, "evil.jsonl");
@@ -389,6 +445,37 @@ test("the CLI strips terminal control characters from transcript-derived fields"
   const { stdout } = await promisify(execFile)(process.execPath, [bin, "session", path]);
   assert.doesNotMatch(stdout, /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/);
   assert.match(stdout, /model/i);
+});
+
+test("usage --json and board --json omit the email and account key when a seat is configured", async (t) => {
+  const root = await fixtureRoot(t);
+  const here = dirname(fileURLToPath(import.meta.url));
+  const bin = join(here, "..", "bin", "cache-statusband-codex.mjs");
+  const server = join(here, "..", "fixtures", "fake-app-server.mjs");
+  const windows = process.platform === "win32";
+  const wrapper = join(root, windows ? "codex.cmd" : "codex");
+  await writeFile(wrapper, windows
+    ? `@echo off\r\n"${process.execPath}" "${server}" %*\r\n`
+    : `#!/bin/sh\nexec "${process.execPath}" "${server}" "$@"\n`, { mode: 0o755 });
+  const seat = join(root, "seat.txt");
+  await writeFile(seat, "alpha");
+  const run = async (args, env) => {
+    const { stdout } = await promisify(execFile)(process.execPath, [bin, ...args, "--json", "--codex-home", root], { env: { ...process.env, CODEX_BIN: wrapper, ...env } });
+    return stdout;
+  };
+  const email = ["test", "example.invalid"].join("@");
+
+  const withSeat = { CACHE_STATUSBAND_CODEX_SEAT_FILE: seat };
+  const usage = await run(["usage"], withSeat);
+  assert.equal(JSON.parse(usage).availableCount, 2);
+  assert.doesNotMatch(usage, /accountEmail|identityKey|test@example|account:/);
+  const board = await run(["board"], withSeat);
+  assert.equal(JSON.parse(board).usage.availableCount, 2);
+  assert.doesNotMatch(board, /accountEmail|identityKey|test@example|account:/);
+
+  // Without a seat the email is the displayed identity and stays in the JSON.
+  const plain = JSON.parse(await run(["usage"], { CACHE_STATUSBAND_CODEX_SEAT_FILE: "" }));
+  assert.equal(plain.accountEmail, email);
 });
 
 async function fixtureRoot(t) {

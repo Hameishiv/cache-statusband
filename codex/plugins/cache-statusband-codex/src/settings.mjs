@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
+import { hasControl, stripControls } from "./sanitize.mjs";
 
 export async function displayIdentity(snapshot, {
   codexHome,
@@ -73,12 +74,12 @@ function expandPath(value, codexHome, env) {
 }
 
 function sanitizeLabel(value) {
-  const text = String(value ?? "").replace(/[\u0000-\u001f\u007f]/g, " ").trim().replace(/\s+/g, " ");
+  const text = stripControls(value).replace(/\s+/g, " ");
   return text ? text.slice(0, 80) : null;
 }
 
 function sanitizeEmail(value) {
   if (typeof value !== "string") return null;
   const text = value.trim();
-  return /^[^\s@]+@[^\s@]+$/.test(text) ? text.slice(0, 320) : null;
+  return !hasControl(text) && /^[^\s@]+@[^\s@]+$/.test(text) ? text.slice(0, 320) : null;
 }

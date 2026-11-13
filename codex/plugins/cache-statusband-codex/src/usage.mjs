@@ -5,6 +5,7 @@ import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { delimiter, dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { acquireLock } from "./lock.mjs";
+import { hasControl, stripControls } from "./sanitize.mjs";
 import { configuredSeatIdentity } from "./settings.mjs";
 
 const CACHE_VERSION = 3;
@@ -20,6 +21,7 @@ export async function getUsageSnapshot({
   env = process.env,
   identity: suppliedIdentity,
   timeoutMs,
+  cacheOnly = false,
 } = {}) {
   if (!codexHome) throw new Error("codexHome is required");
   const dataDir = join(codexHome, "cache-statusband-codex");
@@ -38,6 +40,12 @@ export async function getUsageSnapshot({
   let aligned = alignCache(await readScopedCache(cachePath, legacyPath, identity), identity);
   let cached = aligned.cache;
   if (fresh(cached, now) && !cached?.migrateSeatDeadline) return present(cached, aligned.mismatch ? "identity-changed" : "cache");
+  if (cacheOnly) {
+    // The caller has no time left for a read. Report what is stored and change nothing,
+    // so no attempt or error is recorded and the next caller may still poll.
+    const { migrateSeatDeadline, ...stored } = cached ?? {};
+    return present(cached ? stored : null, aligned.mismatch ? "identity-changed" : "stale");
+  }
 
   const lock = await acquireLock(lockPath, { now, staleMs: LOCK_STALE_MS });
   if (!lock) return present(cached, aligned.mismatch ? "identity-changed" : "cache-busy");
@@ -519,13 +527,13 @@ function finiteNonnegative(value) {
 }
 
 function safeText(value) {
-  return typeof value === "string" ? value.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, 200) : null;
+  return typeof value === "string" ? stripControls(value).slice(0, 200) : null;
 }
 
 function safeEmail(value) {
   if (typeof value !== "string") return null;
   const text = value.trim();
-  return /^[^\s@]+@[^\s@]+$/.test(text) ? text.slice(0, 320) : null;
+  return !hasControl(text) && /^[^\s@]+@[^\s@]+$/.test(text) ? text.slice(0, 320) : null;
 }
 
 function walk(value, callback) {

@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
+import { stripControls } from "../src/sanitize.mjs";
 import { capFirst, formatAge, formatPercent, formatTokens, formatUsageLines } from "../src/format.mjs";
 import { defaultCodexHome, parseRollout, projectName, scanSessions } from "../src/rollouts.mjs";
 import { captureUsageIdentity, getUsageSnapshot } from "../src/usage.mjs";
-import { usagePresentation } from "../src/settings.mjs";
+import { configuredSeatIdentity, usagePresentation } from "../src/settings.mjs";
 
 const args = process.argv.slice(2);
 const command = args.shift() ?? "help";
@@ -47,7 +48,7 @@ async function board(argv) {
   const usageSnapshot = await getUsageSnapshot({ codexHome: home, identity });
   const presented = await usagePresentation(usageSnapshot, { codexHome: home, identity });
   if (options.json) {
-    process.stdout.write(`${JSON.stringify({ usage: presented.snapshot, sessions: summaries }, null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify({ usage: await publicSnapshot(presented.snapshot, home), sessions: summaries }, null, 2)}\n`);
     return;
   }
   process.stdout.write(`${formatUsageLines(presented.snapshot, Date.now(), { identity: presented.identity }).join(" | ")}\n\n`);
@@ -75,8 +76,16 @@ async function usage(argv) {
   const identity = await captureUsageIdentity(home);
   const snapshot = await getUsageSnapshot({ codexHome: home, identity });
   const presented = await usagePresentation(snapshot, { codexHome: home, identity });
-  if (options.json) process.stdout.write(`${JSON.stringify(presented.snapshot, null, 2)}\n`);
+  if (options.json) process.stdout.write(`${JSON.stringify(await publicSnapshot(presented.snapshot, home), null, 2)}\n`);
   else process.stdout.write(`${formatUsageLines(presented.snapshot, Date.now(), { includeResetDetails: true, identity: presented.identity }).join("\n")}\n`);
+}
+
+// With a seat configured the email is deliberately not shown (the seat label is the
+// identity), so the machine-readable output must not carry it or its key either.
+async function publicSnapshot(snapshot, home) {
+  if (!(await configuredSeatIdentity(home))) return snapshot;
+  const { accountEmail, identityKey, ...rest } = snapshot;
+  return rest;
 }
 
 async function session(argv) {
@@ -137,7 +146,7 @@ function integer(value, name) {
 
 // Transcript fields are untrusted: drop C0/C1 control characters (terminal escapes).
 function clean(value) {
-  return String(value ?? "").replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").trim();
+  return stripControls(value);
 }
 
 function shorten(value, length) {

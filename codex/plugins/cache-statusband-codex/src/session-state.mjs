@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { link, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { acquireLock } from "./lock.mjs";
+import { hasControl, stripControls } from "./sanitize.mjs";
 
 const STATE_VERSION = 1;
 const SAVE_LOCK_STALE_MS = 10_000;
@@ -49,9 +50,9 @@ function parseIdentity(text) {
   if (record?.version !== STATE_VERSION) throw new Error("Unknown session identity version");
   const value = record.identity;
   if (value === null) return null;
-  if (!value || typeof value.key !== "string" || !/^account:[^\s@]+@[^\s@]+$/.test(value.key)
+  if (!value || typeof value.key !== "string" || !/^account:[^\s@]+@[^\s@]+$/.test(value.key) || hasControl(value.key)
       || typeof value.label !== "string" || !value.label || value.label.length > 320
-      || /[\u0000-\u001f\u007f]/.test(value.label) || value.unavailable !== false) {
+      || hasControl(value.label) || value.unavailable !== false) {
     throw new Error("Invalid session identity");
   }
   return { key: value.key, label: value.label, unavailable: false };
@@ -140,6 +141,6 @@ function timestamp(value) {
 
 function safeText(value) {
   if (typeof value !== "string") return null;
-  const text = value.replace(/[\u0000-\u001f\u007f]/g, " ").trim();
+  const text = stripControls(value);
   return text ? text.slice(0, 120) : null;
 }
