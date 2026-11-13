@@ -12,6 +12,9 @@ import { configuredSeatIdentity } from "./settings.mjs";
 const CACHE_VERSION = 3;
 export const MIN_POLL_INTERVAL_MS = 5 * 60 * 1000;
 export const MAX_RETRY_AFTER_MS = 60 * 60 * 1000;
+// A writer's clock may be a little ahead of a reader that started earlier; a backoff written
+// at the longest allowed length is still a backoff when read by such a caller.
+const CLOCK_SLACK_MS = 60 * 1000;
 const LOCK_STALE_MS = 30 * 1000;
 const CLIENT_VERSION = "0.4.2";
 const MAX_CREDIT_ROWS = 20;
@@ -612,7 +615,7 @@ function present(cache, source) {
 
 function fresh(cache, now) {
   // A deadline further out than any backoff we would write is corrupt, not a backoff.
-  return Number.isFinite(cache?.nextAllowedAt) && now < cache.nextAllowedAt && cache.nextAllowedAt <= now + MAX_RETRY_AFTER_MS;
+  return Number.isFinite(cache?.nextAllowedAt) && now < cache.nextAllowedAt && cache.nextAllowedAt <= now + MAX_RETRY_AFTER_MS + CLOCK_SLACK_MS;
 }
 
 async function readCache(path) {

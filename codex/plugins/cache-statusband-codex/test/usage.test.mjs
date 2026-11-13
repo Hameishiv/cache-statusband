@@ -111,6 +111,35 @@ test("caps Retry-After at one hour and keeps the last good reading", async (t) =
   assert.equal(failed.nextAllowedAt, now + MIN_POLL_INTERVAL_MS + MAX_RETRY_AFTER_MS);
 });
 
+test("a one-hour backoff written by a caller whose clock is a few seconds ahead still holds for a slightly earlier caller", async (t) => {
+  const root = await fixtureRoot(t);
+  const now = Date.parse("2026-10-29T12:00:00.000Z");
+  const identity = { ...ACCOUNT_IDENTITY, label: `${SEAT_PREFIX} ${FIRST_SEAT}` };
+  await getUsageSnapshot({ codexHome: root, now, identity, fetcher: async () => RAW });
+  const writerNow = now + MIN_POLL_INTERVAL_MS;
+  const failed = await getUsageSnapshot({
+    codexHome: root,
+    now: writerNow,
+    identity,
+    fetcher: async () => {
+      const error = new Error("limited");
+      error.rpcData = { retry_after: 86_400 };
+      throw error;
+    },
+  });
+  assert.equal(failed.nextAllowedAt, writerNow + MAX_RETRY_AFTER_MS);
+  let calls = 0;
+  const reader = await getUsageSnapshot({
+    codexHome: root,
+    now: writerNow - 5_000,
+    identity,
+    fetcher: async () => { calls += 1; return RAW; },
+  });
+  assert.equal(calls, 0, "the backoff holds; no fetch");
+  assert.equal(reader.source, "cache");
+  assert.equal(reader.nextAllowedAt, writerNow + MAX_RETRY_AFTER_MS);
+});
+
 test("speaks the documented app-server protocol", async () => {
   const here = dirname(fileURLToPath(import.meta.url));
   const selectedHome = join(tmpdir(), "selected-codex-home");
