@@ -206,17 +206,14 @@ describe("weekly usage", () => {
     const dir = mkdtempSync(join(tmpdir(), "csb-week-"));
     const logPath = join(dir, "unified.jsonl");
     const cachePath = join(dir, "usage.json");
-    writeFileSync(logPath, `${creditsLine(23)}
-`);
+    writeFileSync(logPath, `${creditsLine(23)}\n`);
     assert.equal(loadWeekly(logPath, cachePath, now).percent, 23);
     const noPercent = JSON.stringify({
       ts: "2026-10-29T12:00:00Z",
       msg: "billing: fetched credits config",
       ctx: { config: { currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", end: "2026-11-02T22:57:09.651+00:00" } } },
     });
-    writeFileSync(logPath, `${creditsLine(23)}
-${noPercent}
-`);
+    writeFileSync(logPath, `${creditsLine(23)}\n${noPercent}\n`);
     ageCache(cachePath, logPath);
     assert.equal(loadWeekly(logPath, cachePath, now + 1000), null);
     assert.equal(JSON.parse(readFileSync(cachePath, "utf8")).sources[logPath].record, null);
@@ -226,11 +223,9 @@ ${noPercent}
     const dir = mkdtempSync(join(tmpdir(), "csb-week-"));
     const logPath = join(dir, "unified.jsonl");
     const cachePath = join(dir, "usage.json");
-    writeFileSync(logPath, "no credits line
-");
+    writeFileSync(logPath, "no credits line\n");
     assert.equal(loadWeekly(logPath, cachePath, now + 60 * 60 * 1000), null);
-    writeFileSync(logPath, `${creditsLine(61)}
-`);
+    writeFileSync(logPath, `${creditsLine(61)}\n`);
     // the clock went back an hour: the stored scan time must not hold the throttle
     assert.equal(loadWeekly(logPath, cachePath, now).percent, 61);
     assert.deepEqual(readdirSync(dir).sort(), ["unified.jsonl", "usage.json"]);
