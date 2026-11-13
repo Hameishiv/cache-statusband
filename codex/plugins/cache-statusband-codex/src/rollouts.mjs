@@ -3,6 +3,9 @@ import { basename, join, resolve, sep } from "node:path";
 
 const HEAD_BYTES = 256 * 1024;
 const TAIL_BYTES = 2 * 1024 * 1024;
+// How far back past the tail we look for the session's latest turn_context when the tail has none.
+const CONTEXT_CHUNK_BYTES = 256 * 1024;
+const CONTEXT_CHUNKS = 4;
 
 export function defaultCodexHome(env = process.env) {
   if (env.CODEX_HOME) return resolve(env.CODEX_HOME);
@@ -32,9 +35,13 @@ export async function parseRollout(path) {
 
   // The head of a truncated file only says who/where the session is; its timestamps
   // and token counts are old news and must not outrank the tail.
-  for (const [text, fromHead] of [[edges.head, true], [edges.tail, false]]) {
-    if (!text) continue;
-    for (const line of text.split(/\r?\n/)) {
+  // On a truncated file the head's model and effort may be many turns out of date, so they
+  // are held back and used only if nothing later is found (see below).
+  let headContext = null;
+  let tailHasContext = false;
+  for (const [chunk, fromHead] of [[edges.head, true], [edges.tail, false]]) {
+    if (!chunk) continue;
+    for (const line of chunk.split(/\r?\n/)) {
       if (!line.trim()) continue;
       let item;
       try {
@@ -42,7 +49,27 @@ export async function parseRollout(path) {
       } catch {
         continue;
       }
+      if (fromHead && item?.type === "turn_context" && item.payload) {
+        headContext = item.payload;
+        summary.cwd = text(item.payload.cwd) ?? summary.cwd;
+        continue;
+      }
+      if (!fromHead && item?.type === "turn_context" && item.payload) tailHasContext = true;
       consume(item, summary, fromHead);
+    }
+  }
+  if (edges.truncated && !tailHasContext) {
+    // The tail window did not include a turn_context. Look in the stretch just before it; if
+    // that stretch reaches the head, the head's context is the latest there is. Otherwise the
+    // model and effort are unknown, which is better than showing a first-turn value.
+    const found = await edges.findEarlierContext();
+    if (found?.payload) {
+      summary.cwd = text(found.payload.cwd) ?? summary.cwd;
+      summary.model = text(found.payload.model) ?? summary.model;
+      summary.effort = text(found.payload.effort) ?? text(found.payload.reasoning_effort) ?? summary.effort;
+    } else if (found?.reachedHead && headContext) {
+      summary.model = text(headContext.model) ?? summary.model;
+      summary.effort = text(headContext.effort) ?? text(headContext.reasoning_effort) ?? summary.effort;
     }
   }
   return summary;
@@ -76,7 +103,7 @@ export async function scanSessions(codexHome, { includeArchived = false, limit =
 
 function consume(item, summary, fromHead = false) {
   const payload = item?.payload;
-  if (fromHead && item?.type !== "session_meta" && item?.type !== "turn_context") return;
+  if (fromHead && item?.type !== "session_meta") return;
   if (!fromHead && typeof item?.timestamp === "string") summary.updatedAt = item.timestamp;
 
   if (item?.type === "session_meta" && payload) {
@@ -152,14 +179,61 @@ function scalarSource(value) {
 async function readEdges(path, size) {
   const handle = await open(path, "r");
   try {
-    if (size <= HEAD_BYTES + TAIL_BYTES) return { head: null, tail: await handle.readFile({ encoding: "utf8" }) };
+    if (size <= HEAD_BYTES + TAIL_BYTES) return { head: null, tail: await handle.readFile({ encoding: "utf8" }), truncated: false };
     const head = Buffer.alloc(HEAD_BYTES);
     const tail = Buffer.alloc(TAIL_BYTES);
     await handle.read(head, 0, HEAD_BYTES, 0);
     await handle.read(tail, 0, TAIL_BYTES, size - TAIL_BYTES);
-    const tailText = tail.toString("utf8");
-    const firstNewline = tailText.indexOf("\n");
-    return { head: head.toString("utf8"), tail: firstNewline >= 0 ? tailText.slice(firstNewline + 1) : "" };
+    const firstNewline = tail.indexOf(0x0a);
+    return {
+      head: head.toString("utf8"),
+      tail: firstNewline >= 0 ? tail.subarray(firstNewline + 1).toString("utf8") : "",
+      truncated: true,
+      findEarlierContext: () => findEarlierContext(path, size),
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+// Reads fixed-size chunks backwards from just before the tail window (never into the head
+// window) and returns { payload } for the latest turn_context found, { reachedHead: true }
+// if the chunks ran all the way back to the head window without finding one, or null.
+async function findEarlierContext(path, size) {
+  const handle = await open(path, "r");
+  try {
+    let end = size - TAIL_BYTES;
+    // The tail window starts part-way through a line: the bytes from `end` up to the first
+    // newline are the end of a line that begins earlier, so they are carried back.
+    const probe = Buffer.alloc(Math.min(CONTEXT_CHUNK_BYTES, size - end));
+    await handle.read(probe, 0, probe.length, end);
+    const probeNewline = probe.indexOf(0x0a);
+    let carry = probeNewline >= 0 ? probe.subarray(0, probeNewline) : probe;
+    for (let i = 0; i < CONTEXT_CHUNKS; i += 1) {
+      const start = Math.max(HEAD_BYTES, end - CONTEXT_CHUNK_BYTES);
+      if (start >= end) return { reachedHead: true };
+      const chunk = Buffer.alloc(end - start);
+      await handle.read(chunk, 0, chunk.length, start);
+      const whole = Buffer.concat([chunk, carry]);
+      // The first line of a chunk begins in an earlier chunk (or in the head's cut-off end).
+      const firstNewline = whole.indexOf(0x0a);
+      const complete = firstNewline >= 0 ? whole.subarray(firstNewline + 1) : Buffer.alloc(0);
+      const lines = complete.toString("utf8").split(/\r?\n/);
+      for (let j = lines.length - 1; j >= 0; j -= 1) {
+        if (!lines[j].trim()) continue;
+        let item;
+        try {
+          item = JSON.parse(lines[j]);
+        } catch {
+          continue;
+        }
+        if (item?.type === "turn_context" && item.payload) return { payload: item.payload };
+      }
+      carry = firstNewline >= 0 ? whole.subarray(0, firstNewline) : whole;
+      end = start;
+      if (start <= HEAD_BYTES) return { reachedHead: true };
+    }
+    return null;
   } finally {
     await handle.close();
   }

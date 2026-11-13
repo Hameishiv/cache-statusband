@@ -542,21 +542,19 @@ test("a startup in a cache folder that refuses new files still shows the stored 
   // session's identity record cannot be written, and neither can the usage cache's lock.
   const folders = [sessionsDir, dataDir];
   const undo = [];
-  if (process.platform === "win32") {
-    for (const dir of folders) {
-      await promisify(execFile)("icacls", [dir, "/deny", "*S-1-1-0:(WD,AD)"]);
-      undo.push(() => promisify(execFile)("icacls", [dir, "/remove:d", "*S-1-1-0"]));
-    }
-  } else if (process.getuid?.() === 0) {
-    return t.skip("root cannot be denied file creation");
-  } else {
-    for (const dir of folders) {
-      await chmod(dir, 0o555);
-      undo.push(() => chmod(dir, 0o755));
-    }
-  }
+  if (process.platform !== "win32" && process.getuid?.() === 0) return t.skip("root cannot be denied file creation");
   let output;
   try {
+    // The setup is inside the try so that a failure part-way still lifts every deny applied so far.
+    for (const dir of folders) {
+      if (process.platform === "win32") {
+        undo.push(() => promisify(execFile)("icacls", [dir, "/remove:d", "*S-1-1-0"]));
+        await promisify(execFile)("icacls", [dir, "/deny", "*S-1-1-0:(WD,AD)"]);
+      } else {
+        undo.push(() => chmod(dir, 0o755));
+        await chmod(dir, 0o555);
+      }
+    }
     output = await handleSessionStart({ source: "startup", session_id: "unwritable-cache" }, {
       codexHome: root,
       identityGetter: async () => ({ key: `account:${email}`, label: email, unavailable: false }),
@@ -643,6 +641,33 @@ test("a truncated rollout takes only identity from its head and everything else 
   await writeFile(path, head + filler, "utf8");
   await utimes(path, mtime, mtime);
   assert.equal((await parseRollout(path)).updatedAt, mtime.toISOString());
+});
+
+test("a truncated rollout shows the latest turn_context it can find, or none, never the first turn's", async (t) => {
+  const root = await fixtureRoot(t);
+  const line = (value) => `${JSON.stringify(value)}\n`;
+  const filler = (count) => line({ type: "response_item", payload: { type: "message", content: "x".repeat(2048) } }).repeat(count);
+  const contextA = { timestamp: "2026-10-29T12:01:00.000Z", type: "turn_context", payload: { cwd: "/workspace/example", model: "model-A", effort: "low" } };
+  const contextB = { timestamp: "2026-10-29T13:01:00.000Z", type: "turn_context", payload: { cwd: "/workspace/later", model: "model-B", effort: "high" } };
+  const tokens = FIXTURE.at(-1);
+
+  // B sits just before the tail window and inside the bounded look-back: B is shown.
+  const near = join(root, "near.jsonl");
+  await writeFile(near, line(FIXTURE[0]) + line(contextA) + filler(150) + line(contextB) + filler(1400) + line(tokens), "utf8");
+  const nearSummary = await parseRollout(near);
+  assert.equal(nearSummary.model, "model-B");
+  assert.equal(nearSummary.effort, "high");
+  assert.equal(nearSummary.cwd, "/workspace/later");
+  assert.equal(nearSummary.contextUsed, 25000);
+
+  // B is further back than the look-back reaches: the model is unknown, not A.
+  const far = join(root, "far.jsonl");
+  await writeFile(far, line(FIXTURE[0]) + line(contextA) + filler(150) + line(contextB) + filler(2600) + line(tokens), "utf8");
+  const farSummary = await parseRollout(far);
+  assert.equal(farSummary.model, null);
+  assert.equal(farSummary.effort, null);
+  assert.equal(farSummary.id, "session-1");
+  assert.equal(farSummary.contextUsed, 25000);
 });
 
 test("rate limits are reduced to numeric primary/secondary window fields", async (t) => {
